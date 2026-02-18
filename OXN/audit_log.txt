@@ -1,0 +1,75 @@
+
+> [Persistence] 
+Auditing 
+Parameters before 
+save:
+  Total 
+Parameters: 189
+  [Persistence] 
+Atomic Save to indu
+strial_ckpt.bin...
+  Checkpointer 
+secured.
+  [Step 0] Forward 
+Pass...
+  [Step 0] 
+Backward Pass...
+  [Step 0] 
+Optimizer Step 
+(Muon)...
+    [Param 0 Norm] 
+0.0000
+  Epoch 2 | Step 
+0/100 | Loss: 
+16.3613
+  [Step 1] Forward 
+Pass...
+  [Step 1] 
+Backward Pass...
+  [Step 1] 
+Optimizer Step 
+(Muon)...
+    [Param 0 Norm] 
+0.0000
+  [Step 2] Forward 
+Pass...
+  [Step 2] 
+Backward Pass...
+  [Step 2] 
+Optimizer Step 
+(Muon)...
+    [Param 0 Norm] 
+0.0000
+  [Step 3] Forward 
+Pass...
+  [Step 3] 
+Backward Pass...
+  [Step 3] 
+Optimizer Step 
+(Muon)...
+    [Param 0 Norm] 
+0.0000
+> [Persistence] 
+Auditing 
+Parameters before 
+save:
+  Total 
+Parameters: 189
+  [Persistence] 
+Atomic Save to indu
+strial_ckpt.bin...
+  Checkpointer 
+secured.
+  
+  [Verification] 
+Reloading Model...
+  Reload Failed: 
+Tensor size 
+mismatch in 
+copy_from
+  
+  === Industrial 
+Training Complete 
+===
+
+

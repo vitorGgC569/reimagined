@@ -1,0 +1,16 @@
+[
+  {
+    "name": "unit_tests",
+    "passed": false,
+    "stdout": "============================= test session starts =============================\nplatform win32 -- Python 3.11.0, pytest-9.0.2, pluggy-1.6.0\nrootdir: C:\\Users\\VitorGGc\\Desktop\\Pantheon-Oxtav1-15338770387506525964\\OXN\ncollected 0 items\n\n============================ no tests ran in 0.01s ============================\n",
+    "stderr": "ERROR: file or directory not found: OXN/tests\n\n",
+    "required": true
+  },
+  {
+    "name": "determinism",
+    "passed": false,
+    "stdout": "",
+    "stderr": "python: can't open file 'C:\\\\Users\\\\VitorGGc\\\\Desktop\\\\Pantheon-Oxtav1-15338770387506525964\\\\OXN\\\\OXN\\\\scripts\\\\verify_determinism.py': [Errno 2] No such file or directory\n",
+    "required": true
+  }
+]

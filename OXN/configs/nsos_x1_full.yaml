@@ -1,0 +1,110 @@
+# nsos_x1_config.yaml
+model:
+  name: "NSOS-X1"
+  version: "1.0.0"
+
+  # Arquitetura híbrida
+  architecture:
+    type: "Jamba-Hybrid"
+    total_params: 100000000000  # 100B total
+    active_params: 25000000000  # 25B ativos (MoE)
+
+  # Configuração de camadas
+  layers:
+    total: 64                   # 64 camadas totais
+    attention_layers: 8         # 1:7 ratio (Jamba)
+    mamba_layers: 56            # Mamba2SSD
+
+  # Mamba2SSD
+  mamba:
+    state_dim: 128
+    head_dim: 64
+    expansion_factor: 2
+    chunk_size: 128
+    quantization: "1.58bit"     # Ternary {-1, 0, 1}
+
+  # Attention (Transformer)
+  attention:
+    heads: 32
+    head_dim: 128
+    window_size: 4096           # Sliding window
+    quantization: "1.58bit"
+
+  # Mixture of Experts
+  moe:
+    num_experts: 16
+    top_k: 2
+    expert_size: "4x"
+    load_balancing: "aux_loss"
+
+  # Test-Time Training (TTT)
+  ttt:
+    enabled: true
+    learning_rate: 1e-4
+    momentum: 0.9
+    friction: 0.1
+    temperature_schedule: "cosine"
+
+  # Holographic Associative Memory
+  ham:
+    enabled: true
+    dimension: 10000            # Hiperdimensional
+    operations: ["bind", "bundle", "permute"]
+
+  # Symbolic Reasoning
+  symbolic:
+    mcts:
+      enabled: true
+      num_simulations: 100
+      uct_constant: 1.414
+    chrass:
+      enabled: true
+      similarity_threshold: 0.85
+      graph_update_freq: 100
+      
+training:
+  # Fase 1: Pré-treinamento
+  pretraining:
+    tokens: "15T"
+    sequence_length: 32768
+    batch_size: 4096
+    
+    optimizer:
+      name: "Muon"              # NSOS custom optimizer
+      lr: 3e-4
+      weight_decay: 0.1
+      
+    schedule:
+      warmup_steps: 10000
+      decay: "cosine"
+      min_lr: 3e-5
+      
+    parallelism:
+      data_parallel: 64
+      tensor_parallel: 8
+      pipeline_parallel: 16
+
+  # Fase 2: Pós-treinamento (SFT)
+  sft:
+    dataset_size: "10M"
+    epochs: 3
+    lr: 1e-5
+
+  # Fase 3: Alinhamento (ORPO)
+  alignment:
+    method: "ORPO"              # Odds Ratio Preference Optimization
+    dataset_size: "1M"
+    epochs: 2
+    lr: 5e-6
+
+  # Fase 4: Test-Time Training Meta-Learning
+  ttt_meta:
+    enabled: true
+    inner_steps: 5
+    outer_lr: 1e-4
+
+cluster:
+  name: "NSOS-SuperPod"
+  nodes: 1024
+  gpus_per_node: 8
+  gpu_type: "H100"

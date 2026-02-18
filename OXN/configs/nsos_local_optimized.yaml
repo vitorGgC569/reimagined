@@ -1,0 +1,82 @@
+# nsos_local_optimized.yaml
+# Optimized for: NVIDIA GTX 1050 Ti (4GB VRAM) | 12GB RAM
+model:
+  name: "NSOS-X1-Local-Debug"
+  version: "1.0.0-local"
+
+  architecture:
+    type: "Jamba-Hybrid"
+    # Scales down to fit in 4GB VRAM with ternary quantization
+    total_params: 250000000     # 250M total
+    active_params: 64000000     # 64M active (MoE)
+    use_cuda: true
+
+  layers:
+    total: 12                   # Reduced for local latency
+    attention_layers: 2         # Jamba ratio
+    mamba_layers: 10
+
+  mamba:
+    state_dim: 32               # Extremely optimized
+    head_dim: 32
+    expansion_factor: 2
+    chunk_size: 64
+    quantization: "1.58bit"     # Ternary weights!
+
+  attention:
+    heads: 8
+    head_dim: 64
+    window_size: 512            # Tight window for VRAM
+    quantization: "1.58bit"
+
+  moe:
+    num_experts: 4              # Fewer experts for local RAM
+    top_k: 1                    # Single expert routing for speed
+    expert_size: "1x"
+    load_balancing: "aux_loss"
+
+  ttt:
+    enabled: true
+    learning_rate: 1e-4
+    momentum: 0.9
+    friction: 0.5               # Higher friction for stability on small scale
+    temperature_schedule: "cosine"
+
+  ham:
+    enabled: true
+    dimension: 2048             # Reduced hd-vector dim for local
+    operations: ["bind", "bundle"]
+
+  symbolic:
+    mcts:
+      enabled: true
+      num_simulations: 20       # Fast reasoning loops
+      uct_constant: 1.414
+    chrass:
+      enabled: false            # Disable graph reasoning locally to save RAM
+
+training:
+  pretraining:
+    tokens: "500M"              # Local small-scale training
+    sequence_length: 512
+    batch_size: 16              # Fits in 4GB
+
+    optimizer:
+      name: "Muon"
+      lr: 5e-4                  # Slightly higher LR for small model
+      weight_decay: 0.05
+
+    schedule:
+      warmup_steps: 100
+      decay: "cosine"
+      min_lr: 5e-5
+
+    parallelism:
+      data_parallel: 1
+      tensor_parallel: 1
+      pipeline_parallel: 1
+
+  sft:
+    dataset_size: "10K"
+    epochs: 5
+    lr: 2e-5

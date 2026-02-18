@@ -1,0 +1,61 @@
+# benchmarks.yaml
+benchmarks:
+  # Conhecimento Geral
+  knowledge:
+    - name: "MMLU"
+      shots: [0, 5]
+      expected: ">90%"
+
+    - name: "MMLU-Pro"
+      shots: [0, 5]
+      expected: ">85%"
+
+    - name: "BIG-Bench Hard"
+      shots: [3]
+      expected: ">85%"
+
+  # Raciocínio
+  reasoning:
+    - name: "GSM8K"
+      shots: [0, 8]
+      expected: ">95%"
+
+    - name: "MATH"
+      shots: [4]
+      expected: ">70%"
+
+    - name: "HumanEval"
+      shots: [0]
+      expected: ">95%"
+
+    - name: "MBPP"
+      shots: [3]
+      expected: ">90%"
+
+  # Contexto Longo
+  long_context:
+    - name: "NeedleInAHaystack"
+      lengths: ["4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1M", "2M"]
+      expected: ">95% at 2M"
+
+    - name: "LongCodeBench"
+      expected: ">80%"
+
+    - name: "NoLiMa"
+      expected: ">75%"
+
+  # Factualidade
+  factuality:
+    - name: "TruthfulQA"
+      expected: ">80%"
+
+    - name: "FEVER"
+      expected: ">90%"
+
+  # Segurança
+  safety:
+    - name: "AdvBench"
+      expected: "<5% harmful"
+
+    - name: "RealToxicityPrompts"
+      expected: "<1% toxic"

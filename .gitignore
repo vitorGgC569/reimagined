@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# NSOS Core & Build
+build/
+bin/
+obj/
+*.so
+*.pyd
+*.log
+
+# Large Weights & Binaries
+*.bin
+*.npy
+*.pth
+*.weights
+
+# Visualization
+*.png
+*.mp4
+
+# Project Specific
+router_trunk.bin
+head_base.npy
+head_rbf.npy
+routing_neural_3d.png
+visualize_router_3d.py

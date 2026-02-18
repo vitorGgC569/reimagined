@@ -1,0 +1,103 @@
+#include "tensor.h"
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "../../../KernelOpen/include/graph_solver.h"
+
+// Included in jamba.cpp via #include
+// Helper function to extract System 2 Graph Logic
+
+void run_system2_graph_reasoning(Tensor& h) {
+    std::cout << "[System 2] High uncertainty detected. Invoking CHRASS Solver (Dynamic Graph)..." << std::endl;
+
+    // 1. Construct Graph from Latent Token Similarity (Concept Linkage)
+    // We treat each token in the sequence as a node.
+    // Edges are formed if Cosine Similarity > Threshold.
+
+    int batch = h.shape[0];
+    int seq_len = h.shape[1];
+    int dim = h.shape[2];
+
+    // Only process first item in batch for System 2 prototype
+    if (batch >= 1 && seq_len > 0) {
+        uhk::graph::CSRGraph context_graph;
+        context_graph.n = seq_len;
+        context_graph.row_ptr.push_back(0);
+
+        // Extract raw pointers for faster access
+        const float* data_ptr = h.data(); // [Batch, Seq, Dim]
+
+        // Parallel Adjacency Construction
+        // Use per-row buffers to avoid race conditions on push_back
+        std::vector<std::vector<std::pair<int, int>>> adj_list(seq_len);
+
+        #pragma omp parallel for
+        for (int i = 0; i < seq_len; ++i) {
+            const float* vec_i = data_ptr + (i * dim);
+            float norm_i = 0;
+            for(int d=0; d<dim; ++d) norm_i += vec_i[d]*vec_i[d];
+            norm_i = std::sqrt(norm_i);
+
+            for (int j = 0; j < seq_len; ++j) {
+                if (i == j) continue;
+
+                const float* vec_j = data_ptr + (j * dim);
+                float dot = 0;
+                for(int d=0; d<dim; ++d) dot += vec_i[d]*vec_j[d];
+
+                float norm_j = 0;
+                for(int d=0; d<dim; ++d) norm_j += vec_j[d]*vec_j[d];
+                norm_j = std::sqrt(norm_j);
+
+                float sim = dot / (norm_i * norm_j + 1e-6);
+
+                if (sim > 0.5f) {
+                    int weight = std::max(1, (int)((1.0f - sim) * 100));
+                    adj_list[i].push_back({j, weight});
+                }
+            }
+        }
+
+        // Flatten to CSR (Serial)
+        for(int i=0; i<seq_len; ++i) {
+            for(auto& edge : adj_list[i]) {
+                context_graph.col_ind.push_back(edge.first);
+                context_graph.values.push_back(edge.second);
+            }
+            context_graph.row_ptr.push_back(context_graph.col_ind.size());
+        }
+
+        // 2. Run CHRASS Solver (SSSP from Token 0)
+        if (context_graph.col_ind.size() > 0) {
+                // SSSP from the first token (Prompt start) to all others
+                // Uses Heat Map + WDD Layout Reordering internally via solve_optimized
+            auto [result, perm] = uhk::graph::solve_optimized(context_graph, 0);
+
+            // 3. Inject Reasoning (Distance to Concept) back into Latent
+            // We add the "Logical Distance" as a bias to the embeddings
+            // This grounds the intuition in the graph topology
+            float* mutable_data = h.data(); // We are modifying h in place (or copy)
+            for(int i=0; i<seq_len; ++i) {
+                if (i < result.size() && result[i] != -1ULL) {
+                    // Inject into first feature dimension as a signal
+                    // We use the calculated 'Logical Distance' to bias the embeddings.
+                    // This grounds the System 1 intuition in the System 2 topology.
+
+                    // FIX: Soft Saturation injection (Tanh) instead of linear accumulation
+                    // Prevents exploding values if result is large
+                    float val = (float)result[i] * 0.01f;
+                    float sat_val = std::tanh(val);
+
+                    mutable_data[i * dim] += sat_val;
+
+                    // Debug Output
+                    if (i < 5) { // Print first few
+                            std::cout << "   -> Token " << i << " Distance: " << result[i] << " (Injected)" << std::endl;
+                    }
+                }
+            }
+        } else {
+                std::cout << "[System 2] Graph too sparse, no reasoning applied." << std::endl;
+        }
+    }
+}

@@ -1,0 +1,17 @@
+E
+======================================================================
+ERROR: test_gradient_stats (__main__.TestGradient.test_gradient_stats)
+Gradient Check: Analytical vs Numerical (Statistical)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/app/tests/integration/test_03_gradient.py", line 37, in test_gradient_stats
+    error = float(abs(calc_grad - expected_grad))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: only 0-dimensional arrays can be converted to Python scalars
+
+----------------------------------------------------------------------
+Ran 1 test in 0.002s
+
+FAILED (errors=1)
+
+--- Gradient Accuracy Statistics ---

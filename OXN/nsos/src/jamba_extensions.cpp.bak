@@ -1,0 +1,23 @@
+
+// Additional Methods for Bindings
+Tensor JambaModel::forward_thought(const Tensor &x, int steps) {
+  return reason(x, steps);
+}
+
+void JambaModel::run_reasoning_loop(int iterations) {
+  // Placeholder: Need state to reason on.
+  // Assuming this is a method called from Python with external state
+  // management? Or it uses internal last state? For now, no-op or print
+  std::cout << "[JambaModel] Reasoning Loop (" << iterations
+            << " iters) - Not implemented fully." << std::endl;
+}
+
+void JambaModel::backward_external(const Tensor &grad, Context &ctx) {
+  backward(grad, ctx);
+}
+
+void JambaModel::backward_embedding(const Tensor &grad, Context &ctx) {
+  if (embedding) {
+    embedding->backward(grad);
+  }
+}

@@ -1,0 +1,18 @@
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.087s
+
+OK
+
+--- MatMul Parity Statistics ---
+Shape (16, 16): MaxErr=1.91e-06, MeanErr=2.17e-07
+Shape (32, 32): MaxErr=3.81e-06, MeanErr=3.97e-07
+Shape (64, 64): MaxErr=9.54e-06, MeanErr=6.52e-07
+Shape (128, 128): MaxErr=1.91e-05, MeanErr=1.36e-06
+📊 Error Magnitude Stats (N=4):
+   Mean:   0.000009
+   StdDev: 0.000008
+   Min:    0.000002
+   Max:    0.000019
+   P95:    0.000019
+   Criteria [Mean Max Error]: 0.000009 < 0.001 -> ✅ PASS

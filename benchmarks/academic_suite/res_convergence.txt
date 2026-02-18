@@ -1,0 +1,525 @@
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+[Jamba] Forward Embedding Start
+[Jamba] Layer 0 Start
+[Jamba] Mamba Forward
+[Jamba] Layer 1 Start
+[Jamba] TTT Forward
+=== 📉 Convergence Benchmark (Associative Recall) ===
+Training for 100 steps...
+Step 0: Loss 4.9175 | Acc 0/15
+Step 10: Loss 5.0640 | Acc 0/15
+Step 20: Loss 5.4996 | Acc 0/15
+Step 30: Loss 5.2255 | Acc 0/15
+Step 40: Loss 5.4731 | Acc 0/15
+Step 50: Loss 5.1927 | Acc 0/15
+Step 60: Loss 5.4931 | Acc 0/15
+Step 70: Loss 5.0647 | Acc 0/15
+Step 80: Loss 5.3574 | Acc 0/15
+Step 90: Loss 5.1789 | Acc 0/15
+Final Loss: 5.2280
+
+[Loss Curve]
+5.63 |                                                                                    *
+5.51 |                                                       *                        *   *
+5.38 |                     *           *       *  *   *      * *   *        *        **   *    *
+5.26 |          *          *   **      *       *  *   **     ***   *     *  *      * ***  *    *
+5.14 |     *    *          *   ** *  * * ***   *  * * ****   ***   *     *  *      * *** **  * * *     *  *
+5.01 |   **********        *  *****  * * ****  ** ******** * ****  * *   *  **     * *** ** ** * *     *  *
+4.89 | * **********  **    *  ***** **** ******** ******** ***********  **  *** *  * *** ******* **    * **
+4.76 | ************* **** **  ***** **** ******** ********************  ** **** * ** *** **********  ******
+4.64 | ************* ******** ***** **** ******** ***************************** ******************* *******
+4.52 | **************************** **** ******** ***************************** ***************************

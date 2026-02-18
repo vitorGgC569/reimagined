@@ -1,0 +1,26 @@
+# Ignore build artifacts
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.vscode/
+.idea/
+*.egg-info/
+dist/
+teacher/
+cache/
+data/
+*.log
+*.txt
+
+# Heavy/Local folders
+checkpoints/
+models/
+venv/
+env/
+tmp/
+weights/
+outputs/
+wandb/

@@ -1,0 +1,36 @@
+# cluster_config.yaml
+cluster:
+  name: "NSOS-SuperPod"
+
+  nodes:
+    count: 1024
+    type: "DGX H100"
+
+    specs_per_node:
+      gpus: 8
+      gpu_model: "NVIDIA H100 80GB SXM5"
+      cpu_cores: 128
+      ram: "2TB"
+      storage: "30TB NVMe"
+
+  network:
+    intra_node: "NVLink 4.0"        # 900 GB/s
+    inter_node: "InfiniBand NDR"     # 400 Gb/s
+    topology: "Fat-tree"
+
+  storage:
+    type: "Parallel Filesystem"
+    capacity: "5PB"
+    throughput: "5TB/s"
+
+  software:
+    os: "Ubuntu 22.04 LTS"
+    cuda: "12.2"
+    nccl: "2.18"
+    mpi: "OpenMPI 4.1"
+
+    frameworks:
+      - "PyTorch 2.1"
+      - "DeepSpeed 0.12"
+      - "Megatron-LM 0.6"
+      - "NSOS 1.0"

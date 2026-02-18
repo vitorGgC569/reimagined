@@ -1,0 +1,80 @@
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-24.6353 Max:28.1975 Mean:-0.0426062 NaNs:0
+[MONITOR] JambaBlock_0 OK. Max=28.1975 Mean=-0.0426062
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-25.0897 Max:27.9568 Mean:-0.0460276 NaNs:0
+[MONITOR] JambaBlock_1 OK. Max=27.9568 Mean=-0.0460276
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-35.0023 Max:35.1974 Mean:-0.120878 NaNs:0
+[MONITOR] JambaBlock_2 OK. Max=35.1974 Mean=-0.120878
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-34.9837 Max:35.1856 Mean:-0.120878 NaNs:0
+[MONITOR] JambaBlock_3 OK. Max=35.1856 Mean=-0.120878
+[MONITOR] FinalOutput OK. Max=3.28013 Mean=-0.0120438
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-22.8557 Max:27.9995 Mean:0.0791231 NaNs:0
+[MONITOR] JambaBlock_0 OK. Max=27.9995 Mean=0.0791231
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-22.8604 Max:27.9786 Mean:0.0682052 NaNs:0
+[MONITOR] JambaBlock_1 OK. Max=27.9786 Mean=0.0682052
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-36.8137 Max:42.9131 Mean:0.0675818 NaNs:0
+[MONITOR] JambaBlock_2 OK. Max=42.9131 Mean=0.0675818
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-36.793 Max:42.8849 Mean:0.0675819 NaNs:0
+[MONITOR] JambaBlock_3 OK. Max=42.8849 Mean=0.0675819
+[MONITOR] FinalOutput OK. Max=4.08073 Mean=0.00732475
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-27.1774 Max:30.1772 Mean:0.04431 NaNs:0
+[MONITOR] JambaBlock_0 OK. Max=30.1772 Mean=0.04431
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-26.9534 Max:30.211 Mean:0.0454877 NaNs:0
+[MONITOR] JambaBlock_1 OK. Max=30.211 Mean=0.0454877
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-37.8987 Max:34.1021 Mean:0.178035 NaNs:0
+[MONITOR] JambaBlock_2 OK. Max=37.8987 Mean=0.178035
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-37.8754 Max:34.0812 Mean:0.178035 NaNs:0
+[MONITOR] JambaBlock_3 OK. Max=37.8754 Mean=0.178035
+[MONITOR] FinalOutput OK. Max=3.80984 Mean=0.0165071
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-23.1842 Max:25.1168 Mean:0.0565857 NaNs:0
+[MONITOR] JambaBlock_0 OK. Max=25.1168 Mean=0.0565857
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-23.3773 Max:25.5069 Mean:0.0621966 NaNs:0
+[MONITOR] JambaBlock_1 OK. Max=25.5069 Mean=0.0621966
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-35.3448 Max:35.0018 Mean:0.145027 NaNs:0
+[MONITOR] JambaBlock_2 OK. Max=35.3448 Mean=0.145027
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-35.3194 Max:34.9763 Mean:0.145027 NaNs:0
+[MONITOR] JambaBlock_3 OK. Max=35.3194 Mean=0.145027
+[MONITOR] FinalOutput OK. Max=3.28808 Mean=0.0131217
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-26.0705 Max:25.5886 Mean:0.0731251 NaNs:0
+[MONITOR] JambaBlock_0 OK. Max=26.0705 Mean=0.0731251
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-25.5702 Max:25.7488 Mean:0.0612906 NaNs:0
+[MONITOR] JambaBlock_1 OK. Max=25.7488 Mean=0.0612906
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-36.2143 Max:38.0746 Mean:0.201921 NaNs:0
+[MONITOR] JambaBlock_2 OK. Max=38.0746 Mean=0.201921
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-36.1784 Max:38.0503 Mean:0.201922 NaNs:0
+[MONITOR] JambaBlock_3 OK. Max=38.0503 Mean=0.201922
+[MONITOR] FinalOutput OK. Max=3.63908 Mean=0.0170995
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-27.7748 Max:25.5443 Mean:0.145678 NaNs:0
+[MONITOR] JambaBlock_0 OK. Max=27.7748 Mean=0.145678
+> JambaBlock
+< JambaBlock Output: [1x32x128] | Min:-27.9158 Max:25.5589 Mean:0.148069 NaNs:0
+[MONITOR] JambaBlock_1 OK. Max=27.9158 Mean=0.148069
+> JambaBlock
+
+
+==========================================
+🔥 PANIC: CRASH DETECTED 🔥
+Last Operation: JambaBlock
+Scope Stack:
+ - JambaBlock
+==========================================

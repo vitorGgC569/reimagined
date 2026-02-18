@@ -1,0 +1,29 @@
+name: NSOS Industrial CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc-12 g++-12 python3-dev python3-pip pybind11-dev libopenmpi-dev
+          pip3 install numpy torch pytest hypothesis
+
+      - name: Build NSOS
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-12 -G Ninja
+          cmake --build build --target nsos_ext -j$(nproc)
+
+      - name: Run Gatekeeper
+        run: |
+          export PYTHONPATH=$PYTHONPATH:$(pwd)/build
+          python3 OXN/scripts/gatekeeper.py
