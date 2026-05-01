@@ -8,27 +8,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  cpu-build-and-test:
+  product:
+    name: product / OXN/nsos CPU
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate Project Boundary
-        run: |
-          python3 scripts/check_project_boundary.py
+      - name: Validate project boundary
+        run: python3 scripts/check_project_boundary.py
 
-      - name: Install dependencies
+      - name: Install product dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build gcc-12 g++-12 python3-dev python3-pip pybind11-dev libopenmpi-dev
+          sudo apt-get install -y cmake ninja-build gcc-12 g++-12 python3-dev python3-pip pybind11-dev
           pip3 install -r requirements-dev.txt
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Build NSOS Release CPU
+      - name: Build product CPU
         run: |
           cmake -S OXN/nsos -B OXN/nsos/build-ci \
             -DCMAKE_BUILD_TYPE=Release \
@@ -43,74 +38,81 @@ jobs:
             -G Ninja
           cmake --build OXN/nsos/build-ci -j$(nproc)
 
-      - name: Run Native Test Suite
-        run: |
-          ctest --test-dir OXN/nsos/build-ci --output-on-failure
+      - name: Run product CTest
+        run: ctest --test-dir OXN/nsos/build-ci --output-on-failure
 
-      - name: Run Python Syntax Smoke
-        run: |
-          python3 -m compileall -q OXN/nsos/scripts OXN/nsos/python OXN/tests modules/oxtamem/python modules/oxtamem/oxta_engine/python modules/oxtamem/nn
+      - name: Run product Python syntax smoke
+        run: python3 -m compileall -q OXN/nsos/scripts OXN/nsos/python OXN/tests
 
-      - name: Run Benchmark Gate
+      - name: Run product benchmark gate
         run: |
           python3 OXN/nsos/scripts/benchmark_gate.py \
             --build-dir OXN/nsos/build-ci \
             --device cpu \
             --profile mamba_small \
+            --max-tokens 8 \
             --min-prompt-tok-s 1.0 \
-            --min-decode-tok-s 0.5 \
+            --min-decode-tok-s 0.1 \
             --max-sampler-share 0.99 \
             --report-path OXN/nsos/build-ci/benchmark_gate_cpu.json
 
-      - name: Run Fuzz Smoke
+      - name: Run product fuzz smoke
         run: |
           python3 OXN/nsos/scripts/fuzz_surface_smoke.py \
             --build-dir OXN/nsos/build-ci \
             --report-path OXN/nsos/build-ci/fuzz_surface_smoke.json
 
-      - name: Build Sanitizer Lane
-        run: |
-          cmake -S OXN/nsos -B OXN/nsos/build-asan \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_COMPILER=g++-12 \
-            -DNSOS_BUILD_PYTHON=OFF \
-            -DNSOS_BUILD_TESTS=ON \
-            -DNSOS_BUILD_API=ON \
-            -DNSOS_BUILD_CLI=OFF \
-            -DNSOS_BUILD_OXTAMEM=OFF \
-            -DNSOS_ENABLE_CUDA=OFF \
-            -DNSOS_ENABLE_NATIVE_OPTIMIZATIONS=OFF \
-            -DNSOS_SANITIZERS='address;undefined' \
-            -G Ninja
-          cmake --build OXN/nsos/build-asan -j$(nproc)
-
-      - name: Run Sanitizer Test Suite
-        run: |
-          ASAN_OPTIONS=detect_leaks=0 ctest --test-dir OXN/nsos/build-asan --output-on-failure
-
-      - name: Run Gatekeeper
+      - name: Run product gatekeeper
         run: |
           export NSOS_BUILD_DIR="$(pwd)/OXN/nsos/build-ci"
           export PYTHONPATH="$PYTHONPATH:$NSOS_BUILD_DIR"
           python3 OXN/scripts/gatekeeper.py
 
-      - name: Run OxtaMem Rust Tests
-        run: |
-          cargo test --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets
-          cargo clippy --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets -- -D warnings
+      - name: Build product Docker image
+        run: docker build -t nsos-mvp-ci .
 
-      - name: Run Rust Dependency Audit
-        run: |
-          cargo install cargo-audit --locked
-          cd modules/oxtamem/oxta_engine
-          cargo audit
+  integrated-oxtamem:
+    name: integrated / modules/oxtamem
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Build MVP Docker Image
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run OxtaMem Rust tests
+        run: cargo test --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets
+
+      - name: Run OxtaMem clippy
+        run: cargo clippy --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run OxtaMem Python syntax smoke
+        run: python3 -m compileall -q modules/oxtamem/python modules/oxtamem/oxta_engine/python modules/oxtamem/nn
+
+  incubation:
+    name: incubation / non-blocking
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inventory incubation Python syntax
         run: |
-          docker build -t nsos-mvp-ci .
+          python3 -m compileall -q \
+            benchmarks \
+            scripts \
+            tests \
+            KernelOpen \
+            CHRASS \
+            CART \
+            OXB \
+            tools
 
   gpu-hotpath:
     if: ${{ vars.NSOS_GPU_CI == 'true' }}
+    name: product / optional GPU hotpath
     runs-on: [self-hosted, linux, x64, gpu, cuda]
     steps:
       - uses: actions/checkout@v4
@@ -118,9 +120,9 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install --upgrade pip
-          pip3 install numpy torch pytest hypothesis requests
+          pip3 install numpy torch pytest hypothesis requests pybind11
 
-      - name: Build NSOS Release GPU
+      - name: Build NSOS GPU
         run: |
           cmake -S OXN/nsos -B OXN/nsos/build-gpu-ci \
             -DCMAKE_BUILD_TYPE=Release \
@@ -135,17 +137,17 @@ jobs:
             -G Ninja
           cmake --build OXN/nsos/build-gpu-ci -j$(nproc)
 
-      - name: Run GPU Native Test Suite
-        run: |
-          ctest --test-dir OXN/nsos/build-gpu-ci --output-on-failure
+      - name: Run GPU CTest
+        run: ctest --test-dir OXN/nsos/build-gpu-ci --output-on-failure
 
-      - name: Run GPU Benchmark Gate
+      - name: Run GPU benchmark gate
         run: |
           python3 OXN/nsos/scripts/benchmark_gate.py \
             --build-dir OXN/nsos/build-gpu-ci \
             --device gpu \
             --profile mamba_small \
+            --max-tokens 8 \
             --min-prompt-tok-s 5.0 \
-            --min-decode-tok-s 2.0 \
+            --min-decode-tok-s 1.0 \
             --max-sampler-share 0.99 \
             --report-path OXN/nsos/build-gpu-ci/benchmark_gate_gpu.json

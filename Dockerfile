@@ -21,14 +21,14 @@ RUN cmake -S /src/OXN/nsos -B /src/OXN/nsos/build-mvp \
     -DCMAKE_BUILD_TYPE=Release \
     -DNSOS_ENABLE_CUDA=OFF \
     -DNSOS_BUILD_PYTHON=ON \
-    -DNSOS_BUILD_TESTS=ON \
+    -DNSOS_BUILD_TESTS=OFF \
+    -DNSOS_BUILD_CIRCUIT_TOOLS=OFF \
     -DNSOS_BUILD_CLI=ON \
     -DNSOS_BUILD_API=ON \
     -DNSOS_BUILD_OXTAMEM=OFF \
     -DNSOS_ENABLE_NATIVE_OPTIMIZATIONS=OFF \
     -G Ninja \
-    && cmake --build /src/OXN/nsos/build-mvp -j"$(nproc)" \
-    && ctest --test-dir /src/OXN/nsos/build-mvp --output-on-failure
+    && cmake --build /src/OXN/nsos/build-mvp -j"$(nproc)"
 
 FROM ubuntu:22.04 AS runtime
 

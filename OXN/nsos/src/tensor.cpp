@@ -285,7 +285,7 @@ void TensorDeleter::operator()(float* ptr) {
 }
 
 Tensor::Tensor() : size(0), device(Device::CPU) {
-    shape = TensorShape({});
+    shape = TensorShape(std::vector<int>{});
     data_ptr = nullptr;
 }
 
@@ -306,7 +306,9 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
 #ifdef _WIN32
         raw_ptr = static_cast<float*>(_aligned_malloc(size * sizeof(float), 64));
 #else
-        posix_memalign((void**)&raw_ptr, 64, size * sizeof(float));
+        if (posix_memalign(reinterpret_cast<void**>(&raw_ptr), 64, size * sizeof(float)) != 0) {
+            raw_ptr = nullptr;
+        }
 #endif
     }
 
