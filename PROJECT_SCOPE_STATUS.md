@@ -1,67 +1,57 @@
 # Project Scope Status
 
-## Official Core Today
+This file is the human summary. The machine-readable source of truth is
+`PROJECT_BOUNDARY.json`.
 
-The part of the repository that is currently treated as the product-facing core is:
+## Supported Product
 
 - `OXN/nsos`
 
-This is where the validated engineering effort is concentrated:
+This is the product-facing NSOS surface. Release claims and product gates should
+default here.
+
+Current product scope:
 
 - model/runtime
-- training
+- training paths that pass the NSOS gate
 - tokenizer
-- edge-pack export
+- model pack load/save
 - API / CLI / Python bindings
-- memory integration
-- benchmark harness
+- memory integration points
+- benchmark and fuzz smoke scripts under `OXN/nsos/scripts`
 
 ## Integrated Companion Module
 
 - `modules/oxtamem`
 
-This module is part of the current NSOS story because:
+OxtaMem is integrated with NSOS, but remains a companion module with its own
+Rust/Python validation lane. It can support the product story without expanding
+the supported NSOS API by default.
 
-- it is copied into the monorepo intentionally
-- it is built from NSOS
-- it is used through FFI and as architectural reference
+## Research / Incubation
 
-## Important But Not Yet At The Same Validation Level
+Everything outside the supported product, integrated module, and release-support
+files is incubation by default.
+
+Known incubation areas:
 
 - `KernelOpen`
-- `Pantheon`
+- root-level Pantheon code under `include`, `src`, and `bindings`
 - `CHRASS`
 - `CART`
 - `OXB`
 - `hardware`
+- root-level benchmark, training, demo, and legacy test tracks
+- datasets and generated experiment inputs
 
-These areas still matter, but they are not the main validation target for the current release effort.
+Incubation code can be developed normally. It becomes product or integrated
+surface only after passing the promotion gate in `docs/PROJECT_BOUNDARY.md`.
 
-## Practical Rule For The Repo
+## Practical Rule
 
-When a task concerns:
+When a task concerns model quality, edge runtime, serving, packs, or the current
+memory integration, start in `OXN/nsos` and `modules/oxtamem`.
 
-- model quality
-- edge runtime
-- training
-- serving
-- packs
-- memory
-
-the default workspace is `OXN/nsos`.
-
-The rest of the monorepo should be treated as:
-
-- research branches
-- supporting infrastructure
-- future integration targets
-- historical experiments
-
-## What The Repo Still Needs
-
-To feel mature as a monorepo, the repository still needs:
-
-- a clearer root README that points first to NSOS
-- a distinction between official and experimental folders
-- archival or relocation of legacy reports/scripts that are no longer part of the active path
-- one release-oriented top-level document that says what is shipping now
+When a task concerns a research folder, keep its claims scoped to incubation
+until it has deterministic builds, tests, CI gates, documentation, and an updated
+entry in `PROJECT_BOUNDARY.json`.

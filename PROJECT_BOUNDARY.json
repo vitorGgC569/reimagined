@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "default_status": "incubation",
+    "summary": "OXN/nsos is the supported product, modules/oxtamem is the integrated companion module, and unlisted paths are research/incubation by default."
+  },
+  "supported_product": {
+    "name": "NSOS MVP",
+    "status": "supported_product",
+    "paths": [
+      "OXN/nsos"
+    ],
+    "release_gates": [
+      "cmake build of OXN/nsos",
+      "ctest over the configured NSOS build directory",
+      "python OXN/scripts/gatekeeper.py",
+      "python OXN/nsos/scripts/benchmark_gate.py",
+      "python OXN/nsos/scripts/fuzz_surface_smoke.py"
+    ]
+  },
+  "integrated_modules": [
+    {
+      "name": "OxtaMem",
+      "status": "integrated_module",
+      "paths": [
+        "modules/oxtamem"
+      ],
+      "release_gates": [
+        "cargo test --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets",
+        "cargo clippy --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets -- -D warnings",
+        "python -m compileall over modules/oxtamem/python, modules/oxtamem/oxta_engine/python, and modules/oxtamem/nn"
+      ]
+    }
+  ],
+  "release_support": {
+    "status": "release_support",
+    "paths": [
+      ".github/workflows/industrial-ci.yml",
+      "Dockerfile",
+      "PROJECT_BOUNDARY.json",
+      "PROJECT_SCOPE_STATUS.md",
+      "README.md",
+      "docs/PROJECT_BOUNDARY.md",
+      "requirements-dev.txt",
+      "scripts/check_project_boundary.py",
+      "OXN/scripts/gatekeeper.py",
+      "OXN/scripts/verify_determinism.py",
+      "OXN/tests/test_industrial_features.py"
+    ]
+  },
+  "incubation_roots": [
+    "KernelOpen",
+    "CHRASS",
+    "CART",
+    "OXB",
+    "hardware",
+    "benchmarks",
+    "bindings",
+    "include",
+    "src",
+    "tests",
+    "tools",
+    "scripts",
+    "docs",
+    "circuit_data",
+    "wikitext_data",
+    "OXN/wikitext_data"
+  ],
+  "promotion_requirements": [
+    "Clear owner and product reason",
+    "Deterministic build instructions",
+    "Unit and integration tests wired into CI",
+    "Security and resource limits for any service/runtime path",
+    "Reproducible benchmark evidence for performance claims",
+    "Documentation updated in README.md, PROJECT_SCOPE_STATUS.md, and docs/PROJECT_BOUNDARY.md",
+    "PROJECT_BOUNDARY.json updated from incubation to product or integrated_module"
+  ]
+}

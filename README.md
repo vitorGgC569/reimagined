@@ -1,31 +1,45 @@
 # NSOS MVP Workspace
 
-This repository contains several research and legacy tracks. The supported MVP
-surface is `OXN/nsos`.
+This repository is intentionally a monorepo, but it is not a single release
+surface. The boundary is tracked in `PROJECT_BOUNDARY.json` and explained in
+`docs/PROJECT_BOUNDARY.md`.
 
-## MVP Scope
+## Repository Boundary
 
-Stable for MVP:
+Supported product:
+
+- `OXN/nsos`
+
+Integrated companion module:
+
+- `modules/oxtamem`
+
+Research/incubation by default:
+
+- everything else unless promoted through the project boundary process
+
+Incubation code can be useful and actively developed, but product claims,
+release blockers, and compatibility promises belong only to the supported
+product and integrated-module surfaces.
+
+## Product Scope
+
+Stable for the current NSOS MVP:
 
 - CPU inference through `nsos_api_server`, `nsos_cli`, and `nsos_ext`.
 - Model pack load/save with manifest checksums and bounded pack parsing.
 - HTTP API with authentication required by default.
 - Local development mode only when `--allow-unauthenticated-local` is explicit.
+- OxtaMem integration when its Rust/Python gates pass.
 
-Experimental:
+Not release-supported yet:
 
-- CUDA/GPU execution and `test_gpu_parity`.
-- OxtaMem as a network service.
+- CUDA/GPU execution beyond explicitly gated lanes.
 - Distributed/MPI orchestration.
-- TTT product flows.
+- TTT product workflows.
 - Lean/formal self-healing claims.
-
-Legacy or research-only:
-
-- Root-level `serve_oxn.py`.
-- Old demo servers and mock scripts outside `OXN/nsos`.
-- `KernelOpen`, `CHRASS`, `CART`, `OXB`, and hardware experiments unless they
-  pass the same build/test gate.
+- `KernelOpen`, `CHRASS`, `CART`, `OXB`, root-level Pantheon code, hardware
+  experiments, root demos, and old benchmark/test tracks until promoted.
 
 ## Build MVP
 

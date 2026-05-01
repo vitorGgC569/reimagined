@@ -13,6 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate Project Boundary
+        run: |
+          python3 scripts/check_project_boundary.py
+
       - name: Install dependencies
         run: |
           sudo apt-get update
