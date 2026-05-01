@@ -1,0 +1,6 @@
+numpy==2.1.3
+torch==2.5.1
+pytest==8.3.4
+hypothesis==6.122.3
+requests==2.32.3
+pybind11==2.13.6

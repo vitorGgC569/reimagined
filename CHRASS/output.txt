@@ -1,0 +1,14 @@
+=== KIMERA STRESS TEST ===
+Nodes: 1000000 | Mode: GRID
+[Gen] Generating Grid 1000x1000 (N=1000000)...
+[Step 1] Chebyshev Spectral Guidance...
+[Step 2] WDD Reordering...
+[Step 3] Kimera Core (Radix Heap + AVX2)...
+
+>>> RESULTS <<<
+Total Time: 373.044 ms
+Step1(Chebyshev): 17.8417 ms
+Step2(Layout): 291.753 ms
+Step3(Core): 0.014612 ms
+Relaxations: 57
+TEPS (Est): 3.9009e+06

@@ -1,0 +1,22 @@
+[package]
+name = "oxta_mem"
+version = "0.1.1"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "oxta_mem"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "oxta_mem_server"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1.11.1"
+clap = { version = "4.5.54", features = ["derive", "env"] }
+memmap2 = "0.9.9"
+pyo3 = { version = "0.27.2", features = ["extension-module"] }
+rkyv = "0.8.14"
+tokio = { version = "1.49.0", features = ["full"] }
+usearch = "2.23.0"

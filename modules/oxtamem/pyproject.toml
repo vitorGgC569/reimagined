@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "oxta-mem"
+version = "0.1.1"
+description = "Industrial-Grade 4D Causal Memory for AI"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "vitorGgC569" }
+]
+license = "MIT"
+dependencies = [
+    "redis",
+    "numpy",
+    "torch",
+    "langchain-core"
+]
+
+[tool.maturin]
+manifest-path = "oxta_engine/Cargo.toml"
+python-source = "python"
+module-name = "oxta_mem.native"

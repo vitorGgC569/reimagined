@@ -1,0 +1,5 @@
+redis
+numpy
+torch
+langchain-core
+geodesic_engine

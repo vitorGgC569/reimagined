@@ -1,0 +1,21 @@
+repos:
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v17.0.6
+    hooks:
+      - id: clang-format
+        files: \.(cpp|hpp|h)$
+        args: ['--style=file']
+
+  - repo: https://github.com/cmake-lint/cmake-lint
+    rev: 1.4.3
+    hooks:
+      - id: cmakelint
+
+  - repo: local
+    hooks:
+      - id: determinism-check
+        name: Determinism Check
+        entry: python3 OXN/scripts/verify_determinism.py
+        language: system
+        files: \.cpp$
+        pass_filenames: false

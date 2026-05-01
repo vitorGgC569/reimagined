@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UHK Mission Control</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pixel_theme.css') }}">
+</head>
+<body>
+
+    <div class="container">
+        <!-- Sidebar Controls -->
+        <div class="panel sidebar">
+            <h1>UHK<br>Mission Control</h1>
+
+            <div class="stat-box">
+                <div class="stat-label">System Status</div>
+                <div class="stat-value" id="status-display">INITIALIZING...</div>
+            </div>
+
+            <div class="stat-box">
+                <div class="stat-label">SDK Link</div>
+                <div class="stat-value">
+                    {% if sdk_status %}
+                    <span style="color:var(--primary-neon)">CONNECTED</span>
+                    {% else %}
+                    <span style="color:var(--secondary-neon)">SIMULATION</span>
+                    {% endif %}
+                </div>
+            </div>
+
+            <hr style="border:0; border-bottom:2px solid #333; margin: 20px 0;">
+
+            <h3>Operations</h3>
+            <button class="btn-pixel" onclick="startJob('BITNET')">Launch BitNet 1.58b</button>
+            <button class="btn-pixel" onclick="startJob('SYNTHETIC')">Launch V10 Synthetic</button>
+            <button class="btn-pixel danger" onclick="stopJob()">Emergency Halt</button>
+
+            <div class="stat-box" style="margin-top: 30px;">
+                <div class="stat-label">Total Throughput</div>
+                <div class="stat-value active" id="tops-display">0.0 TOPS</div>
+            </div>
+
+            <div class="stat-box">
+                <div class="stat-label">Active SMs</div>
+                <div class="stat-value" id="sms-display">0 / 132</div>
+                <div class="status-bar">
+                    <div class="status-fill" id="sms-bar"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Visualizer -->
+        <div class="panel main-view">
+            <h3>Kernel Telemetry Visualization</h3>
+            <div id="visualizer-container">
+                <canvas id="gridCanvas"></canvas>
+            </div>
+
+            <div style="display: flex; gap: 20px; margin-top: 20px;">
+                <div class="panel" style="flex:1; border-color: var(--accent-blue);">
+                    <div class="stat-label">Zero-Copy Latency</div>
+                    <div class="stat-value" id="lat-display">0.0 us</div>
+                </div>
+                <div class="panel" style="flex:1; border-color: #ffcc00;">
+                    <div class="stat-label">Ring Buffer Load</div>
+                    <div class="stat-value" id="rb-display">0%</div>
+                    <div class="status-bar">
+                        <div class="status-fill" id="rb-bar" style="background: #ffcc00;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+# Based on Google's C++ style guide
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+AccessModifierOffset: -4
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+ColumnLimit: 100
+TabWidth: 4
+UseTab: Never

@@ -1,0 +1,25 @@
+# nsos_x1_dryrun.yaml
+model:
+  name: "NSOS-X1-DryRun"
+  architecture:
+    use_cuda: false             # Force CPU for stability during dry run
+  layers:
+    total: 8                    # Reduced layers to avoid OOM
+  ttt:
+    enabled: true
+  ham:
+    enabled: true
+    dimension: 1000
+  symbolic:
+    mcts:
+      enabled: true
+
+training:
+  pretraining:
+    optimizer:
+      name: "Muon"
+      lr: 3e-4
+  sft:
+    enabled: true
+  ttt_meta:
+    enabled: true

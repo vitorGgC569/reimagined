@@ -1,0 +1,17 @@
+build/
+__pycache__/
+*.o
+*.a
+*.so
+.pytest_cache/
+.vscode/
+.idea/
+cmake_install.cmake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.pyc
+*.egg-info
+data/
+checkpoints/
+*.log

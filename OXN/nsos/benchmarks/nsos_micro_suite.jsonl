@@ -1,0 +1,12 @@
+{"id":"alg-001","category":"algorithms","kind":"reverse","prompt":"Reverse this token stream: nsos2026","answer":"6202sosn"}
+{"id":"alg-002","category":"algorithms","kind":"parity","prompt":"Parity bit for 10101101. Answer with 0 for even and 1 for odd.","answer":"1"}
+{"id":"cir-001","category":"circuits","kind":"circuit","prompt":"Circuit solve: gate=XOR A=1 B=1. Answer with 0 or 1.","answer":"0"}
+{"id":"cir-003","category":"circuits","kind":"circuit","prompt":"Circuit solve: gate=OR A=0 B=1. Answer with 0 or 1.","answer":"1"}
+{"id":"code-001","category":"code","kind":"code_output","prompt":"What is the output of this Python snippet?\nprint((4 + 3) * 2)","answer":"14"}
+{"id":"code-004","category":"code","kind":"kv_to_csv","prompt":"Normalize the key=value pairs into CSV ordered as name,lang,mode: name=bitnet lang=en mode=edge","answer":"bitnet,en,edge"}
+{"id":"inst-001","category":"instructions","kind":"translate","prompt":"Translate to Portuguese: Edge inference needs compact weights and predictable latency.","answer":"Inferencia em edge precisa de pesos compactos e latencia previsivel."}
+{"id":"inst-002","category":"instructions","kind":"convert_json","prompt":"Converta para JSON compacto: name=nsos mode=api lang=pt","answer":"{\"name\":\"nsos\",\"mode\":\"api\",\"lang\":\"pt\"}"}
+{"id":"mem-001","category":"memory","kind":"memory_recall","prompt":"System: store the following session facts.\nUser: name=ana\nAssistant: memorized.\nUser: city=recife\nAssistant: memorized.\nUser: tool=nsos\nAssistant: memorized.\nUser: lang=pt\nAssistant: memorized.\nUser: What is the city?\nAssistant:","answer":"recife"}
+{"id":"mem-003","category":"memory","kind":"memory_recall","prompt":"System: store the following session facts.\nUser: name=caio\nAssistant: memorized.\nUser: city=porto\nAssistant: memorized.\nUser: tool=bitnet\nAssistant: memorized.\nUser: lang=pt\nAssistant: memorized.\nUser: What is the lang?\nAssistant:","answer":"pt"}
+{"id":"ver-001","category":"verifier","kind":"parity_label","prompt":"Parity for 1110. Answer with EVEN or ODD.","answer":"ODD"}
+{"id":"ver-002","category":"verifier","kind":"compare_label","prompt":"Compare 12 and 12. Answer with LT, GT, or EQ.","answer":"EQ"}
