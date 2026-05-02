@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -45,6 +46,16 @@ std::filesystem::path unique_temp_dir(const std::string& name) {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     return std::filesystem::temp_directory_path() /
            (name + "_" + std::to_string(stamp));
+}
+
+std::filesystem::path audit_report_path(bool& preserve_report) {
+    const char* explicit_path = std::getenv("NSOS_LAYER_AUDIT_OUT");
+    if (explicit_path != nullptr && explicit_path[0] != '\0') {
+        preserve_report = true;
+        return std::filesystem::path(explicit_path);
+    }
+    preserve_report = false;
+    return unique_temp_dir("nsos_layer_audit") / "audit.json";
 }
 
 } // namespace
@@ -107,8 +118,8 @@ int main() {
         require(pre_summary.healthy(), "pre-reload audit contains NaN/Inf");
 
         const std::filesystem::path pack_dir = unique_temp_dir("nsos_layer_audit_pack");
-        const std::filesystem::path audit_json = unique_temp_dir("nsos_layer_audit") /
-                                                "audit.json";
+        bool preserve_audit_report = false;
+        const std::filesystem::path audit_json = audit_report_path(preserve_audit_report);
         require(engine.save_model_pack(pack_dir.string()), "save_model_pack failed");
 
         InferenceEngine reloaded;
@@ -139,8 +150,25 @@ int main() {
         require(json.find("\"router\"") != std::string::npos,
                 "audit JSON missing router details");
 
+        std::cout << "[LayerAudit] train forward=" << train_summary.forward_records
+                  << " backward=" << train_summary.backward_records
+                  << " router=" << train_summary.router_records
+                  << " training_steps=" << train_summary.training_steps
+                  << " max_latency_ms=" << train_summary.max_latency_ms
+                  << " max_l2_norm=" << train_summary.max_l2_norm << std::endl;
+        std::cout << "[LayerAudit] pre_reload forward=" << pre_summary.forward_records
+                  << " token_contexts=" << pre_summary.token_contexts
+                  << " max_latency_ms=" << pre_summary.max_latency_ms << std::endl;
+        LayerAuditSummary post_summary = audit.summarize_phase("post_reload_probe");
+        std::cout << "[LayerAudit] post_reload forward=" << post_summary.forward_records
+                  << " token_contexts=" << post_summary.token_contexts
+                  << " max_latency_ms=" << post_summary.max_latency_ms << std::endl;
+        std::cout << "[LayerAudit] report=" << audit_json.string() << std::endl;
+
         std::filesystem::remove_all(pack_dir);
-        std::filesystem::remove_all(audit_json.parent_path());
+        if (!preserve_audit_report) {
+            std::filesystem::remove_all(audit_json.parent_path());
+        }
 
         std::cout << "Layer audit E2E test passed!" << std::endl;
         return 0;

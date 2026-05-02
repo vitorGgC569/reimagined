@@ -81,6 +81,14 @@ small TTT/Attention/MoE model, records forward/backward layer telemetry, records
 MoE router distribution, saves a model pack, reloads it, compares the same
 probe tensor before and after reload, and writes an audit JSON.
 
+To preserve the JSON for inspection:
+
+```powershell
+$env:NSOS_LAYER_AUDIT_OUT = "OXN/nsos/build-mvp/layer_audit.local.json"
+ctest --test-dir .\OXN\nsos\build-mvp -C Release -R test_layer_audit --output-on-failure
+Remove-Item Env:\NSOS_LAYER_AUDIT_OUT
+```
+
 Core API:
 
 - `LayerAuditCollector::begin_run`
