@@ -11,7 +11,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, TextIO
+from typing import Any, Dict, List, TextIO
 
 from cuda_env import add_windows_runtime_dirs, parse_preferred_cuda_root
 from nsos_curriculum_lib import (
@@ -21,6 +21,7 @@ from nsos_curriculum_lib import (
     build_tokenizer_bundle,
     curriculum_texts_for_phase,
 )
+from summarize_layer_audit import build_report as build_layer_audit_report
 
 try:
     from tqdm.auto import tqdm
@@ -1159,6 +1160,69 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional session log written directly by the trainer script.",
     )
+    parser.add_argument(
+        "--enable-layer-audit",
+        action="store_true",
+        help="Attach the C++ layer audit collector and write per-phase audit snapshots.",
+    )
+    parser.add_argument(
+        "--layer-audit-out",
+        type=Path,
+        default=None,
+        help="Layer audit JSON output path. Defaults to <run-dir>/layer_audit.json.",
+    )
+    parser.add_argument(
+        "--audit-summary-out",
+        type=Path,
+        default=None,
+        help="Layer audit summary JSON output path. Defaults to <run-dir>/layer_audit_summary.json.",
+    )
+    parser.add_argument(
+        "--audit-min-layer-coverage",
+        type=int,
+        default=0,
+        help="Minimum audited model layers per audited phase. 0 means model_config.num_layers.",
+    )
+    parser.add_argument(
+        "--audit-router-entropy-min",
+        type=float,
+        default=0.0,
+        help="Minimum MoE router entropy when router records exist.",
+    )
+    parser.add_argument(
+        "--audit-router-entropy-max",
+        type=float,
+        default=0.0,
+        help="Maximum MoE router entropy. 0 means auto log2(num_experts)+epsilon.",
+    )
+    parser.add_argument(
+        "--audit-max-reload-drift",
+        type=float,
+        default=1.0e-5,
+        help="Maximum allowed absolute logit drift between pre/post reload probes.",
+    )
+    parser.add_argument(
+        "--holdout-files",
+        type=Path,
+        nargs="*",
+        default=[
+            Path(__file__).resolve().parents[1] / "benchmarks" / "nsos_micro_suite.jsonl",
+            Path(__file__).resolve().parents[1] / "benchmarks" / "nsos_eval_suite.jsonl",
+        ],
+        help="Official holdout JSONL files evaluated at the end of the run.",
+    )
+    parser.add_argument(
+        "--holdout-eval-mode",
+        choices=["fast", "full"],
+        default="full",
+        help="Evaluation mode for official holdout files.",
+    )
+    parser.add_argument(
+        "--holdout-exact-samples",
+        type=int,
+        default=4,
+        help="Greedy exact-match samples per official holdout file.",
+    )
     return parser.parse_args()
 
 
@@ -1178,6 +1242,7 @@ def detect_build_dir(explicit: Path | None) -> Path:
 
 
 def load_nsos(build_dir: Path):
+    build_dir = build_dir.resolve()
     if str(build_dir) not in sys.path:
         sys.path.insert(0, str(build_dir))
     if os.name == "nt":
@@ -1661,6 +1726,202 @@ def save_run_summary(path: Path, summary: Dict) -> None:
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def model_training_mode(model) -> bool | None:
+    if hasattr(model, "training_mode"):
+        return bool(model.training_mode())
+    return None
+
+
+def set_model_training_mode(model, enabled: bool) -> None:
+    if hasattr(model, "set_training_mode"):
+        model.set_training_mode(bool(enabled))
+
+
+def restore_model_training_mode(model, previous: bool | None) -> None:
+    if previous is not None:
+        set_model_training_mode(model, previous)
+
+
+def set_layer_audit_phase(layer_audit, phase: str, step: int = 0) -> None:
+    if layer_audit is None:
+        return
+    layer_audit.set_phase(phase)
+    layer_audit.set_step(int(step))
+
+
+def layer_audit_summary_to_dict(summary) -> Dict[str, Any]:
+    if summary is None:
+        return {}
+    return {
+        "phase": str(summary.phase),
+        "records": int(summary.records),
+        "forward_records": int(summary.forward_records),
+        "backward_records": int(summary.backward_records),
+        "router_records": int(summary.router_records),
+        "token_contexts": int(summary.token_contexts),
+        "training_steps": int(summary.training_steps),
+        "total_nan": int(summary.total_nan),
+        "total_inf": int(summary.total_inf),
+        "max_latency_ms": float(summary.max_latency_ms),
+        "max_l2_norm": float(summary.max_l2_norm),
+        "layers_seen": [int(layer) for layer in summary.layers_seen],
+        "healthy": bool(summary.healthy()),
+    }
+
+
+def write_layer_audit_snapshot(layer_audit, audit_path: Path | None) -> None:
+    if layer_audit is None or audit_path is None:
+        return
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    layer_audit.write_json(str(audit_path))
+
+
+def load_holdout_jsonl(path: Path) -> List[Dict]:
+    rows: List[Dict] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        row = json.loads(stripped)
+        if row.get("prompt") and row.get("answer"):
+            row = dict(row)
+            if "text" not in row:
+                row["text"] = (
+                    f"<|task:{row.get('kind', 'holdout')}|>\n"
+                    f"Prompt:\n{row['prompt']}\n"
+                    f"Answer:\n{row['answer']}"
+                )
+            rows.append(row)
+    return rows
+
+
+def evaluate_official_holdouts(nsos, model, tokenizer, holdout_files: List[Path],
+                               eos_token_id: int, seq_len: int, eval_mode: str,
+                               exact_samples: int, logger, layer_audit) -> Dict[str, Dict]:
+    results: Dict[str, Dict] = {}
+    for holdout_path in holdout_files:
+        rows = load_holdout_jsonl(holdout_path)
+        label = holdout_path.stem
+        if not rows:
+            results[holdout_path.name] = {
+                "path": str(holdout_path),
+                "rows": 0,
+                "missing": not holdout_path.exists(),
+            }
+            logger.log(f"[holdout] {holdout_path.name}: no rows")
+            continue
+        set_layer_audit_phase(layer_audit, f"holdout:{label}", 0)
+        metrics = evaluate_phase(
+            nsos,
+            model,
+            tokenizer,
+            rows,
+            eos_token_id,
+            seq_len,
+            eval_mode,
+            exact_samples,
+            logger=logger,
+            label=f"holdout:{label}",
+        )
+        results[holdout_path.name] = {
+            "path": str(holdout_path),
+            "rows": len(rows),
+            **metrics,
+        }
+        logger.log(
+            f"[holdout] {holdout_path.name}: rows={len(rows)} "
+            f"answer_loss={metrics['answer_loss']:.4f} "
+            f"first={metrics['first_token_accuracy']:.2f} "
+            f"teacher={metrics['teacher_token_accuracy']:.2f} "
+            f"exact={metrics['exact_correct']}/{metrics['exact_total']}"
+        )
+    return results
+
+
+def collect_answer_logits(nsos, model, tokenizer, rows: List[Dict],
+                          eos_token_id: int, limit: int) -> List[List[float]]:
+    collected: List[List[float]] = []
+    previous_training_mode = model_training_mode(model)
+    set_model_training_mode(model, False)
+    try:
+        for row in rows[: max(1, limit)]:
+            prompt_tokens, answer_tokens = build_supervised_tokens(tokenizer, row, eos_token_id)
+            if not prompt_tokens or not answer_tokens:
+                continue
+            inputs = list(prompt_tokens)
+            if len(answer_tokens) > 1:
+                inputs.extend(answer_tokens[:-1])
+            model.reset_session()
+            logits = model.forward_ids(inputs, None)
+            start = len(prompt_tokens) - 1
+            end = start + len(answer_tokens)
+            answer_logits = logits.slice(0, start, end)
+            host_logits = answer_logits.cpu() if answer_logits.device == nsos.Device.GPU else answer_logits
+            collected.append([float(value) for value in host_logits.numpy().reshape(-1).tolist()])
+    finally:
+        restore_model_training_mode(model, previous_training_mode)
+    return collected
+
+
+def compute_max_abs_drift(lhs: List[List[float]], rhs: List[List[float]]) -> float:
+    max_drift = 0.0
+    for lhs_values, rhs_values in zip(lhs, rhs):
+        for lhs_value, rhs_value in zip(lhs_values, rhs_values):
+            drift = abs(float(lhs_value) - float(rhs_value))
+            if drift > max_drift:
+                max_drift = drift
+    return max_drift
+
+
+def run_reload_probe(nsos, model, model_config, device, tokenizer, probe_rows: List[Dict],
+                     eos_token_id: int, run_dir: Path, layer_audit, logger,
+                     sample_limit: int = 4) -> Dict[str, Any]:
+    if not probe_rows:
+        return {"enabled": False, "reason": "no_probe_rows", "max_abs_drift": 0.0}
+
+    probe_path = run_dir / "audit_reload_probe.bin"
+    model.save(str(probe_path))
+
+    set_layer_audit_phase(layer_audit, "reload_probe:pre", 0)
+    pre_logits = collect_answer_logits(
+        nsos,
+        model,
+        tokenizer,
+        probe_rows,
+        eos_token_id,
+        sample_limit,
+    )
+
+    reloaded_model = nsos.JambaModel(model_config, device)
+    reloaded_model.to(device)
+    reloaded_model.load(str(probe_path), True)
+    if layer_audit is not None:
+        reloaded_model.set_audit_collector(layer_audit)
+
+    set_layer_audit_phase(layer_audit, "reload_probe:post", 0)
+    post_logits = collect_answer_logits(
+        nsos,
+        reloaded_model,
+        tokenizer,
+        probe_rows,
+        eos_token_id,
+        sample_limit,
+    )
+    drift = compute_max_abs_drift(pre_logits, post_logits)
+    logger.log(
+        f"[audit] reload_probe samples={min(len(pre_logits), len(post_logits))} "
+        f"max_abs_drift={drift:.8f}"
+    )
+    return {
+        "enabled": True,
+        "path": str(probe_path),
+        "samples": min(len(pre_logits), len(post_logits)),
+        "max_abs_drift": drift,
+    }
+
+
 def train_rows_direct(trainer, tokenizer, rows: List[Dict], max_steps: int, callback,
                       seed: int, eos_token_id: int, batch_size: int) -> Dict[str, float]:
     if not rows or max_steps <= 0:
@@ -1801,9 +2062,9 @@ def evaluate_generation_probe(nsos, model, tokenizer, rows: List[Dict], eos_toke
     }
 
 
-def evaluate_phase(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
-                   seq_len: int, eval_mode: str, exact_samples: int,
-                   logger=None, label: str = "phase_eval") -> Dict[str, float]:
+def evaluate_phase_impl(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
+                        seq_len: int, eval_mode: str, exact_samples: int,
+                        logger=None, label: str = "phase_eval") -> Dict[str, float]:
     debug_eval_log(logger, f"{label}:masked:start rows={len(rows)}")
     masked_metrics = evaluate_masked_supervised(nsos, model, tokenizer, rows, eos_token_id)
     debug_eval_log(logger, f"{label}:masked:done")
@@ -1860,6 +2121,28 @@ def evaluate_phase(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
         result.update({"gen_tokens": 0, "gen_elapsed_s": 0.0, "gen_tokens_per_s": 0.0})
     debug_eval_log(logger, f"{label}:done")
     return result
+
+
+def evaluate_phase(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
+                   seq_len: int, eval_mode: str, exact_samples: int,
+                   logger=None, label: str = "phase_eval") -> Dict[str, float]:
+    previous_training_mode = model_training_mode(model)
+    set_model_training_mode(model, False)
+    try:
+        return evaluate_phase_impl(
+            nsos,
+            model,
+            tokenizer,
+            rows,
+            eos_token_id,
+            seq_len,
+            eval_mode,
+            exact_samples,
+            logger=logger,
+            label=label,
+        )
+    finally:
+        restore_model_training_mode(model, previous_training_mode)
 
 
 def build_global_suite(bundle_dir: Path, samples_per_phase: int) -> Dict[str, List[Dict]]:
@@ -1928,6 +2211,9 @@ def main() -> int:
     canonical_profile, profile = resolve_profile(args.profile)
     run_dir = args.run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
+    layer_audit_path = args.layer_audit_out or (run_dir / "layer_audit.json")
+    layer_audit_summary_path = args.audit_summary_out or (run_dir / "layer_audit_summary.json")
+    layer_audit = None
     session_log_path = args.session_log or (run_dir / "session.log")
     logger = RunLogger(args.progress_mode, session_log_path)
 
@@ -1989,6 +2275,26 @@ def main() -> int:
 
         model = nsos.JambaModel(model_config, device)
         model.to(device)
+        audit_min_layer_coverage = (
+            int(args.audit_min_layer_coverage)
+            if int(args.audit_min_layer_coverage) > 0
+            else int(model_config.num_layers)
+        )
+        audit_thresholds = {
+            "require_zero_nan_inf": True,
+            "min_layer_coverage": audit_min_layer_coverage,
+            "router_entropy_min": float(args.audit_router_entropy_min),
+            "router_entropy_max": float(args.audit_router_entropy_max),
+            "max_reload_drift": float(args.audit_max_reload_drift),
+        }
+        if args.enable_layer_audit:
+            if not hasattr(nsos, "LayerAuditCollector"):
+                raise RuntimeError("nsos_ext does not expose LayerAuditCollector; rebuild nsos_ext first.")
+            layer_audit = nsos.LayerAuditCollector()
+            layer_audit.begin_run(f"{canonical_profile}:seed{args.seed}")
+            layer_audit.set_enabled(True)
+            model.set_audit_collector(layer_audit)
+            logger.log(f"[audit] enabled path={layer_audit_path}")
         if args.resume_model is not None and args.resume_model.exists():
             try:
                 model.load(str(args.resume_model), True)
@@ -2081,11 +2387,22 @@ def main() -> int:
             "phase_best_eval_every_steps": args.phase_best_eval_every_steps,
             "log_ema_beta": args.log_ema_beta,
             "progress_mode": logger.mode,
+            "official_holdout_files": [str(path) for path in args.holdout_files],
+            "holdout_eval_mode": args.holdout_eval_mode,
+            "holdout_exact_samples": args.holdout_exact_samples,
             "total_training_steps": trainer.total_training_steps,
             "generation_guard": {
                 "repetition_penalty": GENERATION_REPETITION_PENALTY,
                 "no_repeat_ngram_size": GENERATION_NO_REPEAT_NGRAM,
             },
+            "layer_audit": {
+                "enabled": bool(args.enable_layer_audit),
+                "path": str(layer_audit_path),
+                "summary_path": str(layer_audit_summary_path),
+                "thresholds": audit_thresholds,
+                "phase_snapshots": [],
+            },
+            "official_holdouts": {},
             "global_champion": {},
             "research_champion": {},
             "release_candidate": {},
@@ -2106,6 +2423,7 @@ def main() -> int:
         def consider_global_champion(source_name: str, source_phase: str) -> float:
             nonlocal best_global_score, best_release_score
             debug_eval_log(logger, f"global:start source={source_name}")
+            set_layer_audit_phase(layer_audit, f"{source_phase}:global", 0)
             global_score, global_metrics = evaluate_global_suite(
                 nsos,
                 model,
@@ -2199,6 +2517,7 @@ def main() -> int:
                     f"reason:{int(phase_aux_cfg['reasoning'])},"
                     f"mem:{int(phase_aux_cfg['memory'])}}}"
                 )
+                set_layer_audit_phase(layer_audit, f"{phase_name}:train", int(trainer.global_step_count))
                 phase_started = time.perf_counter()
                 eval_subset = eval_rows[: max(1, args.phase_eval_samples)]
                 ema_loss = None
@@ -2232,18 +2551,22 @@ def main() -> int:
                         and eval_subset
                         and (step % args.phase_best_eval_every_steps == 0 or step == max_steps)
                     ):
-                        probe_metrics = evaluate_phase(
-                            nsos,
-                            model,
-                            tokenizer,
-                            eval_subset,
-                            eos_token_id,
-                            profile["seq_len"],
-                            args.phase_eval_mode,
-                            args.phase_exact_samples,
-                            logger=logger,
-                            label=f"{phase_name}:probe@{step}",
-                        )
+                        set_layer_audit_phase(layer_audit, f"{phase_name}:probe@{step}", step)
+                        try:
+                            probe_metrics = evaluate_phase(
+                                nsos,
+                                model,
+                                tokenizer,
+                                eval_subset,
+                                eos_token_id,
+                                profile["seq_len"],
+                                args.phase_eval_mode,
+                                args.phase_exact_samples,
+                                logger=logger,
+                                label=f"{phase_name}:probe@{step}",
+                            )
+                        finally:
+                            set_layer_audit_phase(layer_audit, f"{phase_name}:train", step)
                         probe_score = compute_phase_score(probe_metrics)
                         logger.log(
                             f"  probe step={step} score={probe_score:.4f} "
@@ -2300,9 +2623,10 @@ def main() -> int:
                     debug_eval_log(logger, f"{phase_name}:loading_best:done {best_phase_name}")
                     save_checkpoint_artifact(f"{phase_name}_best")
                     selected_source = "best_eval"
+                    set_layer_audit_phase(layer_audit, f"{phase_name}:eval", best_phase_step or max_steps)
                     phase_metrics = (
                         dict(best_phase_metrics)
-                        if best_phase_metrics is not None
+                        if best_phase_metrics is not None and layer_audit is None
                         else evaluate_phase(
                             nsos,
                             model,
@@ -2317,6 +2641,7 @@ def main() -> int:
                         )
                     )
                 else:
+                    set_layer_audit_phase(layer_audit, f"{phase_name}:eval", max_steps)
                     phase_metrics = evaluate_phase(
                         nsos,
                         model,
@@ -2366,6 +2691,27 @@ def main() -> int:
                         f"[global] skipped after {phase_name}; cadence={args.global_suite_every_phases}"
                     )
                 phase_summary["global_suite_evaluated"] = should_run_global_suite
+                if layer_audit is not None:
+                    phase_summary["layer_audit"] = {
+                        "train": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase(f"{phase_name}:train")
+                        ),
+                        "eval": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase(f"{phase_name}:eval")
+                        ),
+                        "global": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase(f"{phase_name}:global")
+                        ),
+                    }
+                    write_layer_audit_snapshot(layer_audit, layer_audit_path)
+                    summary["layer_audit"]["phase_snapshots"].append(
+                        {
+                            "phase": phase_name,
+                            "path": str(layer_audit_path),
+                            "train_records": phase_summary["layer_audit"]["train"].get("records", 0),
+                            "eval_records": phase_summary["layer_audit"]["eval"].get("records", 0),
+                        }
+                    )
                 summary["phases"].append(phase_summary)
                 metrics_file.write(json.dumps(phase_summary, ensure_ascii=False) + "\n")
                 metrics_file.flush()
@@ -2416,6 +2762,7 @@ def main() -> int:
                     f"reason:{int(polish_aux_cfg['reasoning'])},"
                     f"mem:{int(polish_aux_cfg['memory'])}}}"
                 )
+                set_layer_audit_phase(layer_audit, f"{polish_phase_name}:train", int(trainer.global_step_count))
                 polish_started = time.perf_counter()
                 polish_ema = None
                 polish_best_score = float("-inf")
@@ -2457,18 +2804,22 @@ def main() -> int:
                             or step == instruction_polish_steps
                         )
                     ):
-                        probe_metrics = evaluate_phase(
-                            nsos,
-                            model,
-                            tokenizer,
-                            polish_eval_rows,
-                            eos_token_id,
-                            profile["seq_len"],
-                            args.phase_eval_mode,
-                            args.phase_exact_samples,
-                            logger=logger,
-                            label=f"{polish_phase_name}:probe@{step}",
-                        )
+                        set_layer_audit_phase(layer_audit, f"{polish_phase_name}:probe@{step}", step)
+                        try:
+                            probe_metrics = evaluate_phase(
+                                nsos,
+                                model,
+                                tokenizer,
+                                polish_eval_rows,
+                                eos_token_id,
+                                profile["seq_len"],
+                                args.phase_eval_mode,
+                                args.phase_exact_samples,
+                                logger=logger,
+                                label=f"{polish_phase_name}:probe@{step}",
+                            )
+                        finally:
+                            set_layer_audit_phase(layer_audit, f"{polish_phase_name}:train", step)
                         probe_score = compute_phase_score(probe_metrics)
                         logger.log(
                             f"  probe step={step} score={probe_score:.4f} "
@@ -2508,7 +2859,8 @@ def main() -> int:
                     debug_eval_log(logger, f"{polish_phase_name}:loading_best:done {polish_best_name}")
                     save_checkpoint_artifact(f"{polish_phase_name}_best")
                     selected_source = "best_eval"
-                    polish_metrics = dict(polish_best_metrics) if polish_best_metrics is not None else evaluate_phase(
+                    set_layer_audit_phase(layer_audit, f"{polish_phase_name}:eval", polish_best_step or instruction_polish_steps)
+                    polish_metrics = dict(polish_best_metrics) if polish_best_metrics is not None and layer_audit is None else evaluate_phase(
                         nsos,
                         model,
                         tokenizer,
@@ -2521,6 +2873,7 @@ def main() -> int:
                         label=f"{polish_phase_name}:best_eval_reload",
                     )
                 else:
+                    set_layer_audit_phase(layer_audit, f"{polish_phase_name}:eval", instruction_polish_steps)
                     polish_metrics = evaluate_phase(
                         nsos,
                         model,
@@ -2556,6 +2909,27 @@ def main() -> int:
                     polish_phase_name,
                 )
                 polish_summary["global_suite_evaluated"] = True
+                if layer_audit is not None:
+                    polish_summary["layer_audit"] = {
+                        "train": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase(f"{polish_phase_name}:train")
+                        ),
+                        "eval": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase(f"{polish_phase_name}:eval")
+                        ),
+                        "global": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase(f"{polish_phase_name}:global")
+                        ),
+                    }
+                    write_layer_audit_snapshot(layer_audit, layer_audit_path)
+                    summary["layer_audit"]["phase_snapshots"].append(
+                        {
+                            "phase": polish_phase_name,
+                            "path": str(layer_audit_path),
+                            "train_records": polish_summary["layer_audit"]["train"].get("records", 0),
+                            "eval_records": polish_summary["layer_audit"]["eval"].get("records", 0),
+                        }
+                    )
                 summary["phases"].append(polish_summary)
                 metrics_file.write(json.dumps(polish_summary, ensure_ascii=False) + "\n")
                 metrics_file.flush()
@@ -2579,6 +2953,7 @@ def main() -> int:
                     f"[train] consolidation: rows={len(supervised_history)} "
                     f"steps={args.final_consolidation_steps} batch={profile['batch_size']}"
                 )
+                set_layer_audit_phase(layer_audit, "final_consolidation:train", int(trainer.global_step_count))
                 consolidation_started = time.perf_counter()
                 consolidation_ema = None
                 consolidation_aux_metrics: Dict[str, float] = {}
@@ -2641,6 +3016,7 @@ def main() -> int:
                             : max(1, args.phase_eval_samples // 2)
                         ]
                     )
+                set_layer_audit_phase(layer_audit, "final_consolidation:eval", args.final_consolidation_steps)
                 consolidation_metrics = evaluate_phase(
                     nsos,
                     model,
@@ -2670,6 +3046,27 @@ def main() -> int:
                     "final_consolidation",
                 )
                 consolidation_summary["global_suite_evaluated"] = True
+                if layer_audit is not None:
+                    consolidation_summary["layer_audit"] = {
+                        "train": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase("final_consolidation:train")
+                        ),
+                        "eval": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase("final_consolidation:eval")
+                        ),
+                        "global": layer_audit_summary_to_dict(
+                            layer_audit.summarize_phase("final_consolidation:global")
+                        ),
+                    }
+                    write_layer_audit_snapshot(layer_audit, layer_audit_path)
+                    summary["layer_audit"]["phase_snapshots"].append(
+                        {
+                            "phase": "final_consolidation",
+                            "path": str(layer_audit_path),
+                            "train_records": consolidation_summary["layer_audit"]["train"].get("records", 0),
+                            "eval_records": consolidation_summary["layer_audit"]["eval"].get("records", 0),
+                        }
+                    )
                 summary["phases"].append(consolidation_summary)
                 metrics_file.write(json.dumps(consolidation_summary, ensure_ascii=False) + "\n")
                 metrics_file.flush()
@@ -2690,13 +3087,81 @@ def main() -> int:
             model.load(str(champion_path))
             final_model_source = "champion_global"
         summary["final_model_source"] = final_model_source
+
+        summary["official_holdouts"] = evaluate_official_holdouts(
+            nsos,
+            model,
+            tokenizer,
+            list(args.holdout_files or []),
+            eos_token_id,
+            profile["seq_len"],
+            args.holdout_eval_mode,
+            args.holdout_exact_samples,
+            logger,
+            layer_audit,
+        )
+
+        audit_gate_failed = False
+        if layer_audit is not None:
+            reload_probe_rows: List[Dict] = []
+            for holdout_path in list(args.holdout_files or []):
+                reload_probe_rows.extend(load_holdout_jsonl(holdout_path))
+            reload_probe = run_reload_probe(
+                nsos,
+                model,
+                model_config,
+                device,
+                tokenizer,
+                reload_probe_rows,
+                eos_token_id,
+                run_dir,
+                layer_audit,
+                logger,
+                sample_limit=max(1, min(args.holdout_exact_samples, 4)),
+            )
+            summary["layer_audit"]["reload_probe"] = reload_probe
+            write_layer_audit_snapshot(layer_audit, layer_audit_path)
+            inline_run_summary = {
+                "path": str(run_dir / "run_summary.json"),
+                "profile": canonical_profile,
+                "requested_profile": args.profile,
+                "device": summary["device"],
+                "official_holdouts": summary["official_holdouts"],
+                "reload_probe": reload_probe,
+            }
+            audit_report = build_layer_audit_report(
+                [layer_audit_path],
+                metrics_paths=[metrics_path],
+                thresholds=audit_thresholds,
+                run_summaries=[inline_run_summary],
+            )
+            layer_audit_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            layer_audit_summary_path.write_text(
+                json.dumps(audit_report, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            summary["layer_audit"]["gate"] = {
+                "passed": audit_report["verdict"] == "pass",
+                "failure_count": len(audit_report.get("failures", [])),
+                "failures": audit_report.get("failures", []),
+            }
+            summary["layer_audit"]["totals"] = (
+                audit_report.get("audits", [{}])[0].get("totals", {})
+            )
+            summary["layer_audit"]["report_path"] = str(layer_audit_summary_path)
+            audit_gate_failed = audit_report["verdict"] != "pass"
+            logger.log(
+                f"[audit] gate={audit_report['verdict']} "
+                f"failures={len(audit_report.get('failures', []))} "
+                f"summary={layer_audit_summary_path}"
+            )
         model.save(str(run_dir / "final_model.bin"))
         model.save_edge_linear_pack(str(run_dir / "final_edge_linear.nsos"))
         save_run_summary(run_dir / "run_summary.json", summary)
         logger.log(f"[done] final checkpoint: {run_dir / 'final_model.bin'}")
         logger.log(f"[done] final edge pack: {run_dir / 'final_edge_linear.nsos'}")
         logger.log(f"[done] summary: {run_dir / 'run_summary.json'}")
-        return 0
+        return 2 if audit_gate_failed else 0
     finally:
         logger.close()
 

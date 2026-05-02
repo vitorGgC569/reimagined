@@ -32,6 +32,7 @@ set(NSOS_CORE_SOURCES
     src/tensor.cpp
     src/nsos_math.cpp
     src/jamba.cpp
+    src/jamba_utils.cpp
     src/mamba2.cpp
     src/bitlinear.cpp
     src/bitnet_adapter.cpp

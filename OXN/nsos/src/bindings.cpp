@@ -1,4 +1,5 @@
 #include "../include/jamba.h"
+#include "../include/layer_audit.h"
 #include "../include/nsos/determinism.h"
 #include "../include/nsos_sdk.h"
 #include "../include/tensor.h"
@@ -227,6 +228,112 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("grad", &Parameter::grad)
         .def("zero_grad", &Parameter::zero_grad);
 
+    py::class_<TensorAuditStats>(m, "TensorAuditStats")
+        .def(py::init<>())
+        .def_readwrite("shape", &TensorAuditStats::shape)
+        .def_readwrite("elements", &TensorAuditStats::elements)
+        .def_readwrite("min", &TensorAuditStats::min)
+        .def_readwrite("max", &TensorAuditStats::max)
+        .def_readwrite("mean", &TensorAuditStats::mean)
+        .def_readwrite("stddev", &TensorAuditStats::stddev)
+        .def_readwrite("l2_norm", &TensorAuditStats::l2_norm)
+        .def_readwrite("max_abs", &TensorAuditStats::max_abs)
+        .def_readwrite("nan_count", &TensorAuditStats::nan_count)
+        .def_readwrite("inf_count", &TensorAuditStats::inf_count)
+        .def_readwrite("finite", &TensorAuditStats::finite);
+
+    py::class_<RouterAuditStats>(m, "RouterAuditStats")
+        .def(py::init<>())
+        .def_readwrite("rows", &RouterAuditStats::rows)
+        .def_readwrite("num_experts", &RouterAuditStats::num_experts)
+        .def_readwrite("top_k", &RouterAuditStats::top_k)
+        .def_readwrite("topk_counts", &RouterAuditStats::topk_counts)
+        .def_readwrite("expert_loads", &RouterAuditStats::expert_loads)
+        .def_readwrite("entropy", &RouterAuditStats::entropy);
+
+    py::class_<LayerAuditRecord>(m, "LayerAuditRecord")
+        .def(py::init<>())
+        .def_readwrite("sequence", &LayerAuditRecord::sequence)
+        .def_readwrite("run_id", &LayerAuditRecord::run_id)
+        .def_readwrite("phase", &LayerAuditRecord::phase)
+        .def_readwrite("pass_name", &LayerAuditRecord::pass)
+        .def_readwrite("block_type", &LayerAuditRecord::block_type)
+        .def_readwrite("tensor_role", &LayerAuditRecord::tensor_role)
+        .def_readwrite("step", &LayerAuditRecord::step)
+        .def_readwrite("layer_index", &LayerAuditRecord::layer_index)
+        .def_readwrite("input", &LayerAuditRecord::input)
+        .def_readwrite("output", &LayerAuditRecord::output)
+        .def_readwrite("latency_ms", &LayerAuditRecord::latency_ms)
+        .def_readwrite("grad_l2_norm", &LayerAuditRecord::grad_l2_norm)
+        .def_readwrite("has_router", &LayerAuditRecord::has_router)
+        .def_readwrite("router", &LayerAuditRecord::router);
+
+    py::class_<TokenContextAuditRecord>(m, "TokenContextAuditRecord")
+        .def(py::init<>())
+        .def_readwrite("sequence", &TokenContextAuditRecord::sequence)
+        .def_readwrite("run_id", &TokenContextAuditRecord::run_id)
+        .def_readwrite("phase", &TokenContextAuditRecord::phase)
+        .def_readwrite("step", &TokenContextAuditRecord::step)
+        .def_readwrite("batch_size", &TokenContextAuditRecord::batch_size)
+        .def_readwrite("prompt_tokens_total", &TokenContextAuditRecord::prompt_tokens_total)
+        .def_readwrite("prompt_tokens_used", &TokenContextAuditRecord::prompt_tokens_used)
+        .def_readwrite("context_limit", &TokenContextAuditRecord::context_limit)
+        .def_readwrite("truncated", &TokenContextAuditRecord::truncated)
+        .def_readwrite("token_ids_sample", &TokenContextAuditRecord::token_ids_sample);
+
+    py::class_<TrainingStepAuditRecord>(m, "TrainingStepAuditRecord")
+        .def(py::init<>())
+        .def_readwrite("sequence", &TrainingStepAuditRecord::sequence)
+        .def_readwrite("run_id", &TrainingStepAuditRecord::run_id)
+        .def_readwrite("phase", &TrainingStepAuditRecord::phase)
+        .def_readwrite("step", &TrainingStepAuditRecord::step)
+        .def_readwrite("loss", &TrainingStepAuditRecord::loss)
+        .def_readwrite("grad_l2_norm", &TrainingStepAuditRecord::grad_l2_norm)
+        .def_readwrite("parameter_count", &TrainingStepAuditRecord::parameter_count);
+
+    py::class_<LayerAuditSummary>(m, "LayerAuditSummary")
+        .def(py::init<>())
+        .def_readwrite("phase", &LayerAuditSummary::phase)
+        .def_readwrite("records", &LayerAuditSummary::records)
+        .def_readwrite("forward_records", &LayerAuditSummary::forward_records)
+        .def_readwrite("backward_records", &LayerAuditSummary::backward_records)
+        .def_readwrite("router_records", &LayerAuditSummary::router_records)
+        .def_readwrite("token_contexts", &LayerAuditSummary::token_contexts)
+        .def_readwrite("training_steps", &LayerAuditSummary::training_steps)
+        .def_readwrite("total_nan", &LayerAuditSummary::total_nan)
+        .def_readwrite("total_inf", &LayerAuditSummary::total_inf)
+        .def_readwrite("max_latency_ms", &LayerAuditSummary::max_latency_ms)
+        .def_readwrite("max_l2_norm", &LayerAuditSummary::max_l2_norm)
+        .def_readwrite("layers_seen", &LayerAuditSummary::layers_seen)
+        .def("healthy", &LayerAuditSummary::healthy);
+
+    py::class_<LayerAuditCollector>(m, "LayerAuditCollector")
+        .def(py::init<>())
+        .def("set_enabled", &LayerAuditCollector::set_enabled, py::arg("enabled"))
+        .def("enabled", &LayerAuditCollector::enabled)
+        .def("reset", &LayerAuditCollector::reset)
+        .def("begin_run", &LayerAuditCollector::begin_run, py::arg("run_id"))
+        .def("set_phase", &LayerAuditCollector::set_phase, py::arg("phase"))
+        .def("set_step", &LayerAuditCollector::set_step, py::arg("step"))
+        .def("records", &LayerAuditCollector::records)
+        .def("token_contexts", &LayerAuditCollector::token_contexts)
+        .def("training_steps", &LayerAuditCollector::training_steps)
+        .def("summarize_phase", &LayerAuditCollector::summarize_phase, py::arg("phase"))
+        .def("compare_phase_health",
+             [](const LayerAuditCollector& collector,
+                const std::string& lhs_phase,
+                const std::string& rhs_phase) {
+                 std::string reason;
+                 const bool healthy = collector.compare_phase_health(lhs_phase, rhs_phase, &reason);
+                 py::dict result;
+                 result["healthy"] = healthy;
+                 result["reason"] = reason;
+                 return result;
+             },
+             py::arg("lhs_phase"),
+             py::arg("rhs_phase"))
+        .def("write_json", &LayerAuditCollector::write_json, py::arg("path"));
+
     py::class_<JambaModel>(m, "JambaModel")
         .def(py::init<int, int, int, Device>(),
              py::arg("num_layers"),
@@ -263,6 +370,12 @@ PYBIND11_MODULE(nsos_ext, m) {
              py::arg("release_full_precision") = true)
         .def("supports_streaming_inference", &JambaModel::supports_streaming_inference)
         .def("set_streaming_inference", &JambaModel::set_streaming_inference, py::arg("enabled"))
+        .def("set_training_mode", &JambaModel::set_training_mode, py::arg("enabled"))
+        .def("training_mode", &JambaModel::training_mode)
+        .def("set_audit_collector",
+             &JambaModel::set_audit_collector,
+             py::arg("collector"),
+             py::keep_alive<1, 2>())
         .def("model_config", &JambaModel::model_config, py::return_value_policy::reference_internal)
         .def("to", &JambaModel::to)
         .def("parameters", &JambaModel::parameters, py::return_value_policy::reference_internal);
