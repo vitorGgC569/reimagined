@@ -309,6 +309,7 @@ PROFILES["hybrid_moe_long"]["validation_scope"] = (
 PROFILES["hybrid_moe_capacity"] = deepcopy(PROFILES["hybrid_moe_long"])
 PROFILES["hybrid_moe_capacity"]["requested_role"] = "moe_capacity_holdout_champion"
 PROFILES["hybrid_moe_capacity"]["instruction_polish_steps"] = 0
+PROFILES["hybrid_moe_capacity"]["moe_aux_loss_scale"] = 0.35
 PROFILES["hybrid_moe_capacity"]["validation_scope"] = (
     "MoE capacity lane that preserves the best official-holdout checkpoint without the polish tail."
 )
@@ -2579,6 +2580,7 @@ def main() -> int:
         trainer.min_learning_rate_scale = profile["min_lr_scale"]
         trainer.first_token_loss_scale = profile.get("first_token_loss_scale", 2.5)
         trainer.eos_loss_scale = profile.get("eos_loss_scale", 0.35)
+        trainer.moe_aux_loss_scale = profile.get("moe_aux_loss_scale", trainer.moe_aux_loss_scale)
         trainer.repetition_unlikelihood_scale = phase_repetition_scale(
             profile,
             "phase1_algorithms",
@@ -2625,6 +2627,7 @@ def main() -> int:
                 "min_lr_scale": profile["min_lr_scale"],
                 "first_token_loss_scale": trainer.first_token_loss_scale,
                 "eos_loss_scale": trainer.eos_loss_scale,
+                "moe_aux_loss_scale": trainer.moe_aux_loss_scale,
                 "repetition_unlikelihood_scale": float(profile.get("repetition_unlikelihood_scale", 0.0)),
                 "phase_repetition_unlikelihood_scale": dict(
                     profile.get("phase_repetition_unlikelihood_scale", {})
