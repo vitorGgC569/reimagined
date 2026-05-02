@@ -39,6 +39,7 @@ set(NSOS_CORE_SOURCES
     src/kan.cpp
     src/ttt_layer.cpp
     src/trainer.cpp
+    src/layer_audit.cpp
     src/tokenizer.cpp
     src/nsos_sdk.cpp
     src/nsos_mpi.cpp
@@ -293,6 +294,10 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_model_pack PRIVATE nsos_core)
     add_test(NAME test_model_pack COMMAND test_model_pack)
 
+    add_executable(test_layer_audit tests/test_layer_audit.cpp)
+    target_link_libraries(test_layer_audit PRIVATE nsos_core)
+    add_test(NAME test_layer_audit COMMAND test_layer_audit)
+
     add_executable(test_gpu_parity tests/test_gpu_parity.cpp)
     target_link_libraries(test_gpu_parity PRIVATE nsos_core)
     add_test(NAME test_gpu_parity COMMAND test_gpu_parity)
@@ -343,6 +348,7 @@ if (NSOS_BUILD_TESTS)
             test_oxtamem_ffi
             test_jamba
             test_model_pack
+            test_layer_audit
             test_gpu_parity
             test_http_api
             test_circuit_api_pipeline

@@ -19,6 +19,8 @@
 
 namespace nsos {
 
+class LayerAuditCollector;
+
 struct AttentionCacheSnapshot {
   bool enabled = false;
   int cached_tokens = 0;
@@ -158,6 +160,8 @@ public:
   void set_streaming_inference(bool enabled);
   void set_training_mode(bool enabled);
   void set_batch_valid_lengths(const std::vector<int>& lengths);
+  void set_audit_collector(LayerAuditCollector* collector) { audit_collector_ = collector; }
+  std::string audit_block_type() const;
   JambaBlockSessionSnapshot snapshot_session_state() const;
   std::vector<JambaBlockSessionSnapshot> snapshot_session_state_batch() const;
   void restore_session_state(const JambaBlockSessionSnapshot& snapshot);
@@ -181,6 +185,7 @@ private:
   Tensor saved_ff_hidden_pre_;
   Tensor saved_moe_weights_;
   std::vector<std::vector<int>> saved_moe_rows_;
+  LayerAuditCollector* audit_collector_ = nullptr;
 public:
   std::unique_ptr<Attention> attn_layer;
   std::unique_ptr<Mamba2SSD> mamba_layer;
@@ -240,6 +245,14 @@ public:
   const ModelConfig& model_config() const { return model_config_; }
   void reset_runtime_telemetry();
   RuntimeTelemetrySnapshot runtime_telemetry() const;
+  void set_audit_collector(LayerAuditCollector* collector);
+  LayerAuditCollector* audit_collector() const { return audit_collector_; }
+  void record_audit_token_context(const std::vector<int>& token_ids_sample,
+                                  size_t batch_size,
+                                  size_t prompt_tokens_total,
+                                  size_t prompt_tokens_used,
+                                  int context_limit,
+                                  bool truncated);
 private:
   int num_layers, d_model, vocab_size;
   Device device;
@@ -251,6 +264,7 @@ private:
   std::vector<int> last_input_batch_lengths_;
   Tensor saved_final_hidden_;
   Tensor saved_final_norm_;
+  LayerAuditCollector* audit_collector_ = nullptr;
 };
 
 class D2FDecoder {

@@ -39,14 +39,18 @@ Current observability-related code:
 - `include/monitor.h`
 - `src/health_monitor.cpp`
 - `include/numerical_guard.h`
+- `include/layer_audit.h`
+- `src/layer_audit.cpp`
 - HTTP `/metrics`
 - `scripts/inspect_phase_responses.py`
 
-This is useful, but not yet a complete per-layer audit system.
+The product now has a narrow per-layer audit collector. It is disabled by
+default and becomes active only when a `LayerAuditCollector` is attached to a
+`JambaModel`.
 
 ## Required Layer Audit Surface
 
-The per-layer audit should capture, at minimum:
+The per-layer audit captures:
 
 - layer index and block type: Mamba2, Attention, TTT, MoE/FFN
 - input/output shape
@@ -57,7 +61,8 @@ The per-layer audit should capture, at minimum:
 - backward gradient norm when training
 - MoE router top-k distribution and entropy when MoE is active
 - tokenizer IDs and context truncation metadata
-- RNG seed and determinism metadata
+- training step loss and global gradient norm
+- pre-reload and post-reload phase health summaries
 
 ## End-To-End Audit Flow
 
@@ -71,8 +76,22 @@ The per-layer audit should capture, at minimum:
 8. Re-run the same holdout probes.
 9. Compare outputs, metrics, layer health, and determinism.
 
+The official native smoke for this path is `test_layer_audit`. It trains a
+small TTT/Attention/MoE model, records forward/backward layer telemetry, records
+MoE router distribution, saves a model pack, reloads it, compares the same
+probe tensor before and after reload, and writes an audit JSON.
+
+Core API:
+
+- `LayerAuditCollector::begin_run`
+- `LayerAuditCollector::set_phase`
+- `JambaModel::set_audit_collector`
+- `LayerAuditCollector::summarize_phase`
+- `LayerAuditCollector::compare_phase_health`
+- `LayerAuditCollector::write_json`
+
 ## Implementation Rule
 
-Do not start by refactoring `jamba.cpp`. First add a narrow audit collector with
-tests, then wire it into selected layer boundaries. Refactor only after audit
-coverage exists.
+Do not start by refactoring `jamba.cpp`. Keep extending the collector and tests
+first, then extract internals only after the audit signal covers the behavior
+being moved.

@@ -20,6 +20,7 @@ Current product CTest contains:
 - `test_memory_causal_store`
 - `test_jamba`
 - `test_model_pack`
+- `test_layer_audit`
 - `test_gpu_parity`
 - `test_http_api`
 - `test_circuit_api_pipeline`
@@ -30,6 +31,10 @@ Current product CTest contains:
 
 `test_oxtamem_ffi` belongs to the integrated OxtaMem lane and is registered only
 when the Rust engine target is built by CMake.
+
+`test_layer_audit` is the official end-to-end audit smoke. It verifies per-layer
+forward/backward records, tensor health stats, MoE router distribution, training
+step metadata, model-pack save/reload, and pre/post reload phase comparison.
 
 ## Candidate Tests Not Yet Product-Gated
 

@@ -53,6 +53,7 @@ A product release is ready only when:
 
 - clean CPU build succeeds
 - product CTest passes
+- `test_layer_audit` passes as part of CTest
 - gatekeeper passes
 - benchmark gate passes
 - fuzz smoke passes

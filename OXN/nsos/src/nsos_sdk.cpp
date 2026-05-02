@@ -1180,6 +1180,12 @@ std::string InferenceEngine::generate_stream(
         output.erase(output.begin(), output.end() - context_limit);
     }
     const size_t prompt_tokens_used = output.size();
+    this->model->record_audit_token_context(output,
+                                            1,
+                                            prompt_tokens.size(),
+                                            prompt_tokens_used,
+                                            context_limit,
+                                            prompt_tokens_used < prompt_tokens.size());
 
     const int top_k =
         options.top_k > 0
@@ -1400,18 +1406,26 @@ std::vector<std::string> InferenceEngine::generate_batch(
         if (items[index].output_tokens.empty()) {
             items[index].output_tokens.push_back(1);
         }
+        const size_t original_prompt_tokens = items[index].output_tokens.size();
+        aggregate.prompt_tokens_total += original_prompt_tokens;
         if (static_cast<int>(items[index].output_tokens.size()) > context_limit) {
             items[index].output_tokens.erase(
                 items[index].output_tokens.begin(),
                 items[index].output_tokens.end() - context_limit);
         }
         items[index].prompt_tokens_used = items[index].output_tokens.size();
-        aggregate.prompt_tokens_total += items[index].prompt_tokens_used;
     }
 
     for (const auto& item : items) {
         aggregate.prompt_tokens_used += item.prompt_tokens_used;
     }
+    this->model->record_audit_token_context(items.front().output_tokens,
+                                            items.size(),
+                                            aggregate.prompt_tokens_total,
+                                            aggregate.prompt_tokens_used,
+                                            context_limit,
+                                            aggregate.prompt_tokens_used <
+                                                aggregate.prompt_tokens_total);
 
     if (can_use_streaming && this->model->supports_batched_streaming_inference()) {
         auto to_host_logits = [](const Tensor& logits) {

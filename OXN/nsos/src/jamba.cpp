@@ -1,4 +1,5 @@
 #include "../include/jamba.h"
+#include "../include/layer_audit.h"
 #include "../include/nsos_serializer.h"
 #include "../include/nsos/determinism.h"
 #include "../include/mcts_reasoning.h"
@@ -6,6 +7,7 @@
 #include "../include/cuda/kernels.cuh"
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -405,9 +407,19 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
     if (saved_final_norm_.shape.size() == 3 && !last_input_batch_lengths_.empty()) {
         zero_sequence_suffix_inplace(saved_final_norm_, last_input_batch_lengths_);
     }
+    const auto head_started = std::chrono::steady_clock::now();
     Tensor logits = value_head->forward(saved_final_norm_);
     if (logits.shape.size() == 3 && !last_input_batch_lengths_.empty()) {
         zero_sequence_suffix_inplace(logits, last_input_batch_lengths_);
+    }
+    if (audit_collector_ && audit_collector_->enabled()) {
+        const double latency_ms =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - head_started)
+                                    .count()) /
+            1000.0;
+        audit_collector_->record_forward(-1, "value_head", "logits", saved_final_norm_,
+                                         logits, latency_ms);
     }
     return logits;
 }
@@ -584,6 +596,31 @@ void JambaModel::set_training_mode(bool enabled) {
     }
 }
 
+void JambaModel::set_audit_collector(LayerAuditCollector* collector) {
+    audit_collector_ = collector;
+    for (auto& layer : layers) {
+        if (layer) {
+            layer->set_audit_collector(collector);
+        }
+    }
+}
+
+void JambaModel::record_audit_token_context(const std::vector<int>& token_ids_sample,
+                                            size_t batch_size,
+                                            size_t prompt_tokens_total,
+                                            size_t prompt_tokens_used,
+                                            int context_limit,
+                                            bool truncated) {
+    if (audit_collector_ && audit_collector_->enabled()) {
+        audit_collector_->record_token_context(token_ids_sample,
+                                               batch_size,
+                                               prompt_tokens_total,
+                                               prompt_tokens_used,
+                                               context_limit,
+                                               truncated);
+    }
+}
+
 void JambaModel::reset_runtime_telemetry() {
     for (auto& layer : layers) {
         if (layer && layer->mamba_layer) {
@@ -615,6 +652,8 @@ Tensor JambaModel::forward_ids(const std::vector<int>& ids, Context* ctx) {
     }
     last_input_batches_.clear();
     last_input_batch_lengths_.clear();
+    record_audit_token_context(ids, 1, ids.size(), ids.size(),
+                               model_config_.max_context_tokens, false);
     Tensor x = embedding->forward(ids);
     return forward(x, ctx);
 }
@@ -644,6 +683,16 @@ Tensor JambaModel::forward_ids_batch(const std::vector<std::vector<int>>& batch_
     }
     last_input_ids_.clear();
     last_input_batches_ = padded_batch;
+    std::vector<int> sample_ids;
+    if (!padded_batch.empty()) {
+        sample_ids = padded_batch.front();
+    }
+    size_t total_tokens = 0;
+    for (int length : last_input_batch_lengths_) {
+        total_tokens += static_cast<size_t>(std::max(length, 0));
+    }
+    record_audit_token_context(sample_ids, padded_batch.size(), total_tokens,
+                               total_tokens, model_config_.max_context_tokens, false);
     Tensor x = embedding->forward_batch(padded_batch);
     zero_sequence_suffix_inplace(x, last_input_batch_lengths_);
     return forward(x, ctx);
@@ -885,7 +934,16 @@ void JambaModel::backward_embedding(const Tensor& grad, Context& ctx) {
 }
 
 void JambaModel::backward(const Tensor& grad, Context& ctx) {
+    const auto head_started = std::chrono::steady_clock::now();
     Tensor dy = value_head->backward(grad);
+    if (audit_collector_ && audit_collector_->enabled()) {
+        const double latency_ms =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - head_started)
+                                    .count()) /
+            1000.0;
+        audit_collector_->record_backward(-1, "value_head", grad, dy, latency_ms);
+    }
     if (saved_final_hidden_.size > 0 && saved_final_norm_.size > 0) {
         dy = saved_final_hidden_.rmsnorm_backward(dy, saved_final_norm_);
     }
@@ -1070,7 +1128,21 @@ JambaBlock::JambaBlock(int dm,
 
 JambaBlock::~JambaBlock() = default;
 
+std::string JambaBlock::audit_block_type() const {
+    std::string type;
+    if (is_ttt) {
+        type = "ttt";
+    } else if (is_attention) {
+        type = "attention";
+    } else {
+        type = "mamba2";
+    }
+    type += is_moe ? "+moe" : "+ffn";
+    return type;
+}
+
 Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
+    const auto audit_started = std::chrono::steady_clock::now();
     last_batch_size_ = x.shape.size() == 3 ? x.shape[0] : 0;
     saved_input_ = x;
     saved_core_norm_ = x.rmsnorm();
@@ -1098,7 +1170,17 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
                                         "jamba_moe_" + std::to_string(layer_idx),
                                         layer_idx * 17 + 2);
         }
-        return saved_residual_.add(ff);
+        Tensor output = saved_residual_.add(ff);
+        if (audit_collector_ && audit_collector_->enabled()) {
+            const double latency_ms =
+                static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - audit_started)
+                                        .count()) /
+                1000.0;
+            audit_collector_->record_forward(layer_idx, audit_block_type(), "activation",
+                                             x, output, latency_ms);
+        }
+        return output;
     }
 
     saved_ff_hidden_pre_ = ffn_gate_up->forward(saved_ff_norm_);
@@ -1114,7 +1196,17 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
                                     "jamba_ff_out_" + std::to_string(layer_idx),
                                     layer_idx * 17 + 4);
     }
-    return saved_residual_.add(ff);
+    Tensor output = saved_residual_.add(ff);
+    if (audit_collector_ && audit_collector_->enabled()) {
+        const double latency_ms =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - audit_started)
+                                    .count()) /
+            1000.0;
+        audit_collector_->record_forward(layer_idx, audit_block_type(), "activation",
+                                         x, output, latency_ms);
+    }
+    return output;
 }
 
 Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string& ln) {
@@ -1154,6 +1246,20 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
 
     saved_moe_weights_ = weights_host;
     saved_moe_rows_ = expert_rows;
+    if (audit_collector_ && audit_collector_->enabled()) {
+        std::vector<int> topk_counts(static_cast<size_t>(num_experts), 0);
+        for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+            topk_counts[static_cast<size_t>(expert_idx)] =
+                static_cast<int>(expert_rows[static_cast<size_t>(expert_idx)].size());
+        }
+        audit_collector_->record_router(layer_idx,
+                                        audit_block_type(),
+                                        rows,
+                                        num_experts,
+                                        effective_top_k,
+                                        topk_counts,
+                                        router->expert_loads);
+    }
 
     for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
         const auto& selected_rows = expert_rows[static_cast<size_t>(expert_idx)];
@@ -1271,6 +1377,7 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
 }
 
 Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
+    const auto audit_started = std::chrono::steady_clock::now();
     Tensor ff_grad;
     if (is_moe) {
         ff_grad = backward_moe(dy, ctx, "L" + std::to_string(layer_idx), saved_ff_norm_);
@@ -1316,7 +1423,17 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     }
 
     // Regra da Cadeia Inferior: d_input = d_residual + d_core
-    return residual_grad.add(core_grad);
+    Tensor input_grad = residual_grad.add(core_grad);
+    if (audit_collector_ && audit_collector_->enabled()) {
+        const double latency_ms =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - audit_started)
+                                    .count()) /
+            1000.0;
+        audit_collector_->record_backward(layer_idx, audit_block_type(), dy, input_grad,
+                                          latency_ms);
+    }
+    return input_grad;
 }
 
 void JambaBlock::reset() {

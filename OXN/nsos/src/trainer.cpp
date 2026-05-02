@@ -1,6 +1,7 @@
 #include "../include/trainer.h"
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
+#include "../include/layer_audit.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
@@ -746,9 +747,13 @@ float compute_current_lr(const Trainer& trainer) {
 
 void apply_optimizer_step(Trainer& trainer,
                           const std::vector<Parameter*>& params,
-                          int accumulation_steps) {
+                          int accumulation_steps,
+                          float* grad_norm_out = nullptr) {
     scale_gradients(params, 1.0f / std::max(accumulation_steps, 1));
-    clip_gradients(params, trainer.max_grad_norm);
+    const float grad_norm = clip_gradients(params, trainer.max_grad_norm);
+    if (grad_norm_out) {
+        *grad_norm_out = grad_norm;
+    }
 
     trainer.global_step_count++;
     const float cur_lr = compute_current_lr(trainer);
@@ -806,6 +811,22 @@ void apply_optimizer_step(Trainer& trainer,
             w[i] -= cur_lr * m_hat / (std::sqrt(v_hat) + trainer.eps);
         }
         p->mark_updated();
+    }
+}
+
+void record_training_audit_step(Trainer& trainer,
+                                double loss,
+                                double grad_norm,
+                                size_t parameter_count) {
+    if (!trainer.model) {
+        return;
+    }
+    LayerAuditCollector* audit = trainer.model->audit_collector();
+    if (audit && audit->enabled()) {
+        audit->record_training_step(trainer.global_step_count,
+                                    loss,
+                                    grad_norm,
+                                    parameter_count);
     }
 }
 
@@ -1187,10 +1208,13 @@ float train_supervised_batch_impl(Trainer& trainer,
 
     apply_qat_regularization(trainer);
     apply_moe_aux_regularization(trainer);
-    apply_optimizer_step(trainer, params, std::max(sample_count, 1));
+    float grad_norm = 0.0f;
+    apply_optimizer_step(trainer, params, std::max(sample_count, 1), &grad_norm);
     finalize_auxiliary_stats(auxiliary_total);
     trainer.last_auxiliary_stats = auxiliary_total;
-    return total_loss / static_cast<float>(std::max(sample_count, 1));
+    const float mean_loss = total_loss / static_cast<float>(std::max(sample_count, 1));
+    record_training_audit_step(trainer, mean_loss, grad_norm, params.size());
+    return mean_loss;
 }
 
 } // namespace
@@ -1234,7 +1258,9 @@ float Trainer::train_step(const std::vector<int>& tokens,
     model->backward_external(grad, ctx);
     apply_qat_regularization(*this);
     apply_moe_aux_regularization(*this);
-    apply_optimizer_step(*this, params, 1);
+    float grad_norm = 0.0f;
+    apply_optimizer_step(*this, params, 1, &grad_norm);
+    record_training_audit_step(*this, loss, grad_norm, params.size());
 
     return loss;
 }
@@ -1307,7 +1333,9 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
 
             apply_qat_regularization(*this);
             apply_moe_aux_regularization(*this);
-            apply_optimizer_step(*this, params, samples);
+            float grad_norm = 0.0f;
+            apply_optimizer_step(*this, params, samples, &grad_norm);
+            record_training_audit_step(*this, loss, grad_norm, params.size());
 
             ++internal_global_step;
             if (callback) {
