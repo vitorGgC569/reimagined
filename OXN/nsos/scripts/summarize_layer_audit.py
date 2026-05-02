@@ -32,6 +32,7 @@ def _empty_phase_summary(name: str) -> Dict[str, Any]:
         "max_l2_norm": 0.0,
         "max_grad_l2_norm": 0.0,
         "router_entropy_values": [],
+        "router_entropy_stats": None,
         "router_num_experts": [],
         "loss_values": [],
         "grad_l2_norm_values": [],
@@ -67,7 +68,7 @@ def _as_serializable_phase(phase: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(phase)
     result["layers_seen"] = sorted(int(layer) for layer in phase["layers_seen"])
     result["layer_coverage"] = len(result["layers_seen"])
-    result["router_entropy"] = _stats(entropies)
+    result["router_entropy"] = phase.get("router_entropy_stats") or _stats(entropies)
     result["router_entropy_values"] = [float(value) for value in entropies]
     result["router_num_experts"] = [int(value) for value in experts]
     result["loss"] = _stats(phase["loss_values"])
@@ -109,7 +110,64 @@ def summarize_audit_json(path: Path) -> Dict[str, Any]:
         "max_grad_l2_norm": 0.0,
     }
 
-    for record in data.get("records", []):
+    phase_summaries = data.get("phase_summaries", [])
+    if phase_summaries:
+        for item in phase_summaries:
+            phase_name = str(item.get("phase", "default"))
+            phase = phases.setdefault(phase_name, _empty_phase_summary(phase_name))
+            phase["records"] = int(item.get("records", 0) or 0)
+            phase["forward_records"] = int(item.get("forward_records", 0) or 0)
+            phase["backward_records"] = int(item.get("backward_records", 0) or 0)
+            phase["router_records"] = int(item.get("router_records", 0) or 0)
+            phase["token_contexts"] = int(item.get("token_contexts", 0) or 0)
+            phase["training_steps"] = int(item.get("training_steps", 0) or 0)
+            phase["total_nan"] = int(item.get("total_nan", 0) or 0)
+            phase["total_inf"] = int(item.get("total_inf", 0) or 0)
+            phase["max_latency_ms"] = float(item.get("max_latency_ms", 0.0) or 0.0)
+            phase["max_l2_norm"] = float(item.get("max_l2_norm", 0.0) or 0.0)
+            phase["stored_records"] = int(item.get("stored_records", 0) or 0)
+            phase["dropped_records"] = int(item.get("dropped_records", 0) or 0)
+            phase["truncated_contexts"] = int(item.get("truncated_contexts", 0) or 0)
+            phase["layers_seen"] = set(int(layer) for layer in item.get("layers_seen", []))
+            entropy_count = int(item.get("router_entropy_count", 0) or 0)
+            if entropy_count > 0:
+                entropy_min = float(item.get("router_entropy_min", 0.0) or 0.0)
+                entropy_max = float(item.get("router_entropy_max", 0.0) or 0.0)
+                entropy_mean = float(item.get("router_entropy_mean", 0.0) or 0.0)
+                phase["router_entropy_values"] = [
+                    entropy_min,
+                    entropy_max,
+                ]
+                phase["router_entropy_stats"] = {
+                    "min": entropy_min,
+                    "max": entropy_max,
+                    "mean": entropy_mean,
+                    "last": entropy_mean,
+                }
+                phase["router_num_experts"] = [
+                    int(item.get("router_num_experts_max", 0) or 0)
+                ]
+            for key in [
+                "records",
+                "forward_records",
+                "backward_records",
+                "router_records",
+                "token_contexts",
+                "training_steps",
+                "total_nan",
+                "total_inf",
+            ]:
+                totals[key] += int(phase.get(key, 0))
+            totals["max_latency_ms"] = max(
+                float(totals["max_latency_ms"]),
+                float(phase.get("max_latency_ms", 0.0)),
+            )
+            totals["max_l2_norm"] = max(
+                float(totals["max_l2_norm"]),
+                float(phase.get("max_l2_norm", 0.0)),
+            )
+
+    for record in ([] if phase_summaries else data.get("records", [])):
         phase_name = str(record.get("phase", "default"))
         phase = phases.setdefault(phase_name, _empty_phase_summary(phase_name))
         pass_name = str(record.get("pass", ""))
@@ -158,19 +216,22 @@ def summarize_audit_json(path: Path) -> Dict[str, Any]:
     for context in data.get("token_contexts", []):
         phase_name = str(context.get("phase", "default"))
         phase = phases.setdefault(phase_name, _empty_phase_summary(phase_name))
-        phase["token_contexts"] += 1
-        phase["truncated_contexts"] += 1 if bool(context.get("truncated", False)) else 0
-        totals["token_contexts"] += 1
+        if not phase_summaries:
+            phase["token_contexts"] += 1
+            phase["truncated_contexts"] += 1 if bool(context.get("truncated", False)) else 0
+            totals["token_contexts"] += 1
 
     for step in data.get("training_steps", []):
         phase_name = str(step.get("phase", "default"))
         phase = phases.setdefault(phase_name, _empty_phase_summary(phase_name))
-        phase["training_steps"] += 1
+        if not phase_summaries:
+            phase["training_steps"] += 1
         phase["loss_values"].append(float(step.get("loss", 0.0) or 0.0))
         grad_l2 = float(step.get("grad_l2_norm", 0.0) or 0.0)
         phase["grad_l2_norm_values"].append(grad_l2)
         phase["max_grad_l2_norm"] = max(float(phase["max_grad_l2_norm"]), grad_l2)
-        totals["training_steps"] += 1
+        if not phase_summaries:
+            totals["training_steps"] += 1
         totals["max_grad_l2_norm"] = max(float(totals["max_grad_l2_norm"]), grad_l2)
 
     serial_phases = {

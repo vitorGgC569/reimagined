@@ -305,6 +305,14 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("max_latency_ms", &LayerAuditSummary::max_latency_ms)
         .def_readwrite("max_l2_norm", &LayerAuditSummary::max_l2_norm)
         .def_readwrite("layers_seen", &LayerAuditSummary::layers_seen)
+        .def_readwrite("stored_records", &LayerAuditSummary::stored_records)
+        .def_readwrite("dropped_records", &LayerAuditSummary::dropped_records)
+        .def_readwrite("truncated_contexts", &LayerAuditSummary::truncated_contexts)
+        .def_readwrite("router_entropy_count", &LayerAuditSummary::router_entropy_count)
+        .def_readwrite("router_entropy_min", &LayerAuditSummary::router_entropy_min)
+        .def_readwrite("router_entropy_max", &LayerAuditSummary::router_entropy_max)
+        .def_readwrite("router_entropy_mean", &LayerAuditSummary::router_entropy_mean)
+        .def_readwrite("router_num_experts_max", &LayerAuditSummary::router_num_experts_max)
         .def("healthy", &LayerAuditSummary::healthy);
 
     py::class_<LayerAuditCollector>(m, "LayerAuditCollector")
@@ -315,6 +323,16 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def("begin_run", &LayerAuditCollector::begin_run, py::arg("run_id"))
         .def("set_phase", &LayerAuditCollector::set_phase, py::arg("phase"))
         .def("set_step", &LayerAuditCollector::set_step, py::arg("step"))
+        .def("set_storage_policy",
+             &LayerAuditCollector::set_storage_policy,
+             py::arg("summary_only"),
+             py::arg("record_sample_rate"),
+             py::arg("max_records_per_phase"),
+             py::arg("store_token_contexts"))
+        .def("summary_only", &LayerAuditCollector::summary_only)
+        .def("record_sample_rate", &LayerAuditCollector::record_sample_rate)
+        .def("max_records_per_phase", &LayerAuditCollector::max_records_per_phase)
+        .def("store_token_contexts", &LayerAuditCollector::store_token_contexts)
         .def("records", &LayerAuditCollector::records)
         .def("token_contexts", &LayerAuditCollector::token_contexts)
         .def("training_steps", &LayerAuditCollector::training_steps)
@@ -346,6 +364,7 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def("forward", py::overload_cast<const Tensor&, Context*>(&JambaModel::forward),
              py::arg("x"), py::arg("ctx") = nullptr)
         .def("forward_ids", &JambaModel::forward_ids, py::arg("ids"), py::arg("ctx") = nullptr)
+        .def("forward_ids_batch", &JambaModel::forward_ids_batch, py::arg("batch_ids"), py::arg("ctx") = nullptr)
         .def("forward_trunk", &JambaModel::forward_trunk, py::arg("ids"), py::arg("ctx") = nullptr)
         .def("forward_embedding", &JambaModel::forward_embedding, py::arg("x"), py::arg("ctx") = nullptr)
         .def("reason", &JambaModel::reason, py::arg("x"), py::arg("num_simulations") = 100)

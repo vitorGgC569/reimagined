@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -85,6 +86,14 @@ struct LayerAuditSummary {
     double max_latency_ms = 0.0;
     double max_l2_norm = 0.0;
     std::vector<int> layers_seen;
+    size_t stored_records = 0;
+    size_t dropped_records = 0;
+    size_t truncated_contexts = 0;
+    size_t router_entropy_count = 0;
+    double router_entropy_min = 0.0;
+    double router_entropy_max = 0.0;
+    double router_entropy_mean = 0.0;
+    int router_num_experts_max = 0;
 
     bool healthy() const { return total_nan == 0 && total_inf == 0; }
 };
@@ -98,6 +107,14 @@ public:
     void begin_run(const std::string& run_id);
     void set_phase(const std::string& phase);
     void set_step(int step);
+    void set_storage_policy(bool summary_only,
+                            int record_sample_rate,
+                            size_t max_records_per_phase,
+                            bool store_token_contexts);
+    bool summary_only() const;
+    int record_sample_rate() const;
+    size_t max_records_per_phase() const;
+    bool store_token_contexts() const;
 
     void record_token_context(const std::vector<int>& token_ids_sample,
                               size_t batch_size,
@@ -145,16 +162,39 @@ public:
     static TensorAuditStats summarize_tensor(const Tensor& tensor);
 
 private:
+    struct PhaseAuditAccumulator {
+        LayerAuditSummary summary;
+    };
+
     uint64_t next_sequence_unlocked();
+    PhaseAuditAccumulator& phase_accumulator_unlocked(const std::string& phase);
+    const PhaseAuditAccumulator* find_phase_accumulator_unlocked(const std::string& phase) const;
+    bool should_collect_layer_stats_unlocked(const PhaseAuditAccumulator& accumulator,
+                                             const std::string& pass,
+                                             int layer_index) const;
+    bool should_store_layer_record_unlocked(const PhaseAuditAccumulator& accumulator,
+                                            const std::string& pass) const;
+    void update_layer_summary_unlocked(PhaseAuditAccumulator& accumulator,
+                                       const LayerAuditRecord& record,
+                                       bool has_tensor_stats);
+    void mark_layer_record_storage_unlocked(PhaseAuditAccumulator& accumulator,
+                                            bool stored);
+    void update_training_summary_unlocked(PhaseAuditAccumulator& accumulator,
+                                          const TrainingStepAuditRecord& record);
 
     bool enabled_ = false;
     uint64_t next_sequence_ = 1;
     std::string run_id_ = "default";
     std::string phase_ = "default";
     int step_ = 0;
+    bool summary_only_ = false;
+    int record_sample_rate_ = 1;
+    size_t max_records_per_phase_ = 0;
+    bool store_token_contexts_ = true;
     std::vector<LayerAuditRecord> records_;
     std::vector<TokenContextAuditRecord> token_contexts_;
     std::vector<TrainingStepAuditRecord> training_steps_;
+    std::map<std::string, PhaseAuditAccumulator> phase_summaries_;
 };
 
 } // namespace nsos

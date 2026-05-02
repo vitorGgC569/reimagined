@@ -73,6 +73,32 @@ void write_tensor_stats(std::ostream& out, const TensorAuditStats& stats) {
     out << "}";
 }
 
+void write_layer_summary(std::ostream& out, const LayerAuditSummary& summary) {
+    out << "{";
+    out << "\"phase\":\"" << json_escape(summary.phase) << "\"";
+    out << ",\"records\":" << summary.records;
+    out << ",\"forward_records\":" << summary.forward_records;
+    out << ",\"backward_records\":" << summary.backward_records;
+    out << ",\"router_records\":" << summary.router_records;
+    out << ",\"token_contexts\":" << summary.token_contexts;
+    out << ",\"training_steps\":" << summary.training_steps;
+    out << ",\"total_nan\":" << summary.total_nan;
+    out << ",\"total_inf\":" << summary.total_inf;
+    out << ",\"max_latency_ms\":" << summary.max_latency_ms;
+    out << ",\"max_l2_norm\":" << summary.max_l2_norm;
+    out << ",\"layers_seen\":";
+    write_numeric_array(out, summary.layers_seen);
+    out << ",\"stored_records\":" << summary.stored_records;
+    out << ",\"dropped_records\":" << summary.dropped_records;
+    out << ",\"truncated_contexts\":" << summary.truncated_contexts;
+    out << ",\"router_entropy_count\":" << summary.router_entropy_count;
+    out << ",\"router_entropy_min\":" << summary.router_entropy_min;
+    out << ",\"router_entropy_max\":" << summary.router_entropy_max;
+    out << ",\"router_entropy_mean\":" << summary.router_entropy_mean;
+    out << ",\"router_num_experts_max\":" << summary.router_num_experts_max;
+    out << "}";
+}
+
 double router_entropy(const std::vector<float>& loads,
                       const std::vector<int>& topk_counts) {
     double total = 0.0;
@@ -118,6 +144,16 @@ void add_layer_seen(std::set<int>& seen, int layer_index) {
     }
 }
 
+void add_layer_seen(std::vector<int>& seen, int layer_index) {
+    if (layer_index < 0) {
+        return;
+    }
+    if (std::find(seen.begin(), seen.end(), layer_index) == seen.end()) {
+        seen.push_back(layer_index);
+        std::sort(seen.begin(), seen.end());
+    }
+}
+
 } // namespace
 
 void LayerAuditCollector::set_enabled(bool enabled) {
@@ -138,6 +174,7 @@ void LayerAuditCollector::reset() {
     records_.clear();
     token_contexts_.clear();
     training_steps_.clear();
+    phase_summaries_.clear();
 }
 
 void LayerAuditCollector::begin_run(const std::string& run_id) {
@@ -149,6 +186,7 @@ void LayerAuditCollector::begin_run(const std::string& run_id) {
     records_.clear();
     token_contexts_.clear();
     training_steps_.clear();
+    phase_summaries_.clear();
 }
 
 void LayerAuditCollector::set_phase(const std::string& phase) {
@@ -161,8 +199,147 @@ void LayerAuditCollector::set_step(int step) {
     step_ = step;
 }
 
+void LayerAuditCollector::set_storage_policy(bool summary_only,
+                                             int record_sample_rate,
+                                             size_t max_records_per_phase,
+                                             bool store_token_contexts) {
+    std::lock_guard<std::mutex> lock(audit_mutex());
+    summary_only_ = summary_only;
+    record_sample_rate_ = std::max(record_sample_rate, 1);
+    max_records_per_phase_ = max_records_per_phase;
+    store_token_contexts_ = store_token_contexts;
+}
+
+bool LayerAuditCollector::summary_only() const {
+    std::lock_guard<std::mutex> lock(audit_mutex());
+    return summary_only_;
+}
+
+int LayerAuditCollector::record_sample_rate() const {
+    std::lock_guard<std::mutex> lock(audit_mutex());
+    return record_sample_rate_;
+}
+
+size_t LayerAuditCollector::max_records_per_phase() const {
+    std::lock_guard<std::mutex> lock(audit_mutex());
+    return max_records_per_phase_;
+}
+
+bool LayerAuditCollector::store_token_contexts() const {
+    std::lock_guard<std::mutex> lock(audit_mutex());
+    return store_token_contexts_;
+}
+
 uint64_t LayerAuditCollector::next_sequence_unlocked() {
     return next_sequence_++;
+}
+
+LayerAuditCollector::PhaseAuditAccumulator&
+LayerAuditCollector::phase_accumulator_unlocked(const std::string& phase) {
+    auto [it, inserted] = phase_summaries_.try_emplace(phase);
+    if (inserted) {
+        it->second.summary.phase = phase;
+    }
+    return it->second;
+}
+
+const LayerAuditCollector::PhaseAuditAccumulator*
+LayerAuditCollector::find_phase_accumulator_unlocked(const std::string& phase) const {
+    const auto it = phase_summaries_.find(phase);
+    if (it == phase_summaries_.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+bool LayerAuditCollector::should_collect_layer_stats_unlocked(
+    const PhaseAuditAccumulator& accumulator,
+    const std::string& pass,
+    int layer_index) const {
+    if (pass == "router" || record_sample_rate_ <= 1) {
+        return true;
+    }
+    if (layer_index >= 0 &&
+        std::find(accumulator.summary.layers_seen.begin(),
+                  accumulator.summary.layers_seen.end(),
+                  layer_index) == accumulator.summary.layers_seen.end()) {
+        return true;
+    }
+    const size_t observed = accumulator.summary.forward_records +
+                            accumulator.summary.backward_records;
+    return (observed % static_cast<size_t>(record_sample_rate_)) == 0;
+}
+
+bool LayerAuditCollector::should_store_layer_record_unlocked(
+    const PhaseAuditAccumulator& accumulator,
+    const std::string& pass) const {
+    if (summary_only_) {
+        return false;
+    }
+    if (pass == "router") {
+        return max_records_per_phase_ == 0 ||
+               accumulator.summary.stored_records < max_records_per_phase_;
+    }
+    if (max_records_per_phase_ > 0 &&
+        accumulator.summary.stored_records >= max_records_per_phase_) {
+        return false;
+    }
+    return true;
+}
+
+void LayerAuditCollector::update_layer_summary_unlocked(
+    PhaseAuditAccumulator& accumulator,
+    const LayerAuditRecord& record,
+    bool has_tensor_stats) {
+    auto& summary = accumulator.summary;
+    ++summary.records;
+    if (record.pass == "forward") {
+        ++summary.forward_records;
+    } else if (record.pass == "backward") {
+        ++summary.backward_records;
+    } else if (record.pass == "router") {
+        ++summary.router_records;
+        const double entropy = record.router.entropy;
+        if (summary.router_entropy_count == 0) {
+            summary.router_entropy_min = entropy;
+            summary.router_entropy_max = entropy;
+            summary.router_entropy_mean = entropy;
+        } else {
+            summary.router_entropy_min = std::min(summary.router_entropy_min, entropy);
+            summary.router_entropy_max = std::max(summary.router_entropy_max, entropy);
+            summary.router_entropy_mean +=
+                (entropy - summary.router_entropy_mean) /
+                static_cast<double>(summary.router_entropy_count + 1);
+        }
+        ++summary.router_entropy_count;
+        summary.router_num_experts_max =
+            std::max(summary.router_num_experts_max, record.router.num_experts);
+    }
+    add_layer_seen(summary.layers_seen, record.layer_index);
+    summary.max_latency_ms = std::max(summary.max_latency_ms, record.latency_ms);
+    if (has_tensor_stats) {
+        summary.total_nan += record.input.nan_count + record.output.nan_count;
+        summary.total_inf += record.input.inf_count + record.output.inf_count;
+        summary.max_l2_norm =
+            std::max(summary.max_l2_norm,
+                     std::max(record.input.l2_norm, record.output.l2_norm));
+    }
+}
+
+void LayerAuditCollector::mark_layer_record_storage_unlocked(
+    PhaseAuditAccumulator& accumulator,
+    bool stored) {
+    if (stored) {
+        ++accumulator.summary.stored_records;
+    } else {
+        ++accumulator.summary.dropped_records;
+    }
+}
+
+void LayerAuditCollector::update_training_summary_unlocked(
+    PhaseAuditAccumulator& accumulator,
+    const TrainingStepAuditRecord&) {
+    ++accumulator.summary.training_steps;
 }
 
 TensorAuditStats LayerAuditCollector::summarize_tensor(const Tensor& tensor) {
@@ -240,7 +417,14 @@ void LayerAuditCollector::record_token_context(const std::vector<int>& token_ids
     const size_t sample_limit = std::min<size_t>(token_ids_sample.size(), 128);
     record.token_ids_sample.assign(token_ids_sample.begin(),
                                    token_ids_sample.begin() + sample_limit);
-    token_contexts_.push_back(std::move(record));
+    auto& accumulator = phase_accumulator_unlocked(record.phase);
+    ++accumulator.summary.token_contexts;
+    if (truncated) {
+        ++accumulator.summary.truncated_contexts;
+    }
+    if (store_token_contexts_ && !summary_only_) {
+        token_contexts_.push_back(std::move(record));
+    }
 }
 
 void LayerAuditCollector::record_forward(int layer_index,
@@ -253,6 +437,9 @@ void LayerAuditCollector::record_forward(int layer_index,
     if (!enabled_) {
         return;
     }
+    auto& accumulator = phase_accumulator_unlocked(phase_);
+    const bool collect_stats =
+        should_collect_layer_stats_unlocked(accumulator, "forward", layer_index);
     LayerAuditRecord record;
     record.sequence = next_sequence_unlocked();
     record.run_id = run_id_;
@@ -262,10 +449,18 @@ void LayerAuditCollector::record_forward(int layer_index,
     record.tensor_role = tensor_role;
     record.step = step_;
     record.layer_index = layer_index;
-    record.input = summarize_tensor(input);
-    record.output = summarize_tensor(output);
+    if (collect_stats) {
+        record.input = summarize_tensor(input);
+        record.output = summarize_tensor(output);
+    }
     record.latency_ms = latency_ms;
-    records_.push_back(std::move(record));
+    update_layer_summary_unlocked(accumulator, record, collect_stats);
+    const bool store_record =
+        collect_stats && should_store_layer_record_unlocked(accumulator, record.pass);
+    mark_layer_record_storage_unlocked(accumulator, store_record);
+    if (store_record) {
+        records_.push_back(std::move(record));
+    }
 }
 
 void LayerAuditCollector::record_backward(int layer_index,
@@ -277,6 +472,9 @@ void LayerAuditCollector::record_backward(int layer_index,
     if (!enabled_) {
         return;
     }
+    auto& accumulator = phase_accumulator_unlocked(phase_);
+    const bool collect_stats =
+        should_collect_layer_stats_unlocked(accumulator, "backward", layer_index);
     LayerAuditRecord record;
     record.sequence = next_sequence_unlocked();
     record.run_id = run_id_;
@@ -286,11 +484,19 @@ void LayerAuditCollector::record_backward(int layer_index,
     record.tensor_role = "gradient";
     record.step = step_;
     record.layer_index = layer_index;
-    record.input = summarize_tensor(grad_output);
-    record.output = summarize_tensor(grad_input);
+    if (collect_stats) {
+        record.input = summarize_tensor(grad_output);
+        record.output = summarize_tensor(grad_input);
+    }
     record.latency_ms = latency_ms;
     record.grad_l2_norm = record.output.l2_norm;
-    records_.push_back(std::move(record));
+    update_layer_summary_unlocked(accumulator, record, collect_stats);
+    const bool store_record =
+        collect_stats && should_store_layer_record_unlocked(accumulator, record.pass);
+    mark_layer_record_storage_unlocked(accumulator, store_record);
+    if (store_record) {
+        records_.push_back(std::move(record));
+    }
 }
 
 void LayerAuditCollector::record_router(int layer_index,
@@ -320,7 +526,13 @@ void LayerAuditCollector::record_router(int layer_index,
     record.router.topk_counts = topk_counts;
     record.router.expert_loads = expert_loads;
     record.router.entropy = router_entropy(expert_loads, topk_counts);
-    records_.push_back(std::move(record));
+    auto& accumulator = phase_accumulator_unlocked(record.phase);
+    update_layer_summary_unlocked(accumulator, record, true);
+    const bool store_record = should_store_layer_record_unlocked(accumulator, record.pass);
+    mark_layer_record_storage_unlocked(accumulator, store_record);
+    if (store_record) {
+        records_.push_back(std::move(record));
+    }
 }
 
 void LayerAuditCollector::record_training_step(int step,
@@ -339,6 +551,8 @@ void LayerAuditCollector::record_training_step(int step,
     record.loss = loss;
     record.grad_l2_norm = grad_l2_norm;
     record.parameter_count = parameter_count;
+    auto& accumulator = phase_accumulator_unlocked(record.phase);
+    update_training_summary_unlocked(accumulator, record);
     training_steps_.push_back(std::move(record));
     step_ = step;
 }
@@ -360,6 +574,10 @@ std::vector<TrainingStepAuditRecord> LayerAuditCollector::training_steps() const
 
 LayerAuditSummary LayerAuditCollector::summarize_phase(const std::string& phase) const {
     std::lock_guard<std::mutex> lock(audit_mutex());
+    if (const auto* accumulator = find_phase_accumulator_unlocked(phase)) {
+        return accumulator->summary;
+    }
+
     LayerAuditSummary summary;
     summary.phase = phase;
     std::set<int> layers_seen;
@@ -448,6 +666,23 @@ void LayerAuditCollector::write_json(const std::string& path) const {
     out << std::setprecision(10);
     out << "{\n";
     out << "  \"run_id\":\"" << json_escape(run_id_) << "\",\n";
+    out << "  \"storage_policy\":{";
+    out << "\"summary_only\":" << (summary_only_ ? "true" : "false");
+    out << ",\"record_sample_rate\":" << record_sample_rate_;
+    out << ",\"max_records_per_phase\":" << max_records_per_phase_;
+    out << ",\"store_token_contexts\":" << (store_token_contexts_ ? "true" : "false");
+    out << "},\n";
+    out << "  \"phase_summaries\":[\n";
+    size_t summary_index = 0;
+    for (const auto& [_, accumulator] : phase_summaries_) {
+        out << "    ";
+        write_layer_summary(out, accumulator.summary);
+        if (++summary_index < phase_summaries_.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
     out << "  \"records\":[\n";
     for (size_t i = 0; i < records_.size(); ++i) {
         const auto& record = records_[i];

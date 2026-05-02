@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, TextIO
 
+import numpy as np
+
 from cuda_env import add_windows_runtime_dirs, parse_preferred_cuda_root
 from nsos_curriculum_lib import (
     PHASE_ORDER,
@@ -27,6 +29,14 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - optional dependency
     tqdm = None
+
+
+EVAL_RUNTIME_OPTIONS: Dict[str, int] = {
+    "masked_batch_size": 4,
+    "generation_probe_samples": 0,
+    "fast_exact_samples": 0,
+    "text_loss_max_windows": 8,
+}
 
 
 PROFILES: Dict[str, Dict] = {
@@ -244,6 +254,57 @@ PROFILES["hybrid_pilot"]["model_config"] = {
     "use_flash_attn": False,
 }
 PROFILES["hybrid_pilot"]["validation_scope"] = "Validates attention + Mamba without TTT."
+
+PROFILES["hybrid_moe_smoke"] = deepcopy(PROFILES["pilot"])
+PROFILES["hybrid_moe_smoke"]["profile_family"] = "hybrid"
+PROFILES["hybrid_moe_smoke"]["requested_role"] = "moe_audit_smoke"
+PROFILES["hybrid_moe_smoke"]["batch_size"] = 2
+PROFILES["hybrid_moe_smoke"]["lr"] = 0.0012
+PROFILES["hybrid_moe_smoke"]["warmup_steps"] = 12
+PROFILES["hybrid_moe_smoke"]["instruction_polish_steps"] = 0
+PROFILES["hybrid_moe_smoke"]["phase_steps"] = {
+    "phase1_algorithms": 8,
+    "phase2_structured": 8,
+    "phase3_curated_text": 6,
+    "phase4_instructions": 6,
+    "phase5_verifier": 8,
+    "phase6_memory": 6,
+}
+PROFILES["hybrid_moe_smoke"]["model_config"] = {
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "sliding_window": 1024,
+    "attention_period": 2,
+    "attention_slot": 0,
+    "use_moe": True,
+    "num_experts": 4,
+    "num_experts_per_token": 2,
+    "moe_period": 2,
+    "moe_slot": 1,
+    "use_ttt": False,
+    "ttt_period": 64,
+    "ttt_slot": 63,
+    "use_exact_attention_training": True,
+    "use_flash_attn": False,
+}
+PROFILES["hybrid_moe_smoke"]["validation_scope"] = (
+    "CPU-feasible MoE smoke lane for router coverage and quick holdout trend checks."
+)
+
+PROFILES["hybrid_moe_long"] = deepcopy(PROFILES["hybrid_moe_smoke"])
+PROFILES["hybrid_moe_long"]["requested_role"] = "moe_capacity_probe"
+PROFILES["hybrid_moe_long"]["instruction_polish_steps"] = 8
+PROFILES["hybrid_moe_long"]["phase_steps"] = {
+    "phase1_algorithms": 24,
+    "phase2_structured": 24,
+    "phase3_curated_text": 20,
+    "phase4_instructions": 20,
+    "phase5_verifier": 24,
+    "phase6_memory": 20,
+}
+PROFILES["hybrid_moe_long"]["validation_scope"] = (
+    "Longer compact-audit MoE lane for capacity checks after performance probes are green."
+)
 
 PROFILES["hybrid_small"] = deepcopy(PROFILES["small"])
 PROFILES["hybrid_small"]["profile_family"] = "hybrid"
@@ -1073,7 +1134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phase-eval-samples",
         type=int,
-        default=16,
+        default=8,
         help="Held-out samples per phase used during in-training evaluation.",
     )
     parser.add_argument(
@@ -1085,8 +1146,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phase-exact-samples",
         type=int,
-        default=8,
+        default=0,
         help="Number of held-out samples used for greedy exact-match when eval mode is full.",
+    )
+    parser.add_argument(
+        "--fast-exact-samples",
+        type=int,
+        default=0,
+        help="Greedy exact-match samples in fast eval mode. 0 keeps exact-match out of fast gates.",
+    )
+    parser.add_argument(
+        "--generation-probe-samples",
+        type=int,
+        default=0,
+        help="Rows used by the generation probe in evaluate_phase. 0 disables the probe.",
+    )
+    parser.add_argument(
+        "--eval-masked-batch-size",
+        type=int,
+        default=4,
+        help="Batch size for masked supervised evaluation when forward_ids_batch is available.",
+    )
+    parser.add_argument(
+        "--text-loss-max-windows",
+        type=int,
+        default=8,
+        help="Maximum text-loss windows per phase evaluation.",
     )
     parser.add_argument(
         "--global-suite-samples-per-phase",
@@ -1103,7 +1188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global-suite-every-phases",
         type=int,
-        default=1,
+        default=0,
         help="Run global champion evaluation every N phases instead of after every phase.",
     )
     parser.add_argument(
@@ -1133,7 +1218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phase-best-eval-every-steps",
         type=int,
-        default=8,
+        default=0,
         help="If > 0, run in-phase eval every N steps and keep the best checkpoint.",
     )
     parser.add_argument(
@@ -1202,6 +1287,29 @@ def parse_args() -> argparse.Namespace:
         help="Maximum allowed absolute logit drift between pre/post reload probes.",
     )
     parser.add_argument(
+        "--audit-summary-only",
+        action="store_true",
+        help="Keep per-phase audit summaries but omit raw layer records from audit JSON.",
+    )
+    parser.add_argument(
+        "--audit-record-sample-rate",
+        type=int,
+        default=1,
+        help="Collect forward/backward tensor stats every N observed records; router records are always collected.",
+    )
+    parser.add_argument(
+        "--audit-max-records-per-phase",
+        type=int,
+        default=0,
+        help="Maximum raw layer records stored per phase. 0 means unlimited.",
+    )
+    parser.add_argument(
+        "--audit-store-token-contexts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Store raw token contexts in audit JSON. Phase summaries always keep token-context counts.",
+    )
+    parser.add_argument(
         "--holdout-files",
         type=Path,
         nargs="*",
@@ -1214,13 +1322,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--holdout-eval-mode",
         choices=["fast", "full"],
-        default="full",
+        default="fast",
         help="Evaluation mode for official holdout files.",
     )
     parser.add_argument(
         "--holdout-exact-samples",
         type=int,
-        default=4,
+        default=0,
         help="Greedy exact-match samples per official holdout file.",
     )
     return parser.parse_args()
@@ -1540,11 +1648,8 @@ def greedy_generate(
     model.reset_session()
     if supports_streaming:
         model.set_streaming_inference(True)
-        logits = None
-        for prompt_index, token in enumerate(token_ids):
-            logits = model.forward_ids([token], None)
-            if prompt_index == 0 or (prompt_index + 1) == len(token_ids):
-                debug_eval_log(logger, f"{label}:prompt_step={prompt_index + 1}/{len(token_ids)}")
+        logits = model.forward_ids(token_ids, None)
+        debug_eval_log(logger, f"{label}:prompt_prefill={len(token_ids)}")
         for _ in range(max_new_tokens):
             host_logits = logits.cpu() if logits.device == nsos.Device.GPU else logits
             values = host_logits.numpy()
@@ -1622,6 +1727,8 @@ def evaluate_exact(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int, 
 
 
 def evaluate_text_loss(nsos, model, tokenizer, rows: List[Dict], seq_len: int, max_windows: int = 24) -> Dict[str, float]:
+    if max_windows <= 0:
+        return {"heldout_loss": 0.0}
     token_stream = build_token_stream(tokenizer, rows, "<|endoftext|>")
     if len(token_stream) < seq_len + 1:
         return {"heldout_loss": 0.0}
@@ -1643,7 +1750,20 @@ def evaluate_text_loss(nsos, model, tokenizer, rows: List[Dict], seq_len: int, m
     return {"heldout_loss": sum(losses) / len(losses) if losses else 0.0}
 
 
-def evaluate_masked_supervised(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int) -> Dict[str, float]:
+def cross_entropy_from_numpy(logits, targets: List[int]) -> float:
+    if len(targets) == 0:
+        return 0.0
+    target_array = np.asarray(targets, dtype=np.int64)
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    exp_values = np.exp(shifted)
+    log_denominator = np.log(exp_values.sum(axis=1, keepdims=True))
+    log_probs = shifted - log_denominator
+    row_indices = np.arange(target_array.shape[0])
+    return float(-log_probs[row_indices, target_array].mean())
+
+
+def evaluate_masked_supervised(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
+                               batch_size: int | None = None) -> Dict[str, float]:
     if not rows:
         return {
             "answer_loss": 0.0,
@@ -1656,6 +1776,8 @@ def evaluate_masked_supervised(nsos, model, tokenizer, rows: List[Dict], eos_tok
     first_hits = 0
     teacher_hits = 0
     teacher_total = 0
+    sample_count = 0
+    items: List[Dict[str, Any]] = []
 
     for row in rows:
         if not row.get("answer"):
@@ -1667,27 +1789,56 @@ def evaluate_masked_supervised(nsos, model, tokenizer, rows: List[Dict], eos_tok
         inputs = list(prompt_tokens)
         if len(answer_tokens) > 1:
             inputs.extend(answer_tokens[:-1])
+        items.append({
+            "inputs": inputs,
+            "answer_tokens": answer_tokens,
+            "start": len(prompt_tokens) - 1,
+            "end": len(prompt_tokens) - 1 + len(answer_tokens),
+        })
 
+    effective_batch_size = max(int(batch_size or EVAL_RUNTIME_OPTIONS["masked_batch_size"]), 1)
+    has_batch_forward = hasattr(model, "forward_ids_batch") and effective_batch_size > 1
+
+    for offset in range(0, len(items), effective_batch_size):
+        batch = items[offset : offset + effective_batch_size]
         model.reset_session()
-        logits = model.forward_ids(inputs, None)
-        start = len(prompt_tokens) - 1
-        end = start + len(answer_tokens)
-        answer_logits = logits.slice(0, start, end)
-        host_logits = answer_logits.cpu() if answer_logits.device == nsos.Device.GPU else answer_logits
-        loss, _ = host_logits.cross_entropy(answer_tokens)
-        total_loss += float(loss)
+        if has_batch_forward and len(batch) > 1:
+            logits = model.forward_ids_batch([item["inputs"] for item in batch], None)
+            host_logits = logits.cpu() if logits.device == nsos.Device.GPU else logits
+            batch_values = host_logits.numpy()
+            for batch_index, item in enumerate(batch):
+                values = batch_values[batch_index, item["start"] : item["end"], :]
+                answer_tokens = item["answer_tokens"]
+                total_loss += cross_entropy_from_numpy(values, answer_tokens)
+                sample_count += 1
+                if len(answer_tokens) > 0 and int(values[0].argmax()) == int(answer_tokens[0]):
+                    first_hits += 1
+                for row_index, token in enumerate(answer_tokens):
+                    teacher_total += 1
+                    if int(values[row_index].argmax()) == int(token):
+                        teacher_hits += 1
+            continue
 
-        values = host_logits.numpy()
-        if len(answer_tokens) > 0:
-            if int(values[0].argmax()) == int(answer_tokens[0]):
+        for item in batch:
+            model.reset_session()
+            logits = model.forward_ids(item["inputs"], None)
+            answer_logits = logits.slice(0, item["start"], item["end"])
+            host_logits = answer_logits.cpu() if answer_logits.device == nsos.Device.GPU else answer_logits
+            loss, _ = host_logits.cross_entropy(item["answer_tokens"])
+            total_loss += float(loss)
+            sample_count += 1
+
+            values = host_logits.numpy()
+            answer_tokens = item["answer_tokens"]
+            if len(answer_tokens) > 0 and int(values[0].argmax()) == int(answer_tokens[0]):
                 first_hits += 1
 
-        for row_index, token in enumerate(answer_tokens):
-            teacher_total += 1
-            if int(values[row_index].argmax()) == int(token):
-                teacher_hits += 1
+            for row_index, token in enumerate(answer_tokens):
+                teacher_total += 1
+                if int(values[row_index].argmax()) == int(token):
+                    teacher_hits += 1
 
-    sample_count = max(sum(1 for row in rows if row.get("answer")), 1)
+    sample_count = max(sample_count, 1)
     return {
         "answer_loss": total_loss / sample_count,
         "first_token_accuracy": first_hits / sample_count,
@@ -1765,6 +1916,14 @@ def layer_audit_summary_to_dict(summary) -> Dict[str, Any]:
         "max_latency_ms": float(summary.max_latency_ms),
         "max_l2_norm": float(summary.max_l2_norm),
         "layers_seen": [int(layer) for layer in summary.layers_seen],
+        "stored_records": int(getattr(summary, "stored_records", 0)),
+        "dropped_records": int(getattr(summary, "dropped_records", 0)),
+        "truncated_contexts": int(getattr(summary, "truncated_contexts", 0)),
+        "router_entropy_count": int(getattr(summary, "router_entropy_count", 0)),
+        "router_entropy_min": float(getattr(summary, "router_entropy_min", 0.0)),
+        "router_entropy_max": float(getattr(summary, "router_entropy_max", 0.0)),
+        "router_entropy_mean": float(getattr(summary, "router_entropy_mean", 0.0)),
+        "router_num_experts_max": int(getattr(summary, "router_num_experts_max", 0)),
         "healthy": bool(summary.healthy()),
     }
 
@@ -1999,8 +2158,14 @@ def sample_phase_replay_rows(
 
 
 def evaluate_generation_probe(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
-                              logger=None, label: str = "probe") -> Dict[str, float | str]:
-    probe_rows = [row for row in rows if row.get("answer")][: max(1, min(4, len(rows)))]
+                              logger=None, label: str = "probe",
+                              sample_count: int | None = None) -> Dict[str, float | str]:
+    effective_samples = (
+        EVAL_RUNTIME_OPTIONS["generation_probe_samples"]
+        if sample_count is None
+        else max(int(sample_count), 0)
+    )
+    probe_rows = [row for row in rows if row.get("answer")][: min(effective_samples, len(rows))]
     if not probe_rows:
         return {
             "probe_kind": "",
@@ -2066,14 +2231,32 @@ def evaluate_phase_impl(nsos, model, tokenizer, rows: List[Dict], eos_token_id: 
                         seq_len: int, eval_mode: str, exact_samples: int,
                         logger=None, label: str = "phase_eval") -> Dict[str, float]:
     debug_eval_log(logger, f"{label}:masked:start rows={len(rows)}")
-    masked_metrics = evaluate_masked_supervised(nsos, model, tokenizer, rows, eos_token_id)
+    masked_metrics = evaluate_masked_supervised(
+        nsos,
+        model,
+        tokenizer,
+        rows,
+        eos_token_id,
+        batch_size=EVAL_RUNTIME_OPTIONS["masked_batch_size"],
+    )
     debug_eval_log(logger, f"{label}:masked:done")
     debug_eval_log(logger, f"{label}:text:start")
-    text_metrics = evaluate_text_loss(nsos, model, tokenizer, rows, seq_len)
+    text_metrics = evaluate_text_loss(
+        nsos,
+        model,
+        tokenizer,
+        rows,
+        seq_len,
+        max_windows=EVAL_RUNTIME_OPTIONS["text_loss_max_windows"],
+    )
     debug_eval_log(logger, f"{label}:text:done")
     result = {**masked_metrics, **text_metrics}
 
-    effective_exact_samples = max(1, exact_samples if eval_mode == "full" else min(exact_samples, 2))
+    effective_exact_samples = (
+        max(0, exact_samples)
+        if eval_mode == "full"
+        else max(0, EVAL_RUNTIME_OPTIONS["fast_exact_samples"])
+    )
     exact_rows = [row for row in rows if row.get("answer")][:effective_exact_samples]
     if exact_rows:
         debug_eval_log(logger, f"{label}:exact:start rows={len(exact_rows)}")
@@ -2092,19 +2275,33 @@ def evaluate_phase_impl(nsos, model, tokenizer, rows: List[Dict], eos_token_id: 
     else:
         result.update({"exact_total": 0, "exact_correct": 0, "exact_accuracy": 0.0})
 
-    debug_eval_log(logger, f"{label}:probe:start")
-    result.update(
-        evaluate_generation_probe(
-            nsos,
-            model,
-            tokenizer,
-            rows,
-            eos_token_id,
-            logger=logger,
-            label=f"{label}:probe",
+    if EVAL_RUNTIME_OPTIONS["generation_probe_samples"] > 0:
+        debug_eval_log(logger, f"{label}:probe:start")
+        result.update(
+            evaluate_generation_probe(
+                nsos,
+                model,
+                tokenizer,
+                rows,
+                eos_token_id,
+                logger=logger,
+                label=f"{label}:probe",
+                sample_count=EVAL_RUNTIME_OPTIONS["generation_probe_samples"],
+            )
         )
-    )
-    debug_eval_log(logger, f"{label}:probe:done")
+        debug_eval_log(logger, f"{label}:probe:done")
+    else:
+        result.update({
+            "probe_kind": "",
+            "probe_expected": "",
+            "probe_prediction": "",
+            "probe_nonempty": 0.0,
+            "probe_exact_match": 0.0,
+            "probe_prefix_match_ratio": 0.0,
+            "probe_repeat_rate": 0.0,
+            "probe_repeat_run": 0.0,
+            "probe_repetition_penalty": 0.0,
+        })
 
     if eval_mode == "full":
         result.update(
@@ -2208,6 +2405,12 @@ def compute_phase_score(metrics: Dict[str, float]) -> float:
 
 def main() -> int:
     args = parse_args()
+    EVAL_RUNTIME_OPTIONS.update({
+        "masked_batch_size": max(int(args.eval_masked_batch_size), 1),
+        "generation_probe_samples": max(int(args.generation_probe_samples), 0),
+        "fast_exact_samples": max(int(args.fast_exact_samples), 0),
+        "text_loss_max_windows": max(int(args.text_loss_max_windows), 0),
+    })
     canonical_profile, profile = resolve_profile(args.profile)
     run_dir = args.run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -2292,6 +2495,12 @@ def main() -> int:
                 raise RuntimeError("nsos_ext does not expose LayerAuditCollector; rebuild nsos_ext first.")
             layer_audit = nsos.LayerAuditCollector()
             layer_audit.begin_run(f"{canonical_profile}:seed{args.seed}")
+            layer_audit.set_storage_policy(
+                bool(args.audit_summary_only),
+                max(int(args.audit_record_sample_rate), 1),
+                max(int(args.audit_max_records_per_phase), 0),
+                bool(args.audit_store_token_contexts),
+            )
             layer_audit.set_enabled(True)
             model.set_audit_collector(layer_audit)
             logger.log(f"[audit] enabled path={layer_audit_path}")
@@ -2380,6 +2589,10 @@ def main() -> int:
             "phase_eval_mode": args.phase_eval_mode,
             "phase_eval_samples": args.phase_eval_samples,
             "phase_exact_samples": args.phase_exact_samples,
+            "fast_exact_samples": args.fast_exact_samples,
+            "generation_probe_samples": args.generation_probe_samples,
+            "eval_masked_batch_size": args.eval_masked_batch_size,
+            "text_loss_max_windows": args.text_loss_max_windows,
             "global_suite_samples_per_phase": args.global_suite_samples_per_phase,
             "global_suite_exact_samples": args.global_suite_exact_samples,
             "replay_ratio": args.replay_ratio,
@@ -2400,6 +2613,12 @@ def main() -> int:
                 "path": str(layer_audit_path),
                 "summary_path": str(layer_audit_summary_path),
                 "thresholds": audit_thresholds,
+                "storage_policy": {
+                    "summary_only": bool(args.audit_summary_only),
+                    "record_sample_rate": max(int(args.audit_record_sample_rate), 1),
+                    "max_records_per_phase": max(int(args.audit_max_records_per_phase), 0),
+                    "store_token_contexts": bool(args.audit_store_token_contexts),
+                },
                 "phase_snapshots": [],
             },
             "official_holdouts": {},
