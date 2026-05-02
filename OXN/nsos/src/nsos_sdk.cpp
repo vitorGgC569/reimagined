@@ -613,8 +613,10 @@ int sample_from_host_logits_row(const float* raw,
     const bool suppress_control =
         generated_so_far < static_cast<size_t>(std::max(options.min_new_tokens, 0)) &&
         options.suppress_control_tokens_at_start;
-    if ((options.temperature <= 1e-5f || top_k == 1) &&
-        !(options.top_p < 1.0f && options.top_p > 0.0f)) {
+    const bool greedy_selection = options.temperature <= 1e-5f || top_k == 1;
+    const bool top_p_can_change_selection =
+        top_k != 1 && options.top_p < 1.0f && options.top_p > 0.0f;
+    if (greedy_selection && !top_p_can_change_selection) {
         const auto sampler_started_fast = sampler_started;
         int best_token = -1;
         float best_value = -1e30f;
@@ -1244,11 +1246,15 @@ std::string InferenceEngine::generate_stream(
     this->model->reset_session();
     this->model->set_streaming_inference(can_use_streaming);
 
+    auto prefill_started_at = std::chrono::steady_clock::now();
+    auto decode_started_at = prefill_started_at;
+    auto decode_finished_at = prefill_started_at;
     if (can_use_streaming) {
         Tensor logits;
-        for (int token : output) {
-            logits = this->model->forward_ids({token}, nullptr);
+        if (!output.empty()) {
+            logits = this->model->forward_ids(output, nullptr);
         }
+        decode_started_at = std::chrono::steady_clock::now();
 
         for (int step = 0; step < std::max(options.max_tokens, 0); ++step) {
             const int next_token = sample_next_token(logits);
@@ -1265,7 +1271,9 @@ std::string InferenceEngine::generate_stream(
 
             logits = this->model->forward_ids({next_token}, nullptr);
         }
+        decode_finished_at = std::chrono::steady_clock::now();
     } else {
+        decode_started_at = std::chrono::steady_clock::now();
         for (int step = 0; step < std::max(options.max_tokens, 0); ++step) {
             std::vector<int> model_input = output;
             if (static_cast<int>(model_input.size()) > context_limit) {
@@ -1286,6 +1294,7 @@ std::string InferenceEngine::generate_stream(
                 break;
             }
         }
+        decode_finished_at = std::chrono::steady_clock::now();
     }
     this->model->set_streaming_inference(false);
 
@@ -1300,13 +1309,33 @@ std::string InferenceEngine::generate_stream(
     last_metrics_.batch_size = 1;
     last_metrics_.elapsed_ms =
         static_cast<double>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(finished_at - started_at)
+            std::chrono::duration_cast<std::chrono::microseconds>(finished_at - started_at)
                 .count());
+    last_metrics_.elapsed_ms /= 1000.0;
+    last_metrics_.prefill_ms =
+        static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(decode_started_at -
+                                                                  prefill_started_at)
+                .count()) /
+        1000.0;
+    last_metrics_.decode_ms =
+        static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(decode_finished_at -
+                                                                  decode_started_at)
+                .count()) /
+        1000.0;
     const double elapsed_seconds = std::max(last_metrics_.elapsed_ms / 1000.0, 1e-9);
+    const double prefill_seconds = std::max(last_metrics_.prefill_ms / 1000.0, 1e-9);
+    const double decode_seconds = std::max(last_metrics_.decode_ms / 1000.0, 1e-9);
     last_metrics_.prompt_tokens_per_sec =
-        static_cast<double>(last_metrics_.prompt_tokens_used) / elapsed_seconds;
+        static_cast<double>(last_metrics_.prompt_tokens_used) /
+        (can_use_streaming ? prefill_seconds : elapsed_seconds);
     last_metrics_.decode_tokens_per_sec =
-        static_cast<double>(last_metrics_.generated_tokens) / elapsed_seconds;
+        static_cast<double>(last_metrics_.generated_tokens) /
+        (last_metrics_.decode_ms > 0.0 ? decode_seconds : elapsed_seconds);
+    last_metrics_.total_tokens_per_sec =
+        static_cast<double>(last_metrics_.prompt_tokens_used + last_metrics_.generated_tokens) /
+        elapsed_seconds;
     const RuntimeTelemetrySnapshot runtime = this->model->runtime_telemetry();
     last_metrics_.mamba_fast_path_hits = runtime.mamba_fast_path_hits;
     last_metrics_.mamba_fast_path_fallbacks = runtime.mamba_fast_path_fallbacks;
@@ -1427,52 +1456,30 @@ std::vector<std::string> InferenceEngine::generate_batch(
                                             aggregate.prompt_tokens_used <
                                                 aggregate.prompt_tokens_total);
 
+    auto prefill_started_at = std::chrono::steady_clock::now();
+    auto decode_started_at = prefill_started_at;
+    auto decode_finished_at = prefill_started_at;
     if (can_use_streaming && this->model->supports_batched_streaming_inference()) {
         auto to_host_logits = [](const Tensor& logits) {
             return logits.get_device() == Device::GPU ? logits.cpu() : logits;
         };
 
-        std::unordered_map<size_t, std::vector<size_t>> prefill_groups;
-        for (size_t index = 0; index < items.size(); ++index) {
-            prefill_groups[items[index].output_tokens.size()].push_back(index);
-        }
-        for (const auto& entry : prefill_groups) {
-            const size_t prompt_len = entry.first;
+        for (size_t item_index = 0; item_index < items.size(); ++item_index) {
             this->model->reset_session();
-            Tensor logits_batch;
-            for (size_t token_index = 0; token_index < prompt_len; ++token_index) {
-                std::vector<std::vector<int>> batch_step_tokens;
-                batch_step_tokens.reserve(entry.second.size());
-                for (size_t item_index : entry.second) {
-                    batch_step_tokens.push_back(
-                        {items[item_index].output_tokens[static_cast<size_t>(token_index)]});
-                }
-                logits_batch = this->model->forward_ids_batch(batch_step_tokens, nullptr);
-            }
-            Tensor host_logits_batch = to_host_logits(logits_batch);
-            const int batch_count = host_logits_batch.shape[0];
-            const int max_seq_len = host_logits_batch.shape[1];
-            const int vocab_size = host_logits_batch.shape[2];
-            const float* logits_ptr = host_logits_batch.data();
-            auto snapshots = this->model->fork_session_batch();
-            for (int row = 0; row < batch_count; ++row) {
-                const size_t item_index = entry.second[static_cast<size_t>(row)];
-                const size_t row_offset =
-                    ((static_cast<size_t>(row) * static_cast<size_t>(max_seq_len)) +
-                     static_cast<size_t>(max_seq_len - 1)) *
-                    static_cast<size_t>(vocab_size);
-                Tensor row_logits({1, vocab_size}, Device::CPU);
-                std::memcpy(row_logits.data(),
-                            logits_ptr + row_offset,
-                            static_cast<size_t>(vocab_size) * sizeof(float));
-                items[item_index].cached_logits = std::move(row_logits);
-                items[item_index].snapshot =
-                    snapshots.size() > static_cast<size_t>(row)
-                        ? snapshots[static_cast<size_t>(row)]
-                        : JambaSessionSnapshot{};
-                items[item_index].has_snapshot = true;
-            }
+            this->model->set_streaming_inference(true);
+            Tensor logits = this->model->forward_ids(items[item_index].output_tokens, nullptr);
+            Tensor host_logits = to_host_logits(logits);
+            const int vocab_size = host_logits.shape.back();
+            const int last_offset = host_logits.size - vocab_size;
+            Tensor row_logits({1, vocab_size}, Device::CPU);
+            std::memcpy(row_logits.data(),
+                        host_logits.data() + last_offset,
+                        static_cast<size_t>(vocab_size) * sizeof(float));
+            items[item_index].cached_logits = std::move(row_logits);
+            items[item_index].snapshot = this->model->fork_session();
+            items[item_index].has_snapshot = true;
         }
+        decode_started_at = std::chrono::steady_clock::now();
 
         for (int step = 0; step < std::max(options.max_tokens, 0); ++step) {
             std::vector<size_t> active_indices;
@@ -1536,6 +1543,7 @@ std::vector<std::string> InferenceEngine::generate_batch(
                 items[item_index].has_snapshot = true;
             }
         }
+        decode_finished_at = std::chrono::steady_clock::now();
     } else if (can_use_streaming) {
         auto to_host_logits = [](const Tensor& logits) {
             return logits.get_device() == Device::GPU ? logits.cpu() : logits;
@@ -1543,14 +1551,13 @@ std::vector<std::string> InferenceEngine::generate_batch(
 
         for (size_t index = 0; index < items.size(); ++index) {
             this->model->reset_session();
-            Tensor logits;
-            for (int token : items[index].output_tokens) {
-                logits = this->model->forward_ids({token}, nullptr);
-            }
+            this->model->set_streaming_inference(true);
+            Tensor logits = this->model->forward_ids(items[index].output_tokens, nullptr);
             items[index].cached_logits = to_host_logits(logits);
             items[index].snapshot = this->model->fork_session();
             items[index].has_snapshot = true;
         }
+        decode_started_at = std::chrono::steady_clock::now();
 
         for (int step = 0; step < std::max(options.max_tokens, 0); ++step) {
             bool any_active = false;
@@ -1584,7 +1591,9 @@ std::vector<std::string> InferenceEngine::generate_batch(
                 break;
             }
         }
+        decode_finished_at = std::chrono::steady_clock::now();
     } else {
+        decode_started_at = std::chrono::steady_clock::now();
         for (int step = 0; step < std::max(options.max_tokens, 0); ++step) {
             std::vector<size_t> active_indices;
             std::vector<std::vector<int>> batch_inputs;
@@ -1633,6 +1642,7 @@ std::vector<std::string> InferenceEngine::generate_batch(
                 }
             }
         }
+        decode_finished_at = std::chrono::steady_clock::now();
     }
 
     this->model->set_streaming_inference(false);
@@ -1649,13 +1659,33 @@ std::vector<std::string> InferenceEngine::generate_batch(
     const auto finished_at = std::chrono::steady_clock::now();
     aggregate.elapsed_ms =
         static_cast<double>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(finished_at - started_at)
+            std::chrono::duration_cast<std::chrono::microseconds>(finished_at - started_at)
                 .count());
+    aggregate.elapsed_ms /= 1000.0;
+    aggregate.prefill_ms =
+        static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(decode_started_at -
+                                                                  prefill_started_at)
+                .count()) /
+        1000.0;
+    aggregate.decode_ms =
+        static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(decode_finished_at -
+                                                                  decode_started_at)
+                .count()) /
+        1000.0;
     const double elapsed_seconds = std::max(aggregate.elapsed_ms / 1000.0, 1e-9);
+    const double prefill_seconds = std::max(aggregate.prefill_ms / 1000.0, 1e-9);
+    const double decode_seconds = std::max(aggregate.decode_ms / 1000.0, 1e-9);
     aggregate.prompt_tokens_per_sec =
-        static_cast<double>(aggregate.prompt_tokens_used) / elapsed_seconds;
+        static_cast<double>(aggregate.prompt_tokens_used) /
+        (can_use_streaming ? prefill_seconds : elapsed_seconds);
     aggregate.decode_tokens_per_sec =
-        static_cast<double>(aggregate.generated_tokens) / elapsed_seconds;
+        static_cast<double>(aggregate.generated_tokens) /
+        (aggregate.decode_ms > 0.0 ? decode_seconds : elapsed_seconds);
+    aggregate.total_tokens_per_sec =
+        static_cast<double>(aggregate.prompt_tokens_used + aggregate.generated_tokens) /
+        elapsed_seconds;
     const RuntimeTelemetrySnapshot runtime = this->model->runtime_telemetry();
     aggregate.mamba_fast_path_hits = runtime.mamba_fast_path_hits;
     aggregate.mamba_fast_path_fallbacks = runtime.mamba_fast_path_fallbacks;

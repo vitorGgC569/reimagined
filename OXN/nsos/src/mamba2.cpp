@@ -326,6 +326,39 @@ Tensor Mamba2SSD::apply_gating(const Tensor& y_ssd, const Tensor& x,
     return y_ssd.mul(gate);
 }
 
+void Mamba2SSD::update_streaming_state_from_history(const Tensor& input) {
+    if (!streaming_inference_ || saved_state_history_.size == 0 ||
+        (input.shape.size() != 2 && input.shape.size() != 3)) {
+        return;
+    }
+
+    const bool rank_2 = input.shape.size() == 2;
+    const int batch = rank_2 ? 1 : input.shape[0];
+    const int seq = rank_2 ? input.shape[0] : input.shape[1];
+    if (batch <= 0 || seq <= 0 || input.shape.back() != d_model) {
+        return;
+    }
+
+    Tensor history_host =
+        saved_state_history_.get_device() == Device::GPU ? saved_state_history_.cpu()
+                                                         : saved_state_history_;
+    Tensor next_state(batch == 1 ? std::vector<int>{1, d_model}
+                                 : std::vector<int>{batch, d_model},
+                      Device::CPU);
+    const float* history_ptr = history_host.data();
+    float* state_ptr = next_state.data();
+    for (int row = 0; row < batch; ++row) {
+        const int token_index = rank_2 ? (seq - 1) : (row * seq + seq - 1);
+        std::memcpy(state_ptr + static_cast<size_t>(row) * static_cast<size_t>(d_model),
+                    history_ptr + static_cast<size_t>(token_index) * static_cast<size_t>(d_model),
+                    static_cast<size_t>(d_model) * sizeof(float));
+    }
+
+    Tensor target_state =
+        input.get_device() == Device::GPU ? next_state.to(Device::GPU) : next_state;
+    streaming_state_ = std::make_shared<Tensor>(std::move(target_state));
+}
+
 Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
     if (u.shape.size() != 2 && u.shape.size() != 3) {
         throw std::runtime_error("Mamba2SSD expects rank-2 or rank-3 input");
@@ -424,7 +457,7 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
         } else {
             y_ssd = y_ssd.reshape({1, d_model});
         }
-        Tensor gated = apply_gating(y_ssd, x_proj, gate);
+        Tensor gated = y_ssd.mul(selective_c);
         Tensor projected = out_proj.forward(gated);
         Tensor skip = input.mul(D.data);
         Tensor result = projected.add(skip);
@@ -444,7 +477,8 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
     Tensor y_ssd =
         ssd_forward(saved_x_proj_, saved_delta_, A.data, saved_B_, saved_C_, ctx, true);
     saved_ssd_ = y_ssd;
-    Tensor gated = apply_gating(y_ssd, saved_x_proj_, saved_gate_);
+    update_streaming_state_from_history(u);
+    Tensor gated = y_ssd.mul(saved_C_);
     Tensor projected = out_proj.forward(gated);
     Tensor skip = saved_input_.mul(D.data);
     return projected.add(skip);

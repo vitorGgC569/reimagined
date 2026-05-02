@@ -567,18 +567,20 @@ Tensor Tensor::matmul(const Tensor& other) const {
 #endif
 
 #pragma omp parallel for
-    for (int batch_idx = 0; batch_idx < batch; ++batch_idx) {
+    for (int row_index = 0; row_index < batch * m; ++row_index) {
+        const int batch_idx = row_index / m;
+        const int row = row_index % m;
         const float* a_batch = a_ptr + batch_idx * m * k;
         const float* b_batch = b_ptr + (other_batch == 1 ? 0 : batch_idx * k * n);
-        float* out_batch = out_ptr + batch_idx * m * n;
+        float* out_row = out_ptr + row_index * n;
+        std::fill_n(out_row, n, 0.0f);
 
-        for (int row = 0; row < m; ++row) {
+        const float* a_row = a_batch + row * k;
+        for (int kk = 0; kk < k; ++kk) {
+            const float a_value = a_row[kk];
+            const float* b_row = b_batch + kk * n;
             for (int col = 0; col < n; ++col) {
-                float acc = 0.0f;
-                for (int kk = 0; kk < k; ++kk) {
-                    acc += a_batch[row * k + kk] * b_batch[kk * n + col];
-                }
-                out_batch[row * n + col] = acc;
+                out_row[col] += a_value * b_row[col];
             }
         }
     }
@@ -692,26 +694,26 @@ Tensor Tensor::softmax(int dim) const {
     }
 #endif
 
-#pragma omp parallel for collapse(2)
-    for (int outer_idx = 0; outer_idx < outer; ++outer_idx) {
-        for (int inner_idx = 0; inner_idx < inner; ++inner_idx) {
-            const int base = outer_idx * axis * inner + inner_idx;
-            float max_val = src[base];
-            for (int axis_idx = 1; axis_idx < axis; ++axis_idx) {
-                max_val = std::max(max_val, src[base + axis_idx * inner]);
-            }
+#pragma omp parallel for
+    for (int row_index = 0; row_index < outer * inner; ++row_index) {
+        const int outer_idx = row_index / inner;
+        const int inner_idx = row_index % inner;
+        const int base = outer_idx * axis * inner + inner_idx;
+        float max_val = src[base];
+        for (int axis_idx = 1; axis_idx < axis; ++axis_idx) {
+            max_val = std::max(max_val, src[base + axis_idx * inner]);
+        }
 
-            float sum = 0.0f;
-            for (int axis_idx = 0; axis_idx < axis; ++axis_idx) {
-                const int offset = base + axis_idx * inner;
-                dst[offset] = std::exp(src[offset] - max_val);
-                sum += dst[offset];
-            }
+        float sum = 0.0f;
+        for (int axis_idx = 0; axis_idx < axis; ++axis_idx) {
+            const int offset = base + axis_idx * inner;
+            dst[offset] = std::exp(src[offset] - max_val);
+            sum += dst[offset];
+        }
 
-            const float inv_sum = 1.0f / std::max(sum, 1e-8f);
-            for (int axis_idx = 0; axis_idx < axis; ++axis_idx) {
-                dst[base + axis_idx * inner] *= inv_sum;
-            }
+        const float inv_sum = 1.0f / std::max(sum, 1e-8f);
+        for (int axis_idx = 0; axis_idx < axis; ++axis_idx) {
+            dst[base + axis_idx * inner] *= inv_sum;
         }
     }
 

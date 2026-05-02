@@ -70,6 +70,7 @@ private:
   // Gating application helper
   Tensor apply_gating(const Tensor &y_ssd, const Tensor &x, const Tensor &z,
                       Tensor *grad_buffer = nullptr);
+  void update_streaming_state_from_history(const Tensor &input);
 
   int d_model;
   int d_state;

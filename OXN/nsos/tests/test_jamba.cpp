@@ -186,6 +186,29 @@ void test_mamba_session_fork_restore() {
   std::cout << "Jamba session fork/restore test passed!" << std::endl;
 }
 
+void test_mamba_streaming_prefill_matches_incremental() {
+  JambaModel model(4, 16, 64);
+  assert(model.supports_streaming_inference());
+
+  const std::vector<int> prefix = {1, 2, 3, 4, 5, 6};
+  const std::vector<int> next = {7};
+
+  model.reset_session();
+  model.set_streaming_inference(true);
+  (void)model.forward_ids(prefix, nullptr);
+  Tensor full_prefill_next = model.forward_ids(next, nullptr).cpu();
+
+  model.reset_session();
+  model.set_streaming_inference(true);
+  for (int token : prefix) {
+    (void)model.forward_ids({token}, nullptr);
+  }
+  Tensor incremental_next = model.forward_ids(next, nullptr).cpu();
+
+  assert_tensor_close(full_prefill_next, incremental_next, 1e-4f);
+  std::cout << "Mamba streaming prefill parity test passed!" << std::endl;
+}
+
 void test_mamba_batched_streaming_decode() {
   JambaModel model(4, 16, 64);
   assert(model.supports_streaming_inference());
@@ -596,6 +619,7 @@ int main() {
   test_attention_snapshot_branching();
   test_attention_gpu_prefill_parity();
   test_mamba_session_fork_restore();
+  test_mamba_streaming_prefill_matches_incremental();
   test_mamba_batched_streaming_decode();
   test_attention_batched_streaming_decode();
   test_ttt_batched_streaming_decode();

@@ -2108,21 +2108,20 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                     for (float& score_value : token_scores) {
                         score_value *= inv_sum;
                     }
-                    for (int d = 0; d < head_dim; ++d) {
-                        float acc = 0.0f;
-                        for (int t = 0; t < cached_tokens_; ++t) {
-                            const float* cached_value_token =
-                                kv_cache_token_ptr(value_cache_buffer_, batch, t);
-                            const size_t kv_offset =
-                                static_cast<size_t>(kv_head) * static_cast<size_t>(head_dim);
-                            acc += token_scores[static_cast<size_t>(t)] *
-                                   cached_value_token[kv_offset + static_cast<size_t>(d)];
+                    const size_t out_offset =
+                        (((static_cast<size_t>(batch) * 1) * n_heads) + head) *
+                        static_cast<size_t>(head_dim);
+                    float* out_head = out_ptr + out_offset;
+                    std::fill_n(out_head, head_dim, 0.0f);
+                    const size_t kv_offset =
+                        static_cast<size_t>(kv_head) * static_cast<size_t>(head_dim);
+                    for (int t = 0; t < cached_tokens_; ++t) {
+                        const float* cached_value_token =
+                            kv_cache_token_ptr(value_cache_buffer_, batch, t) + kv_offset;
+                        const float score = token_scores[static_cast<size_t>(t)];
+                        for (int d = 0; d < head_dim; ++d) {
+                            out_head[d] += score * cached_value_token[static_cast<size_t>(d)];
                         }
-                        const size_t out_offset =
-                            (((static_cast<size_t>(batch) * 1) * n_heads) + head) *
-                                static_cast<size_t>(head_dim) +
-                            static_cast<size_t>(d);
-                        out_ptr[out_offset] = acc;
                     }
                 }
             }
@@ -2450,15 +2449,17 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             for (float& score_value : token_scores) {
                 score_value *= inv_sum;
             }
-            for (int d = 0; d < head_dim; ++d) {
-                float acc = 0.0f;
-                for (int t = 0; t < cached_tokens_; ++t) {
-                    const float* cached_value_token = kv_cache_token_ptr(value_cache_buffer_, t);
-                    const size_t kv_offset =
-                        static_cast<size_t>(kv_head) * static_cast<size_t>(head_dim);
-                    acc += token_scores[static_cast<size_t>(t)] * cached_value_token[kv_offset + d];
+            float* out_head = out_ptr + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+            std::fill_n(out_head, head_dim, 0.0f);
+            const size_t kv_offset =
+                static_cast<size_t>(kv_head) * static_cast<size_t>(head_dim);
+            for (int t = 0; t < cached_tokens_; ++t) {
+                const float* cached_value_token =
+                    kv_cache_token_ptr(value_cache_buffer_, t) + kv_offset;
+                const float score = token_scores[static_cast<size_t>(t)];
+                for (int d = 0; d < head_dim; ++d) {
+                    out_head[d] += score * cached_value_token[static_cast<size_t>(d)];
                 }
-                out_ptr[h * head_dim + d] = acc;
             }
         }
     } else {

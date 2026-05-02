@@ -33,9 +33,12 @@ struct GenerationMetrics {
     size_t generated_tokens = 0;
     size_t batch_size = 1;
     double elapsed_ms = 0.0;
+    double prefill_ms = 0.0;
+    double decode_ms = 0.0;
     double sampler_ms = 0.0;
     double prompt_tokens_per_sec = 0.0;
     double decode_tokens_per_sec = 0.0;
+    double total_tokens_per_sec = 0.0;
     bool used_streaming = false;
     bool loaded_from_pack = false;
     size_t mamba_fast_path_hits = 0;
