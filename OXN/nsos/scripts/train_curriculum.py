@@ -306,6 +306,13 @@ PROFILES["hybrid_moe_long"]["validation_scope"] = (
     "Longer compact-audit MoE lane for capacity checks after performance probes are green."
 )
 
+PROFILES["hybrid_moe_capacity"] = deepcopy(PROFILES["hybrid_moe_long"])
+PROFILES["hybrid_moe_capacity"]["requested_role"] = "moe_capacity_holdout_champion"
+PROFILES["hybrid_moe_capacity"]["instruction_polish_steps"] = 0
+PROFILES["hybrid_moe_capacity"]["validation_scope"] = (
+    "MoE capacity lane that preserves the best official-holdout checkpoint without the polish tail."
+)
+
 PROFILES["hybrid_small"] = deepcopy(PROFILES["small"])
 PROFILES["hybrid_small"]["profile_family"] = "hybrid"
 PROFILES["hybrid_small"]["model_config"] = {
@@ -1331,6 +1338,20 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Greedy exact-match samples per official holdout file.",
     )
+    parser.add_argument(
+        "--holdout-every-phases",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, evaluate official holdouts every N phases and keep "
+            "a capacity champion checkpoint. 0 evaluates holdouts only at the end."
+        ),
+    )
+    parser.add_argument(
+        "--select-final-by-holdout",
+        action="store_true",
+        help="Load the best official-holdout capacity champion before final holdout/audit gates.",
+    )
     return parser.parse_args()
 
 
@@ -1958,7 +1979,9 @@ def load_holdout_jsonl(path: Path) -> List[Dict]:
 
 def evaluate_official_holdouts(nsos, model, tokenizer, holdout_files: List[Path],
                                eos_token_id: int, seq_len: int, eval_mode: str,
-                               exact_samples: int, logger, layer_audit) -> Dict[str, Dict]:
+                               exact_samples: int, logger, layer_audit,
+                               audit_phase_prefix: str = "holdout",
+                               label_prefix: str = "holdout") -> Dict[str, Dict]:
     results: Dict[str, Dict] = {}
     for holdout_path in holdout_files:
         rows = load_holdout_jsonl(holdout_path)
@@ -1971,7 +1994,7 @@ def evaluate_official_holdouts(nsos, model, tokenizer, holdout_files: List[Path]
             }
             logger.log(f"[holdout] {holdout_path.name}: no rows")
             continue
-        set_layer_audit_phase(layer_audit, f"holdout:{label}", 0)
+        set_layer_audit_phase(layer_audit, f"{audit_phase_prefix}:{label}", 0)
         metrics = evaluate_phase(
             nsos,
             model,
@@ -1982,7 +2005,7 @@ def evaluate_official_holdouts(nsos, model, tokenizer, holdout_files: List[Path]
             eval_mode,
             exact_samples,
             logger=logger,
-            label=f"holdout:{label}",
+            label=f"{label_prefix}:{label}",
         )
         results[holdout_path.name] = {
             "path": str(holdout_path),
@@ -2403,6 +2426,41 @@ def compute_phase_score(metrics: Dict[str, float]) -> float:
     )
 
 
+def compute_official_holdout_score(results: Dict[str, Dict]) -> Dict[str, float]:
+    weighted: Dict[str, float] = {
+        "answer_loss": 0.0,
+        "heldout_loss": 0.0,
+        "first_token_accuracy": 0.0,
+        "teacher_token_accuracy": 0.0,
+        "exact_accuracy": 0.0,
+        "probe_exact_match": 0.0,
+        "probe_prefix_match_ratio": 0.0,
+        "probe_repetition_penalty": 0.0,
+    }
+    total_rows = 0
+    weighted_score = 0.0
+    for metrics in results.values():
+        rows = int(metrics.get("rows", 0))
+        if rows <= 0:
+            continue
+        total_rows += rows
+        weighted_score += compute_phase_score(metrics) * rows
+        for key in weighted:
+            weighted[key] += float(metrics.get(key, 0.0)) * rows
+
+    if total_rows <= 0:
+        return {
+            "score": float("-inf"),
+            "rows": 0.0,
+            **{key: 0.0 for key in weighted},
+        }
+
+    aggregate = {key: value / total_rows for key, value in weighted.items()}
+    aggregate["score"] = weighted_score / total_rows
+    aggregate["rows"] = float(total_rows)
+    return aggregate
+
+
 def main() -> int:
     args = parse_args()
     EVAL_RUNTIME_OPTIONS.update({
@@ -2603,6 +2661,8 @@ def main() -> int:
             "official_holdout_files": [str(path) for path in args.holdout_files],
             "holdout_eval_mode": args.holdout_eval_mode,
             "holdout_exact_samples": args.holdout_exact_samples,
+            "holdout_every_phases": args.holdout_every_phases,
+            "select_final_by_holdout": bool(args.select_final_by_holdout),
             "total_training_steps": trainer.total_training_steps,
             "generation_guard": {
                 "repetition_penalty": GENERATION_REPETITION_PENALTY,
@@ -2622,6 +2682,8 @@ def main() -> int:
                 "phase_snapshots": [],
             },
             "official_holdouts": {},
+            "capacity_champion": {},
+            "capacity_holdout_curve": [],
             "global_champion": {},
             "research_champion": {},
             "release_candidate": {},
@@ -2691,6 +2753,48 @@ def main() -> int:
             }
             return global_score
 
+        def consider_capacity_champion(source_name: str, source_phase: str) -> float:
+            nonlocal best_capacity_score
+            if int(args.holdout_every_phases) <= 0:
+                return float("nan")
+            debug_eval_log(logger, f"capacity_holdout:start source={source_name}")
+            holdout_results = evaluate_official_holdouts(
+                nsos,
+                model,
+                tokenizer,
+                list(args.holdout_files or []),
+                eos_token_id,
+                profile["seq_len"],
+                args.holdout_eval_mode,
+                args.holdout_exact_samples,
+                logger,
+                layer_audit,
+                audit_phase_prefix=f"{source_phase}:holdout",
+                label_prefix=f"capacity_holdout:{source_phase}",
+            )
+            aggregate = compute_official_holdout_score(holdout_results)
+            score = float(aggregate["score"])
+            record = {
+                "source": source_name,
+                "source_phase": source_phase,
+                "score": score,
+                "aggregate": aggregate,
+                "holdouts": holdout_results,
+            }
+            summary["capacity_holdout_curve"].append(record)
+            logger.log(
+                f"[capacity] source={source_name} score={score:.4f} "
+                f"answer_loss={aggregate['answer_loss']:.4f} "
+                f"teacher={aggregate['teacher_token_accuracy']:.2f}"
+            )
+            if score > best_capacity_score:
+                best_capacity_score = score
+                save_checkpoint_artifact("champion_holdout")
+                summary["capacity_champion"] = record
+                logger.log(f"[capacity] champion updated -> {source_name}")
+            debug_eval_log(logger, f"capacity_holdout:done source={source_name} score={score:.4f}")
+            return score
+
         metrics_path = run_dir / "metrics.jsonl"
         supervised_history: List[Dict] = []
         supervised_history_by_family: Dict[str, List[Dict]] = {}
@@ -2699,6 +2803,7 @@ def main() -> int:
         global_suite = build_global_suite(args.bundle_dir, args.global_suite_samples_per_phase)
         best_global_score = float("-inf")
         best_release_score = float("-inf")
+        best_capacity_score = float("-inf")
         with metrics_path.open("w", encoding="utf-8") as metrics_file:
             for phase_index, phase_name in enumerate(PHASE_ORDER):
                 train_rows = curriculum_texts_for_phase(args.bundle_dir, phase_name, "train")
@@ -2910,6 +3015,21 @@ def main() -> int:
                         f"[global] skipped after {phase_name}; cadence={args.global_suite_every_phases}"
                     )
                 phase_summary["global_suite_evaluated"] = should_run_global_suite
+                should_run_capacity_holdout = (
+                    args.holdout_every_phases > 0
+                    and (
+                        ((phase_index + 1) % args.holdout_every_phases == 0)
+                        or phase_index == len(PHASE_ORDER) - 1
+                    )
+                )
+                if should_run_capacity_holdout:
+                    phase_summary["capacity_holdout_score"] = consider_capacity_champion(
+                        f"{phase_name}:{selected_source}@{phase_summary['best_step'] or max_steps}",
+                        phase_name,
+                    )
+                else:
+                    phase_summary["capacity_holdout_score"] = None
+                phase_summary["capacity_holdout_evaluated"] = should_run_capacity_holdout
                 if layer_audit is not None:
                     phase_summary["layer_audit"] = {
                         "train": layer_audit_summary_to_dict(
@@ -3128,6 +3248,15 @@ def main() -> int:
                     polish_phase_name,
                 )
                 polish_summary["global_suite_evaluated"] = True
+                if args.holdout_every_phases > 0:
+                    polish_summary["capacity_holdout_score"] = consider_capacity_champion(
+                        f"{polish_phase_name}:{selected_source}@{polish_summary['best_step'] or instruction_polish_steps}",
+                        polish_phase_name,
+                    )
+                    polish_summary["capacity_holdout_evaluated"] = True
+                else:
+                    polish_summary["capacity_holdout_score"] = None
+                    polish_summary["capacity_holdout_evaluated"] = False
                 if layer_audit is not None:
                     polish_summary["layer_audit"] = {
                         "train": layer_audit_summary_to_dict(
@@ -3265,6 +3394,15 @@ def main() -> int:
                     "final_consolidation",
                 )
                 consolidation_summary["global_suite_evaluated"] = True
+                if args.holdout_every_phases > 0:
+                    consolidation_summary["capacity_holdout_score"] = consider_capacity_champion(
+                        "final_consolidation",
+                        "final_consolidation",
+                    )
+                    consolidation_summary["capacity_holdout_evaluated"] = True
+                else:
+                    consolidation_summary["capacity_holdout_score"] = None
+                    consolidation_summary["capacity_holdout_evaluated"] = False
                 if layer_audit is not None:
                     consolidation_summary["layer_audit"] = {
                         "train": layer_audit_summary_to_dict(
@@ -3298,10 +3436,18 @@ def main() -> int:
 
         final_model_source = "current"
         release_candidate_path = run_dir / "release_candidate.bin"
+        holdout_champion_path = run_dir / "champion_holdout.bin"
         champion_path = run_dir / "champion_global.bin"
         if summary.get("release_candidate", {}).get("source") and release_candidate_path.exists():
             model.load(str(release_candidate_path))
             final_model_source = "release_candidate"
+        elif (
+            args.select_final_by_holdout
+            and summary.get("capacity_champion", {}).get("source")
+            and holdout_champion_path.exists()
+        ):
+            model.load(str(holdout_champion_path))
+            final_model_source = "champion_holdout"
         elif summary.get("global_champion", {}).get("source") and champion_path.exists():
             model.load(str(champion_path))
             final_model_source = "champion_global"

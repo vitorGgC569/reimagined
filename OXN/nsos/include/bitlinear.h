@@ -74,7 +74,8 @@ private:
   Tensor quantize_activations_bitnet(const Tensor &x,
                                      std::vector<float> &out_scales);
   Tensor gemm_158bit_ultra(const Tensor &x_q,
-                           const std::vector<float> &act_scales);
+                           const std::vector<float> &act_scales,
+                           bool fuse_output_affine = false);
   const Tensor& materialize_weight_for_device(Device dev);
   void invalidate_cached_materialized_weights();
 

@@ -150,7 +150,11 @@ bool is_whitespace_byte(unsigned char ch) {
 }
 
 bool is_word_byte(unsigned char ch) {
-  return std::isalnum(ch) != 0 || ch == '_' || ch == '-' || ch == '/';
+  return (ch >= '0' && ch <= '9') ||
+         (ch >= 'A' && ch <= 'Z') ||
+         (ch >= 'a' && ch <= 'z') ||
+         ch == '_' || ch == '-' || ch == '/' ||
+         ch >= 0x80;
 }
 
 void replace_all_inplace(std::string& text, const std::string& needle, const std::string& repl) {

@@ -1765,13 +1765,48 @@ def _apply_merge(sequence: List[bytes], pair: Tuple[bytes, bytes]) -> List[bytes
     return merged
 
 
+def _is_bpe_whitespace_byte(value: int) -> bool:
+    return chr(value).isspace()
+
+
+def _is_bpe_word_byte(value: int) -> bool:
+    return (
+        48 <= value <= 57
+        or 65 <= value <= 90
+        or 97 <= value <= 122
+        or value in (ord("_"), ord("-"), ord("/"))
+        or value >= 0x80
+    )
+
+
+def _pretokenize_bytes_for_bpe(text: str) -> List[bytes]:
+    raw = text.encode("utf-8")
+    pieces: List[bytes] = []
+    cursor = 0
+    while cursor < len(raw):
+        current = raw[cursor]
+        if _is_bpe_whitespace_byte(current):
+            cursor += 1
+            while cursor < len(raw) and _is_bpe_whitespace_byte(raw[cursor]):
+                cursor += 1
+            continue
+
+        word = _is_bpe_word_byte(current)
+        end = cursor + 1
+        if word:
+            while end < len(raw) and _is_bpe_word_byte(raw[end]):
+                end += 1
+        pieces.append(raw[cursor:end])
+        cursor = end
+    return pieces
+
+
 def learn_bpe_merges(texts: Sequence[str], target_vocab: int) -> List[Tuple[bytes, bytes]]:
     sequences: List[List[bytes]] = []
     for text in texts:
-        utf8 = text.encode("utf-8")
-        if not utf8:
-            continue
-        sequences.append([bytes([value]) for value in utf8])
+        for piece in _pretokenize_bytes_for_bpe(text):
+            if len(piece) >= 2:
+                sequences.append([bytes([value]) for value in piece])
 
     merges_needed = max(target_vocab - 256, 0)
     merges: List[Tuple[bytes, bytes]] = []

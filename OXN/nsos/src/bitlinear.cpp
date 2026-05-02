@@ -168,16 +168,22 @@ Tensor BitLinear::quantize_activations_bitnet(const Tensor &x,
 }
 
 Tensor BitLinear::gemm_158bit_ultra(const Tensor &x_q,
-                                    const std::vector<float> &act_scales) {
+                                    const std::vector<float> &act_scales,
+                                    bool fuse_output_affine) {
   const int M = x_q.shape.numel() / in_features;
   const int N = out_features;
   Tensor y({M, N}, Device::CPU);
+  const float* magnitude_ptr = fuse_output_affine ? magnitude.data.data() : nullptr;
+  const float* bias_ptr = fuse_output_affine && use_bias ? bias.data.data() : nullptr;
   
   if (!unpacked_weights_i8.empty()) {
     BitNetAdapter::gemm_158bit_i8(x_q, unpacked_weights_i8, unpacked_weight_row_sums,
-                                  act_scales, weight_scale, y);
+                                  act_scales, weight_scale, y, magnitude_ptr, bias_ptr,
+                                  fuse_output_affine && use_bias);
   } else {
-    BitNetAdapter::gemm_158bit_lut(x_q, packed_weights, act_scales, weight_scale, y);
+    BitNetAdapter::gemm_158bit_lut(x_q, packed_weights, act_scales, weight_scale, y,
+                                   magnitude_ptr, bias_ptr,
+                                   fuse_output_affine && use_bias);
   }
   
   return y;
@@ -279,15 +285,18 @@ Tensor BitLinear::forward(const Tensor &input) {
   if (use_hadamard)
     hadamard_transform(x.data(), M, in_features);
   saved_x_quant = quantize_activations_bitnet(x, saved_act_scales);
-  Tensor output = gemm_158bit_ultra(saved_x_quant, saved_act_scales);
+  const bool fuse_output_affine = !loqa.active;
+  Tensor output = gemm_158bit_ultra(saved_x_quant, saved_act_scales, fuse_output_affine);
   if (loqa.active) {
     Tensor loqa_out = loqa.apply(input);
     if (loqa_out.shape.numel() > 0)
       output = output.add(loqa_out);
   }
-  output = output.mul(magnitude.data);
-  if (use_bias)
-    output = output.add(bias.data);
+  if (!fuse_output_affine) {
+    output = output.mul(magnitude.data);
+    if (use_bias)
+      output = output.add(bias.data);
+  }
   if (input.shape.dims.size() == 3)
     output = output.reshape(
         {input.shape.dims[0], input.shape.dims[1], out_features});

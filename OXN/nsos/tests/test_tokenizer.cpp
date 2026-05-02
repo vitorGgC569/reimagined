@@ -62,11 +62,28 @@ void test_decode_sanitizes_invalid_utf8() {
   std::cout << "OK" << std::endl;
 }
 
+void test_utf8_word_merges() {
+  std::cout << "Testing UTF-8 word merges..." << std::endl;
+  Tokenizer tok;
+  const std::string o_acute = "\xC3\xB3";
+  tok.bpe_ranks[{std::string("\xC3", 1), std::string("\xB3", 1)}] = 0;
+  tok.token_to_id[o_acute] = 256;
+  tok.id_to_token[256] = o_acute;
+  tok.vocab_size = 257;
+
+  std::vector<int> ids = tok.encode(o_acute);
+  assert(ids.size() == 1);
+  assert(ids[0] == 256);
+  assert(tok.decode(ids) == o_acute);
+  std::cout << "OK" << std::endl;
+}
+
 int main() {
   try {
     test_basic_encoding();
     test_special_tokens();
     test_decode_sanitizes_invalid_utf8();
+    test_utf8_word_merges();
     std::cout << "\nAll Tokenizer tests passed!" << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "Test failed: " << e.what() << std::endl;

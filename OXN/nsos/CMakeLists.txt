@@ -15,6 +15,7 @@ option(NSOS_BUILD_OXTAMEM "Build the copied OxtaMem engine with Cargo when avail
 option(NSOS_ENABLE_TURBOQUANT "Enable external TurboQuant integration when configured" ON)
 option(NSOS_CUDA_ALLOW_UNSUPPORTED_COMPILER "Allow nvcc to compile with an unsupported host MSVC version" OFF)
 option(NSOS_ENABLE_NATIVE_OPTIMIZATIONS "Enable host-specific CPU tuning flags such as -march=native" OFF)
+option(NSOS_ENABLE_X86_AVX2_KERNELS "Build runtime-dispatched AVX2 CPU kernels on x86_64" ON)
 set(NSOS_SANITIZERS "" CACHE STRING "Semicolon-separated sanitizers to enable for CPU builds (address;undefined;thread)")
 
 set(NSOS_CUDA_TOOLKIT_ROOT "" CACHE PATH "Preferred CUDA toolkit root directory")
@@ -90,6 +91,16 @@ target_include_directories(nsos_core
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/nsos>
 )
+
+if (NSOS_ENABLE_X86_AVX2_KERNELS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|x64)$")
+    target_sources(nsos_core PRIVATE src/bitnet_adapter_avx2.cpp)
+    target_compile_definitions(nsos_core PUBLIC NSOS_ENABLE_AVX2_KERNELS=1)
+    if (MSVC)
+        set_source_files_properties(src/bitnet_adapter_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    else()
+        set_source_files_properties(src/bitnet_adapter_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
+    endif()
+endif()
 
 if (NSOS_ENABLE_TURBOQUANT)
     set(NSOS_TURBOQUANT_LIB_PATH "")

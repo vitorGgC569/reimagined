@@ -2,6 +2,7 @@
 #include "../include/cuda/gpu_utils.h"
 #include "../include/trainer.h"
 #include <cassert>
+#include <cmath>
 #include <iostream>
 
 using namespace nsos;
@@ -50,6 +51,43 @@ void test_forward() {
   assert(y.shape[1] == 2);
 
   std::cout << "Forward test passed!" << std::endl;
+}
+
+void test_packed_fused_affine_matches_unfused_release() {
+  BitLinear layer(8, 4, true);
+  float* w = layer.weight.data.data();
+  for (int i = 0; i < layer.weight.data.size; ++i) {
+    w[i] = (i % 5 == 0) ? 0.9f : ((i % 3 == 0) ? -0.8f : 0.1f);
+  }
+  float* mag = layer.magnitude.data.data();
+  float* bias = layer.bias.data.data();
+  for (int i = 0; i < 4; ++i) {
+    mag[i] = 0.75f + 0.1f * static_cast<float>(i);
+    bias[i] = -0.2f + 0.05f * static_cast<float>(i);
+  }
+  layer.repack_weights();
+  layer.set_reference_path(false);
+
+  Tensor x({3, 8});
+  for (int i = 0; i < x.size; ++i) {
+    x.data()[i] = static_cast<float>((i % 7) - 3) * 0.125f;
+  }
+
+  Tensor fused = layer.forward(x);
+  BitLinearPackedState state = layer.export_packed_state();
+
+  BitLinear unfused(8, 4, true);
+  unfused.import_packed_state(state, Device::CPU, true);
+  unfused.set_reference_path(false);
+  unfused.set_use_loqa(true);
+  Tensor reference = unfused.forward(x);
+
+  assert(fused.shape == reference.shape);
+  for (int i = 0; i < fused.size; ++i) {
+    assert(std::abs(fused.data()[i] - reference.data()[i]) < 1e-5f);
+  }
+
+  std::cout << "Packed fused affine release test passed!" << std::endl;
 }
 
 void test_progressive_qat_scheduler() {
@@ -225,6 +263,7 @@ void test_supervised_batch_qat_phase6_pattern_regression() {
 int main() {
   test_quantization();
   test_forward();
+  test_packed_fused_affine_matches_unfused_release();
   test_progressive_qat_scheduler();
   test_progressive_qat_short_run_scaling();
   test_supervised_batch_qat_heterogeneous_regression();

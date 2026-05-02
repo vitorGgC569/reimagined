@@ -107,39 +107,43 @@ void MathOps::gemm_prepacked(int M, int N, int K, float alpha, const float* A, i
     #pragma omp parallel for
     for(int i=0; i<M; ++i) { for(int j=0; j<N; ++j) C[i*ldc + j] *= beta; }
     
-    #pragma omp parallel for collapse(2)
-    for(int j=0; j<N; j+=NR) { // Iterate Panels of B (NR columns)
-        for(int i=0; i<M; i+=MC) {
-            int mc_eff = std::min(MC, M-i);
-            int n_eff = std::min(NR, N-j);
+    const int n_panels = (N + NR - 1) / NR;
+    const int m_blocks = (M + MC - 1) / MC;
+    #pragma omp parallel for
+    for(int tile=0; tile<n_panels*m_blocks; ++tile) {
+        int panel = tile / m_blocks;
+        int block = tile - panel * m_blocks;
+        int j = panel * NR; // Iterate Panels of B (NR columns)
+        int i = block * MC;
+        int mc_eff = std::min(MC, M-i);
+        int n_eff = std::min(NR, N-j);
+
+        float* packA = (float*)ArenaAllocator::instance().alloc(mc_eff * K * sizeof(float), Device::CPU);
+
+        // Pack A
+        pack_A(mc_eff, K, A + i*lda, lda, packA);
+
+        // Pointer to B panel
+        const float* b_panel = B_packed + (size_t)j * K;
+
+        // Macro Kernel
+        for(int ir=0; ir<mc_eff; ir+=MR) {
+            int mr_eff = std::min(MR, mc_eff-ir);
+            const float* a_micro = packA + ir * K; // A packed is [MC][K] -> actually packed in small strips?
+            // Wait, original pack_A packs K dim contiguous for MR rows.
+            // Yes, K loop inner.
             
-            float* packA = (float*)ArenaAllocator::instance().alloc(mc_eff * K * sizeof(float), Device::CPU);
+            float* c_ptr = C + (i+ir)*ldc + j;
             
-            // Pack A
-            pack_A(mc_eff, K, A + i*lda, lda, packA);
-            
-            // Pointer to B panel
-            const float* b_panel = B_packed + (size_t)j * K;
-            
-            // Macro Kernel
-            for(int ir=0; ir<mc_eff; ir+=MR) {
-                int mr_eff = std::min(MR, mc_eff-ir);
-                const float* a_micro = packA + ir * K; // A packed is [MC][K] -> actually packed in small strips?
-                // Wait, original pack_A packs K dim contiguous for MR rows.
-                // Yes, K loop inner.
-                
-                float* c_ptr = C + (i+ir)*ldc + j;
-                
-                if (mr_eff == MR && n_eff == NR) {
-                    micro_kernel(K, a_micro, b_panel, c_ptr, ldc, alpha);
-                } else {
-                    float tile[MR*NR];
-                    std::memset(tile, 0, sizeof(tile));
-                    micro_kernel(K, a_micro, b_panel, tile, NR, alpha);
-                    for(int r=0; r<mr_eff; ++r)
-                        for(int c=0; c<n_eff; ++c) 
-                            c_ptr[r*ldc+c] += tile[r*NR+c];
-                }
+            if (mr_eff == MR && n_eff == NR) {
+                micro_kernel(K, a_micro, b_panel, c_ptr, ldc, alpha);
+            } else {
+                float tile_values[MR*NR];
+                std::memset(tile_values, 0, sizeof(tile_values));
+                micro_kernel(K, a_micro, b_panel, tile_values, NR, alpha);
+                for(int r=0; r<mr_eff; ++r)
+                    for(int c=0; c<n_eff; ++c)
+                        c_ptr[r*ldc+c] += tile_values[r*NR+c];
             }
         }
     }
