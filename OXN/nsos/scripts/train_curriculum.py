@@ -1978,6 +1978,100 @@ def load_holdout_jsonl(path: Path) -> List[Dict]:
     return rows
 
 
+def compute_masked_answer_score(metrics: Dict[str, float]) -> float:
+    return (
+        1.20 * float(metrics.get("first_token_accuracy", 0.0))
+        + 1.80 * float(metrics.get("teacher_token_accuracy", 0.0))
+        - 0.70 * float(metrics.get("answer_loss", 0.0))
+    )
+
+
+def evaluate_holdout_kind_breakdown(nsos, model, tokenizer, rows: List[Dict],
+                                    eos_token_id: int, layer_audit) -> Dict[str, Dict[str, float]]:
+    grouped: Dict[str, List[Dict]] = {}
+    for row in rows:
+        kind = str(row.get("kind") or row.get("category") or "unknown")
+        grouped.setdefault(kind, []).append(row)
+
+    if not grouped:
+        return {}
+
+    previous_training_mode = model_training_mode(model)
+    previous_audit_enabled = bool(layer_audit.enabled()) if layer_audit is not None else False
+    if layer_audit is not None:
+        layer_audit.set_enabled(False)
+    set_model_training_mode(model, False)
+    try:
+        breakdown: Dict[str, Dict[str, float]] = {}
+        for kind in sorted(grouped):
+            kind_rows = grouped[kind]
+            metrics = evaluate_masked_supervised(
+                nsos,
+                model,
+                tokenizer,
+                kind_rows,
+                eos_token_id,
+                batch_size=EVAL_RUNTIME_OPTIONS["masked_batch_size"],
+            )
+            breakdown[kind] = {
+                "rows": float(len(kind_rows)),
+                "answer_loss": float(metrics.get("answer_loss", 0.0)),
+                "first_token_accuracy": float(metrics.get("first_token_accuracy", 0.0)),
+                "teacher_token_accuracy": float(metrics.get("teacher_token_accuracy", 0.0)),
+                "teacher_token_total": float(metrics.get("teacher_token_total", 0.0)),
+                "masked_score": compute_masked_answer_score(metrics),
+            }
+        return breakdown
+    finally:
+        restore_model_training_mode(model, previous_training_mode)
+        if layer_audit is not None:
+            layer_audit.set_enabled(previous_audit_enabled)
+
+
+def aggregate_holdout_kind_breakdown(results: Dict[str, Dict]) -> Dict[str, Dict[str, float]]:
+    totals: Dict[str, Dict[str, float]] = {}
+    for holdout_metrics in results.values():
+        for kind, metrics in holdout_metrics.get("kind_breakdown", {}).items():
+            bucket = totals.setdefault(
+                kind,
+                {
+                    "rows": 0.0,
+                    "answer_loss_sum": 0.0,
+                    "first_sum": 0.0,
+                    "teacher_hits_proxy": 0.0,
+                    "teacher_token_total": 0.0,
+                },
+            )
+            rows = float(metrics.get("rows", 0.0))
+            teacher_total = float(metrics.get("teacher_token_total", 0.0))
+            bucket["rows"] += rows
+            bucket["answer_loss_sum"] += float(metrics.get("answer_loss", 0.0)) * rows
+            bucket["first_sum"] += float(metrics.get("first_token_accuracy", 0.0)) * rows
+            bucket["teacher_hits_proxy"] += (
+                float(metrics.get("teacher_token_accuracy", 0.0)) * teacher_total
+            )
+            bucket["teacher_token_total"] += teacher_total
+
+    aggregate: Dict[str, Dict[str, float]] = {}
+    for kind, bucket in sorted(totals.items()):
+        rows = max(float(bucket.get("rows", 0.0)), 1.0)
+        teacher_total = float(bucket.get("teacher_token_total", 0.0))
+        metrics = {
+            "rows": float(bucket.get("rows", 0.0)),
+            "answer_loss": float(bucket.get("answer_loss_sum", 0.0)) / rows,
+            "first_token_accuracy": float(bucket.get("first_sum", 0.0)) / rows,
+            "teacher_token_accuracy": (
+                float(bucket.get("teacher_hits_proxy", 0.0)) / teacher_total
+                if teacher_total > 0.0
+                else 0.0
+            ),
+            "teacher_token_total": teacher_total,
+        }
+        metrics["masked_score"] = compute_masked_answer_score(metrics)
+        aggregate[kind] = metrics
+    return aggregate
+
+
 def evaluate_official_holdouts(nsos, model, tokenizer, holdout_files: List[Path],
                                eos_token_id: int, seq_len: int, eval_mode: str,
                                exact_samples: int, logger, layer_audit,
@@ -2012,7 +2106,30 @@ def evaluate_official_holdouts(nsos, model, tokenizer, holdout_files: List[Path]
             "path": str(holdout_path),
             "rows": len(rows),
             **metrics,
+            "kind_breakdown": evaluate_holdout_kind_breakdown(
+                nsos,
+                model,
+                tokenizer,
+                rows,
+                eos_token_id,
+                layer_audit,
+            ),
         }
+        kind_breakdown = results[holdout_path.name]["kind_breakdown"]
+        if kind_breakdown:
+            weakest_kind, weakest_metrics = min(
+                kind_breakdown.items(),
+                key=lambda item: float(item[1].get("masked_score", 0.0)),
+            )
+            strongest_kind, strongest_metrics = max(
+                kind_breakdown.items(),
+                key=lambda item: float(item[1].get("masked_score", 0.0)),
+            )
+            logger.log(
+                f"[holdout-kind] {holdout_path.name}: "
+                f"best={strongest_kind}:{strongest_metrics['masked_score']:.4f} "
+                f"worst={weakest_kind}:{weakest_metrics['masked_score']:.4f}"
+            )
         logger.log(
             f"[holdout] {holdout_path.name}: rows={len(rows)} "
             f"answer_loss={metrics['answer_loss']:.4f} "
@@ -2685,6 +2802,7 @@ def main() -> int:
                 "phase_snapshots": [],
             },
             "official_holdouts": {},
+            "official_holdout_kind_breakdown": {},
             "capacity_champion": {},
             "capacity_holdout_curve": [],
             "global_champion": {},
@@ -2782,6 +2900,7 @@ def main() -> int:
                 "source_phase": source_phase,
                 "score": score,
                 "aggregate": aggregate,
+                "kind_breakdown": aggregate_holdout_kind_breakdown(holdout_results),
                 "holdouts": holdout_results,
             }
             summary["capacity_holdout_curve"].append(record)
@@ -3467,6 +3586,9 @@ def main() -> int:
             args.holdout_exact_samples,
             logger,
             layer_audit,
+        )
+        summary["official_holdout_kind_breakdown"] = aggregate_holdout_kind_breakdown(
+            summary["official_holdouts"]
         )
 
         audit_gate_failed = False
