@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
 import math
 import os
@@ -309,9 +310,43 @@ PROFILES["hybrid_moe_long"]["validation_scope"] = (
 PROFILES["hybrid_moe_capacity"] = deepcopy(PROFILES["hybrid_moe_long"])
 PROFILES["hybrid_moe_capacity"]["requested_role"] = "moe_capacity_holdout_champion"
 PROFILES["hybrid_moe_capacity"]["instruction_polish_steps"] = 0
-PROFILES["hybrid_moe_capacity"]["moe_aux_loss_scale"] = 0.35
+PROFILES["hybrid_moe_capacity"]["moe_aux_loss_scale"] = 0.50
 PROFILES["hybrid_moe_capacity"]["kind_regression_penalty_scale"] = 0.85
 PROFILES["hybrid_moe_capacity"]["kind_regression_floor"] = 0.20
+PROFILES["hybrid_moe_capacity"]["kind_regression_gate"] = {
+    "enabled": True,
+    "max_regression": 2.25,
+}
+PROFILES["hybrid_moe_capacity"]["weak_kind_rehearsal_steps"] = 24
+PROFILES["hybrid_moe_capacity"]["weak_kind_rehearsal_lr_scale"] = 0.45
+PROFILES["hybrid_moe_capacity"]["weak_kind_minipack"] = {
+    "enabled": True,
+    "kinds": [
+        "binary_add",
+        "boolean_formula",
+        "circuit",
+        "code_output",
+        "compare",
+        "compare_label",
+        "convert_json",
+        "dsl",
+        "kv_to_csv",
+        "logparse",
+        "memory_recall",
+        "parity",
+        "parity_label",
+        "reverse",
+        "summarize",
+        "translate",
+    ],
+    "phase_counts": {
+        "phase2_structured": 160,
+        "phase4_instructions": 224,
+        "phase5_verifier": 320,
+        "phase6_memory": 384,
+        "weak_kind_rehearsal": 768,
+    },
+}
 PROFILES["hybrid_moe_capacity"]["phase_replay_config"] = {
     "phase2_structured": {"families": ["algorithmic"], "ratio_scale": 0.50},
     "phase4_instructions": {"families": ["algorithmic", "structured"], "ratio_scale": 0.75},
@@ -2086,6 +2121,212 @@ def aggregate_holdout_kind_breakdown(results: Dict[str, Dict]) -> Dict[str, Dict
     return aggregate
 
 
+def make_minipack_record(phase_name: str, kind: str, prompt: str, answer: str,
+                         index: int) -> Dict[str, str]:
+    record_id = hashlib.sha256(
+        f"{phase_name}:{kind}:{prompt}:{answer}:{index}".encode("utf-8")
+    ).hexdigest()[:16]
+    return {
+        "id": f"weak-kind-{record_id}",
+        "phase": phase_name,
+        "kind": kind,
+        "prompt": prompt,
+        "answer": answer,
+        "source": "weak_kind_minipack",
+        "text": (
+            f"<|task:{kind}|>\n"
+            f"Prompt:\n{prompt}\n"
+            f"Answer:\n{answer}<|endoftext|>"
+        ),
+    }
+
+
+def evaluate_binary_gate(op: str, a: int, b: int) -> int:
+    if op == "AND":
+        return a & b
+    if op == "OR":
+        return a | b
+    if op == "XOR":
+        return a ^ b
+    if op == "NAND":
+        return 1 - (a & b)
+    if op == "NOR":
+        return 1 - (a | b)
+    if op == "XNOR":
+        return 1 - (a ^ b)
+    return 0
+
+
+def generate_weak_kind_example(kind: str, rng: random.Random, index: int) -> tuple[str, str]:
+    names = ["mila", "ivan", "lia", "nora", "otto", "ravi", "sara", "teo"]
+    cities = ["belem", "curitiba", "natal", "coimbra", "evora", "madrid", "lima", "quito"]
+    tools = ["nsos", "oxtamem", "bitnet", "jamba", "router", "audit", "pack", "kernel"]
+    langs = ["pt", "en", "es"]
+
+    if kind == "reverse":
+        token = rng.choice(["edge9", "router42", "pack17", "audit5", "moe31"]) + rng.choice(["a", "b", "x"])
+        return f"Reverse this token stream: {token}", token[::-1]
+    if kind == "parity":
+        bits = "".join(rng.choice("01") for _ in range(rng.randint(5, 9)))
+        return (
+            f"Parity bit for {bits}. Answer with 0 for even and 1 for odd.",
+            str(bits.count("1") % 2),
+        )
+    if kind == "parity_label":
+        bits = "".join(rng.choice("01") for _ in range(rng.randint(4, 8)))
+        answer = "ODD" if bits.count("1") % 2 else "EVEN"
+        return f"Parity for {bits}. Answer with EVEN or ODD.", answer
+    if kind == "binary_add":
+        lhs = rng.randint(2, 29)
+        rhs = rng.randint(2, 29)
+        return (
+            f"Add the binary numbers {lhs:b} + {rhs:b}. Answer in binary.",
+            f"{lhs + rhs:b}",
+        )
+    if kind == "compare":
+        lhs = rng.randint(-25, 25)
+        rhs = rng.randint(-25, 25)
+        answer = ">" if lhs > rhs else "<" if lhs < rhs else "="
+        return f"Compare {lhs} and {rhs}. Answer with <, > or =.", answer
+    if kind == "compare_label":
+        lhs = rng.randint(-25, 25)
+        rhs = rng.randint(-25, 25)
+        answer = "GT" if lhs > rhs else "LT" if lhs < rhs else "EQ"
+        return f"Compare {lhs} and {rhs}. Answer with LT, GT, or EQ.", answer
+    if kind == "circuit":
+        op = rng.choice(["AND", "OR", "XOR", "NAND", "NOR", "XNOR"])
+        a = rng.randint(0, 1)
+        b = rng.randint(0, 1)
+        return (
+            f"Circuit solve: gate={op} A={a} B={b}. Answer with 0 or 1.",
+            str(evaluate_binary_gate(op, a, b)),
+        )
+    if kind == "boolean_formula":
+        op1 = rng.choice(["AND", "OR", "XOR"])
+        op2 = rng.choice(["AND", "OR", "XOR"])
+        a = rng.randint(0, 1)
+        b = rng.randint(0, 1)
+        c = rng.randint(0, 1)
+        mid = evaluate_binary_gate(op1, a, b)
+        value = evaluate_binary_gate(op2, mid, c)
+        return f"Evaluate (({a} {op1} {b}) {op2} {c}). Answer with 0 or 1.", str(value)
+    if kind == "code_output":
+        a = rng.randint(2, 9)
+        b = rng.randint(1, 8)
+        c = rng.randint(2, 5)
+        if index % 2 == 0:
+            expr = f"({a} + {b}) * {c}"
+            answer = str((a + b) * c)
+        else:
+            expr = f"({a} * {c}) - {b}"
+            answer = str((a * c) - b)
+        return f"What is the output of this Python snippet?\nprint({expr})", answer
+    if kind == "dsl":
+        start = rng.randint(1, 8)
+        add = rng.randint(1, 8)
+        mul = rng.randint(2, 4)
+        sub = rng.randint(0, 8)
+        answer = (start + add) * mul - sub
+        return (
+            "Execute this mini DSL and answer with the final integer: "
+            f"SET {start} | ADD {add} | MUL {mul} | SUB {sub}",
+            str(answer),
+        )
+    if kind == "kv_to_csv":
+        name = rng.choice(["nsos", "bitnet", "oxtamem", "jamba"])
+        lang = rng.choice(["en", "pt", "es"])
+        mode = rng.choice(["edge", "api", "train", "audit"])
+        return (
+            "Normalize the key=value pairs into CSV ordered as name,lang,mode: "
+            f"name={name} lang={lang} mode={mode}",
+            f"{name},{lang},{mode}",
+        )
+    if kind == "convert_json":
+        name = rng.choice(["nsos", "bitnet", "oxtamem", "jamba"])
+        mode = rng.choice(["api", "edge", "audit", "train"])
+        lang = rng.choice(["pt", "en", "es"])
+        payload = {"name": name, "mode": mode, "lang": lang}
+        return (
+            f"Converta para JSON compacto: name={name} mode={mode} lang={lang}",
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+        )
+    if kind == "logparse":
+        level = rng.choice(["INFO", "WARN", "ERROR"])
+        user = rng.choice(names)
+        action = rng.choice(["train", "deploy", "audit", "reload"])
+        status = rng.choice(["ok", "retry", "fail", "pass"])
+        payload = {"level": level, "user": user, "action": action, "status": status}
+        return (
+            "Convert this structured log line to compact JSON with keys level,user,action,status: "
+            f"[{level}] user={user} action={action} status={status}",
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+        )
+    if kind == "translate":
+        examples = [
+            ("The router keeps experts balanced during training.", "O router mantem experts balanceados durante o treino."),
+            ("Compact model packs reduce edge latency.", "Model packs compactos reduzem a latencia em edge."),
+            ("The audit report catches unstable layers early.", "O relatorio de auditoria detecta camadas instaveis cedo."),
+            ("Replay protects old skills during later phases.", "Replay protege habilidades antigas nas fases finais."),
+        ]
+        return rng.choice(examples)
+    if kind == "summarize":
+        examples = [
+            (
+                "Resuma em uma frase curta: Layer audits record shape, norm, latency, and router entropy for each phase.",
+                "Resumo: Layer audits registram metricas por fase.",
+            ),
+            (
+                "Resuma em uma frase curta: Balanced replay keeps algorithmic tasks visible during instruction training.",
+                "Resumo: Replay balanceado preserva tarefas algoritmicas.",
+            ),
+            (
+                "Resuma em uma frase curta: Holdout gates compare checkpoints and reject severe kind regressions.",
+                "Resumo: Holdout gates rejeitam regressoes por kind.",
+            ),
+        ]
+        return rng.choice(examples)
+    if kind == "memory_recall":
+        facts = {
+            "name": rng.choice(names),
+            "city": rng.choice(cities),
+            "tool": rng.choice(tools),
+            "lang": rng.choice(langs),
+        }
+        query_key = rng.choice(list(facts.keys()))
+        prompt = "System: store the following session facts.\n"
+        for key, value in facts.items():
+            prompt += f"User: {key}={value}\nAssistant: memorized.\n"
+        prompt += f"User: What is the {query_key}?\nAssistant:"
+        return prompt, facts[query_key]
+
+    return f"Echo the token: weak{index}", f"weak{index}"
+
+
+def build_weak_kind_minipack(profile: Dict, phase_name: str, seed: int) -> List[Dict]:
+    config = profile.get("weak_kind_minipack", {})
+    if not config or not bool(config.get("enabled", False)):
+        return []
+    phase_counts = config.get("phase_counts", {})
+    target_count = int(phase_counts.get(phase_name, 0))
+    if target_count <= 0:
+        return []
+    kinds = [str(kind) for kind in config.get("kinds", [])]
+    if not kinds:
+        return []
+
+    rng = random.Random(seed + sum(ord(ch) for ch in phase_name) + 515151)
+    per_kind = max(1, math.ceil(target_count / len(kinds)))
+    rows: List[Dict] = []
+    index = 0
+    for kind in kinds:
+        for _ in range(per_kind):
+            prompt, answer = generate_weak_kind_example(kind, rng, index)
+            rows.append(make_minipack_record(phase_name, kind, prompt, answer, index))
+            index += 1
+    rng.shuffle(rows)
+    return rows[:target_count]
+
+
 def update_best_kind_scores(best_scores: Dict[str, float],
                             kind_breakdown: Dict[str, Dict[str, float]]) -> None:
     for kind, metrics in kind_breakdown.items():
@@ -2142,6 +2383,46 @@ def compute_kind_regression_penalty(kind_breakdown: Dict[str, Dict[str, float]],
         "penalty": weighted_average * penalty_scale,
         "weighted_regression": weighted_average,
         "regressions": regressions[:8],
+    }
+
+
+def evaluate_kind_regression_gate(kind_breakdown: Dict[str, Dict[str, float]],
+                                  best_scores: Dict[str, float],
+                                  gate_config: Dict[str, object]) -> Dict[str, object]:
+    if not gate_config or not bool(gate_config.get("enabled", False)):
+        return {
+            "enabled": False,
+            "passed": True,
+            "failure_count": 0,
+            "failures": [],
+        }
+
+    max_regression = float(gate_config.get("max_regression", 0.0))
+    failures: List[Dict[str, float | str]] = []
+    for kind, metrics in sorted(kind_breakdown.items()):
+        if kind not in best_scores:
+            continue
+        current_score = float(metrics.get("masked_score", 0.0))
+        best_score = float(best_scores[kind])
+        regression = best_score - current_score
+        if regression > max_regression:
+            failures.append(
+                {
+                    "kind": kind,
+                    "best_score": best_score,
+                    "current_score": current_score,
+                    "regression": regression,
+                    "max_regression": max_regression,
+                }
+            )
+
+    failures.sort(key=lambda item: float(item["regression"]), reverse=True)
+    return {
+        "enabled": True,
+        "passed": not failures,
+        "failure_count": len(failures),
+        "max_regression": max_regression,
+        "failures": failures,
     }
 
 
@@ -2800,6 +3081,7 @@ def main() -> int:
         trainer.total_training_steps = (
             sum(args.override_phase_steps or profile["phase_steps"][phase] for phase in PHASE_ORDER)
             + int(profile.get("instruction_polish_steps", 0))
+            + int(profile.get("weak_kind_rehearsal_steps", 0))
             + max(args.final_consolidation_steps, 0)
         )
         qat_cfg = profile.get("qat", {})
@@ -2843,6 +3125,12 @@ def main() -> int:
                     profile.get("kind_regression_penalty_scale", 0.0)
                 ),
                 "kind_regression_floor": float(profile.get("kind_regression_floor", 0.0)),
+                "kind_regression_gate": deepcopy(profile.get("kind_regression_gate", {})),
+                "weak_kind_minipack": deepcopy(profile.get("weak_kind_minipack", {})),
+                "weak_kind_rehearsal_steps": int(profile.get("weak_kind_rehearsal_steps", 0)),
+                "weak_kind_rehearsal_lr_scale": float(
+                    profile.get("weak_kind_rehearsal_lr_scale", 1.0)
+                ),
                 "phase_replay_config": deepcopy(profile.get("phase_replay_config", {})),
                 "repetition_unlikelihood_scale": float(profile.get("repetition_unlikelihood_scale", 0.0)),
                 "phase_repetition_unlikelihood_scale": dict(
@@ -2905,6 +3193,12 @@ def main() -> int:
             "capacity_champion": {},
             "capacity_holdout_curve": [],
             "capacity_best_kind_scores": {},
+            "capacity_kind_regression_gate": {
+                "enabled": bool(profile.get("kind_regression_gate", {}).get("enabled", False)),
+                "passed": True,
+                "failure_count": 0,
+                "failures": [],
+            },
             "global_champion": {},
             "research_champion": {},
             "release_candidate": {},
@@ -3002,6 +3296,12 @@ def main() -> int:
                 float(profile.get("kind_regression_penalty_scale", 0.0)),
                 float(profile.get("kind_regression_floor", 0.0)),
             )
+            candidate_kind_gate = evaluate_kind_regression_gate(
+                kind_breakdown,
+                best_capacity_kind_scores,
+                profile.get("kind_regression_gate", {}),
+            )
+            candidate_kind_gate_passed = bool(candidate_kind_gate.get("passed", True))
             score = raw_score - float(regression["penalty"])
             record = {
                 "source": source_name,
@@ -3011,6 +3311,7 @@ def main() -> int:
                 "kind_regression_penalty": float(regression["penalty"]),
                 "kind_weighted_regression": float(regression["weighted_regression"]),
                 "kind_regressions": regression["regressions"],
+                "kind_gate": candidate_kind_gate,
                 "aggregate": aggregate,
                 "kind_breakdown": kind_breakdown,
                 "holdouts": holdout_results,
@@ -3022,12 +3323,18 @@ def main() -> int:
                 f"answer_loss={aggregate['answer_loss']:.4f} "
                 f"teacher={aggregate['teacher_token_accuracy']:.2f}"
             )
-            if score > best_capacity_score:
+            if candidate_kind_gate_passed and score > best_capacity_score:
                 best_capacity_score = score
                 save_checkpoint_artifact("champion_holdout")
                 summary["capacity_champion"] = record
                 logger.log(f"[capacity] champion updated -> {source_name}")
-            update_best_kind_scores(best_capacity_kind_scores, kind_breakdown)
+            elif not candidate_kind_gate_passed:
+                logger.log(
+                    f"[capacity] rejected by kind gate -> {source_name} "
+                    f"failures={candidate_kind_gate.get('failure_count', 0)}"
+                )
+            if candidate_kind_gate_passed:
+                update_best_kind_scores(best_capacity_kind_scores, kind_breakdown)
             debug_eval_log(logger, f"capacity_holdout:done source={source_name} score={score:.4f}")
             return score
 
@@ -3057,6 +3364,12 @@ def main() -> int:
                 trainer.learning_rate = base_learning_rate * phase_lr_scale
                 trainer.repetition_unlikelihood_scale = phase_repeat_scale
                 phase_rows = list(train_rows)
+                weak_kind_minipack_rows = build_weak_kind_minipack(
+                    profile,
+                    phase_name,
+                    args.seed,
+                )
+                phase_rows.extend(weak_kind_minipack_rows)
                 if phase_name != "phase3_curated_text":
                     phase_rows.extend(
                         sample_phase_replay_rows(
@@ -3071,6 +3384,7 @@ def main() -> int:
 
                 logger.log(
                     f"[train] {phase_name}: samples={len(train_rows)} mixed={len(phase_rows)} "
+                    f"weak_pack={len(weak_kind_minipack_rows)} "
                     f"tokens={len(train_tokens)} steps={max_steps} seq_len={profile['seq_len']} "
                     f"batch={profile['batch_size']} lr={trainer.learning_rate:.2e} "
                     f"rul={trainer.repetition_unlikelihood_scale:.3f} "
@@ -3173,10 +3487,11 @@ def main() -> int:
                         progress.close()
 
                 if phase_name != "phase3_curated_text":
-                    supervised_history.extend(train_rows)
+                    history_rows = list(train_rows) + list(weak_kind_minipack_rows)
+                    supervised_history.extend(history_rows)
                     family = PHASE_FAMILIES.get(phase_name)
                     if family:
-                        supervised_history_by_family.setdefault(family, []).extend(train_rows)
+                        supervised_history_by_family.setdefault(family, []).extend(history_rows)
 
                 selected_source = "final"
                 if best_phase_name:
@@ -3222,6 +3537,7 @@ def main() -> int:
                     "phase": phase_name,
                     "train_samples": len(train_rows),
                     "mixed_samples": len(phase_rows),
+                    "weak_kind_minipack_samples": len(weak_kind_minipack_rows),
                     "eval_samples": len(eval_subset),
                     "train_tokens": len(train_tokens),
                     "max_steps": max_steps,
@@ -3304,6 +3620,157 @@ def main() -> int:
                 )
                 if phase_aux_cfg["enabled"]:
                     logger.log(f"[aux] {phase_name}: {format_auxiliary_metrics(phase_aux_metrics)}")
+
+            weak_kind_rehearsal_steps = int(profile.get("weak_kind_rehearsal_steps", 0))
+            if weak_kind_rehearsal_steps > 0 and args.override_phase_steps <= 0:
+                rehearsal_phase_name = "weak_kind_rehearsal"
+                rehearsal_rows = build_weak_kind_minipack(
+                    profile,
+                    rehearsal_phase_name,
+                    args.seed,
+                )
+                if rehearsal_rows:
+                    rehearsal_lr_scale = float(profile.get("weak_kind_rehearsal_lr_scale", 1.0))
+                    trainer.learning_rate = base_learning_rate * rehearsal_lr_scale
+                    trainer.repetition_unlikelihood_scale = 0.0
+                    apply_auxiliary_stack_schedule(
+                        trainer,
+                        resolve_auxiliary_stack_config(profile, rehearsal_phase_name),
+                    )
+                    logger.log(
+                        f"[train] {rehearsal_phase_name}: rows={len(rehearsal_rows)} "
+                        f"steps={weak_kind_rehearsal_steps} batch={profile['batch_size']} "
+                        f"lr={trainer.learning_rate:.2e}"
+                    )
+                    set_layer_audit_phase(
+                        layer_audit,
+                        f"{rehearsal_phase_name}:train",
+                        int(trainer.global_step_count),
+                    )
+                    rehearsal_started = time.perf_counter()
+                    rehearsal_ema = None
+                    rehearsal_progress = logger.make_progress(
+                        weak_kind_rehearsal_steps,
+                        rehearsal_phase_name,
+                    )
+
+                    def rehearsal_callback(step: int, loss: float) -> None:
+                        nonlocal rehearsal_ema
+                        if rehearsal_ema is None:
+                            rehearsal_ema = loss
+                        else:
+                            rehearsal_ema = (
+                                args.log_ema_beta * rehearsal_ema
+                                + (1.0 - args.log_ema_beta) * loss
+                            )
+                        cur_lr = estimate_current_lr(trainer)
+                        if rehearsal_progress is not None:
+                            if step > rehearsal_progress.n:
+                                rehearsal_progress.update(step - rehearsal_progress.n)
+                            rehearsal_progress.set_postfix_str(
+                                f"loss={loss:.4f} ema={rehearsal_ema:.4f} lr={cur_lr:.2e}"
+                            )
+                        elif (
+                            step == 1
+                            or step % max(args.log_every_steps, 1) == 0
+                            or step == weak_kind_rehearsal_steps
+                        ):
+                            logger.log(
+                                f"  step={step} loss={loss:.4f} "
+                                f"ema={rehearsal_ema:.4f} lr={cur_lr:.2e}"
+                            )
+
+                    try:
+                        rehearsal_aux_metrics = train_rows_direct(
+                            trainer,
+                            tokenizer,
+                            rehearsal_rows,
+                            weak_kind_rehearsal_steps,
+                            rehearsal_callback,
+                            seed=args.seed + 919191,
+                            eos_token_id=eos_token_id,
+                            batch_size=profile["batch_size"],
+                        )
+                    finally:
+                        if rehearsal_progress is not None:
+                            if rehearsal_progress.n < weak_kind_rehearsal_steps:
+                                rehearsal_progress.update(
+                                    weak_kind_rehearsal_steps - rehearsal_progress.n
+                                )
+                            rehearsal_progress.close()
+
+                    rehearsal_eval_rows = rehearsal_rows[: max(1, args.phase_eval_samples * 2)]
+                    set_layer_audit_phase(
+                        layer_audit,
+                        f"{rehearsal_phase_name}:eval",
+                        weak_kind_rehearsal_steps,
+                    )
+                    rehearsal_metrics = evaluate_phase(
+                        nsos,
+                        model,
+                        tokenizer,
+                        rehearsal_eval_rows,
+                        eos_token_id,
+                        profile["seq_len"],
+                        args.phase_eval_mode,
+                        args.phase_exact_samples,
+                        logger=logger,
+                        label=f"{rehearsal_phase_name}:final_eval",
+                    )
+                    rehearsal_summary = {
+                        "phase": rehearsal_phase_name,
+                        "train_samples": len(rehearsal_rows),
+                        "mixed_samples": len(rehearsal_rows),
+                        "weak_kind_minipack_samples": len(rehearsal_rows),
+                        "eval_samples": len(rehearsal_eval_rows),
+                        "train_tokens": 0,
+                        "max_steps": weak_kind_rehearsal_steps,
+                        "elapsed_s": time.perf_counter() - rehearsal_started,
+                        "ema_loss_final": rehearsal_ema if rehearsal_ema is not None else 0.0,
+                        "auxiliary_stack_metrics": rehearsal_aux_metrics,
+                        **rehearsal_metrics,
+                    }
+                    rehearsal_summary["global_suite_score"] = None
+                    rehearsal_summary["global_suite_evaluated"] = False
+                    if args.holdout_every_phases > 0:
+                        rehearsal_summary["capacity_holdout_score"] = consider_capacity_champion(
+                            f"{rehearsal_phase_name}:final@{weak_kind_rehearsal_steps}",
+                            rehearsal_phase_name,
+                        )
+                        rehearsal_summary["capacity_holdout_evaluated"] = True
+                    else:
+                        rehearsal_summary["capacity_holdout_score"] = None
+                        rehearsal_summary["capacity_holdout_evaluated"] = False
+                    if layer_audit is not None:
+                        rehearsal_summary["layer_audit"] = {
+                            "train": layer_audit_summary_to_dict(
+                                layer_audit.summarize_phase(f"{rehearsal_phase_name}:train")
+                            ),
+                            "eval": layer_audit_summary_to_dict(
+                                layer_audit.summarize_phase(f"{rehearsal_phase_name}:eval")
+                            ),
+                            "global": {},
+                        }
+                        write_layer_audit_snapshot(layer_audit, layer_audit_path)
+                        summary["layer_audit"]["phase_snapshots"].append(
+                            {
+                                "phase": rehearsal_phase_name,
+                                "path": str(layer_audit_path),
+                                "train_records": rehearsal_summary["layer_audit"]["train"].get("records", 0),
+                                "eval_records": rehearsal_summary["layer_audit"]["eval"].get("records", 0),
+                            }
+                        )
+                    summary["phases"].append(rehearsal_summary)
+                    metrics_file.write(json.dumps(rehearsal_summary, ensure_ascii=False) + "\n")
+                    metrics_file.flush()
+                    save_checkpoint_artifact(rehearsal_phase_name)
+                    trainer.learning_rate = base_learning_rate
+                    logger.log(
+                        f"[eval] {rehearsal_phase_name}: "
+                        f"answer_loss={rehearsal_summary['answer_loss']:.4f} "
+                        f"first={rehearsal_summary['first_token_accuracy']:.2f} "
+                        f"teacher={rehearsal_summary['teacher_token_accuracy']:.2f}"
+                    )
 
             instruction_polish_steps = int(profile.get("instruction_polish_steps", 0))
             if instruction_polish_steps > 0 and args.override_phase_steps <= 0:
@@ -3707,6 +4174,17 @@ def main() -> int:
             summary["official_holdouts"]
         )
         summary["capacity_best_kind_scores"] = dict(best_capacity_kind_scores)
+        summary["capacity_kind_regression_gate"] = evaluate_kind_regression_gate(
+            summary["official_holdout_kind_breakdown"],
+            best_capacity_kind_scores,
+            profile.get("kind_regression_gate", {}),
+        )
+        capacity_gate_failed = not bool(summary["capacity_kind_regression_gate"].get("passed", True))
+        if summary["capacity_kind_regression_gate"].get("enabled", False):
+            logger.log(
+                f"[capacity-gate] passed={int(not capacity_gate_failed)} "
+                f"failures={summary['capacity_kind_regression_gate'].get('failure_count', 0)}"
+            )
 
         audit_gate_failed = False
         if layer_audit is not None:
@@ -3768,7 +4246,11 @@ def main() -> int:
         logger.log(f"[done] final checkpoint: {run_dir / 'final_model.bin'}")
         logger.log(f"[done] final edge pack: {run_dir / 'final_edge_linear.nsos'}")
         logger.log(f"[done] summary: {run_dir / 'run_summary.json'}")
-        return 2 if audit_gate_failed else 0
+        if audit_gate_failed:
+            return 2
+        if capacity_gate_failed:
+            return 3
+        return 0
     finally:
         logger.close()
 
