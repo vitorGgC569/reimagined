@@ -310,6 +310,20 @@ PROFILES["hybrid_moe_capacity"] = deepcopy(PROFILES["hybrid_moe_long"])
 PROFILES["hybrid_moe_capacity"]["requested_role"] = "moe_capacity_holdout_champion"
 PROFILES["hybrid_moe_capacity"]["instruction_polish_steps"] = 0
 PROFILES["hybrid_moe_capacity"]["moe_aux_loss_scale"] = 0.35
+PROFILES["hybrid_moe_capacity"]["kind_regression_penalty_scale"] = 0.85
+PROFILES["hybrid_moe_capacity"]["kind_regression_floor"] = 0.20
+PROFILES["hybrid_moe_capacity"]["phase_replay_config"] = {
+    "phase2_structured": {"families": ["algorithmic"], "ratio_scale": 0.50},
+    "phase4_instructions": {"families": ["algorithmic", "structured"], "ratio_scale": 0.75},
+    "phase5_verifier": {
+        "families": ["algorithmic", "structured", "instruction"],
+        "ratio_scale": 1.50,
+    },
+    "phase6_memory": {
+        "families": ["algorithmic", "structured", "instruction", "verifier"],
+        "ratio_scale": 2.00,
+    },
+}
 PROFILES["hybrid_moe_capacity"]["validation_scope"] = (
     "MoE capacity lane that preserves the best official-holdout checkpoint without the polish tail."
 )
@@ -2072,6 +2086,65 @@ def aggregate_holdout_kind_breakdown(results: Dict[str, Dict]) -> Dict[str, Dict
     return aggregate
 
 
+def update_best_kind_scores(best_scores: Dict[str, float],
+                            kind_breakdown: Dict[str, Dict[str, float]]) -> None:
+    for kind, metrics in kind_breakdown.items():
+        score = float(metrics.get("masked_score", 0.0))
+        if kind not in best_scores or score > best_scores[kind]:
+            best_scores[kind] = score
+
+
+def compute_kind_regression_penalty(kind_breakdown: Dict[str, Dict[str, float]],
+                                    best_scores: Dict[str, float],
+                                    penalty_scale: float,
+                                    regression_floor: float) -> Dict[str, object]:
+    if penalty_scale <= 0.0 or not kind_breakdown or not best_scores:
+        return {
+            "penalty": 0.0,
+            "weighted_regression": 0.0,
+            "regressions": [],
+        }
+
+    weighted_regression = 0.0
+    total_rows = 0.0
+    regressions: List[Dict[str, float | str]] = []
+    for kind, metrics in kind_breakdown.items():
+        if kind not in best_scores:
+            continue
+        current_score = float(metrics.get("masked_score", 0.0))
+        best_score = float(best_scores[kind])
+        regression = best_score - current_score
+        if regression <= regression_floor:
+            continue
+        rows = max(float(metrics.get("rows", 1.0)), 1.0)
+        weighted_regression += regression * rows
+        total_rows += rows
+        regressions.append(
+            {
+                "kind": kind,
+                "rows": rows,
+                "best_score": best_score,
+                "current_score": current_score,
+                "regression": regression,
+            }
+        )
+
+    if total_rows <= 0.0:
+        return {
+            "penalty": 0.0,
+            "weighted_regression": 0.0,
+            "regressions": [],
+        }
+
+    regressions.sort(key=lambda item: float(item["regression"]), reverse=True)
+    weighted_average = weighted_regression / total_rows
+    return {
+        "penalty": weighted_average * penalty_scale,
+        "weighted_regression": weighted_average,
+        "regressions": regressions[:8],
+    }
+
+
 def evaluate_official_holdouts(nsos, model, tokenizer, holdout_files: List[Path],
                                eos_token_id: int, seq_len: int, eval_mode: str,
                                exact_samples: int, logger, layer_audit,
@@ -2277,25 +2350,46 @@ def sample_phase_replay_rows(
     ratio: float,
     current_count: int,
     rng: random.Random,
+    profile_replay_config: Dict[str, Dict[str, object]] | None = None,
 ) -> List[Dict]:
     config = PHASE_REPLAY_CONFIG.get(phase_name, {"families": [], "ratio_scale": 0.0})
+    if profile_replay_config and phase_name in profile_replay_config:
+        config = profile_replay_config[phase_name]
     effective_ratio = float(ratio) * float(config.get("ratio_scale", 0.0))
     families = list(config.get("families", []))
     if effective_ratio <= 0.0 or current_count <= 0 or not families:
         return []
+
+    replay_count = max(1, int(current_count * effective_ratio))
+    picked: List[Dict] = []
+    seen: set[str] = set()
+    per_family = max(1, replay_count // max(len(families), 1))
+    for family in families:
+        family_rows = list(history_by_family.get(family, []))
+        if not family_rows:
+            continue
+        take = min(len(family_rows), per_family)
+        for row in rng.sample(family_rows, take) if take < len(family_rows) else family_rows:
+            row_id = str(row.get("id", id(row)))
+            if row_id in seen:
+                continue
+            seen.add(row_id)
+            picked.append(row)
 
     pool: List[Dict] = []
     for family in families:
         pool.extend(history_by_family.get(family, []))
     if not pool:
         return []
-
-    replay_count = min(len(pool), max(1, int(current_count * effective_ratio)))
-    if replay_count >= len(pool):
-        picked = list(pool)
+    if len(picked) >= replay_count:
         rng.shuffle(picked)
-        return picked
-    return rng.sample(pool, replay_count)
+        return picked[:replay_count]
+
+    remaining = [row for row in pool if str(row.get("id", id(row))) not in seen]
+    rng.shuffle(remaining)
+    picked.extend(remaining[: max(0, replay_count - len(picked))])
+    rng.shuffle(picked)
+    return picked
 
 
 def evaluate_generation_probe(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
@@ -2745,6 +2839,11 @@ def main() -> int:
                 "first_token_loss_scale": trainer.first_token_loss_scale,
                 "eos_loss_scale": trainer.eos_loss_scale,
                 "moe_aux_loss_scale": trainer.moe_aux_loss_scale,
+                "kind_regression_penalty_scale": float(
+                    profile.get("kind_regression_penalty_scale", 0.0)
+                ),
+                "kind_regression_floor": float(profile.get("kind_regression_floor", 0.0)),
+                "phase_replay_config": deepcopy(profile.get("phase_replay_config", {})),
                 "repetition_unlikelihood_scale": float(profile.get("repetition_unlikelihood_scale", 0.0)),
                 "phase_repetition_unlikelihood_scale": dict(
                     profile.get("phase_repetition_unlikelihood_scale", {})
@@ -2805,6 +2904,7 @@ def main() -> int:
             "official_holdout_kind_breakdown": {},
             "capacity_champion": {},
             "capacity_holdout_curve": [],
+            "capacity_best_kind_scores": {},
             "global_champion": {},
             "research_champion": {},
             "release_candidate": {},
@@ -2894,18 +2994,31 @@ def main() -> int:
                 label_prefix=f"capacity_holdout:{source_phase}",
             )
             aggregate = compute_official_holdout_score(holdout_results)
-            score = float(aggregate["score"])
+            kind_breakdown = aggregate_holdout_kind_breakdown(holdout_results)
+            raw_score = float(aggregate["score"])
+            regression = compute_kind_regression_penalty(
+                kind_breakdown,
+                best_capacity_kind_scores,
+                float(profile.get("kind_regression_penalty_scale", 0.0)),
+                float(profile.get("kind_regression_floor", 0.0)),
+            )
+            score = raw_score - float(regression["penalty"])
             record = {
                 "source": source_name,
                 "source_phase": source_phase,
                 "score": score,
+                "raw_score": raw_score,
+                "kind_regression_penalty": float(regression["penalty"]),
+                "kind_weighted_regression": float(regression["weighted_regression"]),
+                "kind_regressions": regression["regressions"],
                 "aggregate": aggregate,
-                "kind_breakdown": aggregate_holdout_kind_breakdown(holdout_results),
+                "kind_breakdown": kind_breakdown,
                 "holdouts": holdout_results,
             }
             summary["capacity_holdout_curve"].append(record)
             logger.log(
                 f"[capacity] source={source_name} score={score:.4f} "
+                f"raw={raw_score:.4f} penalty={float(regression['penalty']):.4f} "
                 f"answer_loss={aggregate['answer_loss']:.4f} "
                 f"teacher={aggregate['teacher_token_accuracy']:.2f}"
             )
@@ -2914,6 +3027,7 @@ def main() -> int:
                 save_checkpoint_artifact("champion_holdout")
                 summary["capacity_champion"] = record
                 logger.log(f"[capacity] champion updated -> {source_name}")
+            update_best_kind_scores(best_capacity_kind_scores, kind_breakdown)
             debug_eval_log(logger, f"capacity_holdout:done source={source_name} score={score:.4f}")
             return score
 
@@ -2926,6 +3040,7 @@ def main() -> int:
         best_global_score = float("-inf")
         best_release_score = float("-inf")
         best_capacity_score = float("-inf")
+        best_capacity_kind_scores: Dict[str, float] = {}
         with metrics_path.open("w", encoding="utf-8") as metrics_file:
             for phase_index, phase_name in enumerate(PHASE_ORDER):
                 train_rows = curriculum_texts_for_phase(args.bundle_dir, phase_name, "train")
@@ -2950,6 +3065,7 @@ def main() -> int:
                             args.replay_ratio,
                             len(train_rows),
                             replay_rng,
+                            profile.get("phase_replay_config"),
                         )
                     )
 
@@ -3590,6 +3706,7 @@ def main() -> int:
         summary["official_holdout_kind_breakdown"] = aggregate_holdout_kind_breakdown(
             summary["official_holdouts"]
         )
+        summary["capacity_best_kind_scores"] = dict(best_capacity_kind_scores)
 
         audit_gate_failed = False
         if layer_audit is not None:
