@@ -58,7 +58,11 @@ GPU_PROFILE_MAP: Dict[str, Dict[str, str]] = {
 }
 
 # Default param scale ("40m" or "80m").  Override via NSOS_PARAM_SCALE.
-DEFAULT_PARAM_SCALE = os.environ.get("NSOS_PARAM_SCALE", "80m").lower()
+# Default is "40m" because at the v11 token budget (~42K samples, ~21M
+# tokens) Chinchilla-optimal sits closer to 40M params than 80M, AND
+# the 40M variant runs ~2x faster per step (fewer FLOPs) so the user
+# completes the curriculum in fewer Colab sessions.
+DEFAULT_PARAM_SCALE = os.environ.get("NSOS_PARAM_SCALE", "40m").lower()
 
 # Map: GPU keyword → CUDA compute capability (for NSOS_CUDA_ARCHITECTURES)
 GPU_ARCH_MAP: Dict[str, str] = {
