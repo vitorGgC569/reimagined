@@ -155,6 +155,66 @@ Tensor Mamba2SSD::ssd_forward(const Tensor& x, const Tensor& delta,
                          : std::vector<int>{batch, seq, dim},
                   x.get_device());
 
+#ifdef USE_CUDA
+    // GPU fast-path: all five inputs must already live on the device,
+    // shapes must match the canonical [B,Seq,D] layout the kernel
+    // expects, and dim must equal x.shape.back().  Otherwise we fall
+    // through to the CPU path (which copies as needed).  This avoids
+    // accidentally promoting/copying when callers pass mixed devices.
+    const bool all_on_gpu = x.get_device() == Device::GPU &&
+                            delta.get_device() == Device::GPU &&
+                            A_data.get_device() == Device::GPU &&
+                            B_data.get_device() == Device::GPU &&
+                            C_data.get_device() == Device::GPU;
+    const bool shapes_match_simple_dim =
+        delta.size == x.size && B_data.size == x.size &&
+        C_data.size == x.size && A_data.size == dim;
+    if (all_on_gpu && shapes_match_simple_dim && batch > 0 && seq > 0 &&
+        dim > 0) {
+        // Reshape to canonical [B, Seq, D] for the kernel.  Reshape is
+        // a metadata-only operation when underlying storage is contiguous
+        // (which it is for tensors freshly allocated on GPU here).
+        const std::vector<int> canonical_shape{batch, seq, dim};
+        Tensor x_canon = rank_2 ? x.reshape(canonical_shape) : x;
+        Tensor dt_canon =
+            rank_2 ? delta.reshape(canonical_shape) : delta;
+        Tensor B_canon =
+            rank_2 ? B_data.reshape(canonical_shape) : B_data;
+        Tensor C_canon =
+            rank_2 ? C_data.reshape(canonical_shape) : C_data;
+
+        // Output buffer with canonical layout; we reshape back to the
+        // caller's expected layout at the return site.
+        Tensor y_canon(canonical_shape, Device::GPU);
+
+        // state_history is required for ssd_backward.  Allocate when the
+        // forward pass is asked to save it; otherwise pass nullptr and
+        // skip the per-step write inside the kernel.
+        Tensor history;
+        float* history_ptr = nullptr;
+        if (save_history) {
+            history = Tensor(canonical_shape, Device::GPU);
+            history_ptr = history.raw_data();
+        }
+
+        cuda::launch_mamba_selective_scan_forward(
+            x_canon.raw_data(), dt_canon.raw_data(), A_data.raw_data(),
+            B_canon.raw_data(), C_canon.raw_data(), y_canon.raw_data(),
+            history_ptr, batch, seq, dim);
+
+        // saved_state_history_ matches the original layout so callers
+        // (notably ssd_backward) can compare shapes safely.
+        if (save_history) {
+            saved_state_history_ =
+                rank_2 ? history.reshape(std::vector<int>{seq, dim}) : history;
+        } else {
+            saved_state_history_ = Tensor();
+        }
+
+        return rank_2 ? y_canon.reshape(std::vector<int>{seq, dim}) : y_canon;
+    }
+#endif
+
     Tensor x_host = x.get_device() == Device::GPU ? x.cpu() : x;
     Tensor delta_host = delta.get_device() == Device::GPU ? delta.cpu() : delta;
     Tensor a_host = A_data.get_device() == Device::GPU ? A_data.cpu() : A_data;
@@ -231,6 +291,60 @@ Mamba2SSD::ssd_backward(const Tensor& grad_y, const Tensor& x,
         (void)ssd_forward(x, delta, A_data, B_data, C_data, nullptr, true);
         state_history = saved_state_history_;
     }
+
+#ifdef USE_CUDA
+    // GPU fast-path mirroring ssd_forward.  Same eligibility rules:
+    // every input must already be on the device and shapes must match
+    // the canonical [B,Seq,D] layout.  state_history must also be on
+    // the device so we don't have to round-trip it.
+    const bool all_on_gpu = grad_y.get_device() == Device::GPU &&
+                            x.get_device() == Device::GPU &&
+                            delta.get_device() == Device::GPU &&
+                            A_data.get_device() == Device::GPU &&
+                            B_data.get_device() == Device::GPU &&
+                            C_data.get_device() == Device::GPU &&
+                            state_history.get_device() == Device::GPU;
+    const bool shapes_match_simple_dim =
+        delta.size == x.size && B_data.size == x.size &&
+        C_data.size == x.size && A_data.size == dim &&
+        grad_y.size == x.size && state_history.size == x.size;
+    if (all_on_gpu && shapes_match_simple_dim && batch > 0 && seq > 0 &&
+        dim > 0) {
+        const std::vector<int> canonical_shape{batch, seq, dim};
+
+        // Reshape (metadata-only on contiguous storage) to canonical 3D.
+        Tensor grad_y_canon =
+            rank_2 ? grad_y.reshape(canonical_shape) : grad_y;
+        Tensor x_canon = rank_2 ? x.reshape(canonical_shape) : x;
+        Tensor dt_canon =
+            rank_2 ? delta.reshape(canonical_shape) : delta;
+        Tensor B_canon =
+            rank_2 ? B_data.reshape(canonical_shape) : B_data;
+        Tensor C_canon =
+            rank_2 ? C_data.reshape(canonical_shape) : C_data;
+        Tensor sh_canon = rank_2
+                              ? state_history.reshape(canonical_shape)
+                              : state_history;
+
+        // Output gradient buffers — match the input shapes so callers
+        // can use them without reshape gymnastics.  Initialize with
+        // zeros only for grad_A; the kernel writes the others fully.
+        Tensor grad_x_t(x.shape.dims, Device::GPU);
+        Tensor grad_delta_t(delta.shape.dims, Device::GPU);
+        Tensor grad_A_t = Tensor::zeros(A_data.shape.dims, Device::GPU);
+        Tensor grad_B_t(B_data.shape.dims, Device::GPU);
+        Tensor grad_C_t(C_data.shape.dims, Device::GPU);
+
+        cuda::launch_mamba_selective_scan_backward(
+            grad_y_canon.raw_data(), x_canon.raw_data(), dt_canon.raw_data(),
+            A_data.raw_data(), B_canon.raw_data(), C_canon.raw_data(),
+            sh_canon.raw_data(), grad_x_t.raw_data(), grad_delta_t.raw_data(),
+            grad_A_t.raw_data(), grad_B_t.raw_data(), grad_C_t.raw_data(),
+            batch, seq, dim);
+
+        return {grad_x_t, grad_delta_t, grad_A_t, grad_B_t, grad_C_t};
+    }
+#endif
 
     Tensor grad_y_host = grad_y.get_device() == Device::GPU ? grad_y.cpu() : grad_y;
     Tensor x_host = x.get_device() == Device::GPU ? x.cpu() : x;
@@ -400,11 +514,11 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
             Tensor x_flat = x_scaled.reshape({batch, d_model});
             Tensor delta_flat = delta.reshape({batch, d_model});
             cuda::launch_mamba_single_token_update(
-                x_flat.data(),
-                delta_flat.data(),
-                A.data.data(),
-                streaming_state_->data(),
-                y_ssd.data(),
+                x_flat.raw_data(),
+                delta_flat.raw_data(),
+                A.data.raw_data(),
+                streaming_state_->raw_data(),
+                y_ssd.raw_data(),
                 batch,
                 d_model);
             y_ssd = y_ssd.mul(selective_c.reshape(state_shape));

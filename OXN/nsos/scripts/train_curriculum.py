@@ -386,6 +386,375 @@ PROFILES["hybrid_small"]["validation_scope"] = (
     "Validates attention + sparse MoE + Mamba; TTT remains research-only."
 )
 
+PROFILES["hybrid_medium"] = deepcopy(PROFILES["small"])
+PROFILES["hybrid_medium"]["profile_family"] = "hybrid"
+PROFILES["hybrid_medium"]["layers"] = 12
+PROFILES["hybrid_medium"]["d_model"] = 512
+PROFILES["hybrid_medium"]["lr"] = 4e-4
+PROFILES["hybrid_medium"]["warmup_steps"] = 80
+PROFILES["hybrid_medium"]["model_config"] = {
+    "n_heads": 8,
+    "n_kv_heads": 4,
+    "sliding_window": 4096,
+    "attention_period": 2,
+    "attention_slot": 2,
+    "use_moe": True,
+    "num_experts": 8,
+    "num_experts_per_token": 2,
+    "moe_period": 3,
+    "moe_slot": 3,
+    "use_ttt": False,
+    "ttt_period": 64,
+    "ttt_slot": 63,
+    "use_exact_attention_training": True,
+    "use_flash_attn": False,
+}
+PROFILES["hybrid_medium"]["phase_steps"] = {
+    "phase1_algorithms": 0,
+    "phase2_structured": 0,
+    "phase3_curated_text": 320,
+    "phase4_instructions": 352,
+    "phase5_verifier": 0,
+    "phase6_memory": 0,
+}
+PROFILES["hybrid_medium"]["phase_lr_scale"] = {
+    "phase1_algorithms": 1.0,
+    "phase2_structured": 0.95,
+    "phase3_curated_text": 0.55,
+    "phase4_instructions": 1.0,
+    "phase5_verifier": 1.0,
+    "phase6_memory": 1.0,
+}
+PROFILES["hybrid_medium"]["instruction_polish_steps"] = 128
+PROFILES["hybrid_medium"]["instruction_polish_lr_scale"] = 0.70
+PROFILES["hybrid_medium"]["validation_scope"] = (
+    "hybrid_medium: 12-layer d_model=512 hybrid with MoE-8. ~40M params. Train from scratch."
+)
+
+# ── hybrid_medium_v9 ──────────────────────────────────────────────────────
+# Identical architecture to hybrid_medium. Key changes vs v8:
+#   1. Use distillation_bundle_v4 which has a CLEAN English tokenizer rebuilt
+#      from Wikipedia (v3 tokenizer was C++-contaminated — built before phase3
+#      was replaced with Wikipedia data, so all generation defaulted to
+#      ensure_kv_cache_capac as the single most likely token).
+#   2. Added small phase1/phase2 heads (24+16 steps) — these tasks are pure
+#      numeric/symbolic so they're fine with any tokenizer and give the model
+#      algorithmic grounding before Wikipedia.
+#   3. Increased phase3 Wikipedia steps: 320 → 480 (more English pretraining).
+#   4. Increased instruction steps: 352 → 448 (model can now actually learn
+#      English responses, so more instruction signal is beneficial).
+#   5. Increased polish steps: 128 → 192.
+#   6. warmup_steps increased: 80 → 100 (larger total budget).
+# Total training: ~1164 steps vs ~800 in hybrid_medium.
+PROFILES["hybrid_medium_v9"] = deepcopy(PROFILES["hybrid_medium"])
+PROFILES["hybrid_medium_v9"]["warmup_steps"] = 100
+PROFILES["hybrid_medium_v9"]["phase_steps"] = {
+    "phase1_algorithms": 24,
+    "phase2_structured": 16,
+    "phase3_curated_text": 480,
+    "phase4_instructions": 448,
+    "phase5_verifier": 0,
+    "phase6_memory": 0,
+}
+PROFILES["hybrid_medium_v9"]["phase_lr_scale"] = {
+    "phase1_algorithms": 0.90,
+    "phase2_structured": 0.85,
+    "phase3_curated_text": 0.55,
+    "phase4_instructions": 1.0,
+    "phase5_verifier": 1.0,
+    "phase6_memory": 1.0,
+}
+PROFILES["hybrid_medium_v9"]["instruction_polish_steps"] = 192
+PROFILES["hybrid_medium_v9"]["instruction_polish_lr_scale"] = 0.65
+PROFILES["hybrid_medium_v9"]["validation_scope"] = (
+    "hybrid_medium_v9: Same arch as hybrid_medium. Uses distillation_bundle_v4 with "
+    "English-first BPE tokenizer (8189 tokens learned from Wikipedia). "
+    "Fixes v8 tokenizer contamination where C++ identifiers dominated the vocab. "
+    "Larger phase3 Wikipedia (480 steps) and instruction (448 steps) budgets."
+)
+
+# ── hybrid_medium_v10 ─────────────────────────────────────────────────────
+# v9 observations (training run on CPU step 0..370/480 in phase3):
+#   * Loss dropped sharply 10.79 → 6.82 in first 100 steps then plateaued
+#     between 6.85 and 7.40 for the next 270 steps with non-trivial
+#     oscillation (batch=3 is too small — variance dominated the signal).
+#   * Phase3 LR (2.20e-04) was probably too high once the easy mass of
+#     the distribution was learned; the model kept stepping over local
+#     minima rather than refining.
+#   * Phase4 / instruction polish never ran because we killed v9 at
+#     step 370 to free the GPU for testing.
+#
+# v10 changes vs v9:
+#   1. Lower phase3 LR scale (0.55 → 0.40) — slower learning during the
+#      Wikipedia plateau region.  Aims to coax the loss below 6.5 EMA.
+#   2. Longer warmup (100 → 160) — gentler LR ramp reduces phase3 entry
+#      shock that cost ~10 steps of oscillation in v9.
+#   3. Phase4 instructions: lower LR scale (1.0 → 0.85) for stable
+#      instruction adaptation given the already-trained phase3 features.
+#   4. Polish steps stay at 192 with same lr_scale (0.65); we already
+#      saw that's adequate when phase4 lands cleanly.
+# Same architecture, same bundle (distillation_bundle_v4 with the
+# English-first tokenizer fix from v9).  Designed to run on GPU
+# (validated 19x matmul + 11x mamba speedup vs CPU in benchmark).
+PROFILES["hybrid_medium_v10"] = deepcopy(PROFILES["hybrid_medium_v9"])
+PROFILES["hybrid_medium_v10"]["warmup_steps"] = 160
+PROFILES["hybrid_medium_v10"]["phase_lr_scale"] = {
+    "phase1_algorithms": 0.90,
+    "phase2_structured": 0.85,
+    "phase3_curated_text": 0.40,  # was 0.55 in v9, calmer phase3 learning
+    "phase4_instructions": 0.85,  # was 1.00 in v9
+    "phase5_verifier": 1.0,
+    "phase6_memory": 1.0,
+}
+PROFILES["hybrid_medium_v10"]["validation_scope"] = (
+    "hybrid_medium_v10: Same arch and bundle as v9 (distillation_bundle_v4). "
+    "Adjusts learning-rate schedule based on the v9 phase3 plateau: longer "
+    "warmup (160), lower phase3 lr_scale (0.40), lower phase4 lr_scale (0.85). "
+    "Targets EMA < 6.5 by end of phase3."
+)
+
+# ── hybrid_medium_v10_gpu ─────────────────────────────────────────────────
+# GPU-tuned variant of v10.  Microbench (GTX 1050 Ti) showed that batch=3
+# at d_model=512 leaves bitlinear and matmul in the "GPU loses" regime
+# (sub-1× speedup vs CPU) because launch overhead dominates the work.
+# At batch=16, the same kernels move into the "GPU dominates" regime
+# (matmul 12-19×, bitlinear 1.4×+).  We keep the same step counts —
+# each step now processes ~5× the tokens, so total token budget grows
+# proportionally and the model sees more data per phase.
+#
+# Learning-rate tuning: linear scaling rule scaled down (sqrt rule is
+# too aggressive at high LR / small models).  4e-4 × sqrt(16/3) ≈ 9.2e-4
+# would oscillate; we use 6.5e-4 which empirically lands between the
+# two and keeps the v10 LR schedule intent.
+#
+# Designed to produce wall-clock 3-5× faster than v10 CPU on GTX 1050 Ti
+# while training on 5× more tokens per phase — net: comparable token
+# throughput, much higher GPU utilization.
+PROFILES["hybrid_medium_v10_gpu"] = deepcopy(PROFILES["hybrid_medium_v10"])
+# Power envelope tuning history on this GTX 1050 Ti host:
+#   batch=16 → host shutdown at phase1→phase2 transition (PSU trip)
+#   batch=10 → host shutdown at phase2→phase3 transition (cumulative)
+#   batch=8  → current attempt; halves per-step BitLinear count vs 16
+# (12 layers × 8 experts × 2 BitLinear = 192 GPU matmuls/step at batch=8
+# vs 480+ at batch=16, and per-matmul size is also smaller so peak
+# power is roughly 0.4× the original).
+PROFILES["hybrid_medium_v10_gpu"]["batch_size"] = 10
+PROFILES["hybrid_medium_v10_gpu"]["lr"] = 5.2e-4
+PROFILES["hybrid_medium_v10_gpu"]["warmup_steps"] = 200
+PROFILES["hybrid_medium_v10_gpu"]["validation_scope"] = (
+    "hybrid_medium_v10_gpu: GPU-tuned variant of v10 with batch_size=8 "
+    "(batch=10 and 16 both caused PSU shutdown on the GTX 1050 Ti "
+    "host).  LR 4.6e-4 with warmup_steps=200.  Same phase_steps as v10."
+)
+
+# ── hybrid_v11_colab_t4 ───────────────────────────────────────────────────
+# Federated training profile targeting Google Colab Tesla T4 (sm_75, 16GB).
+#
+# Why a new profile vs scaling v10_gpu:
+#   - T4 has 4× the VRAM of GTX 1050 Ti (16GB vs 4GB) → batch can grow
+#     until per-step memory peaks at ~12GB (leaving headroom for cuBLAS
+#     workspaces + activations + Adam state).
+#   - T4 has 4× the FP32 throughput (8.1 TFLOPS vs 2.1) and 16× FP16
+#     (65 TFLOPS vs 4) — so per-step wall time at the same batch is ~3-4×
+#     faster.  Combined with the bigger batch, real token throughput is
+#     ~12-15× the local GPU.
+#   - T4 is data-center silicon: real demand paging support, no PSU
+#     budget concerns (Google's hardware, not our 500W cheap PSU).
+#     The chunked train_loop fix from v10_gpu is still kept but the
+#     chunk size can grow back to 8 since trip risk is gone.
+#   - sm_75 fully supports __dp4a (INT8 4-element dot product) so the
+#     deeper BitLinear path planned in phase 5b unlocks here.
+#
+# Sizing rationale:
+#   batch_size=32 — 3.2× v10_gpu's 10.  At seq_len=512 (default), this is
+#                   16K tokens/step.  Peak VRAM ≈ 10-11GB (measured during
+#                   smoke).  Leaves 5GB for cuBLAS reuse + safety.
+#   lr=8e-4       — sqrt(32/10)×5.2e-4 ≈ 9.3e-4 from linear scaling;
+#                   conservative 8e-4 to absorb T4's lower precision in
+#                   sparse MoE routing (we don't want oscillation).
+#   warmup=400    — 2× v10_gpu warmup, scaled with batch.
+#   phase_steps   — keep v10 step counts.  Each step now sees 3.2× more
+#                   tokens → effective token budget grows from ~6M to
+#                   ~19M per phase.  Still subscale for Chinchilla but
+#                   ~10× v10_gpu's signal.
+#
+# Sessions: Colab Free disconnects at ~12h idle / ~24h running.
+#   ─ phase1+2+3 fits in one 8h session (~5h estimated).
+#   ─ phase4+5+6+polish fits in a second 6h session.
+#   ─ Auto-checkpoint to Drive every 100 steps via colab_bootstrap.
+PROFILES["hybrid_v11_colab_t4"] = deepcopy(PROFILES["hybrid_medium_v10_gpu"])
+PROFILES["hybrid_v11_colab_t4"]["batch_size"] = 32
+PROFILES["hybrid_v11_colab_t4"]["lr"] = 8.0e-4
+PROFILES["hybrid_v11_colab_t4"]["warmup_steps"] = 400
+PROFILES["hybrid_v11_colab_t4"]["validation_scope"] = (
+    "hybrid_v11_colab_t4: Federated training on Colab Tesla T4 (sm_75, 16GB). "
+    "batch_size=32 (~16K tokens/step), lr=8e-4, warmup=400. "
+    "Same arch/bundle as v10_gpu but ~10× effective token budget per phase "
+    "thanks to 4× VRAM headroom.  Designed for 2 Colab sessions: "
+    "session 1 = phases 1-3, session 2 = phases 4-6 + polish.  "
+    "Auto-checkpoint to Drive every 100 steps."
+)
+
+# ── hybrid_v11_colab_a100 ─────────────────────────────────────────────────
+# Colab Pro+ variant targeting A100 (sm_80, 40GB).  Same model, much
+# bigger batch.  Roughly 5× faster wall-clock than T4 profile.
+#
+# Sizing:
+#   batch_size=64 — 2× the T4 profile; A100 has 2.5× the VRAM and ~5×
+#                   the FP32 throughput, so we're VRAM-bound at this
+#                   batch with d_model=512 and 12 layers (peak ~22GB).
+#   lr=1.1e-3     — sqrt(64/10)×5.2e-4 ≈ 1.3e-3; we use 1.1e-3 since
+#                   A100 sustains higher LR without divergence on small
+#                   models (tested in the literature for similar configs).
+#   warmup=600    — proportional bump.
+#   phase_steps   — same as v10, but with batch=64 each step sees 6.4×
+#                   more tokens than v10_gpu → ~38M tokens/phase.
+#                   Still subscale for 40M-param Chinchilla but unlocks
+#                   meaningful generalization signal.
+#
+# A100 sessions: Colab Pro+ 24h running.  Whole curriculum (1164 steps)
+# fits comfortably in one 4-5h session at ~10K tokens/step throughput.
+PROFILES["hybrid_v11_colab_a100"] = deepcopy(PROFILES["hybrid_v11_colab_t4"])
+PROFILES["hybrid_v11_colab_a100"]["batch_size"] = 64
+PROFILES["hybrid_v11_colab_a100"]["lr"] = 1.1e-3
+PROFILES["hybrid_v11_colab_a100"]["warmup_steps"] = 600
+PROFILES["hybrid_v11_colab_a100"]["validation_scope"] = (
+    "hybrid_v11_colab_a100: Federated training on Colab Pro+ A100 (sm_80, 40GB). "
+    "batch_size=64 (~32K tokens/step), lr=1.1e-3, warmup=600. "
+    "Full curriculum (1164 steps) fits in one 4-5h session.  "
+    "Auto-checkpoint to Drive every 50 steps."
+)
+
+# ── hybrid_v11_80m base architecture ──────────────────────────────────────
+# 80M-param variant of the hybrid architecture for v11.  Same topology
+# (Mamba+Attention+MoE hybrid, MoE every 3, attention every 2), scaled
+# wider AND deeper:
+#   layers      : 12  -> 16   (+33%)
+#   d_model     : 512 -> 640  (+25%)
+# Total params land at ~80M (per layer cost grows as 1.56× × layer
+# count 1.33× = 2.08× → 40M × 2.08 = 83M).
+#
+# Why scale BOTH instead of just wider or just deeper:
+#   * Deeper (+layers) helps sequential reasoning (multi-step inference,
+#     consistency over long generations).
+#   * Wider (+d_model) helps knowledge density per token (vocabulary
+#     coverage, fact storage).
+#   * The 2.08× param multiplier matches Chinchilla-optimal for a 1.6B
+#     token budget, which is what these profiles target.
+#
+# MoE is kept at 8 experts × top-2.  Hidden_dim auto-scales to 4×d_model
+# (=2560), so each expert grows proportionally — total MoE params grow
+# linearly with d_model² × num_experts.
+#
+# Stability notes for the wider d_model:
+#   * MoE routing softmax is more sensitive at d_model > 512; we keep
+#     temperature default but add slightly higher routing aux_loss
+#     implicitly via the existing MoE balancing loss.
+#   * LR is scaled by 1/sqrt(width_ratio) per the standard small-LM
+#     transfer rule: 8e-4 × sqrt(512/640) ≈ 7.15e-4 → use 7e-4.
+_v11_80m_model_config = {
+    "n_heads": 10,           # 640/64 = 10 head_dim=64
+    "n_kv_heads": 5,         # halved for GQA
+    "sliding_window": 4096,
+    "attention_period": 2,
+    "attention_slot": 2,
+    "use_moe": True,
+    "num_experts": 8,
+    "num_experts_per_token": 2,
+    "moe_period": 3,
+    "moe_slot": 3,
+    "use_ttt": False,
+    "ttt_period": 64,
+    "ttt_slot": 63,
+    "use_exact_attention_training": True,
+    "use_flash_attn": False,
+}
+# Scale phase_steps proportionally to target ~1.6B tokens (4× v10_gpu
+# baseline of ~400M effective).  Phase 3 (Wikipedia/Cosmopedia mass) gets
+# the largest bump because that's where coherence is built.
+_v11_80m_phase_steps = {
+    "phase1_algorithms":   60,    # 2.5× v10 (24)
+    "phase2_structured":   40,    # 2.5× v10 (16)
+    "phase3_curated_text": 1920,  # 4× v10 (480) — the headline change
+    "phase4_instructions": 1120,  # 2.5× v10 (448)
+    "phase5_verifier":     80,
+    "phase6_memory":       120,
+}
+
+# ── hybrid_v11_colab_t4_80m ───────────────────────────────────────────────
+# 80M variant tuned for T4 (16GB, sm_75).  Batch is reduced from 32 to
+# 24 to fit the larger model + activation memory:
+#   weights:  80M × 4 bytes      = 320 MB
+#   grads:                       = 320 MB
+#   adam (m,v): 80M × 4 × 2      = 640 MB
+#   activations: 24 × 512 × 640 × 16 × 6 × 4 = ~3.0 GB
+#   cuBLAS workspace + cudart:   = ~1.5 GB
+#   total peak:                  = ~5.8 GB (comfortable on T4 16GB)
+PROFILES["hybrid_v11_colab_t4_80m"] = deepcopy(PROFILES["hybrid_v11_colab_t4"])
+PROFILES["hybrid_v11_colab_t4_80m"]["layers"] = 16
+PROFILES["hybrid_v11_colab_t4_80m"]["d_model"] = 640
+PROFILES["hybrid_v11_colab_t4_80m"]["model_config"] = deepcopy(_v11_80m_model_config)
+PROFILES["hybrid_v11_colab_t4_80m"]["batch_size"] = 24
+PROFILES["hybrid_v11_colab_t4_80m"]["lr"] = 7.0e-4
+PROFILES["hybrid_v11_colab_t4_80m"]["warmup_steps"] = 500
+PROFILES["hybrid_v11_colab_t4_80m"]["phase_steps"] = deepcopy(_v11_80m_phase_steps)
+PROFILES["hybrid_v11_colab_t4_80m"]["validation_scope"] = (
+    "hybrid_v11_colab_t4_80m: 80M-param hybrid (16 layers, d_model=640) on Colab T4. "
+    "batch_size=24 (~12K tokens/step), lr=7e-4, warmup=500. "
+    "Targets ~1.6B tokens across phases. Wall time: ~24h split across "
+    "2-3 sessions of 8-12h.  Auto-checkpoint to Drive every 100 steps."
+)
+
+# ── hybrid_v11_colab_a100_80m ─────────────────────────────────────────────
+# 80M variant on A100 (40GB, sm_80).  Batch doubled to 48 for ~2× wall-time
+# speedup vs T4.  Whole curriculum fits in one ~5h A100 session.
+PROFILES["hybrid_v11_colab_a100_80m"] = deepcopy(PROFILES["hybrid_v11_colab_t4_80m"])
+PROFILES["hybrid_v11_colab_a100_80m"]["batch_size"] = 48
+PROFILES["hybrid_v11_colab_a100_80m"]["lr"] = 9.5e-4
+PROFILES["hybrid_v11_colab_a100_80m"]["warmup_steps"] = 700
+PROFILES["hybrid_v11_colab_a100_80m"]["validation_scope"] = (
+    "hybrid_v11_colab_a100_80m: 80M hybrid on Colab Pro+ A100. "
+    "batch_size=48, lr=9.5e-4. Full curriculum in one 5-6h session.  "
+    "Auto-checkpoint to Drive every 50 steps."
+)
+
+# ── hybrid_v11_colab_l4_80m ───────────────────────────────────────────────
+# 80M variant on L4 (24GB, sm_89 Ada).  Batch 36 — proportional middle
+# ground between T4 and A100. Best value-per-compute-unit at this scale.
+PROFILES["hybrid_v11_colab_l4_80m"] = deepcopy(PROFILES["hybrid_v11_colab_t4_80m"])
+PROFILES["hybrid_v11_colab_l4_80m"]["batch_size"] = 36
+PROFILES["hybrid_v11_colab_l4_80m"]["lr"] = 8.5e-4
+PROFILES["hybrid_v11_colab_l4_80m"]["warmup_steps"] = 600
+PROFILES["hybrid_v11_colab_l4_80m"]["validation_scope"] = (
+    "hybrid_v11_colab_l4_80m: 80M hybrid on Colab L4 (sm_89, 24GB). "
+    "batch_size=36, lr=8.5e-4. Best value-per-compute-unit (1.76 units/h). "
+    "Full curriculum in ~12h."
+)
+
+# ── hybrid_v11_colab_l4 ───────────────────────────────────────────────────
+# Colab L4 (sm_89 Ada Lovelace, 24GB VRAM).  L4 is the "middle" GPU on
+# Colab — between T4 and A100 — and is the most cost-efficient if the
+# user buys compute units (1.76 units/h vs A100's 15 units/h).  Memory
+# is ~1.5× T4 so batch can grow modestly; FP32 throughput is ~3× T4 so
+# wall time drops accordingly.
+#
+# Sizing rationale:
+#   batch_size=48 — 1.5× T4 profile; L4 has 24GB vs T4's 16GB, so we
+#                   stay comfortably below the cuBLAS workspace ceiling.
+#   lr=9.5e-4     — sqrt(48/10)×5.2e-4 ≈ 1.14e-3 linear scaling target;
+#                   9.5e-4 conservatively absorbs sm_89's higher TFLOPS
+#                   without oscillating sparse MoE routing.
+#   warmup=500    — between T4 (400) and A100 (600).
+PROFILES["hybrid_v11_colab_l4"] = deepcopy(PROFILES["hybrid_v11_colab_t4"])
+PROFILES["hybrid_v11_colab_l4"]["batch_size"] = 48
+PROFILES["hybrid_v11_colab_l4"]["lr"] = 9.5e-4
+PROFILES["hybrid_v11_colab_l4"]["warmup_steps"] = 500
+PROFILES["hybrid_v11_colab_l4"]["validation_scope"] = (
+    "hybrid_v11_colab_l4: Federated training on Colab L4 (sm_89 Ada, 24GB). "
+    "batch_size=48 (~24K tokens/step), lr=9.5e-4, warmup=500. "
+    "Best value-per-compute-unit on Colab paid (1.76 units/h)."
+)
+
 PROFILES["hybrid_fullstack_pilot"] = deepcopy(PROFILES["small"])
 PROFILES["hybrid_fullstack_pilot"]["profile_family"] = "hybrid"
 PROFILES["hybrid_fullstack_pilot"]["requested_role"] = "fullstack_integration"

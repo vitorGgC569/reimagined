@@ -311,12 +311,15 @@ void launch_mamba_ssd_forward(const float *x, const float *dt, const float *A,
 void launch_mamba_simple_scan_forward(const float *x, const float *dt,
                                       const float *A, float *y, int Batch,
                                       int Seq, int D) {
+  // No internal cudaDeviceSynchronize: callers serialize with the host
+  // explicitly (e.g. before reading outputs on the CPU).  Keeping the
+  // launch fire-and-forget lets training and inference overlap CPU work
+  // with the kernel runtime.
   const int total_channels = Batch * D;
   const int threads = 256;
   const int blocks = (total_channels + threads - 1) / threads;
   mamba_simple_scan_forward_kernel<<<blocks, threads>>>(x, dt, A, y, Batch, Seq,
                                                         D);
-  cudaDeviceSynchronize();
 }
 
 void launch_mamba_simple_scan_backward(const float *grad_y, const float *y,
@@ -324,18 +327,27 @@ void launch_mamba_simple_scan_backward(const float *grad_y, const float *y,
                                        float *grad_x, float *grad_dt,
                                        float *grad_A, int Batch, int Seq,
                                        int D) {
+  // grad_A uses atomicAdd inside the kernel, so it MUST be zeroed first.
+  // The cudaMemset is asynchronous on the default stream and serializes
+  // implicitly with the launch below.
   const int total_channels = Batch * D;
   const int threads = 256;
   const int blocks = (total_channels + threads - 1) / threads;
-  cudaMemset(grad_A, 0, static_cast<size_t>(D) * sizeof(float));
+  cudaMemsetAsync(grad_A, 0, static_cast<size_t>(D) * sizeof(float));
   mamba_simple_scan_backward_kernel<<<blocks, threads>>>(
       grad_y, y, dt, A, grad_x, grad_dt, grad_A, Batch, Seq, D);
-  cudaDeviceSynchronize();
 }
 
 void launch_mamba_single_token_update(const float *x, const float *dt,
                                       const float *A, float *state,
                                       float *y, int Batch, int D) {
+  // Streaming-inference critical path: callers in mamba2.cpp chain
+  // tensor ops on `y` and `state` immediately after this launch and
+  // historically relied on an implicit synchronization here.  The other
+  // launchers in this file are fire-and-forget by design (callers sync
+  // explicitly via `.cpu()` or cudaDeviceSynchronize), but the
+  // single-token streaming path is hot enough that exposing a race
+  // there would be a regression.  Keep sync inside the launcher.
   const int total_channels = Batch * D;
   const int threads = 256;
   const int blocks = (total_channels + threads - 1) / threads;
@@ -344,5 +356,172 @@ void launch_mamba_single_token_update(const float *x, const float *dt,
   cudaDeviceSynchronize();
 }
 
-} // namespace cuda
-} // namespace nsos
+// =====================================================================
+// Selective scan with B/C gating — matches the CPU implementation in
+// src/mamba2.cpp::Mamba2SSD::ssd_forward token-for-token.
+//
+// Parallelization: one CUDA thread per (batch, dim) channel processes
+// the full sequence sequentially (SSM recurrence is inherently serial
+// in time).  Across the (B*D) axis the channels are independent so we
+// scale linearly with grid width.
+//
+// Compared to the simple_scan kernel above, this variant honors the
+// selective B and C parameters (per-token, per-channel gating) which
+// the v9-class hybrid models use.  Without these gates the model
+// computes a different function — see ssd_forward CPU loop for the
+// authoritative recurrence.
+// =====================================================================
+
+__global__ void mamba_selective_scan_forward_kernel(
+    const float *__restrict__ x,
+    const float *__restrict__ dt,
+    const float *__restrict__ A,
+    const float *__restrict__ B_in,
+    const float *__restrict__ C_in,
+    float *__restrict__ y,
+    float *__restrict__ state_history,  // may be nullptr
+    int Batch, int Seq, int D) {
+  const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_channels = Batch * D;
+  if (channel >= total_channels) return;
+
+  const int b = channel / D;
+  const int d = channel % D;
+  const float a_value = fmaxf(A[d], 1e-3f);
+
+  float state = 0.0f;
+  for (int t = 0; t < Seq; ++t) {
+    const int idx = (b * Seq + t) * D + d;
+    const float dt_val = dt[idx];
+    const float decay = expf(-softplus_device(dt_val) * a_value);
+    state = state * decay + B_in[idx] * x[idx];
+    if (state_history != nullptr) {
+      state_history[idx] = state;
+    }
+    y[idx] = tanhf(state) * C_in[idx];
+  }
+}
+
+// Backward pass.  Mirrors the CPU loop in
+// src/mamba2.cpp::Mamba2SSD::ssd_backward exactly, including:
+//   * y_t  = tanh(h_t) * C_t   →   dC_t = grad_y_t * tanh(h_t)
+//   * dh_t = grad_y_t * C_t * (1 - tanh(h_t)^2) + dh_next
+//   * h_t  = h_{t-1} * decay + B_t * x_t
+//       dx_t  = dh_t * B_t
+//       dB_t  = dh_t * x_t
+//       dh_{t-1} (carried) = dh_t * decay
+//       dDecay = dh_t * h_{t-1}
+//       ddt_t  = dDecay * decay * (-A) * sigmoid(dt_t)
+//       dA    += dDecay * decay * (-softplus(dt_t))   (only when A>1e-3)
+//
+// Each thread handles one (batch, dim) channel and walks t from Seq-1
+// down to 0, accumulating dA locally and atomicAdd-ing once at the end
+// to minimize contention.
+__global__ void mamba_selective_scan_backward_kernel(
+    const float *__restrict__ grad_y,
+    const float *__restrict__ x,
+    const float *__restrict__ dt,
+    const float *__restrict__ A,
+    const float *__restrict__ B_in,
+    const float *__restrict__ C_in,
+    const float *__restrict__ state_history,
+    float *__restrict__ grad_x,
+    float *__restrict__ grad_dt,
+    float *__restrict__ grad_A,   // accumulated via atomicAdd
+    float *__restrict__ grad_B,
+    float *__restrict__ grad_C,
+    int Batch, int Seq, int D) {
+  const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total_channels = Batch * D;
+  if (channel >= total_channels) return;
+
+  const int b = channel / D;
+  const int d = channel % D;
+  const float raw_a = A[d];
+  const float a_value = fmaxf(raw_a, 1e-3f);
+
+  float grad_state_next = 0.0f;
+  float grad_a_local = 0.0f;
+
+  for (int t = Seq - 1; t >= 0; --t) {
+    const int idx = (b * Seq + t) * D + d;
+    const int prev_idx = (t == 0) ? idx : ((b * Seq + (t - 1)) * D + d);
+
+    const float state_t = state_history[idx];
+    const float prev_state = (t == 0) ? 0.0f : state_history[prev_idx];
+    const float c_value = C_in[idx];
+    const float dt_val = dt[idx];
+    const float dt_sp = softplus_device(dt_val);
+    const float decay = expf(-dt_sp * a_value);
+    const float candidate = tanhf(state_t);
+
+    // dC = grad_y * tanh(h)
+    grad_C[idx] = grad_y[idx] * candidate;
+
+    // dh = grad_y * C * (1 - tanh^2(h)) + dh_next
+    const float grad_candidate = grad_y[idx] * c_value;
+    const float grad_state =
+        grad_candidate * (1.0f - candidate * candidate) + grad_state_next;
+
+    // dx = dh * B  ;  dB = dh * x
+    grad_x[idx] = grad_state * B_in[idx];
+    grad_B[idx] = grad_state * x[idx];
+
+    // Carry through the recurrence
+    const float grad_decay = grad_state * prev_state;
+    grad_state_next = grad_state * decay;
+
+    // ddt = dDecay * decay * (-A) * sigmoid(dt)
+    const float decay_pre = grad_decay * decay;
+    // Numerically stable sigmoid (CPU path uses a branched form; expf is
+    // sufficient here because dt magnitudes are bounded by softplus scale).
+    const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_val));
+    grad_dt[idx] = decay_pre * (-a_value) * sigmoid_dt;
+
+    // dA += dDecay * decay * (-softplus(dt))   — only when A is not clamped
+    if (raw_a > 1e-3f) {
+      grad_a_local += decay_pre * (-dt_sp);
+    }
+  }
+
+  if (grad_a_local != 0.0f) {
+    atomicAdd(&grad_A[d], grad_a_local);
+  }
+}
+
+void launch_mamba_selective_scan_forward(
+    const float *x, const float *dt, const float *A, const float *B_in,
+    const float *C_in, float *y, float *state_history, int Batch, int Seq,
+    int D) {
+  const int total_channels = Batch * D;
+  if (total_channels <= 0 || Seq <= 0) {
+    return;
+  }
+  const int threads = 256;
+  const int blocks = (total_channels + threads - 1) / threads;
+  mamba_selective_scan_forward_kernel<<<blocks, threads>>>(
+      x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D);
+}
+
+void launch_mamba_selective_scan_backward(
+    const float *grad_y, const float *x, const float *dt, const float *A,
+    const float *B_in, const float *C_in, const float *state_history,
+    float *grad_x, float *grad_dt, float *grad_A, float *grad_B,
+    float *grad_C, int Batch, int Seq, int D) {
+  const int total_channels = Batch * D;
+  if (total_channels <= 0 || Seq <= 0) {
+    return;
+  }
+  // grad_A uses atomicAdd; zero before launch.  Async memset serializes
+  // implicitly with the kernel below on the default stream.
+  cudaMemsetAsync(grad_A, 0, static_cast<size_t>(D) * sizeof(float));
+
+  const int threads = 256;
+  const int blocks = (total_channels + threads - 1) / threads;
+  mamba_selective_scan_backward_kernel<<<blocks, threads>>>(
+      grad_y, x, dt, A, B_in, C_in, state_history, grad_x, grad_dt, grad_A,
+      grad_B, grad_C, Batch, Seq, D);
+}
+
+}  // namespace cuda
+}  // namespace nsos

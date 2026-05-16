@@ -48,7 +48,7 @@ void HolographicMemory::add_concept(std::string name, const Tensor &vec) {
                   (size_t)current_size * dim * sizeof(float));
     } else {
 #ifdef USE_CUDA
-      cudaMemcpy(new_matrix.data(), item_memory_matrix.data(),
+      cudaMemcpy(new_matrix.raw_data(), item_memory_matrix.raw_data(),
                  (size_t)current_size * dim * sizeof(float),
                  cudaMemcpyDeviceToDevice);
 #endif
@@ -64,8 +64,9 @@ void HolographicMemory::add_concept(std::string name, const Tensor &vec) {
                 stored_vec.data(), dim * sizeof(float));
   } else {
 #ifdef USE_CUDA
-    cudaMemcpy(item_memory_matrix.data() + (size_t)current_size * dim,
-               stored_vec.data(), dim * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(item_memory_matrix.raw_data() + (size_t)current_size * dim,
+               stored_vec.raw_data(), dim * sizeof(float),
+               cudaMemcpyDeviceToDevice);
 #endif
   }
 

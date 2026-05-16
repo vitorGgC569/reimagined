@@ -70,9 +70,42 @@ public:
     Tensor();
     Tensor(std::vector<int> s, Device dev = Device::CPU, float fill_value = 0.0f);
     
-    float* data() { return data_ptr.get(); }
-    const float* data() const { return data_ptr.get(); }
-    
+    // Raw pointer access.  When `eager_gpu_sync_enabled()` is true
+    // AND the tensor lives on GPU, an implicit cudaDeviceSynchronize
+    // runs first so the caller observes a consistent view of UM.
+    //
+    // This is the dynamic safety net for the Pascal+Windows UM bug:
+    // setting NSOS_EAGER_GPU_SYNC=1 turns ALL data() calls into a
+    // sync barrier on GPU, eliminating the entire class of "host
+    // access on UM with pending kernel" segfaults at the cost of one
+    // cudaDeviceSynchronize per access (typically dominated by
+    // pipeline serialization, not driver overhead).
+    //
+    // Default is OFF — kernel-launch hot paths that pass data() into
+    // launch_xxx_kernel() do not need a sync because kernels on the
+    // default stream serialize with each other.  Set the env var when
+    // running on Pascal+Windows, or call sync_host_access() at known
+    // CPU-access sites for a more targeted fix.
+    float* data();
+    const float* data() const;
+
+    // Returns the raw pointer without any implicit sync.  Use ONLY
+    // when passing into a CUDA kernel launch (which serializes with
+    // prior launches via the default stream and does not need host-
+    // side synchronization).
+    float* raw_data() { return data_ptr.get(); }
+    const float* raw_data() const { return data_ptr.get(); }
+
+    // Explicit synchronization barrier.  Equivalent to calling data()
+    // when eager sync is enabled.  Idempotent and cheap (~1µs) when
+    // the GPU has no pending work.
+    void sync_host_access() const;
+
+    // Process-wide toggle for eager GPU sync inside data().  Reads
+    // NSOS_EAGER_GPU_SYNC env var on first call.  Safe to call from
+    // any thread (uses an atomic flag).
+    static bool eager_gpu_sync_enabled();
+
     Tensor to(Device dev) const;
     Tensor cpu() const;
     Tensor clone() const;

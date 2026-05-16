@@ -520,5 +520,25 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def("save_model_pack", &InferenceEngine::save_model_pack, py::arg("directory"))
         .def("get_memory_usage", &InferenceEngine::get_memory_usage)
         .def("last_generation_metrics",
-             [](const InferenceEngine& engine) { return engine.last_generation_metrics(); });
+             [](const InferenceEngine& engine) { return engine.last_generation_metrics(); })
+        // Pacote A.3: route BitLinear forward through the GPU __dp4a
+        // packed path on every linear layer in the model.  Idempotent.
+        // Returns true if the underlying model was available.
+        .def("set_gpu_packed_inference",
+             [](InferenceEngine& engine, bool enabled) {
+                 if (!engine.model) return false;
+                 engine.model->set_gpu_packed_inference(enabled);
+                 return true;
+             },
+             py::arg("enabled"))
+        // Pacote A.1: at decode time, route MoE through top-k=k instead
+        // of the trained top-k.  Pass 0 to clear and restore the
+        // trained top-k.  Returns true if a model is loaded.
+        .def("set_moe_inference_top_k",
+             [](InferenceEngine& engine, int k) {
+                 if (!engine.model) return false;
+                 engine.model->set_moe_inference_top_k(k);
+                 return true;
+             },
+             py::arg("k"));
 }

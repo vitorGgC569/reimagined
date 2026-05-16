@@ -37,15 +37,26 @@
     "paths": [
       ".github/workflows/industrial-ci.yml",
       "Dockerfile",
+      "Dockerfile.industrial",
       "PROJECT_BOUNDARY.json",
       "PROJECT_SCOPE_STATUS.md",
       "README.md",
       "docs/PROJECT_BOUNDARY.md",
+      "OXN/nsos/docs/PRODUCT.md",
+      "OXN/nsos/docs/INCUBATION.md",
+      "OXN/nsos/docs/DEPLOY.md",
       "requirements-dev.txt",
       "scripts/check_project_boundary.py",
       "OXN/scripts/gatekeeper.py",
       "OXN/scripts/verify_determinism.py",
       "OXN/tests/test_industrial_features.py"
+    ]
+  },
+  "frozen_legacy": {
+    "status": "frozen_legacy",
+    "summary": "Append-only archive of historical scripts, docs, and superseded source. Not built, not tested, not on any execution path.",
+    "paths": [
+      "legacy"
     ]
   },
   "incubation_roots": [

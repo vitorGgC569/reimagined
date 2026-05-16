@@ -63,6 +63,7 @@ set(NSOS_CORE_SOURCES
     src/self_healer.cpp
     src/numerical_guard.cpp
     src/turboquant_fallback.cpp
+    src/bitnet_gpu_dispatch.cpp
  )
 
 if (MSVC)
@@ -171,8 +172,13 @@ if (NSOS_ENABLE_CUDA)
             src/cuda/kernels.cu
             src/cuda/persistent_kernel.cu
             src/cuda/mamba_kernels.cu
+            src/cuda/moe_kernels.cu
+            src/cuda/bitnet_kernels.cu
         )
-        target_link_libraries(nsos_core PRIVATE CUDA::cudart CUDA::cublas)
+        # PUBLIC because tensor.h includes <cuda_runtime.h> when USE_CUDA
+        # is defined; tests/CLI/API targets that link nsos_core need to
+        # inherit the CUDA include directory to compile that header.
+        target_link_libraries(nsos_core PUBLIC CUDA::cudart CUDA::cublas)
         message(STATUS "Using CUDA toolkit: ${CUDAToolkit_BIN_DIR}")
         message(STATUS "Using CUDA toolkit version: ${CUDAToolkit_VERSION}")
         message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
@@ -314,6 +320,67 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gpu_parity PRIVATE nsos_core)
     add_test(NAME test_gpu_parity COMMAND test_gpu_parity)
 
+    # Decomposed GPU parity sub-tests.  Each binary covers one kernel /
+    # surface so that a CUDA segfault in one (historically the streaming
+    # mamba scan on CUDA 12.9) does not mask passing kernels in the rest
+    # of the parity gate.  Header-only helpers in tests/gpu/.
+    add_executable(test_gpu_parity_basic tests/gpu/test_gpu_parity_basic.cpp)
+    target_link_libraries(test_gpu_parity_basic PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_basic PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_basic COMMAND test_gpu_parity_basic)
+
+    add_executable(test_gpu_parity_bitlinear tests/gpu/test_gpu_parity_bitlinear.cpp)
+    target_link_libraries(test_gpu_parity_bitlinear PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_bitlinear PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_bitlinear COMMAND test_gpu_parity_bitlinear)
+
+    add_executable(test_gpu_parity_mamba_stream tests/gpu/test_gpu_parity_mamba_stream.cpp)
+    target_link_libraries(test_gpu_parity_mamba_stream PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_mamba_stream PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_mamba_stream COMMAND test_gpu_parity_mamba_stream)
+
+    add_executable(test_gpu_parity_mamba_scan tests/gpu/test_gpu_parity_mamba_scan.cpp)
+    target_link_libraries(test_gpu_parity_mamba_scan PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_mamba_scan PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_mamba_scan COMMAND test_gpu_parity_mamba_scan)
+
+    add_executable(test_gpu_parity_jamba tests/gpu/test_gpu_parity_jamba.cpp)
+    target_link_libraries(test_gpu_parity_jamba PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_jamba PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_jamba COMMAND test_gpu_parity_jamba)
+
+    # MoE router top-k mask + load accumulation parity (Phase 4 GPU plan).
+    add_executable(test_gpu_parity_moe_router tests/gpu/test_gpu_parity_moe_router.cpp)
+    target_link_libraries(test_gpu_parity_moe_router PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_moe_router PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_moe_router COMMAND test_gpu_parity_moe_router)
+
+    # MoE batched forward (Phase 4-extended): full JambaModel with MoE
+    # blocks, parity through forward_ids_batch.
+    add_executable(test_gpu_parity_moe_batched tests/gpu/test_gpu_parity_moe_batched.cpp)
+    target_link_libraries(test_gpu_parity_moe_batched PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_moe_batched PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_moe_batched COMMAND test_gpu_parity_moe_batched)
+
+    # BitNet 1.58-bit __dp4a GPU dispatch vs CPU int8 GEMM (Phase 5a).
+    add_executable(test_gpu_parity_bitnet_dispatch tests/gpu/test_gpu_parity_bitnet_dispatch.cpp)
+    target_link_libraries(test_gpu_parity_bitnet_dispatch PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_bitnet_dispatch PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_bitnet_dispatch COMMAND test_gpu_parity_bitnet_dispatch)
+
+    # BitLinear::forward GPU __dp4a inference fast path (Phase 5b).
+    add_executable(test_gpu_parity_bitlinear_dp4a tests/gpu/test_gpu_parity_bitlinear_dp4a.cpp)
+    target_link_libraries(test_gpu_parity_bitlinear_dp4a PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_bitlinear_dp4a PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_bitlinear_dp4a COMMAND test_gpu_parity_bitlinear_dp4a)
+
+    # SmartLoader async semantics (real future-based wait, drain barrier,
+    # concurrent producers, missing-file error path).  CPU-only, runs on
+    # every build.
+    add_executable(test_smart_loader_async tests/test_smart_loader_async.cpp)
+    target_link_libraries(test_smart_loader_async PRIVATE nsos_core)
+    add_test(NAME test_smart_loader_async COMMAND test_smart_loader_async)
+
     add_executable(test_http_api tests/test_http_api.cpp)
     target_link_libraries(test_http_api PRIVATE nsos_core)
     if (WIN32)
@@ -345,8 +412,18 @@ if (NSOS_BUILD_TESTS)
     target_include_directories(train_e2e PRIVATE include include/nsos)
     add_test(NAME train_e2e COMMAND train_e2e)
 
+    # GPU vs CPU microbenchmark (Phase 3/4/5 surfaces).  Build target,
+    # not registered as a CTest entry — runs ad-hoc with --report.
+    add_executable(bench_gpu_vs_cpu tests/bench_gpu_vs_cpu.cpp)
+    target_link_libraries(bench_gpu_vs_cpu PRIVATE nsos_core)
+    target_include_directories(bench_gpu_vs_cpu PRIVATE include include/nsos)
+
     if (CMAKE_CUDA_COMPILER)
-        set_tests_properties(
+        # Build the list of tests to annotate dynamically — some targets
+        # (test_oxtamem_ffi) are only created when their dependencies
+        # are satisfied.  Listing them unconditionally would break
+        # configuration when those dependencies are disabled.
+        set(_NSOS_CUDA_SYNC_TESTS
             test_sanity
             test_bitlinear
             test_bitnet_integrated
@@ -357,17 +434,32 @@ if (NSOS_BUILD_TESTS)
             test_tokenizer
             test_mcts_reasoning_v3
             test_memory_causal_store
-            test_oxtamem_ffi
             test_jamba
             test_model_pack
             test_layer_audit
             test_gpu_parity
+            test_gpu_parity_basic
+            test_gpu_parity_bitlinear
+            test_gpu_parity_mamba_stream
+            test_gpu_parity_mamba_scan
+            test_gpu_parity_jamba
+            test_gpu_parity_moe_router
+            test_gpu_parity_moe_batched
+            test_gpu_parity_bitnet_dispatch
+            test_gpu_parity_bitlinear_dp4a
+            test_smart_loader_async
             test_http_api
             test_circuit_api_pipeline
             test_holographic_full
             test_ultra_integration
             test_swarm_orchestration
             train_e2e
+        )
+        if (TARGET test_oxtamem_ffi)
+            list(APPEND _NSOS_CUDA_SYNC_TESTS test_oxtamem_ffi)
+        endif()
+        set_tests_properties(
+            ${_NSOS_CUDA_SYNC_TESTS}
             PROPERTIES ENVIRONMENT "NSOS_CUDA_SYNC=1")
     endif()
 endif()

@@ -57,6 +57,19 @@ public:
   void set_reference_path(bool use) { use_reference_path = use; }
   bool reference_path_enabled() const { return use_reference_path; }
 
+  // Opts the GPU forward path into the __dp4a-accelerated 1.58-bit
+  // dispatch (see src/bitnet_gpu_dispatch.cpp).  This is INFERENCE-ONLY:
+  // backward and gradient computation continue to use the float matmul
+  // path so training behavior is unchanged.  Default is OFF — callers
+  // such as the inference engine flip it on after weight pack is
+  // finalized.  No-op when CUDA is disabled.
+  void set_gpu_packed_inference(bool enabled) {
+    gpu_packed_inference_enabled_ = enabled;
+  }
+  bool gpu_packed_inference_enabled() const {
+    return gpu_packed_inference_enabled_;
+  }
+
   Tensor forward(const Tensor &input);
   Tensor backward(const Tensor &grad_output);
   void to(Device dev);
@@ -124,6 +137,17 @@ private:
   bool packed_weight_valid = false;
   Tensor cached_gpu_weight_;
   uint64_t cached_gpu_weight_version = 0;
+
+  // GPU-resident packed weight buffer for the __dp4a inference fast
+  // path (Phase 5b).  Lazy-allocated and refreshed when
+  // packed_weight_version changes.  The Tensor is allocated as a flat
+  // float buffer whose underlying bytes are reinterpret_cast as
+  // uint32_t* by bitnet_gemm_158bit_gpu — float is used because
+  // Tensor only knows the float type today (changing that is a much
+  // larger refactor not in scope here).
+  Tensor cached_gpu_packed_weights_;
+  uint64_t cached_gpu_packed_version_ = 0;
+  bool gpu_packed_inference_enabled_ = false;
 };
 
 } // namespace nsos

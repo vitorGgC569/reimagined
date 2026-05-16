@@ -64,6 +64,109 @@ void launch_check_stability_kernel(int *d_found_issue, const float *in,
 void launch_moe_topk_kernel(const float *logits, float *weights, float *indices,
                             int batch, int num_experts, int k);
 
+// =====================================================================
+// Generic top-k mask + renormalization for MoE routing.
+//
+// In-place transformation of `weights[batch * num_experts]`:
+//   * For each row, find the top-`k` values.
+//   * Set every non-top-k entry to 0.
+//   * Renormalize the surviving values so they sum to 1 (within the row).
+//
+// Matches the CPU implementation in jamba.cpp::MoERouter::forward.  k must
+// satisfy 1 <= k <= num_experts.  num_experts is bounded by
+// MOE_TOPK_MASK_MAX_EXPERTS (compile-time constant in mamba_kernels.cu /
+// moe_kernels.cu — currently 64).  Single launch, no internal sync.
+// =====================================================================
+void launch_moe_topk_mask_kernel(float *weights, int batch, int num_experts,
+                                 int k);
+
+// Accumulates per-expert load (sum of router weights across the batch)
+// directly on the device.  `expert_loads[num_experts]` must be
+// pre-zeroed by the caller (cudaMemsetAsync recommended) — kernel uses
+// atomicAdd for thread-safe accumulation.  No internal sync.
+void launch_moe_load_accumulate_kernel(const float *weights,
+                                       float *expert_loads, int batch,
+                                       int num_experts);
+
+// =====================================================================
+// Batched MoE dispatch primitives (Phase 4-extended).
+//
+// These kernels implement the GPU-resident permute-gather-execute-
+// scatter pipeline that replaces the per-expert std::memcpy loops in
+// JambaBlock::forward_moe.  Recipe:
+//   1. count[e]   = number of (row, expert) pairs with mask != 0
+//   2. offset[e]  = exclusive_scan(count)
+//   3. permutation[k] = source row index, packed by expert
+//      assignment[k]  = expert id for slot k
+//      scale[k]       = router weight for slot k
+//   4. permuted_input[k, :] = x[permutation[k], :]   (contiguous by expert)
+//   5. expert e processes permuted_input[offset[e] : offset[e]+count[e], :]
+//   6. y[row, :] += scale[k] * permuted_output[k, :]   for every active k
+//
+// All kernels require pre-allocated, properly-sized output buffers and
+// do NOT call cudaDeviceSynchronize internally.  Callers serialize via
+// the default stream or explicit sync.
+// =====================================================================
+
+// Counts the number of nonzero weights per expert column.  counts[E]
+// must be zeroed before launch (uses atomicAdd).  weights layout is
+// [batch, num_experts] post-mask (zeros for non-top-k entries).
+void launch_moe_count_per_expert_kernel(const float *weights, int *counts,
+                                         int batch, int num_experts);
+
+// Exclusive scan over a small array (num_experts ≤ 1024).  Single block,
+// shared-memory Hillis-Steele scan.  offsets[num_experts+1] is filled
+// such that offsets[0]=0 and offsets[num_experts] = total active slots.
+void launch_moe_exclusive_scan_small_kernel(const int *counts, int *offsets,
+                                             int num_experts);
+
+// Computes the permutation, expert assignments and scales given the
+// post-mask weights and per-expert offsets.  permutation[N_active],
+// assignment[N_active], scale[N_active] are output.  N_active equals
+// offsets[num_experts] from the previous step.  Internally uses
+// atomicAdd against a small workspace counters[num_experts] (the
+// caller passes a zeroed buffer of size num_experts).
+void launch_moe_compute_assignments_kernel(const float *weights,
+                                            const int *offsets,
+                                            int *workspace_counters,
+                                            int *permutation,
+                                            int *assignment, float *scale,
+                                            int batch, int num_experts);
+
+// Gathers rows from input[batch, dim] into permuted[N_active, dim] in
+// the order defined by permutation[N_active].
+void launch_moe_gather_rows_kernel(const float *input, const int *permutation,
+                                    float *permuted, int N_active, int dim);
+
+// Scatter-add the per-slot scaled output back into y[batch, dim].
+// y MUST be pre-zeroed by the caller (cudaMemsetAsync recommended); the
+// kernel uses atomicAdd to accumulate over slots that share a row.
+void launch_moe_scatter_add_weighted_kernel(const float *permuted_output,
+                                             const int *permutation,
+                                             const float *scale, float *y,
+                                             int N_active, int dim);
+
+// =====================================================================
+// BitNet 1.58-bit GPU dispatch primitives (Phase 5a of the GPU plan).
+//
+// Per-row activation quantization mirroring
+// BitLinear::quantize_activations_bitnet on CPU:
+//   * x  : float [M, K]    (input activations, device)
+//   * x_q: int8  [M, K]    (output, device, must be allocated)
+//   * act_scales: float [M] (output, device, must be allocated)
+//   * precision_bits selects q_max (2 → ternary, 8 → INT8, etc.)
+// No internal sync.  See src/cuda/bitnet_kernels.cu for details.
+// =====================================================================
+void launch_quantize_activations_bitnet_kernel(const float *x, int8_t *x_q,
+                                               float *act_scales, int M, int K,
+                                               int precision_bits);
+
+// In-place per-row scaling: y[row, col] *= act_scales[row].
+// Used to fold per-row activation scale into the output of
+// `launch_bitnet_gemm` (which only carries the global weight_scale).
+void launch_bitnet_apply_act_scales_kernel(float *y, const float *act_scales,
+                                           int M, int N);
+
 // HPC Fused Cross-Entropy: softmax + log + NLL in single kernel
 void launch_fused_cross_entropy(float *d_loss, float *grad, const float *logits,
                                 const int *target, int batch, int vocab);

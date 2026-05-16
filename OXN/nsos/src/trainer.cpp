@@ -50,7 +50,7 @@ void scale_tensor_inplace(Tensor& tensor, float scale) {
         return;
     }
     if (tensor.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
-        launch_scale_inplace_kernel(tensor.data(), scale, tensor.size);
+        launch_scale_inplace_kernel(tensor.raw_data(), scale, tensor.size);
         trainer_check_cuda("launch_scale_inplace_kernel");
         return;
     }
@@ -65,7 +65,8 @@ void zero_tensor_inplace(Tensor& tensor) {
         return;
     }
     if (tensor.get_device() == Device::GPU) {
-        cudaMemset(tensor.data(), 0, static_cast<size_t>(tensor.size) * sizeof(float));
+        cudaMemset(tensor.raw_data(), 0,
+                   static_cast<size_t>(tensor.size) * sizeof(float));
         trainer_check_cuda("cudaMemset");
         return;
     }
@@ -774,10 +775,10 @@ void apply_optimizer_step(Trainer& trainer,
 #ifdef USE_CUDA
         if (can_use_gpu_optimizer(*p, m_tensor, v_tensor)) {
             launch_adamw_update_kernel(
-                p->data.data(),
-                p->grad.data(),
-                m_tensor.data(),
-                v_tensor.data(),
+                p->data.raw_data(),
+                p->grad.raw_data(),
+                m_tensor.raw_data(),
+                v_tensor.raw_data(),
                 p->data.size,
                 trainer.beta1,
                 trainer.beta2,
@@ -837,6 +838,10 @@ void apply_supervised_gradient_weights(const Trainer& trainer,
     if (answer_tokens.empty() || vocab <= 0 || answer_grad.size == 0) {
         return;
     }
+
+    // Drain pending GPU work before host write — Pascal+Windows UM has
+    // no demand paging.  No-op when answer_grad is host-resident.
+    answer_grad.sync_host_access();
 
     float* grad_ptr = answer_grad.data();
     const int last_row = static_cast<int>(answer_tokens.size()) - 1;
@@ -939,6 +944,10 @@ void apply_supervised_gradient_weights_batch(const Trainer& trainer,
 
     const int batch_size = answer_grad.shape[0];
     const int seq_len = answer_grad.shape[1];
+
+    // Same Pascal+Windows UM hazard as the non-batched variant above.
+    answer_grad.sync_host_access();
+
     float* grad_ptr = answer_grad.data();
     for (int batch = 0; batch < batch_size; ++batch) {
         const auto& answer_tokens = answer_batch[static_cast<size_t>(batch)];
@@ -1325,21 +1334,65 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
             const int samples = static_cast<int>(batch_inputs.size());
             if (samples == 0) continue;
 
-            model->reset_session();
-            Context ctx;
-            Tensor logits = model->forward_ids_batch(batch_inputs, &ctx);
-            auto [loss, grad] = logits.cross_entropy(flat_targets);
-            model->backward_external(grad, ctx);
+            // Chunked forward + cross_entropy + backward.
+            //
+            // The original implementation issued ONE forward over the
+            // full batch and ONE cross_entropy launch of size
+            // (batch_size × seq_len × vocab) — for a typical phase-3
+            // shape this is 10M+ entries in a single sustained kernel.
+            // On underprovisioned hosts (e.g. GTX 1050 Ti on a marginal
+            // PSU) this monolithic launch keeps the GPU at peak draw
+            // long enough to trip the supply, causing host shutdowns
+            // exactly at the start of phase3 (Wikipedia).
+            //
+            // Splitting into micro-chunks of `kCrossEntropyChunkSize`
+            // samples gives the host brief recovery windows between
+            // launches without changing the math: gradients accumulate
+            // through Parameter::add_grad (which does grad += new_grad),
+            // and we fire the optimizer step exactly once at the end
+            // with `samples` as the accumulation_steps divisor — same
+            // as before.  Loss is reported as the per-sample mean.
+            constexpr int kCrossEntropyChunkSize = 2;
+
+            float aggregate_loss = 0.0f;
+            int aggregate_samples = 0;
+            for (int chunk_start = 0; chunk_start < samples;
+                 chunk_start += kCrossEntropyChunkSize) {
+                const int chunk_end =
+                    std::min(chunk_start + kCrossEntropyChunkSize, samples);
+                const int chunk_samples = chunk_end - chunk_start;
+
+                std::vector<std::vector<int>> chunk_inputs(
+                    batch_inputs.begin() + chunk_start,
+                    batch_inputs.begin() + chunk_end);
+                std::vector<int> chunk_targets(
+                    flat_targets.begin() +
+                        static_cast<size_t>(chunk_start * seq_len),
+                    flat_targets.begin() +
+                        static_cast<size_t>(chunk_end * seq_len));
+
+                model->reset_session();
+                Context ctx;
+                Tensor logits = model->forward_ids_batch(chunk_inputs, &ctx);
+                auto [loss, grad] = logits.cross_entropy(chunk_targets);
+                model->backward_external(grad, ctx);
+
+                aggregate_loss += loss * static_cast<float>(chunk_samples);
+                aggregate_samples += chunk_samples;
+            }
+
+            const float mean_loss =
+                aggregate_loss / static_cast<float>(std::max(aggregate_samples, 1));
 
             apply_qat_regularization(*this);
             apply_moe_aux_regularization(*this);
             float grad_norm = 0.0f;
             apply_optimizer_step(*this, params, samples, &grad_norm);
-            record_training_audit_step(*this, loss, grad_norm, params.size());
+            record_training_audit_step(*this, mean_loss, grad_norm, params.size());
 
             ++internal_global_step;
             if (callback) {
-                callback(internal_global_step, loss);
+                callback(internal_global_step, mean_loss);
             }
 
             if (max_steps > 0 && internal_global_step >= max_steps) return;

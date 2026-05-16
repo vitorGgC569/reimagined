@@ -99,3 +99,23 @@ tests/test_pure_mamba
 OXN/nsos/build_log*.txt
 OXN/nsos/train_*.txt
 OXN/nsos/src/*.bak
+
+# Claude Code agent state — never commit
+.claude/
+
+# Training run outputs (checkpoints live in Drive on Colab side, not in git)
+OXN/nsos/scripts/live_distill_*/
+OXN/nsos/scripts/live_*/
+OXN/nsos/scripts/*_train.log
+OXN/nsos/scripts/*_train.err
+
+# Distillation bundles (regenerated; too big for git)
+OXN/nsos/scripts/distillation_bundle_*/
+
+# Benchmark output JSON (regenerated per-run)
+OXN/nsos/scripts/bench_report.json
+OXN/nsos/artifacts/bench_*.json
+
+# Test results
+OXN/nsos/scripts/test_v10_results.log
+OXN/nsos/cpp_cuda_log.txt

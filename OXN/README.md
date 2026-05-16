@@ -12,7 +12,7 @@
 | Distributed/MPI | Experimental | Do not present as production multi-node support. |
 | TTT flows | Research | Available only where explicitly wired and tested. |
 | Lean/self-healing claims | Research | Current code is not production formal verification. |
-| Old servers/scripts | Legacy | Root `serve_oxn.py` is disabled. Use `OXN/nsos` entrypoints. |
+| Old servers/scripts | Removed | Root `serve_oxn.py` and the legacy root `train_*.py` mocks were removed in the MVP cleanup. Hybrid prototypes (`train_oxn_real.py`, `train_oxn_full.py`, `train_oxn_complete.py`, `train_oxn_wikitext.py`) live under `legacy/scripts/` for historical reference. Use `OXN/nsos` entrypoints. |
 
 ## Supported Entry Points
 

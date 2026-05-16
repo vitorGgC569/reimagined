@@ -161,6 +161,13 @@ public:
   void set_training_mode(bool enabled);
   void set_batch_valid_lengths(const std::vector<int>& lengths);
   void set_audit_collector(LayerAuditCollector* collector) { audit_collector_ = collector; }
+  // Pacote A.1: when > 0 AND training_mode_ is false, forward_moe uses
+  // this top-k instead of router->top_k.  Lets us train with top-2 and
+  // decode with top-1 (cuts expert FLOPs ~50% per token).  No effect
+  // during training or when the override is 0.  Per-block setting; the
+  // JambaModel-level set_moe_inference_top_k iterates and sets each.
+  void set_inference_top_k_override(int k) { inference_top_k_override_ = k; }
+  int inference_top_k_override() const { return inference_top_k_override_; }
   std::string audit_block_type() const;
   JambaBlockSessionSnapshot snapshot_session_state() const;
   std::vector<JambaBlockSessionSnapshot> snapshot_session_state_batch() const;
@@ -173,10 +180,25 @@ public:
 private:
   Tensor forward_moe(const Tensor &x, Context *ctx, const std::string &ln);
   Tensor backward_moe(const Tensor &dy, Context *ctx, const std::string &ln, const Tensor &x);
+  // Phase 4-extended: GPU-resident batched MoE forward.  Uses count +
+  // exclusive-scan + gather + per-expert forward + scatter-add kernels
+  // to replace the per-expert std::memcpy loops in forward_moe.
+  // Caller must verify GPU eligibility (target_device, gpu_custom_kernels)
+  // before invoking — this function does no fallback.
+  Tensor forward_moe_gpu_batched(const Tensor &x, const Tensor &weights,
+                                  int rows, int dim, int effective_top_k);
+
+  // GPU-resident batched MoE backward, paired with the forward above.
+  // Recomputes the permutation/gather pipeline from saved_moe_weights_
+  // (which the forward syncs to host) and dispatches per-expert
+  // backward calls on contiguous slices.  Returns the input gradient
+  // [rows, dim] in the same device as dy.
+  Tensor backward_moe_gpu_batched(const Tensor &dy, const Tensor &x);
   bool is_attention, is_moe, is_ttt;
   int layer_idx, total_layers, d_model, num_experts;
   float dropout_rate_;
   bool training_mode_ = true;
+  int inference_top_k_override_ = 0;  // Pacote A.1; 0 = no override
   int last_batch_size_ = 0;
   Tensor saved_input_;
   Tensor saved_core_norm_;
@@ -226,6 +248,17 @@ public:
   void backward(const Tensor &grad, Context &ctx);
   std::vector<BitLinear*> collect_bitlinear_layers();
   void set_reference_path(bool use_reference_path);
+  // Phase 5b deeper: enable/disable the GPU __dp4a packed-inference
+  // fast path on every BitLinear in the model in one call.  Safe to
+  // toggle at runtime.  Caller is responsible for ensuring weights
+  // have already been packed (via repack_weights / load_edge_linear_pack)
+  // when enabling — the BitLinear forward path falls back to float
+  // matmul if packed weights are not yet materialized.
+  void set_gpu_packed_inference(bool enabled);
+  // Pacote A.1: when k >= 1, every MoE block uses this top-k during
+  // inference (training_mode_=false).  Pass 0 to clear and fall back to
+  // router->top_k.  Typical use: train with top-2, decode with top-1.
+  void set_moe_inference_top_k(int k);
   void release_full_precision_linear_weights();
   void save_edge_linear_pack(const std::string& path);
   void load_edge_linear_pack(const std::string& path, bool release_full_precision = true);

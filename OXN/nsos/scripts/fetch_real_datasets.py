@@ -114,6 +114,80 @@ DATASET_SPECS = {
         "page_length": 100,
         "pages": 6,
     },
+    # ── v11 expansion (added 2026-05-16) ────────────────────────────────
+    # These six datasets close the gap from "3,840 samples / ~1M tokens"
+    # to "~800M tokens" that Chinchilla-optimal scaling wants for our
+    # 40M-param model.  See OXN/nsos/docs/v11_dataset_plan.md for the
+    # full rationale; in brief:
+    #   * cosmopedia_v2  — synthetic educational text DESIGNED for small
+    #                       LMs.  TinyTextbook + Stanford + WikiHow mix.
+    #                       The single most important addition: at our
+    #                       parameter count, Cosmopedia is THE dataset
+    #                       that makes the model coherent.
+    #   * tinystories   — simple narratives.  Eldridge & Li (2023) show
+    #                       10-30M models become fluent on TinyStories
+    #                       alone — proves our arch can learn fluency.
+    #   * smoltalk      — modern synthetic instructions (HuggingFaceTB).
+    #                       Replaces older Alpaca-style with better
+    #                       quality and matched to small-model context.
+    #   * the_stack_smol — code subset.  v4 bundle had ZERO code; this
+    #                       fixes that for `explain_code` tasks.
+    #   * c4_sample     — cleaned web text; complements Wikipedia's
+    #                       formal-encyclopedic register.
+    #   * squad_v2      — extractive QA; complements CoQA's multi-turn
+    #                       with short factual answers.
+    #
+    # target_rows here are PER-FETCH; the user can override with
+    # --scale-factor at the CLI to multiply all of them uniformly.
+    "cosmopedia_v2": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "auto_math_text",  # subset; full has multiple configs
+        "split": "train",
+        "target_rows": 8000,
+        "page_length": 100,
+        "pages": 80,
+    },
+    "tinystories": {
+        "dataset": "roneneldan/TinyStories",
+        "config": "default",
+        "split": "train",
+        "target_rows": 5000,
+        "page_length": 100,
+        "pages": 50,
+    },
+    "smoltalk": {
+        "dataset": "HuggingFaceTB/smoltalk",
+        "config": "all",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
+    },
+    "the_stack_smol": {
+        "dataset": "bigcode/the-stack-smol",
+        "config": "data/python",  # python only for our scale; other langs
+                                  # would dilute the small budget
+        "split": "train",
+        "target_rows": 3000,
+        "page_length": 100,
+        "pages": 30,
+    },
+    "c4_sample": {
+        "dataset": "allenai/c4",
+        "config": "en",
+        "split": "train",
+        "target_rows": 2000,
+        "page_length": 100,
+        "pages": 20,
+    },
+    "squad_v2": {
+        "dataset": "rajpurkar/squad_v2",
+        "config": "squad_v2",
+        "split": "train",
+        "target_rows": 2000,
+        "page_length": 100,
+        "pages": 20,
+    },
 }
 
 
@@ -450,6 +524,137 @@ def filter_opus(row: Dict) -> Dict | None:
     }
 
 
+def filter_cosmopedia(row: Dict) -> Dict | None:
+    """HuggingFaceTB/cosmopedia (auto_math_text subset) rows have
+    `prompt`, `text`, `seed_data` keys.  `text` is the generated content
+    that we want as document-style training material.
+    """
+    text = normalize_whitespace(row.get("text", ""))
+    if len(text) < 400:
+        return None
+    title = normalize_whitespace(row.get("prompt", "")) or "Cosmopedia passage"
+    if len(title) > 200:
+        title = title[:200].rsplit(" ", 1)[0] + "..."
+    return {
+        "source": "HuggingFaceTB/cosmopedia:auto_math_text",
+        "title": title,
+        "text": text,
+        "seed_data": row.get("seed_data", ""),
+    }
+
+
+def filter_tinystories(row: Dict) -> Dict | None:
+    """roneneldan/TinyStories: just a `text` field with a short story.
+    Filter out the very short and very repetitive ones.
+    """
+    text = normalize_whitespace(row.get("text", ""))
+    if len(text) < 200 or len(text) > 4000:
+        return None
+    words = text.split()
+    if len(set(words)) / max(len(words), 1) < 0.35:
+        return None  # too repetitive (likely a generation artifact)
+    return {
+        "source": "roneneldan/TinyStories:default",
+        "title": "TinyStory",
+        "text": text,
+    }
+
+
+def filter_smoltalk(row: Dict) -> Dict | None:
+    """HuggingFaceTB/smoltalk: rows have a `messages` list of
+    {role, content} dicts.  We flatten to a single instruction+response
+    pair (first user turn + first assistant turn).
+    """
+    messages = row.get("messages", []) or []
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+    user_msg = next((m for m in messages if m.get("role") == "user"), None)
+    asst_msg = next((m for m in messages if m.get("role") == "assistant"), None)
+    if not user_msg or not asst_msg:
+        return None
+    prompt = normalize_whitespace(user_msg.get("content", ""))
+    answer = normalize_whitespace(asst_msg.get("content", ""))
+    if len(prompt) < 8 or len(answer) < 8:
+        return None
+    if len(answer) > 800:
+        # truncate at sentence boundary
+        cut = answer.rfind(". ", 0, 800)
+        answer = answer[:cut + 1] if cut > 200 else answer[:800]
+    return {
+        "source": "HuggingFaceTB/smoltalk:all",
+        "prompt": prompt,
+        "answer": answer,
+        "source_id": row.get("source", ""),
+    }
+
+
+def filter_the_stack_smol(row: Dict) -> Dict | None:
+    """bigcode/the-stack-smol (Python subset).  Rows have `content`,
+    `lang`, `path`.  We keep short-to-medium Python files only; full
+    repos are too big for our context window.
+    """
+    content = row.get("content", "") or ""
+    if not isinstance(content, str):
+        return None
+    if len(content) < 80 or len(content) > 4000:
+        return None
+    lang = (row.get("lang", "") or "").lower()
+    if lang and lang != "python":
+        return None
+    # Skip generated / vendored
+    path = row.get("path", "") or ""
+    skip_markers = ("vendor/", "third_party/", "_generated", "test/fixtures/",
+                    "/__pycache__/", ".min.")
+    if any(m in path for m in skip_markers):
+        return None
+    return {
+        "source": "bigcode/the-stack-smol:python",
+        "path": path,
+        "content": content,
+    }
+
+
+def filter_c4(row: Dict) -> Dict | None:
+    """allenai/c4 (en) rows have `text`, `url`, `timestamp`.  Clean
+    web text — we filter for medium-length passages that aren't full
+    pages of HTML cruft."""
+    text = normalize_whitespace(row.get("text", ""))
+    if len(text) < 500 or len(text) > 6000:
+        return None
+    # C4 still has some boilerplate; reject if too many repeated short lines
+    if text.count("\n") > 50:
+        return None
+    return {
+        "source": "allenai/c4:en",
+        "url": row.get("url", ""),
+        "text": text,
+    }
+
+
+def filter_squad_v2(row: Dict) -> Dict | None:
+    """rajpurkar/squad_v2 rows have `question`, `context`, `answers`
+    (where `answers.text` is a list).  We keep only answerable questions
+    (squad_v2 contains many unanswerable ones for negative training).
+    """
+    question = normalize_whitespace(row.get("question", ""))
+    context = normalize_whitespace(row.get("context", ""))
+    answers = row.get("answers", {}) or {}
+    answer_texts = answers.get("text", []) or []
+    if not answer_texts:
+        return None  # unanswerable — skip for instruction fine-tuning
+    answer = normalize_whitespace(answer_texts[0])
+    if len(question) < 8 or len(context) < 50 or not answer:
+        return None
+    if len(context) > 2000:
+        return None  # too long for our seq_len=512
+    return {
+        "source": "rajpurkar/squad_v2:squad_v2",
+        "question": question,
+        "context": context,
+        "answer": answer,
+    }
+
+
 FILTERS: Dict[str, Callable[[Dict], Dict | None]] = {
     "orca_math_word_problems": filter_orca_math,
     "deepmind_math_large": filter_deepmind_math,
@@ -462,6 +667,13 @@ FILTERS: Dict[str, Callable[[Dict], Dict | None]] = {
     "xlsum_en": lambda row: filter_xlsum(row, "english"),
     "xlsum_pt": lambda row: filter_xlsum(row, "portuguese"),
     "opus_books_en_pt": filter_opus,
+    # v11 expansion
+    "cosmopedia_v2": filter_cosmopedia,
+    "tinystories": filter_tinystories,
+    "smoltalk": filter_smoltalk,
+    "the_stack_smol": filter_the_stack_smol,
+    "c4_sample": filter_c4,
+    "squad_v2": filter_squad_v2,
 }
 
 
@@ -537,6 +749,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Re-download and overwrite existing files.",
     )
+    parser.add_argument(
+        "--scale-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiply every dataset's target_rows by this factor.  Use 10 "
+            "for v11 (~800M tokens), 1 for original v10 (~3M tokens)."
+        ),
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        help=(
+            "Fetch only these datasets by name (repeatable).  Example: "
+            "--only cosmopedia_v2 --only tinystories"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -552,7 +782,26 @@ def main() -> None:
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-    for name, spec in DATASET_SPECS.items():
+    selected = DATASET_SPECS
+    if args.only:
+        unknown = [n for n in args.only if n not in DATASET_SPECS]
+        if unknown:
+            print(f"[warn] unknown dataset names ignored: {unknown}")
+        selected = {n: spec for n, spec in DATASET_SPECS.items() if n in args.only}
+
+    if args.scale_factor != 1.0:
+        scaled = {}
+        for name, spec in selected.items():
+            new_spec = dict(spec)
+            new_spec["target_rows"] = int(round(spec["target_rows"] * args.scale_factor))
+            # Also scale page count so we actually fetch enough source rows
+            # to fill the larger target.  Per-page size stays constant.
+            new_spec["pages"] = max(int(round(spec["pages"] * args.scale_factor)), spec["pages"])
+            scaled[name] = new_spec
+        selected = scaled
+        print(f"[scale] applied scale_factor={args.scale_factor}")
+
+    for name, spec in selected.items():
         out_path = out_dir / f"{name}.jsonl"
         if out_path.exists() and not args.force:
             rows = sum(1 for _ in out_path.open("r", encoding="utf-8"))

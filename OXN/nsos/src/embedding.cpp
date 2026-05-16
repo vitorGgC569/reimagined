@@ -101,7 +101,8 @@ Tensor Embedding::forward_batch(const std::vector<std::vector<int>>& indices_bat
                    cudaMemcpyHostToDevice) != cudaSuccess) {
       throw std::runtime_error("Embedding GPU id upload failed");
     }
-    launch_embedding_gather_kernel(out.data(), weight.data.data(), d_ids.get(),
+    launch_embedding_gather_kernel(out.raw_data(), weight.data.raw_data(),
+                                   d_ids.get(),
                                    batch_size * max_seq_len, vocab_size,
                                    embedding_dim);
     return out;
@@ -181,7 +182,8 @@ void Embedding::backward_batch(const Tensor& grad_output,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
       throw std::runtime_error("Embedding GPU id upload failed");
     }
-    launch_embedding_scatter_add_kernel(d_w.data(), grad_device.data(), d_ids.get(),
+    launch_embedding_scatter_add_kernel(d_w.raw_data(), grad_device.raw_data(),
+                                        d_ids.get(),
                                         batch_size * seq_len, vocab_size,
                                         embedding_dim);
     weight.add_grad(d_w);

@@ -36,6 +36,57 @@ constexpr int kStableTopKExperts = 2;
 constexpr uint32_t kEdgePackMagic = 0x31454744; // DGE1
 constexpr uint32_t kEdgePackVersion = 1;
 
+#ifdef USE_CUDA
+// RAII wrapper for a contiguous GPU device buffer of typed elements.
+// Used by the batched MoE pipeline (counts, offsets, permutation,
+// assignment) to keep the pointer lifetime tied to the calling scope
+// without leaking through Tensor (which is float-only).
+template <typename T>
+class GpuDeviceBuffer {
+ public:
+  GpuDeviceBuffer() = default;
+  explicit GpuDeviceBuffer(size_t count) { allocate(count); }
+  ~GpuDeviceBuffer() {
+    if (ptr_ != nullptr) {
+      cudaFree(ptr_);
+    }
+  }
+
+  GpuDeviceBuffer(const GpuDeviceBuffer&) = delete;
+  GpuDeviceBuffer& operator=(const GpuDeviceBuffer&) = delete;
+
+  GpuDeviceBuffer(GpuDeviceBuffer&& other) noexcept : ptr_(other.ptr_) {
+    other.ptr_ = nullptr;
+  }
+  GpuDeviceBuffer& operator=(GpuDeviceBuffer&& other) noexcept {
+    if (this != &other) {
+      if (ptr_ != nullptr) {
+        cudaFree(ptr_);
+      }
+      ptr_ = other.ptr_;
+      other.ptr_ = nullptr;
+    }
+    return *this;
+  }
+
+  void allocate(size_t count) {
+    if (ptr_ != nullptr) {
+      cudaFree(ptr_);
+      ptr_ = nullptr;
+    }
+    if (count == 0) return;
+    if (cudaMalloc(&ptr_, count * sizeof(T)) != cudaSuccess) {
+      throw std::runtime_error("MoE batched GPU buffer allocation failed");
+    }
+  }
+
+  T* get() const { return ptr_; }
+
+ private:
+  T* ptr_ = nullptr;
+};
+#endif
+
 uint64_t hash_token_sequence(const std::vector<int>& tokens) {
     constexpr uint64_t kOffset = 1469598103934665603ull;
     constexpr uint64_t kPrime = 1099511628211ull;
@@ -84,6 +135,11 @@ void zero_sequence_suffix_inplace(Tensor& tensor, const std::vector<int>& length
     const int batch_size = tensor.shape[0];
     const int seq_len = tensor.shape[1];
     const int dim = tensor.shape[2];
+
+    // Drain any pending GPU work before host access — required on
+    // Pascal+Windows where Unified Memory has no demand paging.
+    tensor.sync_host_access();
+
     float* ptr = tensor.data();
     for (int batch = 0; batch < batch_size; ++batch) {
         const int valid = std::clamp(lengths[static_cast<size_t>(batch)], 0, seq_len);
@@ -407,6 +463,35 @@ void JambaModel::set_reference_path(bool use_reference_path) {
     for (BitLinear* layer : collect_bitlinear_layers()) {
         if (layer) {
             layer->set_reference_path(use_reference_path);
+        }
+    }
+}
+
+void JambaModel::set_gpu_packed_inference(bool enabled) {
+    // Toggle the BitLinear GPU __dp4a fast path on every linear layer
+    // (attention QKV/O, mamba projections, FFN/MoE experts).  Used by
+    // the inference engine after model load + repack to opt the entire
+    // model into the dp4a path with one call.  Training callers should
+    // leave this disabled — gradients flow through the float matmul
+    // path only.
+    for (BitLinear* layer : collect_bitlinear_layers()) {
+        if (layer) {
+            layer->set_gpu_packed_inference(enabled);
+        }
+    }
+}
+
+void JambaModel::set_moe_inference_top_k(int k) {
+    // Pacote A.1: propagate the inference-only top-k override to every
+    // JambaBlock that owns a router.  k <= 0 clears the override (each
+    // block falls back to router->top_k).  k >= 1 will be clamped to
+    // [1, router->num_experts] inside forward_moe — we keep the value
+    // as-set here so a caller can configure once and switch models
+    // without re-reading.  The override only takes effect when the
+    // block's training_mode_ is false (decode path).
+    for (auto& layer : layers) {
+        if (layer) {
+            layer->set_inference_top_k_override(k);
         }
     }
 }
@@ -1147,6 +1232,165 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     return output;
 }
 
+#ifdef USE_CUDA
+Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
+                                            const Tensor& weights,
+                                            int rows, int dim,
+                                            int effective_top_k) {
+    // Pre-condition (verified by caller):
+    //   * x and weights are on GPU
+    //   * gpu_custom_kernels_supported() == true
+    //   * rows > 0, num_experts > 0, dim > 0
+    //   * num_experts <= 1024 (scan kernel constraint)
+    //
+    // Pipeline (all device side, single CUDA default-stream chain):
+    //   1. counts[E] = nonzero entries per column of weights
+    //   2. offsets[E+1] = exclusive_scan(counts);
+    //      offsets[E] is the total number of (row, expert) active pairs.
+    //   3. permutation[N_active] = source row id, sorted by expert
+    //      assignment[N_active] = expert id at slot k
+    //      scale[N_active]      = router weight at slot k
+    //   4. permuted_input[N_active, dim] = gather x[permutation[k], :]
+    //   5. for each expert e: process permuted_input[off[e]:off[e+1]]
+    //      and write into permuted_output[off[e]:off[e+1]]
+    //   6. y[rows, dim] = scatter-add scale[k] * permuted_output[k, :]
+    //      back into y[permutation[k], :].
+    //
+    // The std::memcpy gather/scatter loops in the CPU path are replaced
+    // by 3 launch_moe_* kernels.  Per-expert sequencing in step 5 is
+    // unavoidable here because experts have different weight tensors;
+    // a fully batched expert matmul would require concatenated weights
+    // and a block-sparse GEMM, which is left for a future PR.
+
+    GpuDeviceBuffer<int> counts_buf(static_cast<size_t>(num_experts));
+    cudaMemset(counts_buf.get(), 0,
+               static_cast<size_t>(num_experts) * sizeof(int));
+    launch_moe_count_per_expert_kernel(weights.raw_data(), counts_buf.get(),
+                                        rows, num_experts);
+
+    GpuDeviceBuffer<int> offsets_buf(static_cast<size_t>(num_experts + 1));
+    launch_moe_exclusive_scan_small_kernel(counts_buf.get(), offsets_buf.get(),
+                                            num_experts);
+
+    // Pull counts and offsets to host once: we need them for slice
+    // bounds and per-expert dispatch.  This is a single small D2H
+    // (num_experts ints + num_experts+1 ints) so the cost is dominated
+    // by the synchronization, not the bytes.
+    std::vector<int> counts_host(static_cast<size_t>(num_experts), 0);
+    std::vector<int> offsets_host(static_cast<size_t>(num_experts + 1), 0);
+    cudaMemcpy(counts_host.data(), counts_buf.get(),
+               static_cast<size_t>(num_experts) * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(offsets_host.data(), offsets_buf.get(),
+               static_cast<size_t>(num_experts + 1) * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    const int N_active = offsets_host[static_cast<size_t>(num_experts)];
+
+    // Bookkeeping (audit + state needed by backward) is recorded from
+    // the same per-expert counts already on the host.  We also need
+    // the host weights for the saved_moe_weights_ snapshot — re-use
+    // the existing CPU-side observer logic by syncing weights down once.
+    Tensor weights_host = weights.cpu();
+    saved_moe_weights_ = weights_host;
+
+    // Reconstruct saved_moe_rows_ on the host from weights_host so the
+    // matching backward_moe call can dispatch per-expert grad slices.
+    // This is one O(rows × num_experts) pass on the host but happens
+    // exactly once per forward call (not per expert), so the cost is
+    // small compared to the per-expert gather/scatter loops the GPU
+    // path eliminates.
+    saved_moe_rows_.assign(static_cast<size_t>(num_experts),
+                           std::vector<int>{});
+    {
+        const float* weight_host_ptr = weights_host.data();
+        std::vector<int> ranked_experts(static_cast<size_t>(num_experts));
+        std::iota(ranked_experts.begin(), ranked_experts.end(), 0);
+        for (int row = 0; row < rows; ++row) {
+            std::partial_sort(
+                ranked_experts.begin(),
+                ranked_experts.begin() + effective_top_k,
+                ranked_experts.end(),
+                [&](int lhs, int rhs) {
+                    return weight_host_ptr[row * num_experts + lhs] >
+                           weight_host_ptr[row * num_experts + rhs];
+                });
+            for (int rank = 0; rank < effective_top_k; ++rank) {
+                saved_moe_rows_[static_cast<size_t>(ranked_experts[rank])]
+                    .push_back(row);
+            }
+        }
+    }
+
+    if (audit_collector_ && audit_collector_->enabled()) {
+        std::vector<int> topk_counts(static_cast<size_t>(num_experts), 0);
+        for (int e = 0; e < num_experts; ++e) {
+            topk_counts[static_cast<size_t>(e)] = counts_host[static_cast<size_t>(e)];
+        }
+        audit_collector_->record_router(layer_idx,
+                                        audit_block_type(),
+                                        rows,
+                                        num_experts,
+                                        effective_top_k,
+                                        topk_counts,
+                                        router->expert_loads);
+    }
+
+    Tensor output_accum = Tensor::zeros({rows, dim}, Device::GPU);
+    if (N_active <= 0) {
+        return output_accum.reshape(x.shape.dims);
+    }
+
+    // Workspace counters for compute_assignments (atomicAdd target).
+    GpuDeviceBuffer<int> workspace_counters(static_cast<size_t>(num_experts));
+    cudaMemset(workspace_counters.get(), 0,
+               static_cast<size_t>(num_experts) * sizeof(int));
+
+    GpuDeviceBuffer<int> permutation_buf(static_cast<size_t>(N_active));
+    GpuDeviceBuffer<int> assignment_buf(static_cast<size_t>(N_active));
+    GpuDeviceBuffer<float> scale_buf(static_cast<size_t>(N_active));
+
+    launch_moe_compute_assignments_kernel(
+        weights.raw_data(), offsets_buf.get(), workspace_counters.get(),
+        permutation_buf.get(), assignment_buf.get(), scale_buf.get(), rows,
+        num_experts);
+
+    // Permuted input: contiguous by expert.
+    Tensor permuted_input({N_active, dim}, Device::GPU);
+    launch_moe_gather_rows_kernel(x.raw_data(), permutation_buf.get(),
+                                   permuted_input.raw_data(), N_active, dim);
+
+    // Per-expert forward into a permuted_output buffer.  Slices of
+    // permuted_input are computed cheaply (Tensor::slice is a view in
+    // the current API) and the BitLinear forwards already use the GPU
+    // path on x.get_device() == GPU.
+    Tensor permuted_output = Tensor::zeros({N_active, dim}, Device::GPU);
+    for (int e = 0; e < num_experts; ++e) {
+        const int count = counts_host[static_cast<size_t>(e)];
+        if (count <= 0) continue;
+        const int offset = offsets_host[static_cast<size_t>(e)];
+        Tensor expert_input = permuted_input.slice(0, offset, offset + count);
+        Tensor expert_hidden = expert_gate_up[e]->forward(expert_input).relu();
+        Tensor expert_out = expert_down[e]->forward(expert_hidden);
+        // Copy expert_out into permuted_output[offset:offset+count, :].
+        // expert_out is on GPU; do a contiguous device-to-device memcpy
+        // into the right slice.
+        cudaMemcpy(
+            permuted_output.raw_data() + static_cast<size_t>(offset) *
+                                              static_cast<size_t>(dim),
+            expert_out.raw_data(),
+            static_cast<size_t>(count) * static_cast<size_t>(dim) *
+                sizeof(float),
+            cudaMemcpyDeviceToDevice);
+    }
+
+    launch_moe_scatter_add_weighted_kernel(
+        permuted_output.raw_data(), permutation_buf.get(), scale_buf.get(),
+        output_accum.raw_data(), N_active, dim);
+
+    return output_accum.reshape(x.shape.dims);
+}
+#endif  // USE_CUDA
+
 Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string& ln) {
     (void)ctx;
     (void)ln;
@@ -1160,10 +1404,43 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
     const int rows = x.size / x.shape.back();
     const int dim = x.shape.back();
     const Device target_device = x.get_device();
+    // Pacote A.1: at inference (training_mode_=false), an explicit
+    // override > 0 wins over router->top_k.  This is how we cut MoE
+    // expert FLOPs to top-1 during decode without retraining.  During
+    // training the override is ignored — gradients still use the same
+    // top-k the router was trained with.
+    int router_top_k = router->top_k;
+    if (!training_mode_ && inference_top_k_override_ > 0) {
+        router_top_k = inference_top_k_override_;
+    }
+    const int effective_top_k = std::clamp(router_top_k, 1, num_experts);
+
+#ifdef USE_CUDA
+    // Phase 4-extended GPU batched dispatch.
+    // Eligibility:
+    //   * Both input x and routing weights live on the GPU.
+    //   * The custom CUDA kernels are supported on this device.
+    //   * Input has the canonical [rows, dim] layout (rank 2 or 3).
+    //   * num_experts and rows are positive.
+    //
+    // The batched path replaces the per-expert std::memcpy gather/
+    // scatter loops with three on-device kernels (count, gather,
+    // scatter-add) and a single pass over the experts that operates
+    // on contiguous slices of the permuted input.  This eliminates the
+    // ~rows × num_experts host-side bookkeeping that used to dominate
+    // forward_moe wall-time at batch_size > 3.
+    if (target_device == Device::GPU &&
+        weights.get_device() == Device::GPU &&
+        gpu_custom_kernels_supported() && rows > 0 && num_experts > 0 &&
+        num_experts <= 1024 && dim > 0) {
+        return forward_moe_gpu_batched(x, weights, rows, dim,
+                                        effective_top_k);
+    }
+#endif
+
     Tensor weights_host = weights.get_device() == Device::GPU ? weights.cpu() : weights;
     Tensor output_accum = Tensor::zeros({rows, dim}, target_device);
     const float* weight_ptr = weights_host.data();
-    const int effective_top_k = std::clamp(router->top_k, 1, num_experts);
     std::vector<std::vector<int>> expert_rows(static_cast<size_t>(num_experts));
     std::vector<int> ranked_experts(static_cast<size_t>(num_experts));
     std::iota(ranked_experts.begin(), ranked_experts.end(), 0);
@@ -1246,11 +1523,162 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
     return output_accum.reshape(x.shape.dims);
 }
 
+#ifdef USE_CUDA
+Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
+    // Pre-condition: caller verified eligibility (dy on GPU,
+    // saved_moe_weights_ populated, gpu_custom_kernels_supported).
+    //
+    // Pipeline mirrors forward_moe_gpu_batched:
+    //   1. Upload saved_moe_weights_ (host) -> weights_gpu
+    //   2. count + scan + assignments rebuild the same permutation
+    //      that forward used (deterministic given the same weights).
+    //   3. gather dy into permuted_dy [N_active, dim]
+    //   4. scale rows of permuted_dy by the stored router weights
+    //   5. for each expert: down.backward + gate_up.backward on the
+    //      contiguous slice of permuted_dy
+    //   6. scatter-add per-slot grad back into grad_accum [rows, dim]
+
+    const int dim = x.shape.back();
+    const int rows = static_cast<int>(saved_moe_weights_.size) /
+                     std::max(num_experts, 1);
+
+    // Upload the host-side saved router weights to GPU so the kernels
+    // can drive the same routing the forward pass used.
+    Tensor weights_gpu = saved_moe_weights_.to(Device::GPU);
+
+    GpuDeviceBuffer<int> counts_buf(static_cast<size_t>(num_experts));
+    cudaMemset(counts_buf.get(), 0,
+               static_cast<size_t>(num_experts) * sizeof(int));
+    launch_moe_count_per_expert_kernel(weights_gpu.raw_data(), counts_buf.get(),
+                                        rows, num_experts);
+
+    GpuDeviceBuffer<int> offsets_buf(static_cast<size_t>(num_experts + 1));
+    launch_moe_exclusive_scan_small_kernel(counts_buf.get(), offsets_buf.get(),
+                                            num_experts);
+
+    std::vector<int> counts_host(static_cast<size_t>(num_experts), 0);
+    std::vector<int> offsets_host(static_cast<size_t>(num_experts + 1), 0);
+    cudaMemcpy(counts_host.data(), counts_buf.get(),
+               static_cast<size_t>(num_experts) * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(offsets_host.data(), offsets_buf.get(),
+               static_cast<size_t>(num_experts + 1) * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    const int N_active = offsets_host[static_cast<size_t>(num_experts)];
+
+    Tensor grad_accum = Tensor::zeros(dy.shape.dims, Device::GPU);
+    if (N_active <= 0) {
+        return grad_accum;
+    }
+
+    GpuDeviceBuffer<int> workspace_counters(static_cast<size_t>(num_experts));
+    cudaMemset(workspace_counters.get(), 0,
+               static_cast<size_t>(num_experts) * sizeof(int));
+
+    GpuDeviceBuffer<int> permutation_buf(static_cast<size_t>(N_active));
+    GpuDeviceBuffer<int> assignment_buf(static_cast<size_t>(N_active));
+    GpuDeviceBuffer<float> scale_buf(static_cast<size_t>(N_active));
+
+    launch_moe_compute_assignments_kernel(
+        weights_gpu.raw_data(), offsets_buf.get(), workspace_counters.get(),
+        permutation_buf.get(), assignment_buf.get(), scale_buf.get(), rows,
+        num_experts);
+
+    // Gather dy into permuted layout (contiguous by expert).
+    Tensor permuted_dy({N_active, dim}, Device::GPU);
+    launch_moe_gather_rows_kernel(dy.raw_data(), permutation_buf.get(),
+                                   permuted_dy.raw_data(), N_active, dim);
+
+    // Apply per-slot router-weight scaling in-place via multiply-by-vector.
+    // We use a simple mul broadcast: scale_buf has shape [N_active], so
+    // we treat permuted_dy as [N_active, dim] and multiply each row by
+    // scale_buf[row].  Done with the existing mul_vector_broadcast kernel.
+    {
+        Tensor scaled({N_active, dim}, Device::GPU);
+        // scale_buf is the per-row vector; reuse mul_vector_broadcast
+        // semantics via a direct kernel launch.  We emit a small
+        // strided-mul through the existing infrastructure to keep
+        // changes localized; since launch_mul_vector_broadcast_kernel
+        // expects [rows, cols] * [cols] (column-broadcast), we instead
+        // do an explicit row-scale via the scatter kernel later — so
+        // here we just retain permuted_dy unmodified and pass scale
+        // into the scatter step.
+        (void)scaled;
+    }
+
+    // Per-expert backward on contiguous slices.  expert_grad will be
+    // copied into permuted_grad_input at the same offsets so the final
+    // scatter aggregates correctly.
+    Tensor permuted_grad_input = Tensor::zeros({N_active, dim}, Device::GPU);
+    for (int e = 0; e < num_experts; ++e) {
+        const int count = counts_host[static_cast<size_t>(e)];
+        if (count <= 0) continue;
+        const int offset = offsets_host[static_cast<size_t>(e)];
+
+        // Pull the matching slice of permuted_dy and apply per-row
+        // scale (CPU loop over count is small; the device-side
+        // alternative is an extra kernel for marginal benefit).
+        Tensor expert_dy = permuted_dy.slice(0, offset, offset + count);
+
+        // Build a per-row scale tensor for this expert from scale_buf.
+        // scale_buf[offset:offset+count] contains the router weights
+        // for these slots — copy them to a small CPU vector then to
+        // a device tensor for mul.
+        std::vector<float> slot_scales(static_cast<size_t>(count), 0.0f);
+        cudaMemcpy(slot_scales.data(),
+                   scale_buf.get() + static_cast<size_t>(offset),
+                   static_cast<size_t>(count) * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        Tensor scale_col_host({count, 1}, Device::CPU);
+        std::memcpy(scale_col_host.data(), slot_scales.data(),
+                    static_cast<size_t>(count) * sizeof(float));
+        Tensor scale_col_gpu = scale_col_host.to(Device::GPU);
+        Tensor scaled_dy = expert_dy.mul(scale_col_gpu);
+
+        Tensor expert_grad = expert_down[e]->backward(scaled_dy);
+        expert_grad = expert_gate_up[e]->backward(expert_grad);
+
+        cudaMemcpy(
+            permuted_grad_input.raw_data() +
+                static_cast<size_t>(offset) * static_cast<size_t>(dim),
+            expert_grad.raw_data(),
+            static_cast<size_t>(count) * static_cast<size_t>(dim) *
+                sizeof(float),
+            cudaMemcpyDeviceToDevice);
+    }
+
+    // Scatter-add the per-slot grads back into grad_accum.  Pass a
+    // unit-scale tensor because the per-slot scaling was already
+    // applied above on the dy side.
+    GpuDeviceBuffer<float> unit_scale(static_cast<size_t>(N_active));
+    {
+        std::vector<float> ones(static_cast<size_t>(N_active), 1.0f);
+        cudaMemcpy(unit_scale.get(), ones.data(),
+                   static_cast<size_t>(N_active) * sizeof(float),
+                   cudaMemcpyHostToDevice);
+    }
+    launch_moe_scatter_add_weighted_kernel(
+        permuted_grad_input.raw_data(), permutation_buf.get(),
+        unit_scale.get(), grad_accum.raw_data(), N_active, dim);
+
+    return grad_accum;
+}
+#endif  // USE_CUDA
+
 Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::string& ln,
                                 const Tensor& x) {
     (void)ctx;
     (void)ln;
     const Device target_device = dy.get_device();
+
+#ifdef USE_CUDA
+    if (target_device == Device::GPU && gpu_custom_kernels_supported() &&
+        !saved_moe_rows_.empty() && saved_moe_weights_.size > 0 &&
+        num_experts > 0 && num_experts <= 1024 && x.shape.back() > 0) {
+        return backward_moe_gpu_batched(dy, x);
+    }
+#endif
+
     Tensor grad_accum = Tensor::zeros(dy.shape.dims, target_device);
     if (saved_moe_rows_.empty() || saved_moe_weights_.size == 0) {
         Tensor grad = Tensor::zeros(dy.shape.dims, dy.get_device());
@@ -1823,9 +2251,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             seq_len <= 4096 &&
             gpu_custom_kernels_supported()) {
             exact_forward_gpu = Tensor({batch_size, seq_len, d_model}, Device::GPU);
-            launch_batched_gqa_causal_attention_kernel(q_flat.data(),
-                                                       kv_flat.data(),
-                                                       exact_forward_gpu.data(),
+            launch_batched_gqa_causal_attention_kernel(q_flat.raw_data(),
+                                                       kv_flat.raw_data(),
+                                                       exact_forward_gpu.raw_data(),
                                                        batch_size,
                                                        seq_len,
                                                        d_model,
@@ -2003,18 +2431,18 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 const size_t out_row_stride = static_cast<size_t>(d_model);
                 for (int batch = 0; batch < batch_size; ++batch) {
                     launch_gqa_append_kv_cache_kernel(
-                        kv_flat.data() + static_cast<size_t>(batch) * kv_row_stride,
-                        key_cache_buffer_.data() + static_cast<size_t>(batch) * cache_row_stride,
-                        value_cache_buffer_.data() + static_cast<size_t>(batch) * cache_row_stride,
+                        kv_flat.raw_data() + static_cast<size_t>(batch) * kv_row_stride,
+                        key_cache_buffer_.raw_data() + static_cast<size_t>(batch) * cache_row_stride,
+                        value_cache_buffer_.raw_data() + static_cast<size_t>(batch) * cache_row_stride,
                         cached_tokens_,
                         n_kv_heads,
                         head_dim,
                         theta);
                     launch_gqa_cached_attention_decode_kernel(
-                        q_flat.data() + static_cast<size_t>(batch) * q_row_stride,
-                        key_cache_buffer_.data() + static_cast<size_t>(batch) * cache_row_stride,
-                        value_cache_buffer_.data() + static_cast<size_t>(batch) * cache_row_stride,
-                        output_gpu.data() + static_cast<size_t>(batch) * out_row_stride,
+                        q_flat.raw_data() + static_cast<size_t>(batch) * q_row_stride,
+                        key_cache_buffer_.raw_data() + static_cast<size_t>(batch) * cache_row_stride,
+                        value_cache_buffer_.raw_data() + static_cast<size_t>(batch) * cache_row_stride,
+                        output_gpu.raw_data() + static_cast<size_t>(batch) * out_row_stride,
                         cached_tokens_ + 1,
                         d_model,
                         n_heads,
@@ -2145,9 +2573,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             seq_len <= 4096 &&
             gpu_custom_kernels_supported()) {
             Tensor output_gpu({batch_size, seq_len, d_model}, Device::GPU);
-            launch_batched_gqa_causal_attention_kernel(q_flat.data(),
-                                                       kv_flat.data(),
-                                                       output_gpu.data(),
+            launch_batched_gqa_causal_attention_kernel(q_flat.raw_data(),
+                                                       kv_flat.raw_data(),
+                                                       output_gpu.raw_data(),
                                                        batch_size,
                                                        seq_len,
                                                        d_model,
@@ -2307,18 +2735,18 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             ensure_kv_cache_capacity(cached_tokens_ + 1, Device::GPU);
             Tensor output_gpu({seq_len, d_model}, Device::GPU);
             launch_gqa_append_kv_cache_kernel(
-                kv_flat.data(),
-                key_cache_buffer_.data(),
-                value_cache_buffer_.data(),
+                kv_flat.raw_data(),
+                key_cache_buffer_.raw_data(),
+                value_cache_buffer_.raw_data(),
                 cached_tokens_,
                 n_kv_heads,
                 head_dim,
                 theta);
             launch_gqa_cached_attention_decode_kernel(
-                q_flat.data(),
-                key_cache_buffer_.data(),
-                value_cache_buffer_.data(),
-                output_gpu.data(),
+                q_flat.raw_data(),
+                key_cache_buffer_.raw_data(),
+                value_cache_buffer_.raw_data(),
+                output_gpu.raw_data(),
                 cached_tokens_ + 1,
                 d_model,
                 n_heads,
@@ -2352,9 +2780,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         if (!streaming_inference_) {
         Tensor output_gpu({seq_len, d_model}, Device::GPU);
         launch_gqa_causal_attention_kernel(
-            q_flat.data(),
-            kv_flat.data(),
-            output_gpu.data(),
+            q_flat.raw_data(),
+            kv_flat.raw_data(),
+            output_gpu.raw_data(),
             seq_len,
             d_model,
             n_heads,
@@ -3089,9 +3517,54 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
     Tensor weights = logits.softmax(-1);
 
     std::fill(expert_loads.begin(), expert_loads.end(), 0.0f);
-    Tensor weights_host = weights.get_device() == Device::GPU ? weights.cpu() : weights;
-    float* weight_ptr = weights_host.data();
     const int rows = x.size / x.shape.back();
+    if (rows <= 0 || num_experts <= 0) {
+        return {logits, weights};
+    }
+
+#ifdef USE_CUDA
+    // GPU fast-path: avoid the GPU→CPU→GPU round-trip on `weights`
+    // (which used to fire on every routed token in every MoE layer at
+    // every step).  We:
+    //   * Apply the top-k mask + renormalization in-place on the device.
+    //   * Accumulate per-expert loads into a small device buffer.
+    //   * Issue a single tiny D2H copy of expert_loads at the end.
+    //
+    // Eligibility: weights must already live on the device, and the
+    // expected layout is contiguous [rows, num_experts].
+    if (weights.get_device() == Device::GPU) {
+        // Top-k mask + renormalize in-place.  No-op when top_k >=
+        // num_experts (kernel takes the renormalize-only branch).
+        const int eff_top_k =
+            (top_k > 0 && top_k < num_experts) ? top_k : num_experts;
+        launch_moe_topk_mask_kernel(weights.raw_data(), rows, num_experts,
+                                    eff_top_k);
+
+        // Per-expert load accumulation in GPU memory.  We use a fresh
+        // buffer rather than reusing one across calls so that the
+        // device memset is safe regardless of previous async work.
+        Tensor loads_gpu = Tensor::zeros(
+            std::vector<int>{num_experts}, Device::GPU);
+        launch_moe_load_accumulate_kernel(weights.raw_data(),
+                                          loads_gpu.raw_data(),
+                                          rows, num_experts);
+
+        // Single small D2H copy (num_experts floats).  Required because
+        // expert_loads is observed by audit collectors and Python
+        // bindings on the CPU side.
+        Tensor loads_host = loads_gpu.cpu();
+        const float* loads_ptr = loads_host.data();
+        for (int e = 0; e < num_experts; ++e) {
+            expert_loads[e] = loads_ptr[e];
+        }
+        return {logits, weights};
+    }
+#endif
+
+    // CPU path (unchanged) — kept for builds without CUDA and for the
+    // case where weights happen to live on the host (e.g. eval scripts).
+    Tensor weights_host = weights;
+    float* weight_ptr = weights_host.data();
     if (top_k > 0 && top_k < num_experts) {
         std::vector<int> ranked(static_cast<size_t>(num_experts));
         std::vector<char> keep(static_cast<size_t>(num_experts), 0);
@@ -3125,12 +3598,7 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
         }
     }
 
-    if (weights.get_device() == Device::GPU) {
-        weights.copy_from(weights_host.to(Device::GPU));
-    } else {
-        weights = weights_host;
-    }
-
+    weights = weights_host;
     return {logits, weights};
 }
 

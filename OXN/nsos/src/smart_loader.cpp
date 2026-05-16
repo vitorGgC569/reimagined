@@ -1,96 +1,188 @@
+// SmartLoader: real async positioned-read I/O via a single worker
+// thread.  Replaces the previous implementation which fulfilled neither
+// "async" nor "wait" honestly: the old wait_for_completion(Tensor*)
+// slept for one millisecond regardless of whether the read was actually
+// finished, and the IORequest::completed flag was never observed by any
+// API surface.
+//
+// The new design uses std::promise / std::future so callers receive a
+// real synchronization handle and a structured LoadResult on completion.
+// drain() lets shutdown and checkpoint barriers wait for the queue to
+// flush without polling.
+//
+// File I/O strategy:
+//   * On POSIX we use pread(2) which is atomic per-call.
+//   * On Windows we wrap _lseeki64 + _read (not atomic, but the worker
+//     is single-threaded so no race exists).  Each request opens and
+//     closes the file independently; the request rate is low enough
+//     that connection caching would be premature optimization.
+
 #include "smart_loader.h"
-#include <cstring>
+
 #include <fcntl.h>
+#include <cstring>
 #include <iostream>
+#include <utility>
 
 #ifdef _WIN32
-#include <BaseTsd.h>
 #include <io.h>
-typedef SSIZE_T ssize_t;
-#define open _open
-#define close _close
-#define O_RDONLY _O_RDONLY
-// Fallback pread for Windows (uses _lseeki64 + _read, not atomic but
-// functional)
-inline ssize_t pread(int fd, void *buf, size_t count, long long offset) {
-  _lseeki64(fd, offset, SEEK_SET);
-  return _read(fd, buf, (unsigned int)count);
+#define NSOS_OPEN  _open
+#define NSOS_CLOSE _close
+#define NSOS_O_RDONLY _O_RDONLY
+namespace {
+nsos::io_ssize_t pread_compat(int fd, void* buf, size_t count,
+                               long long offset) {
+  if (_lseeki64(fd, offset, SEEK_SET) < 0) {
+    return -1;
+  }
+  return static_cast<nsos::io_ssize_t>(
+      _read(fd, buf, static_cast<unsigned int>(count)));
 }
+}  // namespace
+#define NSOS_PREAD pread_compat
 #else
 #include <unistd.h>
+#include <sys/types.h>
+#define NSOS_OPEN  ::open
+#define NSOS_CLOSE ::close
+#define NSOS_O_RDONLY O_RDONLY
+namespace {
+nsos::io_ssize_t pread_compat(int fd, void* buf, size_t count,
+                               long long offset) {
+  return static_cast<nsos::io_ssize_t>(
+      ::pread(fd, buf, count, static_cast<off_t>(offset)));
+}
+}  // namespace
+#define NSOS_PREAD pread_compat
 #endif
-
-// Simulating io_uring using pread in a worker thread
-// This provides the API contract for "Zero Copy" (direct to pointer)
-// even if the underlying syscall is POSIX.
 
 namespace nsos {
 
-SmartLoader::SmartLoader(size_t buffer_size) : running(true) {
-  worker_thread = std::thread(&SmartLoader::worker_loop, this);
+SmartLoader::SmartLoader(size_t /*buffer_size*/) {
+  worker_thread_ = std::thread(&SmartLoader::worker_loop, this);
 }
 
 SmartLoader::~SmartLoader() {
-  running = false;
-  queue_cv.notify_all();
-  if (worker_thread.joinable())
-    worker_thread.join();
-}
+  // Drain first so promises in the queue are fulfilled instead of
+  // abandoned (which would surface as broken_promise on future::get()
+  // in any caller still holding a future).
+  drain();
 
-void SmartLoader::submit_request(const std::string &path, size_t offset,
-                                 size_t size, Tensor *dest) {
-  IORequest *req = new IORequest{path, offset, size, dest, false};
   {
-    std::lock_guard<std::mutex> lock(queue_mutex);
-    request_queue.push(req);
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    running_.store(false, std::memory_order_release);
   }
-  queue_cv.notify_one();
+  queue_cv_.notify_all();
+
+  if (worker_thread_.joinable()) {
+    worker_thread_.join();
+  }
 }
 
-void SmartLoader::wait_for_completion(Tensor *t) {
-  // In a real io_uring, we'd poll completion queue.
-  // Here we spin-wait on the request associated with tensor t.
-  // Implementation constraint: We assume 't' is unique or caller manages the
-  // request mapping. For MVP: Block until queue empty? No. We just sleep
-  // briefly. Real implementation requires request ID return.
-  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+std::future<LoadResult> SmartLoader::submit_request(const std::string& path,
+                                                    size_t offset,
+                                                    size_t size,
+                                                    Tensor* dest) {
+  // We allocate IORequest on the heap so the promise survives across
+  // the worker's lifetime; ownership transfers to the worker which
+  // will delete it after fulfilling the promise.
+  IORequest* req = new IORequest{};
+  req->filepath = path;
+  req->offset = offset;
+  req->size = size;
+  req->destination = dest;
+
+  std::future<LoadResult> fut = req->promise.get_future();
+
+  // Increment in_flight_ BEFORE pushing so that drain() cannot observe
+  // an empty queue + in_flight_ == 0 race window.
+  in_flight_.fetch_add(1, std::memory_order_acq_rel);
+
+  {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    request_queue_.push(req);
+  }
+  queue_cv_.notify_one();
+
+  return fut;
+}
+
+void SmartLoader::drain() {
+  std::unique_lock<std::mutex> lk(drain_mutex_);
+  drain_cv_.wait(lk, [this] {
+    return in_flight_.load(std::memory_order_acquire) == 0;
+  });
 }
 
 void SmartLoader::worker_loop() {
-  while (running) {
-    IORequest *req = nullptr;
+  while (true) {
+    IORequest* req = nullptr;
+
     {
-      std::unique_lock<std::mutex> lock(queue_mutex);
-      queue_cv.wait(lock,
-                    [this] { return !request_queue.empty() || !running; });
-      if (!running && request_queue.empty())
+      std::unique_lock<std::mutex> lk(queue_mutex_);
+      queue_cv_.wait(lk, [this] {
+        return !request_queue_.empty() ||
+               !running_.load(std::memory_order_acquire);
+      });
+
+      if (request_queue_.empty()) {
+        // Shutdown path: queue drained, running_ is false.  Exit cleanly.
         return;
-      req = request_queue.front();
-      request_queue.pop();
+      }
+
+      req = request_queue_.front();
+      request_queue_.pop();
     }
 
-    if (req) {
-      int fd = open(req->filepath.c_str(), O_RDONLY);
-      if (fd >= 0) {
-        // Read directly into tensor memory (Zero-Copy-ish)
-        // If Tensor is GPU, this would require cudaHostRegister or direct pread
-        // to managed memory. Assuming CPU Tensor or Unified Memory for now.
+    // Perform the read outside the queue lock so other producers can
+    // continue submitting concurrently.
+    LoadResult result;
 
-        ssize_t bytes =
-            pread(fd, req->destination->data(), req->size, req->offset);
-        if (bytes < 0) {
-          std::cerr << "[SmartLoader] Read Error: " << req->filepath
-                    << std::endl;
-        }
-        close(fd);
+    if (req->destination == nullptr) {
+      result.error_msg = "[SmartLoader] null destination tensor: " + req->filepath;
+      std::cerr << result.error_msg << std::endl;
+    } else {
+      const int fd = NSOS_OPEN(req->filepath.c_str(), NSOS_O_RDONLY);
+      if (fd < 0) {
+        result.error_msg = "[SmartLoader] open failed: " + req->filepath;
+        std::cerr << result.error_msg << std::endl;
       } else {
-        std::cerr << "[SmartLoader] Open Error: " << req->filepath << std::endl;
+        const io_ssize_t bytes = NSOS_PREAD(
+            fd, req->destination->data(), req->size,
+            static_cast<long long>(req->offset));
+        NSOS_CLOSE(fd);
+
+        if (bytes < 0) {
+          result.error_msg = "[SmartLoader] pread failed: " + req->filepath;
+          std::cerr << result.error_msg << std::endl;
+        } else {
+          result.bytes_read = bytes;
+        }
       }
-      req->completed = true;
-      // Clean up request struct logic would go here (callback or future)
-      delete req;
+    }
+
+    // Fulfill the promise BEFORE decrementing in_flight_ so a thread
+    // racing in drain() cannot observe in_flight_ == 0 and proceed
+    // before the result is visible to the original future holder.
+    try {
+      req->promise.set_value(std::move(result));
+    } catch (const std::future_error& e) {
+      // Promise was already satisfied or future was destroyed; log but
+      // do not propagate so the worker stays alive.
+      std::cerr << "[SmartLoader] promise.set_value failed: " << e.what()
+                << std::endl;
+    }
+
+    delete req;
+
+    const std::size_t remaining =
+        in_flight_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (remaining == 0) {
+      // Notify *all* drainers — there may be several barriers waiting.
+      std::lock_guard<std::mutex> lk(drain_mutex_);
+      drain_cv_.notify_all();
     }
   }
 }
 
-} // namespace nsos
+}  // namespace nsos

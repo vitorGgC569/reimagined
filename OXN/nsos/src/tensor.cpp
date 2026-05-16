@@ -301,6 +301,23 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
     if (device == Device::GPU) {
 #ifdef USE_CUDA
         cudaMallocManaged(&raw_ptr, size * sizeof(float));
+        // Pascal+Windows hardening: tell the driver this UM allocation
+        // will be accessed concurrently by both host and device.  This
+        // hints the runtime to keep pages migratable rather than locking
+        // them on the GPU (which would page-fault on host access since
+        // sm_61 + Windows lacks demand paging).  Errors here are
+        // non-fatal — older driver/arch combinations may not honor the
+        // advice, in which case sync_host_access remains the safety net.
+        if (raw_ptr) {
+            int device_id = 0;
+            if (cudaGetDevice(&device_id) == cudaSuccess) {
+                cudaMemAdvise(raw_ptr, size * sizeof(float),
+                              cudaMemAdviseSetAccessedBy, device_id);
+                cudaMemAdvise(raw_ptr, size * sizeof(float),
+                              cudaMemAdviseSetAccessedBy, cudaCpuDeviceId);
+            }
+            (void)cudaGetLastError();
+        }
 #endif
     } else {
 #ifdef _WIN32
@@ -421,14 +438,15 @@ Tensor Tensor::add(const Tensor& other) const {
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, other) && gpu_custom_kernels_supported()) {
         if (shape == other.shape) {
-            launch_add_kernel(result.data(), data(), other.data(), size);
+            launch_add_kernel(result.raw_data(), raw_data(), other.raw_data(),
+                              size);
             sync_cuda();
             return result;
         }
         if (!shape.empty() && other.shape.size() == 1 &&
             other.shape.back() == shape.back() && size == result.size) {
-            launch_add_broadcast_kernel(result.data(), data(), other.data(), size,
-                                        shape.back());
+            launch_add_broadcast_kernel(result.raw_data(), raw_data(),
+                                         other.raw_data(), size, shape.back());
             sync_cuda();
             return result;
         }
@@ -446,7 +464,8 @@ Tensor Tensor::sub(const Tensor& other) const {
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, other) && gpu_custom_kernels_supported() &&
         shape == other.shape) {
-        launch_sub_kernel(result.data(), data(), other.data(), size);
+        launch_sub_kernel(result.raw_data(), raw_data(), other.raw_data(),
+                          size);
         sync_cuda();
         return result;
     }
@@ -463,7 +482,8 @@ Tensor Tensor::mul(const Tensor& other) const {
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, other) && gpu_custom_kernels_supported()) {
         if (shape == other.shape) {
-            launch_mul_tensor_kernel(result.data(), data(), other.data(), size);
+            launch_mul_tensor_kernel(result.raw_data(), raw_data(),
+                                     other.raw_data(), size);
             sync_cuda();
             return result;
         }
@@ -471,8 +491,8 @@ Tensor Tensor::mul(const Tensor& other) const {
             other.shape.back() == shape.back() && size == result.size) {
             const int cols = shape.back();
             const int rows = size / std::max(cols, 1);
-            launch_mul_vector_broadcast_kernel(result.data(), data(), other.data(),
-                                               rows, cols);
+            launch_mul_vector_broadcast_kernel(result.raw_data(), raw_data(),
+                                                other.raw_data(), rows, cols);
             sync_cuda();
             return result;
         }
@@ -485,15 +505,15 @@ Tensor Tensor::mul(const Tensor& other) const {
 
 Tensor Tensor::mul(float scalar) const {
     Tensor result(shape.dims, device);
-    const float* src = data();
-    float* dst = result.data();
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        launch_mul_scalar_kernel(dst, src, scalar, size);
+        launch_mul_scalar_kernel(result.raw_data(), raw_data(), scalar, size);
         sync_cuda();
         return result;
     }
 #endif
+    const float* src = data();
+    float* dst = result.data();
 #pragma omp parallel for
     for (int i = 0; i < size; ++i) {
         dst[i] = src[i] * scalar;
@@ -638,15 +658,15 @@ Tensor Tensor::transpose() const {
 
 Tensor Tensor::relu() const {
     Tensor result(shape.dims, device);
-    const float* src = data();
-    float* dst = result.data();
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        launch_relu_kernel(dst, src, size);
+        launch_relu_kernel(result.raw_data(), raw_data(), size);
         sync_cuda();
         return result;
     }
 #endif
+    const float* src = data();
+    float* dst = result.data();
 #pragma omp parallel for
     for (int i = 0; i < size; ++i) {
         dst[i] = std::max(src[i], 0.0f);
@@ -656,15 +676,15 @@ Tensor Tensor::relu() const {
 
 Tensor Tensor::sigmoid() const {
     Tensor result(shape.dims, device);
-    const float* src = data();
-    float* dst = result.data();
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        launch_sigmoid_kernel(dst, src, size);
+        launch_sigmoid_kernel(result.raw_data(), raw_data(), size);
         sync_cuda();
         return result;
     }
 #endif
+    const float* src = data();
+    float* dst = result.data();
 #pragma omp parallel for
     for (int i = 0; i < size; ++i) {
         dst[i] = 1.0f / (1.0f + std::exp(-src[i]));
@@ -683,17 +703,17 @@ Tensor Tensor::softmax(int dim) const {
         inner *= shape[i];
     }
     int outer = size / (axis * inner);
-    const float* src = data();
-    float* dst = result.data();
 
 #ifdef USE_CUDA
     if (dim == rank - 1 && use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        launch_softmax_kernel(dst, src, outer, axis);
+        launch_softmax_kernel(result.raw_data(), raw_data(), outer, axis);
         sync_cuda();
         return result;
     }
 #endif
 
+    const float* src = data();
+    float* dst = result.data();
 #pragma omp parallel for
     for (int row_index = 0; row_index < outer * inner; ++row_index) {
         const int outer_idx = row_index / inner;
@@ -724,17 +744,18 @@ Tensor Tensor::rmsnorm(float eps) const {
     Tensor result(shape.dims, device);
     int inner = shape.back();
     int outer = size / inner;
-    const float* src = data();
-    float* dst = result.data();
 
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        launch_rmsnorm_kernel(dst, src, outer, inner, 0, 0);
+        launch_rmsnorm_kernel(result.raw_data(), raw_data(), outer, inner,
+                              0, 0);
         sync_cuda();
         return result;
     }
 #endif
 
+    const float* src = data();
+    float* dst = result.data();
 #pragma omp parallel for
     for (int i = 0; i < outer; ++i) {
         float sum_sq = 0.0f;
@@ -754,15 +775,16 @@ Tensor Tensor::rmsnorm(float eps) const {
 
 Tensor Tensor::clamp(float min_val, float max_val) const {
     Tensor result(shape.dims, device);
-    const float* src = data();
-    float* dst = result.data();
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        launch_clamp_kernel(dst, src, min_val, max_val, size);
+        launch_clamp_kernel(result.raw_data(), raw_data(), min_val, max_val,
+                            size);
         sync_cuda();
         return result;
     }
 #endif
+    const float* src = data();
+    float* dst = result.data();
 #pragma omp parallel for
     for (int i = 0; i < size; ++i) {
         dst[i] = std::clamp(src[i], min_val, max_val);
@@ -799,16 +821,16 @@ Tensor Tensor::sum(int dim, bool keepdim) const {
         }
         Tensor result(gpu_out_dims, device);
         if (dim == 0) {
-            launch_mean_kernel(result.data(), data(), 1, rows, cols);
-            launch_scale_inplace_kernel(result.data(), static_cast<float>(rows),
-                                        cols);
+            launch_mean_kernel(result.raw_data(), raw_data(), 1, rows, cols);
+            launch_scale_inplace_kernel(result.raw_data(),
+                                         static_cast<float>(rows), cols);
             sync_cuda();
             return result;
         }
         if (dim == 1) {
-            launch_mean_kernel(result.data(), data(), rows, cols, 1);
-            launch_scale_inplace_kernel(result.data(), static_cast<float>(cols),
-                                        rows);
+            launch_mean_kernel(result.raw_data(), raw_data(), rows, cols, 1);
+            launch_scale_inplace_kernel(result.raw_data(),
+                                         static_cast<float>(cols), rows);
             sync_cuda();
             return result;
         }
@@ -855,7 +877,7 @@ float Tensor::norm() const {
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
         CudaBuffer<float> d_sum_sq(1);
         cudaMemset(d_sum_sq.get(), 0, sizeof(float));
-        launch_norm_kernel(d_sum_sq.get(), data(), size);
+        launch_norm_kernel(d_sum_sq.get(), raw_data(), size);
         sync_cuda();
         const float sum_sq = copy_scalar_from_device(d_sum_sq.get());
         return std::sqrt(sum_sq);
@@ -891,6 +913,58 @@ Tensor Tensor::to(Device dev) const {
 
 Tensor Tensor::cpu() const {
     return to(Device::CPU);
+}
+
+void Tensor::sync_host_access() const {
+#ifdef USE_CUDA
+    if (device == Device::GPU && size > 0) {
+        // Cheap-when-idle barrier:
+        //   * cudaStreamQuery(0) returns cudaSuccess in microseconds when
+        //     the default stream has no in-flight work — the common case
+        //     for back-to-back data() reads after the first sync.
+        //   * Only when there IS pending work (cudaErrorNotReady) do we
+        //     pay the cost of cudaDeviceSynchronize.
+        // This lets eager-sync mode stay viable for production: a chain
+        // of data() reads after a single kernel launch syncs once and
+        // then no-ops, instead of bottlenecking on N cudaDeviceSync.
+        const cudaError_t pending = cudaStreamQuery(0);
+        if (pending != cudaSuccess) {
+            // Drain the default stream and reset any sticky error state
+            // so a subsequent kernel launch isn't poisoned by the
+            // ErrorNotReady we just observed.
+            cudaDeviceSynchronize();
+            (void)cudaGetLastError();
+        }
+    }
+#endif
+}
+
+bool Tensor::eager_gpu_sync_enabled() {
+    // Retained as a public predicate for tests / diagnostics.  No
+    // longer consulted by data() — auto-sync is now mandatory because
+    // Pascal+Windows UM cannot be relied upon for safe host access.
+    return true;
+}
+
+float* Tensor::data() {
+    // ALWAYS synchronize when device == GPU.  This is the safety net
+    // for the Pascal+Windows UM bug class: any host code that obtains
+    // a pointer through data() can rely on the underlying memory being
+    // up-to-date and host-accessible by the time the call returns.
+    //
+    // Cost: on CPU, no-op.  On GPU, one cudaStreamQuery (microseconds
+    // when idle) plus an unconditional cudaDeviceSynchronize when the
+    // default stream has pending work.  Hot kernel-launch paths that
+    // do NOT need this safety should call raw_data() instead, which
+    // returns the pointer with zero sync overhead — see callers in
+    // jamba.cpp / mamba2.cpp / trainer.cpp etc.
+    sync_host_access();
+    return data_ptr.get();
+}
+
+const float* Tensor::data() const {
+    sync_host_access();
+    return data_ptr.get();
 }
 
 void Tensor::copy_from(const Tensor& other) {
@@ -1044,19 +1118,20 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const 
     Tensor dx(shape.dims, device);
     int inner = shape.back();
     int outer = size / inner;
-    const float* g = grad.data();
-    const float* y = x_norm.data();
-    float* dx_ptr = dx.data();
 
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, grad) && x_norm.get_device() == Device::GPU &&
         gpu_custom_kernels_supported()) {
-        launch_rmsnorm_backward_kernel(dx_ptr, g, y, outer, inner);
+        launch_rmsnorm_backward_kernel(dx.raw_data(), grad.raw_data(),
+                                        x_norm.raw_data(), outer, inner);
         sync_cuda();
         return dx;
     }
 #endif
 
+    const float* g = grad.data();
+    const float* y = x_norm.data();
+    float* dx_ptr = dx.data();
 #pragma omp parallel for
     for (int i = 0; i < outer; ++i) {
         float dot = 0.0f;
@@ -1090,8 +1165,6 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
     }
 
     Tensor grad(shape.dims, device);
-    const float* logits = data();
-    float* grad_ptr = grad.data();
     float loss = 0.0f;
 
 #ifdef USE_CUDA
@@ -1099,17 +1172,22 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
         CudaBuffer<float> d_loss(1);
         CudaBuffer<int> d_target(static_cast<size_t>(rows));
         cudaMemset(d_loss.get(), 0, sizeof(float));
-        cudaMemcpy(d_target.get(), target.data(), static_cast<size_t>(rows) * sizeof(int),
+        cudaMemcpy(d_target.get(), target.data(),
+                   static_cast<size_t>(rows) * sizeof(int),
                    cudaMemcpyHostToDevice);
-        launch_fused_cross_entropy(d_loss.get(), grad_ptr, logits, d_target.get(), rows, classes);
+        launch_fused_cross_entropy(d_loss.get(), grad.raw_data(), raw_data(),
+                                    d_target.get(), rows, classes);
         sync_cuda();
         const float inv_rows = 1.0f / std::max(rows, 1);
-        launch_scale_inplace_kernel(grad_ptr, inv_rows, grad.size);
+        launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
         sync_cuda();
         loss = copy_scalar_from_device(d_loss.get()) * inv_rows;
         return {loss, grad};
     }
 #endif
+
+    const float* logits = data();
+    float* grad_ptr = grad.data();
 
     for (int row = 0; row < rows; ++row) {
         const float* row_ptr = logits + row * classes;

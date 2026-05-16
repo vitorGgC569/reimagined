@@ -1,5 +1,6 @@
 #include "../include/bitlinear.h"
 #include "../include/bitnet_adapter.h"
+#include "../include/bitnet_gpu_dispatch.h"
 #include "../include/hadamard.h"
 #include "nsos_sdk.h"
 #include <algorithm>
@@ -247,6 +248,64 @@ Tensor BitLinear::forward(const Tensor &input) {
       linear_input = linear_input.reshape({M, in_features});
     }
     saved_linear_input = linear_input.clone();
+
+#ifdef USE_CUDA
+    // Phase 5b GPU __dp4a fast path.  Engaged only when:
+    //   * `set_gpu_packed_inference(true)` was called (inference engines
+    //     opt in after the model has been loaded and packed)
+    //   * packed weights have been computed and are still current
+    //   * LoQA adapter is not active (would require a separate
+    //     dequantize-then-add path; falls back to float matmul for
+    //     correctness when active)
+    //   * input dimensions exercise the kernel within its supported
+    //     range (M and N positive; K must be a multiple of 16 because
+    //     of the 2-bit-per-weight packing scheme)
+    //
+    // Backward path is intentionally NOT modified: the float weight is
+    // still available via `materialize_weight_for_device` for gradient
+    // computation, so training gradients are byte-identical to the
+    // pre-Phase-5b implementation.
+    const bool dp4a_eligible =
+        gpu_packed_inference_enabled_ && packed_weight_valid &&
+        !loqa.active && M > 0 && in_features > 0 && out_features > 0 &&
+        (in_features % 16 == 0);
+    if (dp4a_eligible) {
+      // Refresh GPU packed-weights cache when the underlying weights
+      // have changed since the last upload.  The buffer is sized in
+      // float-words because Tensor today only knows the float type;
+      // bitnet_gemm_158bit_gpu reinterprets it as uint32_t* internally.
+      const int packed_float_words =
+          static_cast<int>(packed_weights.size());
+      const bool cache_stale =
+          cached_gpu_packed_weights_.size != packed_float_words ||
+          cached_gpu_packed_version_ != packed_weight_version;
+      if (cache_stale && packed_float_words > 0) {
+        Tensor cpu_view({packed_float_words}, Device::CPU);
+        std::memcpy(cpu_view.data(), packed_weights.data(),
+                    static_cast<size_t>(packed_float_words) * sizeof(uint32_t));
+        cached_gpu_packed_weights_ = cpu_view.to(Device::GPU);
+        cached_gpu_packed_version_ = packed_weight_version;
+      }
+
+      Tensor y = bitnet_gemm_158bit_gpu(
+          linear_input, cached_gpu_packed_weights_, weight_scale, M,
+          in_features, out_features, precision_bits);
+
+      saved_pre_output = y.clone();
+      y = y.mul(magnitude.data);
+      if (use_bias) {
+        y = y.add(bias.data);
+      }
+      if (input.shape.dims.size() == 3) {
+        return y.reshape(
+            {input.shape.dims[0], input.shape.dims[1], out_features});
+      }
+      if (input.shape.dims.size() == 1) {
+        return y.reshape({out_features});
+      }
+      return y;
+    }
+#endif
 
     const Tensor& effective_weight = materialize_weight_for_device(Device::GPU);
     Tensor output = linear_input.matmul(effective_weight.transpose());
