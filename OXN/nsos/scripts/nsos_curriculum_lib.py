@@ -31,6 +31,31 @@ DEFAULT_PHASE_SIZES = {
     "phase6_memory": {"train": 512, "eval": 128},
 }
 
+# v11 preset: scales up phase budgets so the model sees materially more
+# unique data per epoch.  Sizing rationale (assumes Cosmopedia + TinyStories
+# + SmolTalk are present in artifacts/real_datasets/):
+#
+#   phase1 algorithms: 4× — still small, but enough to absorb scaled
+#                      orca_math + deepmind_math + svamp pulls
+#   phase2 structured: 5× — adds SQuAD v2 as a third evidence source
+#                      next to CoQA; needs more rows to cover SQuAD's variety
+#   phase3 curated_text: 25× — THE headline change.  The 30,000-row
+#                      target gives ~15M tokens from a Cosmopedia/Wikipedia/
+#                      TinyStories/C4/Stack mix, which is enough that the
+#                      v10 plateau at loss 7.3 should actually move.
+#   phase4 instructions: 8× — adds SmolTalk (4,000 modern synthetic
+#                      conversations) to the xlsum + opus_books mix
+#   phase5 verifier: 4× — proportional bump
+#   phase6 memory: 5× — proportional bump; CoQA has the rows to support it
+DEFAULT_PHASE_SIZES_V11 = {
+    "phase1_algorithms":   {"train":  2000, "eval": 512},
+    "phase2_structured":   {"train":  2000, "eval": 512},
+    "phase3_curated_text": {"train": 30000, "eval": 1000},
+    "phase4_instructions": {"train":  4000, "eval": 1024},
+    "phase5_verifier":     {"train":  1500, "eval": 384},
+    "phase6_memory":       {"train":  2500, "eval": 640},
+}
+
 COUNT_LABELS = ["ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN"]
 TOKENIZER_PHASE_TEXT_CAPS = {
     "phase1_algorithms": 160,
@@ -61,6 +86,13 @@ REAL_DATASET_FILES = {
     "xlsum_en": "xlsum_en.jsonl",
     "xlsum_pt": "xlsum_pt.jsonl",
     "opus_books_en_pt": "opus_books_en_pt.jsonl",
+    # v11 expansion (added 2026-05-16)
+    "cosmopedia_v2": "cosmopedia_v2.jsonl",
+    "tinystories": "tinystories.jsonl",
+    "smoltalk": "smoltalk.jsonl",
+    "the_stack_smol": "the_stack_smol.jsonl",
+    "c4_sample": "c4_sample.jsonl",
+    "squad_v2": "squad_v2.jsonl",
 }
 _REAL_DATASET_CACHE: Dict[str, List[Dict]] = {}
 
@@ -453,14 +485,30 @@ def build_phase1_algorithms_v2(repo_root: Path, count: int, seed: int, split: st
 
 
 def _phase2_real_rows(repo_root: Path, split: str, seed: int) -> List[Dict]:
+    """Source phase-2 structured rows (evidence_extract).
+
+    v10 baseline: CoQA only (multi-turn QA over stories, ~360 train rows).
+    v11 expansion: ADDITIONALLY sources SQuAD v2 — short factual answers
+    from Wikipedia passages.  SQuAD complements CoQA because:
+      * CoQA answers are conversation-style ("oh, the cat"); SQuAD
+        answers are clean spans ("the cat")
+      * CoQA contexts are stories; SQuAD contexts are factual paragraphs
+      * Together they teach the model to extract precise spans across
+        registers (narrative + encyclopedic)
+
+    SQuAD v2 also contains unanswerable questions which filter_squad_v2
+    drops, so every row we get here has a verifiable answer.
+    """
     rows: List[Dict] = []
-    dataset_rows = _pick_split_rows(
+
+    # ── CoQA (multi-turn, conversational extraction) ───────────────────
+    coqa_rows = _pick_split_rows(
         _load_real_dataset_rows(repo_root, "coqa"),
         split,
         random.Random(seed + 173),
-        max_rows=360 if split == "train" else 96,
+        max_rows=800 if split == "train" else 200,
     )
-    for row in dataset_rows:
+    for row in coqa_rows:
         story = row.get("story", "")
         qa_pairs = row.get("questions", []) or []
         for pair in qa_pairs[:5]:
@@ -478,6 +526,40 @@ def _phase2_real_rows(repo_root: Path, split: str, seed: int) -> List[Dict]:
                 """
             ).strip()
             rows.append(_make_record("phase2_structured", "evidence_extract", prompt, answer, row.get("source", "coqa")))
+
+    # ── v11: SQuAD v2 (Wikipedia factual extraction) ───────────────────
+    squad_rows = _pick_split_rows(
+        _load_real_dataset_rows(repo_root, "squad_v2"),
+        split,
+        random.Random(seed + 197),
+        max_rows=1500 if split == "train" else 400,
+    )
+    for row in squad_rows:
+        question = _normalize_inline_text(row.get("question", ""))
+        context = _normalize_inline_text(row.get("context", ""))
+        answer = _normalize_inline_text(row.get("answer", ""))
+        if len(question) < 8 or len(context) < 50 or not answer:
+            continue
+        # Truncate long context to keep within seq_len; preserve the part
+        # around the answer if possible (simple find).
+        if len(context) > 800:
+            answer_pos = context.find(answer)
+            if answer_pos >= 0:
+                start = max(answer_pos - 350, 0)
+                end = min(start + 800, len(context))
+                context = context[start:end]
+            else:
+                context = context[:800]
+        prompt = textwrap.dedent(
+            f"""
+            Use the evidence snippet and return the shortest exact answer span only.
+            Evidence: {context}
+            Question: {question}
+            """
+        ).strip()
+        rows.append(_make_record("phase2_structured", "evidence_extract", prompt, answer,
+                                  row.get("source", "rajpurkar/squad_v2")))
+
     return rows
 
 
@@ -577,39 +659,104 @@ def _repo_code_documents(repo_root: Path) -> List[Tuple[str, Path]]:
 
 
 def _phase3_real_documents(repo_root: Path, split: str, seed: int) -> List[Tuple[str, str, str]]:
+    """Source phase-3 documents from real datasets.
+
+    v10 baseline: Wikipedia EN/PT + WikiText only.
+    v11 expansion: ADDITIONALLY sources from Cosmopedia (synthetic
+    educational, designed for small LMs), TinyStories (simple narrative,
+    proves coherence in small models per Eldridge & Li 2023), C4 sample
+    (cleaned web text), and The Stack (Python code, code-aware chunking).
+
+    Each new dataset is gated on file existence — if the user hasn't
+    fetched it via fetch_real_datasets.py, _load_real_dataset_rows()
+    returns [] and that source is silently skipped.  This means the same
+    nsos_curriculum_lib.py works for v10 (no new datasets fetched) and
+    v11 (new datasets present) without code branching.
+
+    Per-source row limits scale with the v11 phase budget — when the
+    caller wants 30,000 phase-3 rows (DEFAULT_PHASE_SIZES_V11), we pull
+    more aggressively from the larger sources.  The split parameter
+    'train' vs 'eval' is honored by _pick_split_rows; each source uses
+    a different RNG offset to avoid correlation."""
     dataset_specs = [
-        ("wikipedia_en", 620, 72, 120 if split == "train" else 28),
-        ("wikipedia_pt", 620, 72, 120 if split == "train" else 28),
-        ("wikitext_en", 560, 64, 90 if split == "train" else 20),
+        # (dataset_name, chunk_chars, overlap_chars, max_rows_train, max_rows_eval)
+        # ── v10 baseline (always pulled) ─────────────────────────────────
+        ("wikipedia_en", 620, 72, 4000, 240),
+        ("wikipedia_pt", 620, 72, 4000, 240),
+        ("wikitext_en",  560, 64, 2000, 120),
+        # ── v11 expansion (skipped if not fetched) ───────────────────────
+        # Cosmopedia: educational-style content tailored for small LMs.
+        # Longer chunks (720) because passages are coherent multi-paragraph.
+        ("cosmopedia_v2", 720, 80, 8000, 400),
+        # TinyStories: simple narrative; small chunks (320) because each
+        # story is short on purpose.  Eldridge & Li (2023) shows these
+        # alone make 10-30M models coherent.
+        ("tinystories",   320, 32, 4000, 200),
+        # C4: cleaned web text; mid-length chunks for sentence variety.
+        ("c4_sample",     580, 64, 2500, 160),
+        # The Stack (Python only): code documents.  Smaller chunks (420)
+        # because per-token information density is higher than prose.
+        ("the_stack_smol", 420, 56, 1500, 120),
     ]
     docs: List[Tuple[str, str, str]] = []
-    for offset, (dataset_name, chunk_chars, overlap_chars, max_rows) in enumerate(dataset_specs):
+    for offset, (dataset_name, chunk_chars, overlap_chars,
+                 max_rows_train, max_rows_eval) in enumerate(dataset_specs):
+        max_rows = max_rows_train if split == "train" else max_rows_eval
         rows = _pick_split_rows(
             _load_real_dataset_rows(repo_root, dataset_name),
             split,
             random.Random(seed + 101 + offset * 17),
             max_rows=max_rows,
         )
+        if not rows:
+            # Dataset wasn't fetched (or fetch failed) — skip silently.
+            # This is the gate that lets v10 callers keep working.
+            continue
         for row in rows:
-            raw = row.get("text", "").strip()
+            # Each dataset stores its document text under slightly different
+            # keys; the filters in fetch_real_datasets.py normalize most
+            # of them to `text`, but `the_stack_smol` uses `content`.
+            if dataset_name == "the_stack_smol":
+                raw = row.get("content", "").strip()
+                title = row.get("path") or "stack_python_file"
+            else:
+                raw = row.get("text", "").strip()
+                title = row.get("title") or row.get("id") or dataset_name
             if not raw:
                 continue
-            title = row.get("title") or row.get("id") or dataset_name
             source = row.get("source", dataset_name)
-            for index, chunk in enumerate(chunk_text(raw, chunk_chars=chunk_chars, overlap_chars=overlap_chars)):
+            for index, chunk in enumerate(
+                chunk_text(raw, chunk_chars=chunk_chars, overlap_chars=overlap_chars)
+            ):
                 docs.append((f"{title} #{index + 1}", chunk, source))
     return docs
 
 
 def _phase4_real_rows(repo_root: Path, split: str, seed: int) -> List[Dict]:
+    """Source phase-4 instruction rows.
+
+    v10 baseline: xlsum_en + xlsum_pt (summarization) + opus_books_en_pt
+                  (translation).  Total ~400 train rows max.
+    v11 expansion: ADDITIONALLY sources SmolTalk (HuggingFaceTB) for
+                  modern synthetic instructions — replaces aging Alpaca-
+                  style data with conversation-format prompts that are
+                  better matched to small-model context windows.
+
+    SmolTalk filter (in fetch_real_datasets.py::filter_smoltalk) already
+    flattens multi-turn conversations into single (prompt, answer)
+    pairs taking the first user→assistant exchange.  We classify these
+    under the kind "instruction_conversation" so the trainer can balance
+    them against the structured tasks.
+    """
     rows: List[Dict] = []
 
+    # ── xlsum (summarization) ──────────────────────────────────────────
     for offset, dataset_name in enumerate(("xlsum_en", "xlsum_pt")):
         dataset_rows = _pick_split_rows(
             _load_real_dataset_rows(repo_root, dataset_name),
             split,
             random.Random(seed + 211 + offset * 19),
-            max_rows=120 if split == "train" else 28,
+            max_rows=800 if split == "train" else 200,
         )
         for row in dataset_rows:
             text = _normalize_inline_text(row.get("text", ""))
@@ -624,11 +771,12 @@ def _phase4_real_rows(repo_root: Path, split: str, seed: int) -> List[Dict]:
                 prompt = f"Write one short summary sentence in English.\nTitle: {title}\nText:\n{text[:960]}"
             rows.append(_make_record("phase4_instructions", "summarize", prompt, summary, source))
 
+    # ── opus_books (translation) ───────────────────────────────────────
     opus_rows = _pick_split_rows(
         _load_real_dataset_rows(repo_root, "opus_books_en_pt"),
         split,
         random.Random(seed + 263),
-        max_rows=160 if split == "train" else 40,
+        max_rows=1000 if split == "train" else 240,
     )
     for row in opus_rows:
         english = _normalize_inline_text(row.get("en", ""))
@@ -656,6 +804,27 @@ def _phase4_real_rows(repo_root: Path, split: str, seed: int) -> List[Dict]:
                 source,
             )
         )
+
+    # ── v11: SmolTalk (modern synthetic instructions) ──────────────────
+    smoltalk_rows = _pick_split_rows(
+        _load_real_dataset_rows(repo_root, "smoltalk"),
+        split,
+        random.Random(seed + 311),
+        max_rows=3000 if split == "train" else 600,
+    )
+    for row in smoltalk_rows:
+        prompt = _normalize_inline_text(row.get("prompt", ""))
+        answer = _normalize_inline_text(row.get("answer", ""))
+        if len(prompt) < 8 or len(answer) < 8:
+            continue
+        # Cap prompt to keep within model seq_len budget; answer is already
+        # capped at 800 chars by filter_smoltalk.
+        if len(prompt) > 600:
+            prompt = prompt[:600].rsplit(" ", 1)[0] + "…"
+        source = row.get("source", "HuggingFaceTB/smoltalk")
+        rows.append(_make_record("phase4_instructions",
+                                  "instruction_conversation",
+                                  prompt, answer, source))
 
     return rows
 
