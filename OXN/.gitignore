@@ -13,5 +13,8 @@ Makefile
 *.pyc
 *.egg-info
 data/
+# EXCEPTION: v4 baseline bundle ships with the repo (2.7 MB)
+!nsos/scripts/distillation_bundle_v4/
+!nsos/scripts/distillation_bundle_v4/**
 checkpoints/
 *.log

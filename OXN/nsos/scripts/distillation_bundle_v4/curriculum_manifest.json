@@ -1,0 +1,65 @@
+{
+  "seed": 42,
+  "special_tokens": [
+    "<|endoftext|>",
+    "<|pad|>",
+    "<|sep|>"
+  ],
+  "phases": [
+    {
+      "name": "phase1_algorithms",
+      "train_file": "data\\phase1_algorithms.train.jsonl",
+      "eval_file": "data\\phase1_algorithms.eval.jsonl",
+      "train_samples": 512,
+      "eval_samples": 128,
+      "train_sha256": "3c6b01918d071981fa6c0973edd4c8d1e3a1be6a30cbbf0f73ae9ce6eddb8255",
+      "eval_sha256": "5a0b11f5e284ae7f1d4b90039bbf7c3907ff4f7fd3f6a0df3d338e88876a691d"
+    },
+    {
+      "name": "phase2_structured",
+      "train_file": "data\\phase2_structured.train.jsonl",
+      "eval_file": "data\\phase2_structured.eval.jsonl",
+      "train_samples": 384,
+      "eval_samples": 96,
+      "train_sha256": "7536a58939012ea703c417730aed5a085b6b8c17397afeeb6198860f093565a5",
+      "eval_sha256": "4deba60a3dd3b976b30aacb17774bbede5eb23a142423ba9700edba5d3a408aa"
+    },
+    {
+      "name": "phase3_curated_text",
+      "train_file": "data\\phase3_curated_text.train.jsonl",
+      "eval_file": "data\\phase3_curated_text.eval.jsonl",
+      "train_samples": 1536,
+      "eval_samples": 8,
+      "train_sha256": "36ea25cb57bce0e32a1b76100b9094a2988c6f9300d44207841510834fb2d2ac",
+      "eval_sha256": "9c09d7eb9636700cb88b35653676ba8f89f6b046993cfe37a261a1983fed3619"
+    },
+    {
+      "name": "phase4_instructions",
+      "train_file": "data\\phase4_instructions.train.jsonl",
+      "eval_file": "data\\phase4_instructions.eval.jsonl",
+      "train_samples": 512,
+      "eval_samples": 128,
+      "train_sha256": "2867a697f1a361e81f4e742d694d9f0910ab172b5b261ea2ee02f918a7554762",
+      "eval_sha256": "43c0058c8321ac41855656aef3ce587eee5b0c0a9c62054b8c651b1609acaf1b"
+    },
+    {
+      "name": "phase5_verifier",
+      "train_file": "data\\phase5_verifier.train.jsonl",
+      "eval_file": "data\\phase5_verifier.eval.jsonl",
+      "train_samples": 384,
+      "eval_samples": 96,
+      "train_sha256": "58ab67236ec21d7e44a3cc91f92ddf2ceebcdfae1a15b750d41e80321af9f78a",
+      "eval_sha256": "03e220cbeb0bb7cf2dbe4abe1e079b7e79ec14f65de812c22d9128d85ab51047"
+    },
+    {
+      "name": "phase6_memory",
+      "train_file": "data\\phase6_memory.train.jsonl",
+      "eval_file": "data\\phase6_memory.eval.jsonl",
+      "train_samples": 512,
+      "eval_samples": 128,
+      "train_sha256": "659c3cd27bbbc4d7bca3de9d107dafc165e59ba71ef077c688bcf45fb1622bc8",
+      "eval_sha256": "3b6984f9421f8a8e759c5fc454324115bee2df2dcb3cbdc000b79664a4f6b3e0"
+    }
+  ],
+  "_note": "v4: rebuilt tokenizer from Wikipedia-phase3 data. v3 tokenizer was built before Wikipedia replaced C++ code in phase3."
+}

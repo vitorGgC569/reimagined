@@ -1,0 +1,20 @@
+{
+  "target_vocab": 8192,
+  "base_vocab": 256,
+  "special_tokens": [
+    "<|endoftext|>",
+    "<|pad|>",
+    "<|sep|>"
+  ],
+  "learned_merges": 7933,
+  "tokenizer_training_texts": 1574,
+  "tokenizer_phase_weights": {
+    "phase1_algorithms": 160,
+    "phase2_structured": 160,
+    "phase3_curated_text": 534,
+    "phase4_instructions": 320,
+    "phase5_verifier": 160,
+    "phase6_memory": 240
+  },
+  "sha256": "d52af8996967080acadf7efebff71b380d7068a8f2008e26531967dd1db82582"
+}

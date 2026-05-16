@@ -110,7 +110,10 @@ OXN/nsos/scripts/*_train.log
 OXN/nsos/scripts/*_train.err
 
 # Distillation bundles (regenerated; too big for git)
+# EXCEPT v4 which is the baseline shipped with the repo (2.7 MB)
 OXN/nsos/scripts/distillation_bundle_*/
+!OXN/nsos/scripts/distillation_bundle_v4/
+!OXN/nsos/scripts/distillation_bundle_v4/**
 
 # Benchmark output JSON (regenerated per-run)
 OXN/nsos/scripts/bench_report.json
