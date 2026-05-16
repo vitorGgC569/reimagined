@@ -1780,13 +1780,25 @@ def detect_build_dir(explicit: Path | None) -> Path:
         candidates.extend([explicit, explicit / "Release"])
     repo_root = Path(__file__).resolve().parents[3]
     nsos_root = repo_root / "OXN" / "nsos"
-    for name in ["build_cuda129", "build_v1", "build_full", "build_codex", "build"]:
+    # Also search the Colab build dir produced by colab/colab_bootstrap.py
+    for name in ["build_cuda129", "build_v1", "build_full", "build_codex",
+                 "build", "build-colab", "build-cuda-validation"]:
         candidates.extend([nsos_root / name / "Release", nsos_root / name])
 
+    # Accept both Windows (.pyd) and Linux (.so) Python extension files
+    # so the same train_curriculum.py works on the local 1050ti host AND
+    # on Colab Linux without changing the search logic.
+    patterns = ("nsos_ext*.pyd", "nsos_ext*.so")
     for candidate in candidates:
-        if candidate.is_dir() and any(candidate.glob("nsos_ext*.pyd")):
-            return candidate
-    raise RuntimeError("Could not find a build directory with nsos_ext.")
+        if not candidate.is_dir():
+            continue
+        for pattern in patterns:
+            if any(candidate.glob(pattern)):
+                return candidate
+    raise RuntimeError(
+        "Could not find a build directory with nsos_ext.  Searched: "
+        + ", ".join(str(c) for c in candidates)
+    )
 
 
 def load_nsos(build_dir: Path):
