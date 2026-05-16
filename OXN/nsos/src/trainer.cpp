@@ -1352,7 +1352,30 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
             // and we fire the optimizer step exactly once at the end
             // with `samples` as the accumulation_steps divisor — same
             // as before.  Loss is reported as the per-sample mean.
-            constexpr int kCrossEntropyChunkSize = 2;
+            //
+            // ── Chunk size policy ──────────────────────────────────────
+            // PSU-marginal hosts (GTX 1050 Ti + 500W PSU): set
+            //   NSOS_TRAIN_CHUNK_SIZE=2 in the environment.  This was
+            //   the default until 2026-05-16, when chunking-as-default
+            //   was found to leave 5/6 of T4/A100 throughput on the
+            //   floor in Colab (low PSU risk).
+            // Data-center hosts (T4 / A100 / H100 / well-provisioned
+            //   workstations): leave NSOS_TRAIN_CHUNK_SIZE unset OR
+            //   set to 0.  We then run the full batch in a single
+            //   forward+backward pass and the optimizer step still
+            //   divides gradients by `samples` exactly as before.
+            // Custom values: any positive integer is honored verbatim.
+            //   E.g. NSOS_TRAIN_CHUNK_SIZE=8 is a middle-ground that
+            //   keeps GPU utilization high while still giving brief
+            //   power-recovery windows for borderline-PSU hosts.
+            int chunk_size_env = 0;
+            if (const char* env = std::getenv("NSOS_TRAIN_CHUNK_SIZE")) {
+                if (*env != '\0') {
+                    chunk_size_env = std::atoi(env);
+                }
+            }
+            const int kCrossEntropyChunkSize =
+                (chunk_size_env > 0) ? chunk_size_env : samples;
 
             float aggregate_loss = 0.0f;
             int aggregate_samples = 0;
