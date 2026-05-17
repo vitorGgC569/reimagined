@@ -14,7 +14,16 @@ namespace nsos {
 // Use ModelConfig from nsos_config.h instead of redefining
 
 struct GenerationOptions {
-    int max_tokens = 50;
+    // Default raised from 50 -> 512 (2026-05-17).  The old default
+    // forced users to override on every call to get a useful chat
+    // response (50 tokens is roughly one short sentence).  With the
+    // KV cache pre-allocation fix in InferenceEngine::generate and
+    // the always-on streaming path, generating 512 tokens is now a
+    // 512-step O(1) loop instead of the O(N^2) regression the small
+    // default was masking.  Users who want short outputs override
+    // explicitly; the new default matches frontier chat APIs
+    // (Anthropic / OpenAI default around 1024).
+    int max_tokens = 512;
     int min_new_tokens = 1;
     float temperature = 0.7f;
     float top_p = 0.92f;

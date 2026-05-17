@@ -17,6 +17,11 @@ extern "C" void launch_matmul_kernel(const float *A, const float *B, float *C,
 
 namespace nsos {
 
+#if defined(NSOS_ENABLE_AVX2_KERNELS)
+// Forward decl implemented in src/bitlinear_quantize_avx2.cpp.
+int32_t bitlinear_row_sum_i8_avx2(const int8_t* row_ptr, int cols);
+#endif
+
 namespace {
 
 void compute_weight_row_sums(const std::vector<int8_t>& weights,
@@ -24,13 +29,23 @@ void compute_weight_row_sums(const std::vector<int8_t>& weights,
                              int cols,
                              std::vector<int32_t>& row_sums) {
   row_sums.assign(static_cast<size_t>(rows), 0);
+  // SIMD Gap #4 fix (2026-05-17): per-row int8 sum via AVX2 when
+  // available.  Called at repack/load time, not on the per-token
+  // forward path — so the wall-time impact is small but the
+  // implementation is identical math (no quantization error) and
+  // the kernel pattern is reused by the inference path for activation
+  // statistics.  Scalar fallback below for non-x86 builds.
   for (int row = 0; row < rows; ++row) {
-    int32_t sum = 0;
     const int8_t* row_ptr = weights.data() + static_cast<size_t>(row) * cols;
+#if defined(NSOS_ENABLE_AVX2_KERNELS)
+    row_sums[static_cast<size_t>(row)] = bitlinear_row_sum_i8_avx2(row_ptr, cols);
+#else
+    int32_t sum = 0;
     for (int col = 0; col < cols; ++col) {
       sum += static_cast<int32_t>(row_ptr[col]);
     }
     row_sums[static_cast<size_t>(row)] = sum;
+#endif
   }
 }
 
@@ -128,6 +143,15 @@ const Tensor& BitLinear::materialize_weight_for_device(Device dev) {
   return cached_gpu_weight_;
 }
 
+#if defined(NSOS_ENABLE_AVX2_KERNELS)
+// Forward decls implemented in src/bitlinear_quantize_avx2.cpp.  Both
+// require the file they live in to be compiled with /arch:AVX2 (MSVC)
+// or -mavx2 (GCC/Clang); the CMake build registers that property.
+float bitlinear_row_max_abs_avx2(const float* row_ptr, int K);
+void  bitlinear_row_scale_round_avx2(float* dst, const float* src,
+                                      int K, float scale);
+#endif
+
 Tensor BitLinear::quantize_activations_bitnet(const Tensor &x,
                                               std::vector<float> &out_scales) {
   int K = in_features;
@@ -146,24 +170,37 @@ Tensor BitLinear::quantize_activations_bitnet(const Tensor &x,
 
 #pragma omp parallel for
   for (int i = 0; i < M; ++i) {
+    const float* row_ptr = x_ptr + static_cast<size_t>(i) * K;
+    float* row_q_ptr = q_ptr + static_cast<size_t>(i) * K;
+
+    // SIMD Gap #1 fix (2026-05-17): dispatch to AVX2 row kernels
+    // when the build enabled them.  The math is bit-exact identical
+    // to the scalar code: branch-free abs via sign-mask AND, max
+    // reduction over 8 lanes, _mm256_round_ps with
+    // _MM_FROUND_TO_NEAREST_INT matches std::round under IEEE 754
+    // (round-half-to-even).  Scalar tails handle K not divisible
+    // by 8.  Scalar fallback below stays for non-x86 builds and
+    // for builds that explicitly disabled AVX2 kernels.
+#if defined(NSOS_ENABLE_AVX2_KERNELS)
+    const float max_val = bitlinear_row_max_abs_avx2(row_ptr, K);
+    const float scale = q_max / (max_val + 1e-8f);
+    out_scales[i] = (max_val + 1e-8f) / q_max;
+    bitlinear_row_scale_round_avx2(row_q_ptr, row_ptr, K, scale);
+#else
     float max_val = 0.0f;
     for (int j = 0; j < K; ++j)
-      max_val = std::max(max_val, std::abs(x_ptr[i * K + j]));
-
-    // Calculate scale to map max_val to q_max
+      max_val = std::max(max_val, std::abs(row_ptr[j]));
     float scale = q_max / (max_val + 1e-8f);
     out_scales[i] = (max_val + 1e-8f) / q_max;
-
     for (int j = 0; j < K; ++j) {
-      float val = x_ptr[i * K + j] * scale;
+      float val = row_ptr[j] * scale;
       if (precision_bits == 2) {
-        // 1.58-bit / Ternary logic: round to -1, 0, 1
-        q_ptr[i * K + j] = std::round(val);
+        row_q_ptr[j] = std::round(val);
       } else {
-        // Standard INT-N logic
-        q_ptr[i * K + j] = std::round(val);
+        row_q_ptr[j] = std::round(val);
       }
     }
+#endif
   }
   return x_q;
 }

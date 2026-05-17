@@ -94,12 +94,27 @@ target_include_directories(nsos_core
 )
 
 if (NSOS_ENABLE_X86_AVX2_KERNELS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|x64)$")
-    target_sources(nsos_core PRIVATE src/bitnet_adapter_avx2.cpp)
+    target_sources(nsos_core PRIVATE
+        src/bitnet_adapter_avx2.cpp
+        # SIMD Gap #1 + #4 (2026-05-17): row-level activation quantize
+        # kernels for BitLinear::quantize_activations_bitnet and the
+        # weight row-sum reduction for BitLinear pack.  Live in their
+        # own TU so we can apply -mavx2 / /arch:AVX2 to just this file
+        # without forcing the whole target onto AVX2 (which would
+        # break non-AVX2 distribution builds).
+        src/bitlinear_quantize_avx2.cpp
+    )
     target_compile_definitions(nsos_core PUBLIC NSOS_ENABLE_AVX2_KERNELS=1)
     if (MSVC)
-        set_source_files_properties(src/bitnet_adapter_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(src/bitnet_adapter_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(src/bitlinear_quantize_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     else()
-        set_source_files_properties(src/bitnet_adapter_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(src/bitnet_adapter_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(src/bitlinear_quantize_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
     endif()
 endif()
 

@@ -66,6 +66,15 @@ public:
     active_batch_valid_lengths_ = lengths;
   }
   void reset();
+  // Public pre-allocation hook for inference paths.  Reserves the KV
+  // cache for `total_tokens` slots up-front so the per-token decode
+  // loop never triggers the page-growth path (default page size is
+  // 64; without pre-alloc we realloc + memcpy every 64 generated
+  // tokens, ~8 reallocs for 512 tokens).  Safe to call before any
+  // forward; idempotent if already large enough; the rotary frequency
+  // cache is recomputed if total_tokens exceeds the current capacity
+  // of cos_cached/sin_cached.
+  void reserve_kv_cache(int total_tokens, Device device, int batch_size = 1);
   AttentionCacheSnapshot snapshot_cache() const;
   std::vector<AttentionCacheSnapshot> snapshot_cache_batch() const;
   void restore_cache(const AttentionCacheSnapshot& snapshot);
@@ -285,6 +294,13 @@ public:
   // inference (training_mode_=false).  Pass 0 to clear and fall back to
   // router->top_k.  Typical use: train with top-2, decode with top-1.
   void set_moe_inference_top_k(int k);
+  // Pre-allocate KV cache on every attention layer up to `total_tokens`.
+  // Eliminates page-growth realloc+memcpy spikes during long
+  // generations (default page size is 64; for 512 tokens that's 8
+  // reallocs * O(cache_size_so_far) memcpy each — measurable on
+  // sustained decode workloads).  Caller passes prompt_len +
+  // max_new_tokens before the decode loop.  Idempotent.
+  void reserve_kv_cache(int total_tokens, Device device, int batch_size = 1);
   void release_full_precision_linear_weights();
   void save_edge_linear_pack(const std::string& path);
   void load_edge_linear_pack(const std::string& path, bool release_full_precision = true);

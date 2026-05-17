@@ -10,14 +10,27 @@ namespace nsos {
 
 namespace {
 
+// SIMD Gap #2 fix (2026-05-17): in-register horizontal reduction
+// of __m256i.  The old implementation did _mm256_store_si256 + a
+// scalar loop, which forces 32 bytes through L1 each call.  This
+// function is called once per (row, out_col) in the bitnet GEMM
+// inner loop, so for out_cols=512 that's 512 unnecessary stores
+// per input row.
+//
+// The reduction here is the canonical "Agner Fog" pattern:
+//   1. Split the 256-bit register into two 128-bit halves.
+//   2. Add them (4 lanes).
+//   3. Horizontal-add pairs into another 128-bit register (2 lanes).
+//   4. Horizontal-add pairs again (1 lane = the final sum).
+//   5. Extract the bottom 32-bit lane as an int.
+// Total: 5 SSE instructions, all in registers, zero memory traffic.
 inline int horizontal_sum_epi32(__m256i value) {
-    alignas(32) int lanes[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), value);
-    int total = 0;
-    for (int lane : lanes) {
-        total += lane;
-    }
-    return total;
+    const __m128i lo = _mm256_castsi256_si128(value);           // lanes 0..3
+    const __m128i hi = _mm256_extracti128_si256(value, 1);      // lanes 4..7
+    __m128i sum128 = _mm_add_epi32(lo, hi);                     // 4 lanes
+    sum128 = _mm_hadd_epi32(sum128, sum128);                    // 2 lanes
+    sum128 = _mm_hadd_epi32(sum128, sum128);                    // 1 lane
+    return _mm_cvtsi128_si32(sum128);                           // extract bottom
 }
 
 inline float apply_output_affine(float value,
@@ -56,7 +69,57 @@ void gemm_158bit_i8_avx2_kernel(const Tensor& input,
             row < static_cast<int>(act_scales.size()) ? act_scales[row] : 1.0f;
         const float combined_scale = act_scale * weight_scale;
         const float* row_ptr = x_ptr + row * cols;
-        for (int col = 0; col < cols; ++col) {
+
+        // SIMD Gap #3 fix (2026-05-17): vectorize the row quantization.
+        // The scalar version ran round + clamp + cast for each column,
+        // about cols * (3 op + 1 cast) cycles per row, called once per
+        // input row.  With AVX2 we process 8 floats per iteration:
+        //   1. Round-to-nearest-even via _mm256_round_ps (one instr)
+        //   2. Clamp to [-127, 127] via max+min on the float vector
+        //   3. Convert to 32-bit ints, pack down to 16-bit, then 8-bit
+        //   4. Store 8 packed int8 values
+        // We also use FMA-style ops where they fit.  The clamp range is
+        // [-127, 127] (not [-128, 127]) to keep the result symmetric;
+        // this matches the original scalar code and the BitNet paper
+        // convention for activation quantization (signed 8-bit
+        // symmetric).
+        const __m256 v_neg127 = _mm256_set1_ps(-127.0f);
+        const __m256 v_pos127 = _mm256_set1_ps(127.0f);
+        // _mm256_packs_epi32 saturates to int16 range; we need int8.
+        // After two packs (32->16, 16->8) the lanes from each 256-bit
+        // input are NOT in natural order: the result of packus across
+        // two halves uses an interleave pattern.  For a single 8-wide
+        // input we cast through int32, pack to int16, then to int8 in
+        // a temporary register and extract the low 8 bytes.
+        int col = 0;
+        for (; col + 8 <= cols; col += 8) {
+            __m256 vals = _mm256_loadu_ps(row_ptr + col);
+            vals = _mm256_round_ps(vals,
+                                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            vals = _mm256_max_ps(vals, v_neg127);
+            vals = _mm256_min_ps(vals, v_pos127);
+            // Convert 8 floats -> 8 int32.  Already rounded above so
+            // _mm256_cvttps_epi32 (truncation) is exact.
+            const __m256i i32 = _mm256_cvttps_epi32(vals);
+            // Pack int32 -> int16.  _mm256_packs_epi32 produces an
+            // interleaved result across the two 128-bit halves; we
+            // unscramble below.  For a single 8-lane input we want
+            // lanes 0..7 of the result to be the 8 int16 values.
+            // permute4x64 reorders the 64-bit chunks so the four
+            // valid int16s from each half end up contiguous.
+            __m256i i16 = _mm256_packs_epi32(i32, i32);  // upper half = dup
+            i16 = _mm256_permute4x64_epi64(i16, 0xD8);   // 0b11011000
+            // Now the low 128 bits hold our 8 int16 values in order.
+            const __m128i i16_lo = _mm256_castsi256_si128(i16);
+            // Pack int16 -> int8 with signed saturation.  Same trick:
+            // packs across two halves; we only need the low 8 bytes.
+            const __m128i i8 = _mm_packs_epi16(i16_lo, i16_lo);
+            // Store the low 8 bytes (one int64 worth) to row_quant.
+            _mm_storel_epi64(
+                reinterpret_cast<__m128i*>(row_quant.data() + col), i8);
+        }
+        // Scalar tail for the last <8 elements.
+        for (; col < cols; ++col) {
             const float rounded = std::round(row_ptr[col]);
             const float clamped = std::max(-127.0f, std::min(127.0f, rounded));
             row_quant[static_cast<size_t>(col)] = static_cast<int8_t>(clamped);

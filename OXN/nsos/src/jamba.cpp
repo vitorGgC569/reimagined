@@ -481,6 +481,37 @@ void JambaModel::set_gpu_packed_inference(bool enabled) {
     }
 }
 
+void Attention::reserve_kv_cache(int total_tokens, Device device, int batch_size) {
+    // Public wrapper around the private ensure_kv_cache_capacity.  This
+    // is the inference-side hook that lets the SDK pre-allocate the
+    // cache to its known maximum before the decode loop runs, so the
+    // per-token forward never triggers the page-growth path.
+    //
+    // We round up to a multiple of cache_page_tokens_ so the resulting
+    // capacity is aligned with the page-growth strategy — if the user
+    // generates a few more than they asked for (e.g. continuing past
+    // max_tokens because EOS didn't fire), we still avoid one realloc.
+    if (total_tokens <= 0) {
+        return;
+    }
+    const int pages = (total_tokens + cache_page_tokens_ - 1) / cache_page_tokens_;
+    const int aligned = pages * cache_page_tokens_;
+    ensure_kv_cache_capacity(aligned, device, std::max(batch_size, 1));
+}
+
+void JambaModel::reserve_kv_cache(int total_tokens, Device device, int batch_size) {
+    // Iterate every JambaBlock that has an attention layer and reserve
+    // its KV cache.  Mamba-only blocks have no KV cache to reserve.
+    // TTT blocks similarly don't need this.  Safe to call repeatedly:
+    // ensure_kv_cache_capacity is idempotent when the target is already
+    // <= current capacity.
+    for (auto& layer : layers) {
+        if (layer && layer->attn_layer) {
+            layer->attn_layer->reserve_kv_cache(total_tokens, device, batch_size);
+        }
+    }
+}
+
 void JambaModel::set_moe_inference_top_k(int k) {
     // Pacote A.1: propagate the inference-only top-k override to every
     // JambaBlock that owns a router.  k <= 0 clears the override (each

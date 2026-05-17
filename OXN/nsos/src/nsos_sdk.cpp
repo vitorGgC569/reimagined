@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <numeric>
@@ -1245,6 +1246,72 @@ std::string InferenceEngine::generate_stream(
     last_metrics_.used_streaming = can_use_streaming;
     this->model->reset_session();
     this->model->set_streaming_inference(can_use_streaming);
+
+    // ─────────────────────────────────────────────────────────────────
+    // INFERENCE BOTTLENECK #1 mitigation (2026-05-17):
+    // If the model reports !supports_streaming_inference, the decode
+    // loop falls into the O(N²) re-process-everything path below.  For
+    // a 50-token prompt + 200 generated tokens that's ~30,000 tokens
+    // re-processed across the run — and the per-step time grows
+    // quadratically.  v10 inference observed slow decode that the user
+    // attributed to baseline cost; this path being silently selected
+    // is a plausible additional contributor.
+    //
+    // We emit a one-shot stderr warning the first time we hit the
+    // fallback so deployments don't silently degrade.  Without this
+    // warning, telemetry has no signal that the slow path was taken
+    // (used_streaming is set in last_metrics_ but production users
+    // rarely check it).
+    if (!can_use_streaming) {
+        static std::once_flag warned_once;
+        std::call_once(warned_once, [] {
+            std::cerr << "[nsos][WARN] decode falling back to O(N^2) "
+                         "re-process path: model->supports_streaming_inference() "
+                         "returned false.  Every generated token re-processes "
+                         "the entire output history, so long generations "
+                         "become exponentially slower per token.  "
+                         "Investigate which layer type returns false from "
+                         "the streaming check (see JambaModel::"
+                         "supports_streaming_inference)."
+                      << std::endl;
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // INFERENCE BOTTLENECK #2 mitigation (2026-05-17):
+    // Pre-allocate the KV cache to the FULL expected sequence length
+    // before the decode loop runs.  The default cache page size is 64
+    // tokens; without pre-allocation, the cache grows in pages,
+    // triggering a realloc + memcpy of the entire cache content every
+    // 64 generated tokens.  For 512 tokens that's 8 reallocs each
+    // copying an ever-growing block (last realloc copies ~448 tokens
+    // worth of KV state for every attention layer).  Pre-allocating
+    // is one ensure_kv_cache_capacity call per attention layer.
+    //
+    // The reserve target is prompt + requested new tokens.  If the
+    // user's prompt was truncated to fit context_limit, `output`
+    // already reflects the truncated length so reserving for
+    // output.size() + max_tokens is correct.
+    {
+        const int reserve_total = static_cast<int>(output.size()) +
+                                   std::max(options.max_tokens, 0);
+        if (reserve_total > 0) {
+            // Device: take it from the model's first parameter that
+            // exposes a device.  Inference engines set this consistently
+            // at load_model time.  If we can't determine the device,
+            // skip the reserve — the cache will grow on demand as before.
+            try {
+                const Device device = this->model->parameters().empty()
+                    ? Device::CPU
+                    : this->model->parameters().front()->data.get_device();
+                this->model->reserve_kv_cache(reserve_total, device, 1);
+            } catch (const std::exception&) {
+                // Reserve is an optimization, never a correctness
+                // requirement.  Failures fall through to on-demand
+                // growth.
+            }
+        }
+    }
 
     auto prefill_started_at = std::chrono::steady_clock::now();
     auto decode_started_at = prefill_started_at;
