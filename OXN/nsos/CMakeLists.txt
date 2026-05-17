@@ -174,6 +174,7 @@ if (NSOS_ENABLE_CUDA)
             src/cuda/mamba_kernels.cu
             src/cuda/moe_kernels.cu
             src/cuda/bitnet_kernels.cu
+            src/cuda/flash_attention.cu
         )
         # PUBLIC because tensor.h includes <cuda_runtime.h> when USE_CUDA
         # is defined; tests/CLI/API targets that link nsos_core need to

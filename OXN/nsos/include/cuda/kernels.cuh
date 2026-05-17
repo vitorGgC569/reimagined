@@ -55,6 +55,33 @@ void launch_adamw_update_kernel(float *weights, const float *grad, float *m,
 // New Phase 5 Kernels
 void launch_relu_kernel(float *out, const float *in, int n);
 
+// LEARN C1 (2026-05-16): FlashAttention-2 forward kernel for GQA
+// causal self-attention.  See src/cuda/flash_attention.cu for the
+// full algorithm description.  Strides:
+//   Q, O: [seq_len, num_heads,    head_dim]
+//   K, V: [seq_len, num_kv_heads, head_dim]
+//   kv_group_size = num_heads / num_kv_heads (GQA mapping)
+// scale should be 1/sqrt(head_dim) at call time (caller pre-applies).
+//
+// Opt-in via NSOS_USE_FLASH_ATTENTION=1.  Default keeps the existing
+// gqa_causal_attention_kernel which materializes attention rows in
+// shared memory (works for seq_len <= 1024 with head_dim <= 64).
+void launch_flash_attention_kernel(const float* Q, const float* K,
+                                    const float* V, float* O,
+                                    int seq_len, int num_heads,
+                                    int num_kv_heads, int head_dim,
+                                    int kv_group_size, float scale);
+
+// AUDIT #6 + LEARN B3 (2026-05-16): cast FP32 -> low-precision in
+// place for mixed-precision matmul.  mode=1 -> BF16, mode=2 -> FP16.
+// Output buffer must be `n * 2` bytes pre-allocated by the caller.
+// Used by Tensor::matmul to prepare A/B for cublasGemmStridedBatchedEx
+// Tensor Cores path.  See the rationale in tensor.cpp::matmul about
+// why BF16 is the default (8-bit exponent matches FP32 range,
+// avoids BitNet activation overflow that FP16's 5-bit exponent
+// can't handle).
+void launch_cast_f32_to_lowp_kernel(void *out, const float *in, size_t n, int mode);
+
 // LEARN S1 (BitNet b1.58 2B4T 2026): Squared ReLU activation.
 //   forward:  out[i] = max(0, in[i])^2
 //   backward: in_grad[i] = grad_out[i] * 2 * max(0, in[i])

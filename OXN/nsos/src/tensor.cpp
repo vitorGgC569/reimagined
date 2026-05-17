@@ -560,6 +560,125 @@ Tensor Tensor::matmul(const Tensor& other) const {
         cublasHandle_t handle = cublas_handle();
         const float alpha = 1.0f;
         const float beta = 0.0f;
+
+        // AUDIT #6 + LEARN B3 (2026-05-16): mixed-precision matmul
+        // dispatch via cublasGemmEx + Tensor Cores.  T4 (sm_75) and
+        // newer have hardware Tensor Cores for BF16 GEMM that runs
+        // ~4-8x faster than FP32 cublasSgemm.  When NSOS_MIXED_PRECISION
+        // is set to "bf16" or "fp16", we cast inputs to the lower
+        // precision, do the GEMM in Tensor Cores, and write FP32
+        // accumulated output.
+        //
+        // Why BF16 over FP16:
+        //   BF16 has the same 8-bit exponent as FP32 (range ~1e-38 to
+        //   ~3e38) — no underflow/overflow risk vs FP32 baselines.
+        //   FP16 has only 5-bit exponent (range ~6e-5 to ~6e4) which
+        //   bites BitNet 1.58 because the per-row activation scaling
+        //   factors can land outside that range.  BF16 is the right
+        //   default for any model with BitNet-style quantization.
+        //
+        // Why this is gated behind an env var:
+        //   Existing checkpoints were trained in FP32.  Switching to
+        //   BF16 mid-run produces visible loss spikes (the optimizer
+        //   has to re-calibrate to the new noise floor).  Users opt
+        //   in explicitly for the speedup; default stays FP32 for
+        //   correctness parity with prior runs.
+        //
+        // Adam state stays FP32 always.  Weights stay FP32 in storage;
+        // they're cast to BF16 only at the GEMM call site.  This is
+        // the standard "mixed precision" recipe (TF / PyTorch AMP).
+        static const int mixed_mode = [] {
+            const char* env = std::getenv("NSOS_MIXED_PRECISION");
+            if (!env || *env == '\0') return 0;  // 0 = FP32
+            const std::string v(env);
+            if (v == "bf16" || v == "BF16") return 1;
+            if (v == "fp16" || v == "FP16") return 2;
+            return 0;
+        }();
+
+        if (mixed_mode != 0) {
+            // cublasGemmEx with mixed precision: A and B in lower
+            // precision, accumulation and C in FP32.  We allocate
+            // workspace tensors for the BF16/FP16 copies of A and B
+            // and use cublasGemmStridedBatchedEx to handle the batch.
+            //
+            // Per-call cost of the cast: O(rows × cols) elementwise.
+            // For a forward pass this is dominated by the GEMM cost
+            // (O(m*n*k)) so amortizes well.  In a tight loop the
+            // alloc+cast could be hoisted as a workspace; current
+            // implementation favors clarity.
+            cudaDataType_t compute_dtype =
+                (mixed_mode == 1) ? CUDA_R_16BF : CUDA_R_16F;
+            cublasComputeType_t accumulate_type = CUBLAS_COMPUTE_32F;
+
+            const size_t bytes_per_lp = 2;  // both bf16 and fp16 are 2 bytes
+            const size_t total_a_elems =
+                static_cast<size_t>(batch) * static_cast<size_t>(m) * static_cast<size_t>(k);
+            const size_t total_b_elems =
+                (other_batch == 1
+                     ? static_cast<size_t>(k) * static_cast<size_t>(n)
+                     : static_cast<size_t>(batch) * static_cast<size_t>(k) *
+                           static_cast<size_t>(n));
+
+            void* a_low_ptr = nullptr;
+            void* b_low_ptr = nullptr;
+            cudaError_t alloc_a =
+                cudaMalloc(&a_low_ptr, total_a_elems * bytes_per_lp);
+            cudaError_t alloc_b =
+                cudaMalloc(&b_low_ptr, total_b_elems * bytes_per_lp);
+            if (alloc_a == cudaSuccess && alloc_b == cudaSuccess) {
+                // Cast A and B to lower precision.  Reuse our
+                // existing float->bf16 / float->fp16 cast kernel if
+                // available; else use cuBLAS's BLAS-internal cast via
+                // cublasSgemmEx auto-conversion through CUDA_R_32F
+                // inputs is also valid but slower.  We launch the
+                // dedicated cast kernel for both A and B.
+                launch_cast_f32_to_lowp_kernel(
+                    a_low_ptr, a_ptr, total_a_elems, mixed_mode);
+                launch_cast_f32_to_lowp_kernel(
+                    b_low_ptr, b_ptr, total_b_elems, mixed_mode);
+
+                const long long stride_a = static_cast<long long>(m) * k;
+                const long long stride_b = (other_batch == 1)
+                                                ? 0LL
+                                                : static_cast<long long>(k) * n;
+                const long long stride_c = static_cast<long long>(m) * n;
+                cublas_check(
+                    cublasGemmStridedBatchedEx(
+                        handle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        n,
+                        m,
+                        k,
+                        &alpha,
+                        b_low_ptr,
+                        compute_dtype,
+                        n,
+                        stride_b,
+                        a_low_ptr,
+                        compute_dtype,
+                        k,
+                        stride_a,
+                        &beta,
+                        out_ptr,
+                        CUDA_R_32F,
+                        n,
+                        stride_c,
+                        batch,
+                        accumulate_type,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "cublasGemmStridedBatchedEx");
+                cudaFree(a_low_ptr);
+                cudaFree(b_low_ptr);
+                sync_cuda();
+                return result;
+            }
+            // Fall through to FP32 path if low-precision alloc failed.
+            if (a_low_ptr) cudaFree(a_low_ptr);
+            if (b_low_ptr) cudaFree(b_low_ptr);
+        }
+
         // AUDIT #3 (2026-05-16): use cublasSgemmStridedBatched to fuse
         // all batch_idx iterations into ONE kernel launch.  The
         // original loop did `batch` separate cublasSgemm calls, each

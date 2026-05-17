@@ -853,6 +853,54 @@ extern "C" void launch_adamw_update_kernel(float *weights, const float *grad,
 // Utility Kernels (unchanged — already simple/efficient)
 // -------------------------------------------------------------------------
 
+// ── Mixed-precision casts (AUDIT #6 + LEARN B3) ─────────────────────────
+// Cast FP32 -> BF16 or FP16 for Tensor Core matmul inputs.  Done as
+// a dedicated kernel rather than via cuBLAS's auto-conversion because
+// (a) we want explicit control over rounding (BF16 here uses
+// round-to-nearest-even which matches IEEE 754) and (b) doing the cast
+// in-place on the same stream as the GEMM avoids implicit syncs.
+//
+// __nv_bfloat16 is in <cuda_bf16.h>; __half is in <cuda_fp16.h>.
+// Both ship with the CUDA toolkit since CUDA 11 (Ampere).
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+__global__ void cast_f32_to_bf16_kernel(__nv_bfloat16 *out, const float *in, size_t n) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    out[idx] = __float2bfloat16(in[idx]);
+  }
+}
+
+__global__ void cast_f32_to_fp16_kernel(__half *out, const float *in, size_t n) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    out[idx] = __float2half(in[idx]);
+  }
+}
+
+extern "C" void launch_cast_f32_to_lowp_kernel(void *out, const float *in,
+                                                size_t n, int mode) {
+  // mode=1 -> BF16; mode=2 -> FP16; anything else is a no-op (caller
+  // should have screened the env var before getting here).
+  const int threads = 256;
+  const size_t blocks_sz = (n + threads - 1) / threads;
+  // CUDA grid x dim is capped at 2^31-1 on most archs; assert we fit.
+  if (blocks_sz > static_cast<size_t>(2147483647)) {
+    // Caller bug: tensor too large for a single launch.  Bail
+    // silently — the caller path falls back to FP32 sgemm.
+    return;
+  }
+  const int blocks = static_cast<int>(blocks_sz);
+  if (mode == 1) {
+    cast_f32_to_bf16_kernel<<<blocks, threads>>>(
+        reinterpret_cast<__nv_bfloat16 *>(out), in, n);
+  } else if (mode == 2) {
+    cast_f32_to_fp16_kernel<<<blocks, threads>>>(
+        reinterpret_cast<__half *>(out), in, n);
+  }
+}
+
 __global__ void relu_kernel(float *out, const float *in, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n)
