@@ -178,10 +178,15 @@ class KANEdgeLUT(nn.Module):
     @torch.no_grad()
     def forward(self, x):
         # Map x ∈ [x_min, x_max] to table index, then linear interp.
+        # FP32 precision gotcha: `self.n - 1 - 1e-6` rounds to `n - 1.0`
+        # exactly in float32 (epsilon for 1023 is ~0.125, so 1e-6 is lost),
+        # which lets `xn` reach exactly `n - 1`, making `i0+1 == n` → out of
+        # bounds for y_grid[n].  Clamp i0 itself to n-2 after the cast to
+        # be precision-independent.
         xn = (x.squeeze(-1) - self.x_min) / (self.x_max - self.x_min) * (self.n - 1)
-        xn = xn.clamp(0, self.n - 1 - 1e-6)
-        i0 = xn.long()
-        frac = (xn - i0.float()).unsqueeze(-1)
+        xn = xn.clamp(0.0, float(self.n - 1))
+        i0 = xn.long().clamp(0, self.n - 2)
+        frac = (xn - i0.float()).clamp(0.0, 1.0).unsqueeze(-1)
         y0 = self.y_grid[i0].unsqueeze(-1)
         y1 = self.y_grid[i0 + 1].unsqueeze(-1)
         return y0 + frac * (y1 - y0)

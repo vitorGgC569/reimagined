@@ -174,6 +174,10 @@ class TinyTransformerLM(nn.Module):
 def pretrain_on_nca(model: nn.Module, vocab_size: int, *, device: torch.device,
                      n_rollouts: int = 50, batch: int = 8, steps_per_rollout: int = 16,
                      lr: float = 3e-4) -> List[float]:
+    # The caller passes a freshly-constructed model that lives on CPU.
+    # We move it to device here so tokens (also on device) match.
+    # train_and_eval downstream re-moves it, which is a no-op.
+    model.to(device)
     nca = SimpleNCA(channels=8, grid=32).to(device)
     # We DO NOT train the NCA — we use a randomly-init'd NCA as a
     # synthetic data generator.  Mordvintsev's original NCA paper
