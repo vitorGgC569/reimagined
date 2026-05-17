@@ -27,14 +27,15 @@
 #include <cuda_runtime.h>
 #endif
 
-// ── Profiler hook globals (default null; populated by nsos_profiler
-// library if-and-only-if the user runs the standalone profile tool).
-// Declared with C linkage so the static-library boundary is clean.
+// ── Profiler hook globals (legacy — kept null, never used) ─────────────
+// The profiler now attaches callbacks AS INSTANCE MEMBERS via
+// JambaModel::set_profiler_callbacks().  The globals below are no
+// longer read by the forward path but remain defined so any external
+// build that links against nsos_core and references them does not
+// break.  They are always null.
 extern "C" {
     typedef void (*nsos_profiler_layer_event_fn)(void* profiler, int layer_idx);
     typedef void (*nsos_profiler_layer_end_fn)(void* profiler);
-    // Defined as null pointers here; the profiler library's
-    // nsos_profiler_install_hooks() flips them to its real callbacks.
     nsos_profiler_layer_event_fn g_nsos_profiler_begin_layer = nullptr;
     nsos_profiler_layer_end_fn   g_nsos_profiler_end_layer   = nullptr;
 }
@@ -399,25 +400,22 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
         zero_sequence_suffix_inplace(hidden, last_input_batch_lengths_);
     }
     // ── OPT-IN profiler hook ───────────────────────────────────────────
-    // When `profiler_` is non-null (only set by the standalone profile
-    // tool, never in production builds), we emit per-layer events.
-    // The implementation lives in a separate translation unit linked
-    // from the nsos_profiler library; we resolve it via a weak symbol
-    // pattern: the helper functions are declared with weak linkage in
-    // jamba_profiler_hooks.h and defined ONLY in the profiler library.
-    // In a production link without that library, the symbols are null
-    // and the (profiler_ != nullptr) branch never fires anyway.
-    // For simplicity here we use a direct C ABI thunk that the
-    // profiler library installs at runtime via attach_profiler.
-    // The hot-path cost when profiler_ is null is exactly one pointer
-    // load + one branch — the branch predictor learns it on iteration
-    // 1 and the cost vanishes.
-    nsos_profiler_layer_event_fn  profiler_begin_layer = nullptr;
-    nsos_profiler_layer_end_fn    profiler_end_layer   = nullptr;
-    if (profiler_) {
-        profiler_begin_layer = g_nsos_profiler_begin_layer;
-        profiler_end_layer   = g_nsos_profiler_end_layer;
-    }
+    // The callbacks are stored as INSTANCE MEMBERS of JambaModel
+    // (profiler_begin_layer_ / profiler_end_layer_), not as DLL
+    // globals.  This is intentional: in a Windows two-pyd setup
+    // (nsos_ext.pyd holds the model code, nsos_profiler_ext.pyd
+    // provides the callbacks), each pyd gets its OWN copy of any
+    // global initialized by a static library, so a global setter
+    // pattern reads the WRONG copy on the model side.  Function
+    // pointers stored on the instance bypass that — they're plain
+    // address values that the model can call regardless of which
+    // pyd defined them.
+    //
+    // Production cost when no profiler is attached: one pointer load
+    // (profiler_begin_layer_) and one branch (predicted not-taken
+    // after first iteration).  Effectively free.
+    const auto profiler_begin_layer = profiler_begin_layer_;
+    const auto profiler_end_layer   = profiler_end_layer_;
     int layer_index = 0;
     for (auto& layer : layers) {
         if (ctx && ctx->abort_signal && ctx->abort_signal->load(std::memory_order_relaxed)) {

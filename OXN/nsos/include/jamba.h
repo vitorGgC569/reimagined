@@ -337,8 +337,28 @@ public:
   // the profiler-aware build path reinterprets back to the typed
   // pointer.  This is a deliberate choice: production headers don't
   // need to know the profiler type exists.
+  // Function-pointer + data attach.  We store the callbacks AS
+  // POINTERS ON THE INSTANCE (not in globals) so that the Windows
+  // DLL boundary between nsos_ext.pyd (which has the model code) and
+  // nsos_profiler_ext.pyd (which provides the callbacks) doesn't
+  // matter — function-pointer values are uniform across DLLs in the
+  // same process, and we never need a shared global symbol.
+  //
+  // Both callbacks take (void* profiler_opaque, int layer_idx) for
+  // begin and (void* profiler_opaque) for end.  The profiler library
+  // installs them by passing raw function-pointer addresses cast to
+  // uintptr_t (and back through reinterpret_cast inside set_layer_callbacks).
+  using ProfilerBeginLayerFn = void (*)(void* profiler, int layer_idx);
+  using ProfilerEndLayerFn   = void (*)(void* profiler);
   void attach_profiler(void* profiler) { profiler_ = profiler; }
+  void set_profiler_callbacks(ProfilerBeginLayerFn begin_fn,
+                              ProfilerEndLayerFn end_fn) {
+      profiler_begin_layer_ = begin_fn;
+      profiler_end_layer_   = end_fn;
+  }
   void* profiler() const { return profiler_; }
+  ProfilerBeginLayerFn profiler_begin_layer_fn() const { return profiler_begin_layer_; }
+  ProfilerEndLayerFn   profiler_end_layer_fn()   const { return profiler_end_layer_; }
   void record_audit_token_context(const std::vector<int>& token_ids_sample,
                                   size_t batch_size,
                                   size_t prompt_tokens_total,
@@ -357,10 +377,11 @@ private:
   Tensor saved_final_hidden_;
   Tensor saved_final_norm_;
   LayerAuditCollector* audit_collector_ = nullptr;
-  // Opt-in profiler.  Typed as void* in the header so production
-  // TUs never need to include profiler/inference_profiler.h.
-  // Implementation TUs cast back; see jamba.cpp for the helper.
-  void* profiler_ = nullptr;
+  // Opt-in profiler state.  All three default to null; production
+  // forward path is a single load + branch when set is empty.
+  void*                profiler_              = nullptr;
+  ProfilerBeginLayerFn profiler_begin_layer_  = nullptr;
+  ProfilerEndLayerFn   profiler_end_layer_    = nullptr;
 };
 
 class D2FDecoder {

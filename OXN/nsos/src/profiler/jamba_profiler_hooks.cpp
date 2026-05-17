@@ -47,24 +47,35 @@ const char* layer_name(int idx) {
     return "layer_overflow";  // very rare; reports under one bucket
 }
 
-void on_layer_begin(void* profiler_ptr, int layer_idx) {
+}  // namespace
+
+// Public C ABI callbacks.  The profiler_bindings.cpp takes the
+// address of these and passes them through set_profiler_callbacks
+// on the model instance.  They live in this TU (which is compiled
+// into nsos_profiler.lib and linked into nsos_profiler_ext.pyd) but
+// the model code in nsos_ext.pyd can CALL them by pointer — function
+// pointers cross DLL boundaries fine, only globals don't.
+void nsos_profiler_on_layer_begin(void* profiler_ptr, int layer_idx) {
     auto* p = reinterpret_cast<nsos::profiler::InferenceProfiler*>(profiler_ptr);
     if (!p) return;
     p->begin_event(nsos::profiler::EventKind::LAYER, layer_name(layer_idx),
                     layer_idx);
 }
 
-void on_layer_end(void* profiler_ptr) {
+void nsos_profiler_on_layer_end(void* profiler_ptr) {
     auto* p = reinterpret_cast<nsos::profiler::InferenceProfiler*>(profiler_ptr);
     if (!p) return;
     p->end_event();
 }
 
-}  // namespace
-
+// Legacy install/uninstall API kept for source compatibility with
+// older code paths that referenced the old global-based mechanism.
+// Now they just install into the same globals (which are read by
+// nothing).  The real install happens in attach_to_engine inside
+// profiler_bindings.cpp via the model's set_profiler_callbacks.
 void nsos_profiler_install_hooks() {
-    g_nsos_profiler_begin_layer = &on_layer_begin;
-    g_nsos_profiler_end_layer   = &on_layer_end;
+    g_nsos_profiler_begin_layer = &nsos_profiler_on_layer_begin;
+    g_nsos_profiler_end_layer   = &nsos_profiler_on_layer_end;
 }
 
 void nsos_profiler_uninstall_hooks() {

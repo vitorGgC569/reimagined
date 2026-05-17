@@ -133,7 +133,9 @@ def main() -> int:
     args = parse_args()
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    build_dir = detect_build_dir(args.build_dir)
+    # os.add_dll_directory requires an ABSOLUTE path on Windows; convert
+    # so users can pass relative paths from any working directory.
+    build_dir = detect_build_dir(args.build_dir).resolve()
     add_windows_runtime_dirs(build_dir, parse_preferred_cuda_root(None))
     if str(build_dir) not in sys.path:
         sys.path.insert(0, str(build_dir))
@@ -220,7 +222,10 @@ def main() -> int:
     print("[profiler] attaching profiler...")
     profiler = profiler_ext.InferenceProfiler(args.ring_capacity)
     profiler_ext.install_hooks()
-    profiler_ext.attach_to_model(engine.model, profiler)
+    # Use attach_to_engine: the InferenceEngine wrapper holds the
+    # JambaModel internally and the profiler bindings dereference it
+    # safely.  This avoids needing engine.model exposed in nsos_ext.
+    profiler_ext.attach_to_engine(engine, profiler)
 
     # ── Measured passes ─────────────────────────────────────────────────
     print(f"[profiler] measuring ({args.measured_passes} passes)...")
@@ -237,7 +242,7 @@ def main() -> int:
     wall_elapsed = time.time() - wall_started
 
     # ── Detach + drain ──────────────────────────────────────────────────
-    profiler_ext.detach_from_model(engine.model)
+    profiler_ext.detach_from_engine(engine)
     profiler_ext.uninstall_hooks()
 
     summary = profiler.drain_summary()

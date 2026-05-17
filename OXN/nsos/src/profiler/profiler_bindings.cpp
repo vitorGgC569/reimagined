@@ -16,6 +16,7 @@
 #include "../../include/profiler/cache_probe.h"
 #include "../../include/profiler/jamba_profiler_hooks.h"
 #include "../../include/jamba.h"
+#include "../../include/nsos_sdk.h"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -124,4 +125,44 @@ PYBIND11_MODULE(nsos_profiler_ext, m) {
               m->attach_profiler(nullptr);
           },
           py::arg("model"));
+
+    // Engine-level convenience: attach/detach via the InferenceEngine
+    // wrapper.  Saves the caller from having to expose engine.model
+    // separately.
+    m.def("attach_to_engine",
+          [](py::object engine_obj, nsos::profiler::InferenceProfiler& profiler) {
+              auto* engine = engine_obj.cast<nsos::InferenceEngine*>();
+              if (!engine || !engine->model) {
+                  throw std::runtime_error(
+                      "attach_to_engine: engine has no loaded model");
+              }
+              // Set the opaque data pointer (the profiler instance) AND
+              // the function-pointer callbacks on the model instance.
+              // Storing function pointers on the instance (not DLL
+              // globals) sidesteps the Windows two-pyd boundary issue:
+              // the model code in nsos_ext.pyd and the callback code in
+              // nsos_profiler_ext.pyd live in different DLLs but share
+              // the same process address space, so function-pointer
+              // values are uniformly callable.
+              engine->model->attach_profiler(static_cast<void*>(&profiler));
+              engine->model->set_profiler_callbacks(
+                  &nsos_profiler_on_layer_begin,
+                  &nsos_profiler_on_layer_end);
+          },
+          py::arg("engine"), py::arg("profiler"),
+          "Attach a profiler to a fully-loaded InferenceEngine.  Installs "
+          "both the data pointer (the profiler itself) AND the function-"
+          "pointer callbacks on the model instance.  No globals involved, "
+          "so works across the nsos_ext.pyd / nsos_profiler_ext.pyd DLL "
+          "boundary.");
+
+    m.def("detach_from_engine",
+          [](py::object engine_obj) {
+              auto* engine = engine_obj.cast<nsos::InferenceEngine*>();
+              if (engine && engine->model) {
+                  engine->model->attach_profiler(nullptr);
+                  engine->model->set_profiler_callbacks(nullptr, nullptr);
+              }
+          },
+          py::arg("engine"));
 }

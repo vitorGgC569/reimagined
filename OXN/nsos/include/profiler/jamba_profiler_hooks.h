@@ -43,6 +43,12 @@ void nsos_profiler_install_hooks();
 // Uninstall (sets the globals back to nullptr).
 void nsos_profiler_uninstall_hooks();
 
+// Direct callbacks — exported so profiler_bindings.cpp can take
+// their address and pass them through set_profiler_callbacks on
+// the model instance.  This is the cross-DLL-safe path.
+void nsos_profiler_on_layer_begin(void* profiler_ptr, int layer_idx);
+void nsos_profiler_on_layer_end(void* profiler_ptr);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
