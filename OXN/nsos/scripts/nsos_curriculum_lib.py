@@ -22,6 +22,57 @@ PHASE_ORDER = [
     "phase6_memory",
 ]
 
+# LEARN A2 (Curriculum reorder — Arxiv 2405.07490, 2506.11300, 2601.21698):
+# v11 curriculum order changes the EXECUTION sequence from the historical
+# "algorithms → structured → text → instructions → verifier → memory" to
+# "curated_text → algorithms → structured → instructions → verifier → memory".
+#
+# Rationale (curriculum learning research 2024-2026):
+#   * Curated text (phase 3 in v11: TinyStories + Cosmopedia + Wikipedia
+#     + C4) is the EASIEST distribution for an under-trained model to
+#     fit — high lexical regularity, natural narrative flow, large
+#     sample count.  Starting with it builds the basic language model.
+#   * Algorithms (phase 1) is the HARDEST distribution at this scale
+#     because outputs are exact short strings ("EVEN", "11010", "12")
+#     with no fluency safety net.  Asking a from-scratch model to
+#     learn that first poisons the first-token distribution.
+#   * Structured QA (phase 2) needs the model to already know how
+#     English sentences work — it learns "answer is a span of the
+#     evidence", which assumes it can read.
+#   * Instructions (phase 4) is composition of all the above.
+#   * Verifier (5) and Memory (6) are specialty phases at the end.
+#
+# Empirically (Strategic Data Ordering, Arxiv 2405.07490): curriculum
+# learning gives a notable boost in early-to-mid training and is most
+# useful when the model has limited capacity (our 40M case).
+#
+# The names of the phases are kept (so existing checkpoints and
+# bundle layouts continue to load) but the execution order changes.
+# train_curriculum.py reads PHASE_ORDER_V11 when the profile sets
+# `curriculum_phase_order = "v11"`, else falls back to PHASE_ORDER.
+PHASE_ORDER_V11 = [
+    "phase3_curated_text",   # easiest distribution → foundation
+    "phase1_algorithms",     # symbolic math after basic English
+    "phase2_structured",     # extractive QA on top of comprehension
+    "phase4_instructions",   # compose: read + answer briefly
+    "phase5_verifier",       # specialty: verify previous answers
+    "phase6_memory",         # specialty: multi-turn memory
+]
+
+
+def resolve_phase_order(profile_curriculum_order: str | None = None) -> list:
+    """Return the phase execution order for a given profile setting.
+
+    profile_curriculum_order:
+        - None or "v10": use the historical PHASE_ORDER
+          (algorithms → structured → text → instructions → verifier → memory)
+        - "v11": use PHASE_ORDER_V11 (curated_text first; curriculum-learning
+          easier-to-harder ordering per Arxiv 2405.07490)
+    """
+    if profile_curriculum_order == "v11":
+        return list(PHASE_ORDER_V11)
+    return list(PHASE_ORDER)
+
 DEFAULT_PHASE_SIZES = {
     "phase1_algorithms": {"train": 512, "eval": 128},
     "phase2_structured": {"train": 384, "eval": 96},
@@ -93,6 +144,17 @@ REAL_DATASET_FILES = {
     "the_stack_smol": "the_stack_smol.jsonl",
     "c4_sample": "c4_sample.jsonl",
     "squad_v2": "squad_v2.jsonl",
+    # LEARN A1: all eight Cosmopedia configs (Cosmopedia paper trained
+    # cosmo-1B on the full mix totaling ~25B tokens).  Each config
+    # targets a different register; we sample from all to keep phase 3
+    # text registry diverse.
+    "cosmopedia_khanacademy": "cosmopedia_khanacademy.jsonl",
+    "cosmopedia_openstax":    "cosmopedia_openstax.jsonl",
+    "cosmopedia_stanford":    "cosmopedia_stanford.jsonl",
+    "cosmopedia_stories":     "cosmopedia_stories.jsonl",
+    "cosmopedia_web_v1":      "cosmopedia_web_v1.jsonl",
+    "cosmopedia_web_v2":      "cosmopedia_web_v2.jsonl",
+    "cosmopedia_wikihow":     "cosmopedia_wikihow.jsonl",
 }
 _REAL_DATASET_CACHE: Dict[str, List[Dict]] = {}
 
@@ -685,9 +747,19 @@ def _phase3_real_documents(repo_root: Path, split: str, seed: int) -> List[Tuple
         ("wikipedia_pt", 620, 72, 4000, 240),
         ("wikitext_en",  560, 64, 2000, 120),
         # ── v11 expansion (skipped if not fetched) ───────────────────────
-        # Cosmopedia: educational-style content tailored for small LMs.
+        # Cosmopedia (LEARN A1 — full multi-config sweep, 2026-05-16):
+        # We pull from all 8 configs to diversify the synthetic register.
+        # cosmopedia_v2 is the auto_math_text config kept for backward
+        # compat with the v11 first-pass build that only fetched it.
         # Longer chunks (720) because passages are coherent multi-paragraph.
-        ("cosmopedia_v2", 720, 80, 8000, 400),
+        ("cosmopedia_v2",          720, 80, 4000, 200),
+        ("cosmopedia_khanacademy", 720, 80, 4000, 200),
+        ("cosmopedia_openstax",    720, 80, 4000, 200),
+        ("cosmopedia_stanford",    720, 80, 4000, 200),
+        ("cosmopedia_stories",     560, 64, 4000, 200),  # narrative — shorter chunks
+        ("cosmopedia_web_v1",      720, 80, 4000, 200),
+        ("cosmopedia_web_v2",      720, 80, 4000, 200),
+        ("cosmopedia_wikihow",     560, 64, 4000, 200),  # how-to — shorter chunks
         # TinyStories: simple narrative; small chunks (320) because each
         # story is short on purpose.  Eldridge & Li (2023) shows these
         # alone make 10-30M models coherent.

@@ -54,8 +54,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-vocab",
         type=int,
-        default=2048,
-        help="Final target vocabulary size including special tokens.",
+        default=16384,
+        help=(
+            "Final target vocabulary size including special tokens.  "
+            "LEARN S2 (2026-05-16): default raised from 2048 -> 16384.  "
+            "Larger vocabularies reduce tokenization fragmentation "
+            "(~10-25%% fewer tokens per sequence for English+code mix), "
+            "which means more useful context per training step.  v10 "
+            "tokenizer ended at vocab=4897 because the curated bundle "
+            "didn't have enough byte-pair coverage to reach 8192; "
+            "with the v11 Cosmopedia + TinyStories + The Stack mix "
+            "there is enough corpus diversity to reach 16384 BPE "
+            "merges.  Frontier LLMs typically use 32K-128K vocab "
+            "(GPT-4 ~100K, Llama-3 128K) — 16K is the practical "
+            "middle ground for our 40M-80M model where embedding "
+            "table memory matters (16384 * 512 * 4 bytes = 32MB)."
+        ),
     )
     return parser.parse_args()
 

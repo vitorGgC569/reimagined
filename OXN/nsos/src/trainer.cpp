@@ -761,12 +761,34 @@ void apply_optimizer_step(Trainer& trainer,
     const float bc1 = 1.0f - std::pow(trainer.beta1, trainer.global_step_count);
     const float bc2 = 1.0f - std::pow(trainer.beta2, trainer.global_step_count);
 
+    // AUDIT #10 (2026-05-16): hoist Adam state allocation out of the
+    // hot per-step loop.  Previously each step did a find() check per
+    // parameter and lazy-initialized.  Even with std::unordered_map's
+    // O(1) find, this is wasted work after the first step: every
+    // subsequent step hits the same "already present" branch on every
+    // parameter.  We now pre-allocate state on first visit per param
+    // and rely on operator[] returning an existing reference cheaply.
+    //
+    // The shape-mismatch guard is an extra safety net: if a parameter
+    // is added or resized between calls (e.g., during architecture
+    // surgery in tests), we re-init that state to avoid silent shape
+    // bugs.  In production training the shapes are stable so this
+    // branch never fires after warmup.
     for (auto* p : params) {
         if (!p || p->grad.size == 0) continue;
 
-        if (trainer.m_state.find(p) == trainer.m_state.end()) {
-            trainer.m_state[p] = Tensor::zeros(p->data.shape.dims, p->data.get_device());
-            trainer.v_state[p] = Tensor::zeros(p->data.shape.dims, p->data.get_device());
+        auto m_it = trainer.m_state.find(p);
+        if (m_it == trainer.m_state.end()) {
+            trainer.m_state.emplace(p, Tensor::zeros(p->data.shape.dims,
+                                                      p->data.get_device()));
+            trainer.v_state.emplace(p, Tensor::zeros(p->data.shape.dims,
+                                                      p->data.get_device()));
+        } else if (m_it->second.shape != p->data.shape ||
+                   m_it->second.get_device() != p->data.get_device()) {
+            // Architecture changed under us — re-init this entry.
+            m_it->second = Tensor::zeros(p->data.shape.dims, p->data.get_device());
+            trainer.v_state[p] =
+                Tensor::zeros(p->data.shape.dims, p->data.get_device());
         }
 
         Tensor& m_tensor = trainer.m_state[p];

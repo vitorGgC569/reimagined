@@ -139,13 +139,90 @@ DATASET_SPECS = {
     #
     # target_rows here are PER-FETCH; the user can override with
     # --scale-factor at the CLI to multiply all of them uniformly.
+    # LEARN A1 (2026-05-16): Cosmopedia is shipped as eight distinct
+    # configs that target different "registers" of synthetic content.
+    # The auto_math_text subset alone (used in v11 first pass) is the
+    # smallest and most narrow.  Frontier-quality small-model training
+    # uses the FULL Cosmopedia mix because each config teaches the
+    # model a different distribution of style/structure.
+    #
+    # Per the Cosmopedia paper (HuggingFace 2024), the cosmo-1B model
+    # was trained on the full mix totaling ~25B tokens.  At our 40M
+    # scale we sample much less, but we pull from every config so the
+    # phase 3 text registry stays diverse.
+    #
+    # The eight configs (HF dataset HuggingFaceTB/cosmopedia):
+    #   auto_math_text  - educational math from web sources
+    #   khanacademy     - Khan Academy style explanations
+    #   openstax        - OpenStax textbook style passages
+    #   stanford        - Stanford encyclopedia of philosophy style
+    #   stories         - narrative passages (similar to TinyStories)
+    #   web_samples_v1  - general web rewrites (first batch)
+    #   web_samples_v2  - general web rewrites (second batch)
+    #   wikihow         - WikiHow how-to article style
     "cosmopedia_v2": {
         "dataset": "HuggingFaceTB/cosmopedia",
-        "config": "auto_math_text",  # subset; full has multiple configs
+        "config": "auto_math_text",
         "split": "train",
-        "target_rows": 8000,
+        "target_rows": 4000,    # one config of 8 — total ~32K with full mix
         "page_length": 100,
-        "pages": 80,
+        "pages": 40,
+    },
+    "cosmopedia_khanacademy": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "khanacademy",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
+    },
+    "cosmopedia_openstax": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "openstax",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
+    },
+    "cosmopedia_stanford": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "stanford",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
+    },
+    "cosmopedia_stories": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "stories",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
+    },
+    "cosmopedia_web_v1": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "web_samples_v1",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
+    },
+    "cosmopedia_web_v2": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "web_samples_v2",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
+    },
+    "cosmopedia_wikihow": {
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "config": "wikihow",
+        "split": "train",
+        "target_rows": 4000,
+        "page_length": 100,
+        "pages": 40,
     },
     "tinystories": {
         "dataset": "roneneldan/TinyStories",
@@ -674,6 +751,15 @@ FILTERS: Dict[str, Callable[[Dict], Dict | None]] = {
     "the_stack_smol": filter_the_stack_smol,
     "c4_sample": filter_c4,
     "squad_v2": filter_squad_v2,
+    # LEARN A1: all eight Cosmopedia configs share the same row schema
+    # (`text` + `prompt` + `seed_data`), so they reuse filter_cosmopedia.
+    "cosmopedia_khanacademy": filter_cosmopedia,
+    "cosmopedia_openstax":    filter_cosmopedia,
+    "cosmopedia_stanford":    filter_cosmopedia,
+    "cosmopedia_stories":     filter_cosmopedia,
+    "cosmopedia_web_v1":      filter_cosmopedia,
+    "cosmopedia_web_v2":      filter_cosmopedia,
+    "cosmopedia_wikihow":     filter_cosmopedia,
 }
 
 

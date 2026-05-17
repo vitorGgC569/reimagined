@@ -19,10 +19,12 @@ import numpy as np
 from cuda_env import add_windows_runtime_dirs, parse_preferred_cuda_root
 from nsos_curriculum_lib import (
     PHASE_ORDER,
+    PHASE_ORDER_V11,
     SPECIAL_TOKENS,
     build_curriculum,
     build_tokenizer_bundle,
     curriculum_texts_for_phase,
+    resolve_phase_order,
 )
 from summarize_layer_audit import build_report as build_layer_audit_report
 
@@ -611,6 +613,13 @@ PROFILES["hybrid_v11_colab_t4"]["phase_repetition_unlikelihood_scale"] = {
     "phase6_memory":       0.03,
     "instruction_polish":  0.05,
 }
+# LEARN A2 (2026-05-16): switch to the v11 curriculum order
+# (curated_text → algorithms → structured → instructions → verifier →
+# memory).  Strategic Data Ordering (Arxiv 2405.07490) and Efficient
+# Pretraining via Curriculum (Arxiv 2506.11300) both show that easier
+# distributions first builds better foundational representations for
+# under-trained small models.
+PROFILES["hybrid_v11_colab_t4"]["curriculum_phase_order"] = "v11"
 PROFILES["hybrid_v11_colab_t4"]["validation_scope"] = (
     "hybrid_v11_colab_t4: Federated training on Colab Tesla T4 (sm_75, 16GB). "
     "batch_size=32 (~16K tokens/step), lr=8e-4, warmup=400. "
@@ -3282,7 +3291,7 @@ def evaluate_phase(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int,
 
 def build_global_suite(bundle_dir: Path, samples_per_phase: int) -> Dict[str, List[Dict]]:
     suite: Dict[str, List[Dict]] = {}
-    for phase_name in PHASE_ORDER:
+    for phase_name in resolve_phase_order(None):
         suite[phase_name] = curriculum_texts_for_phase(bundle_dir, phase_name, "eval")[: max(1, samples_per_phase)]
     return suite
 
@@ -3760,7 +3769,30 @@ def main() -> int:
             debug_eval_log(logger, f"capacity_holdout:done source={source_name} score={score:.4f}")
             return score
 
+        # AUDIT #8 (2026-05-16): write metrics to a LOCAL fast file
+        # first and copy to the run_dir (which may be on Drive fuse,
+        # ~5-10ms per write) periodically.  Drive fuse syncs each
+        # write to the cloud, so every metrics_file.write+flush turns
+        # into a network roundtrip.  Local /tmp file is ~microseconds.
+        #
+        # The local file is the source of truth during the run; we
+        # copy to run_dir at:
+        #   * end of every phase (after phase_summary written)
+        #   * end of every rehearsal block
+        #   * end of polish + consolidation phases
+        # If the run crashes between flushes, the local file has
+        # everything; user can `cp /tmp/<file> <run_dir>/` manually.
         metrics_path = run_dir / "metrics.jsonl"
+        import tempfile
+        _metrics_local_dir = Path(tempfile.gettempdir())
+        _metrics_local_name = (
+            f"nsos_metrics_{run_dir.name}_{int(time.time())}.jsonl"
+        )
+        metrics_local_path = _metrics_local_dir / _metrics_local_name
+        def _flush_metrics_to_run_dir():
+            """Atomically copy the local metrics file to run_dir."""
+            if metrics_local_path.exists():
+                shutil.copy2(metrics_local_path, metrics_path)
         supervised_history: List[Dict] = []
         supervised_history_by_family: Dict[str, List[Dict]] = {}
         replay_rng = random.Random(args.seed + 9001)
@@ -3770,8 +3802,16 @@ def main() -> int:
         best_release_score = float("-inf")
         best_capacity_score = float("-inf")
         best_capacity_kind_scores: Dict[str, float] = {}
-        with metrics_path.open("w", encoding="utf-8") as metrics_file:
-            for phase_index, phase_name in enumerate(PHASE_ORDER):
+        # LEARN A2: resolve curriculum phase order from profile.  v11
+        # profiles set curriculum_phase_order="v11" which orders as
+        # curated_text→algorithms→structured→instructions→verifier→memory.
+        execution_phase_order = resolve_phase_order(
+            profile.get("curriculum_phase_order"))
+        # AUDIT #8: open the LOCAL metrics file for writing.  Periodic
+        # _flush_metrics_to_run_dir() copies it to the (possibly slow)
+        # run_dir at phase boundaries.
+        with metrics_local_path.open("w", encoding="utf-8") as metrics_file:
+            for phase_index, phase_name in enumerate(execution_phase_order):
                 train_rows = curriculum_texts_for_phase(args.bundle_dir, phase_name, "train")
                 eval_rows = curriculum_texts_for_phase(args.bundle_dir, phase_name, "eval")
                 train_tokens = build_token_stream(tokenizer, train_rows, "<|endoftext|>")
@@ -4030,6 +4070,8 @@ def main() -> int:
                 summary["phases"].append(phase_summary)
                 metrics_file.write(json.dumps(phase_summary, ensure_ascii=False) + "\n")
                 metrics_file.flush()
+                # AUDIT #8: copy local metrics to run_dir at phase boundary.
+                _flush_metrics_to_run_dir()
 
                 if selected_source == "final":
                     save_checkpoint_artifact(phase_name)
@@ -4185,6 +4227,7 @@ def main() -> int:
                     summary["phases"].append(rehearsal_summary)
                     metrics_file.write(json.dumps(rehearsal_summary, ensure_ascii=False) + "\n")
                     metrics_file.flush()
+                    _flush_metrics_to_run_dir()
                     save_checkpoint_artifact(rehearsal_phase_name)
                     trainer.learning_rate = base_learning_rate
                     logger.log(
@@ -4408,6 +4451,7 @@ def main() -> int:
                 summary["phases"].append(polish_summary)
                 metrics_file.write(json.dumps(polish_summary, ensure_ascii=False) + "\n")
                 metrics_file.flush()
+                _flush_metrics_to_run_dir()
                 if selected_source == "final":
                     save_checkpoint_artifact(polish_phase_name)
                 logger.log(
@@ -4483,7 +4527,7 @@ def main() -> int:
                         consolidation_progress.close()
 
                 consolidation_eval_rows: List[Dict] = []
-                for phase_name in PHASE_ORDER:
+                for phase_name in resolve_phase_order(None):
                     if phase_name == "phase3_curated_text":
                         continue
                     consolidation_eval_rows.extend(
@@ -4554,6 +4598,7 @@ def main() -> int:
                 summary["phases"].append(consolidation_summary)
                 metrics_file.write(json.dumps(consolidation_summary, ensure_ascii=False) + "\n")
                 metrics_file.flush()
+                _flush_metrics_to_run_dir()
                 save_checkpoint_artifact("final_consolidation")
                 logger.log(
                     f"[eval] final_consolidation: answer_loss={consolidation_summary['answer_loss']:.4f} "
