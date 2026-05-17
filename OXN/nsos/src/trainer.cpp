@@ -861,19 +861,35 @@ void apply_supervised_gradient_weights(const Trainer& trainer,
         return;
     }
 
+    // PERF: short-circuit BEFORE the sync_host_access barrier when no
+    // row will actually be rescaled.  The old code called
+    // sync_host_access (= cudaDeviceSynchronize on Pascal+Windows /
+    // first-touch on any platform) every training step even when both
+    // scales were effectively 1.0 and the inner loop was a no-op.  By
+    // computing the gate up front we skip the GPU drain for free
+    // whenever first_token_loss_scale and eos_loss_scale are 1.0.
+    const float ft_scale  = std::max(trainer.first_token_loss_scale, 0.0f);
+    const float eos_scale = std::max(trainer.eos_loss_scale, 0.0f);
+    const int last_row = static_cast<int>(answer_tokens.size()) - 1;
+    const bool needs_first_token = std::abs(ft_scale - 1.0f) > 1e-6f && last_row >= 0;
+    const bool needs_eos = std::abs(eos_scale - 1.0f) > 1e-6f && last_row >= 0 &&
+                           answer_tokens[static_cast<size_t>(last_row)] == trainer.eos_token_id;
+    if (!needs_first_token && !needs_eos) {
+        return;
+    }
+
     // Drain pending GPU work before host write — Pascal+Windows UM has
     // no demand paging.  No-op when answer_grad is host-resident.
     answer_grad.sync_host_access();
 
     float* grad_ptr = answer_grad.data();
-    const int last_row = static_cast<int>(answer_tokens.size()) - 1;
     for (int row = 0; row <= last_row; ++row) {
         float scale = 1.0f;
         if (row == 0) {
-            scale *= std::max(trainer.first_token_loss_scale, 0.0f);
+            scale *= ft_scale;
         }
-        if (row == last_row && answer_tokens[row] == trainer.eos_token_id) {
-            scale *= std::max(trainer.eos_loss_scale, 0.0f);
+        if (row == last_row && answer_tokens[static_cast<size_t>(row)] == trainer.eos_token_id) {
+            scale *= eos_scale;
         }
         if (std::abs(scale - 1.0f) <= 1e-6f) {
             continue;

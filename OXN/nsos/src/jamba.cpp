@@ -98,6 +98,98 @@ class GpuDeviceBuffer {
  private:
   T* ptr_ = nullptr;
 };
+
+// Persistent workspace for the batched MoE forward + backward GPU
+// pipelines.  Replaces 6 GpuDeviceBuffer constructions / destructions
+// per MoE call (12 per layer counting forward+backward) — each pair
+// was costing ~1-5 ms in cudaMalloc/cudaFree plus an implicit stream
+// sync.  With 4 MoE layers and 2 passes per step that was 48-240 ms
+// per step of pure allocator churn on top of the actual compute.
+//
+// One static instance; the training loop is single-threaded so no
+// concurrency guard needed.  Buffers grow geometrically (2×) when a
+// larger N_active comes through and never shrink — CUDA context
+// teardown reclaims them at process exit.
+class MoeWorkspace {
+ public:
+  // num_experts-sized buffers (counts, offsets+1, workspace_counters).
+  // These rarely change shape (num_experts is a model constant), so the
+  // allocation happens once and the buffers are reused forever.
+  int* counts(int num_experts)             { ensure_int(counts_, counts_cap_, num_experts); return counts_; }
+  int* offsets(int num_experts)            { ensure_int(offsets_, offsets_cap_, num_experts + 1); return offsets_; }
+  int* workspace_counters(int num_experts) { ensure_int(work_, work_cap_, num_experts); return work_; }
+  // N_active-sized buffers.  N_active varies per batch (= sum of top-k
+  // selections), so growth happens more often early in training, then
+  // stabilizes once the buffers exceed typical batch maxima.
+  int*   permutation(int n)                { ensure_int(perm_, perm_cap_, n); return perm_; }
+  int*   assignment(int n)                 { ensure_int(assign_, assign_cap_, n); return assign_; }
+  float* scale(int n)                      { ensure_float(scale_, scale_cap_, n); return scale_; }
+  // Pre-filled buffer of 1.0f used by backward's scatter (where the
+  // per-slot weighting was already applied earlier on the dy side).
+  // We refill the vector after a grow but skip the upload when the
+  // existing N_active still fits — avoids a redundant H2D copy per
+  // backward call.
+  float* unit_scale(int n) {
+    bool grew = false;
+    if (n > unit_cap_ || unit_ == nullptr) {
+      if (unit_ != nullptr) { cudaFree(unit_); unit_ = nullptr; }
+      const int new_cap = std::max(n, std::max(unit_cap_ * 2, 1));
+      if (cudaMalloc(&unit_, static_cast<size_t>(new_cap) * sizeof(float)) != cudaSuccess) {
+        unit_ = nullptr; unit_cap_ = unit_filled_ = 0;
+        throw std::runtime_error("MoeWorkspace unit_scale allocation failed");
+      }
+      unit_cap_ = new_cap;
+      unit_filled_ = 0;
+      grew = true;
+    }
+    // Refill only if we grew OR caller wants more elements than we've
+    // initialized so far (the buffer is overprovisioned so a single
+    // upload covers many subsequent same-or-smaller N_active calls).
+    if (grew || n > unit_filled_) {
+      std::vector<float> ones(static_cast<size_t>(unit_cap_), 1.0f);
+      cudaMemcpy(unit_, ones.data(),
+                 static_cast<size_t>(unit_cap_) * sizeof(float),
+                 cudaMemcpyHostToDevice);
+      unit_filled_ = unit_cap_;
+    }
+    return unit_;
+  }
+
+ private:
+  static void ensure_int(int*& ptr, int& cap, int requested) {
+    if (requested <= cap && ptr != nullptr) return;
+    if (ptr != nullptr) { cudaFree(ptr); ptr = nullptr; }
+    const int new_cap = std::max(requested, std::max(cap * 2, 1));
+    if (cudaMalloc(&ptr, static_cast<size_t>(new_cap) * sizeof(int)) != cudaSuccess) {
+      ptr = nullptr; cap = 0;
+      throw std::runtime_error("MoeWorkspace int allocation failed");
+    }
+    cap = new_cap;
+  }
+  static void ensure_float(float*& ptr, int& cap, int requested) {
+    if (requested <= cap && ptr != nullptr) return;
+    if (ptr != nullptr) { cudaFree(ptr); ptr = nullptr; }
+    const int new_cap = std::max(requested, std::max(cap * 2, 1));
+    if (cudaMalloc(&ptr, static_cast<size_t>(new_cap) * sizeof(float)) != cudaSuccess) {
+      ptr = nullptr; cap = 0;
+      throw std::runtime_error("MoeWorkspace float allocation failed");
+    }
+    cap = new_cap;
+  }
+
+  int*   counts_       = nullptr; int counts_cap_     = 0;
+  int*   offsets_      = nullptr; int offsets_cap_    = 0;
+  int*   work_         = nullptr; int work_cap_       = 0;
+  int*   perm_         = nullptr; int perm_cap_       = 0;
+  int*   assign_       = nullptr; int assign_cap_     = 0;
+  float* scale_        = nullptr; int scale_cap_      = 0;
+  float* unit_         = nullptr; int unit_cap_       = 0;
+  int    unit_filled_  = 0;  // how many leading elements of unit_ are 1.0f
+};
+MoeWorkspace& moe_workspace() {
+  static MoeWorkspace ws;
+  return ws;
+}
 #endif
 
 uint64_t hash_token_sequence(const std::vector<int>& tokens) {
@@ -149,10 +241,34 @@ void zero_sequence_suffix_inplace(Tensor& tensor, const std::vector<int>& length
     const int seq_len = tensor.shape[1];
     const int dim = tensor.shape[2];
 
-    // Drain any pending GPU work before host access — required on
-    // Pascal+Windows where Unified Memory has no demand paging.
-    tensor.sync_host_access();
+#ifdef USE_CUDA
+    // GPU path: cudaMemsetAsync per padded row.  Queued on the default
+    // stream and returns immediately — no cudaDeviceSynchronize, no
+    // host pointer access, no D2H staging.  Previously this function
+    // called sync_host_access() (= cudaDeviceSynchronize on first call)
+    // 14 times per forward pass (1 + 12 layers + 1 final), costing
+    // ~150-300 ms/step on Colab T4 even though the actual zeroing work
+    // is microseconds.  cudaMemsetAsync overlaps with whatever kernel
+    // launches next on the same stream, costing effectively zero.
+    if (tensor.get_device() == Device::GPU) {
+        float* base = tensor.raw_data();
+        for (int batch = 0; batch < batch_size; ++batch) {
+            const int valid = std::clamp(lengths[static_cast<size_t>(batch)], 0, seq_len);
+            const int padding_tokens = seq_len - valid;
+            if (padding_tokens <= 0) continue;
+            float* start = base + (static_cast<size_t>(batch) * seq_len + valid) *
+                                  static_cast<size_t>(dim);
+            const size_t bytes = static_cast<size_t>(padding_tokens) *
+                                 static_cast<size_t>(dim) * sizeof(float);
+            cudaMemsetAsync(start, 0, bytes, 0);
+        }
+        return;
+    }
+#endif
 
+    // CPU path (unchanged) — still needs the sync barrier on Pascal+
+    // Windows UM, but it's a no-op on host-resident tensors.
+    tensor.sync_host_access();
     float* ptr = tensor.data();
     for (int batch = 0; batch < batch_size; ++batch) {
         const int valid = std::clamp(lengths[static_cast<size_t>(batch)], 0, seq_len);
@@ -1335,14 +1451,17 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     // a fully batched expert matmul would require concatenated weights
     // and a block-sparse GEMM, which is left for a future PR.
 
-    GpuDeviceBuffer<int> counts_buf(static_cast<size_t>(num_experts));
-    cudaMemset(counts_buf.get(), 0,
-               static_cast<size_t>(num_experts) * sizeof(int));
-    launch_moe_count_per_expert_kernel(weights.raw_data(), counts_buf.get(),
+    // Pull the persistent MoE workspace — counts/offsets/workspace_counters/
+    // permutation/assignment/scale buffers are sized once and reused
+    // forever.  Was 6 cudaMalloc + 6 cudaFree per call (= ~10-30 ms of
+    // pure allocator overhead).
+    MoeWorkspace& moe_ws = moe_workspace();
+    int* counts_ptr  = moe_ws.counts(num_experts);
+    int* offsets_ptr = moe_ws.offsets(num_experts);
+    cudaMemset(counts_ptr, 0, static_cast<size_t>(num_experts) * sizeof(int));
+    launch_moe_count_per_expert_kernel(weights.raw_data(), counts_ptr,
                                         rows, num_experts);
-
-    GpuDeviceBuffer<int> offsets_buf(static_cast<size_t>(num_experts + 1));
-    launch_moe_exclusive_scan_small_kernel(counts_buf.get(), offsets_buf.get(),
+    launch_moe_exclusive_scan_small_kernel(counts_ptr, offsets_ptr,
                                             num_experts);
 
     // Pull counts and offsets to host once: we need them for slice
@@ -1351,10 +1470,10 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     // by the synchronization, not the bytes.
     std::vector<int> counts_host(static_cast<size_t>(num_experts), 0);
     std::vector<int> offsets_host(static_cast<size_t>(num_experts + 1), 0);
-    cudaMemcpy(counts_host.data(), counts_buf.get(),
+    cudaMemcpy(counts_host.data(), counts_ptr,
                static_cast<size_t>(num_experts) * sizeof(int),
                cudaMemcpyDeviceToHost);
-    cudaMemcpy(offsets_host.data(), offsets_buf.get(),
+    cudaMemcpy(offsets_host.data(), offsets_ptr,
                static_cast<size_t>(num_experts + 1) * sizeof(int),
                cudaMemcpyDeviceToHost);
     const int N_active = offsets_host[static_cast<size_t>(num_experts)];
@@ -1407,28 +1526,28 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     }
 
     // Workspace counters for compute_assignments (atomicAdd target).
-    GpuDeviceBuffer<int> workspace_counters(static_cast<size_t>(num_experts));
-    cudaMemset(workspace_counters.get(), 0,
+    int* workspace_counters_ptr = moe_ws.workspace_counters(num_experts);
+    cudaMemset(workspace_counters_ptr, 0,
                static_cast<size_t>(num_experts) * sizeof(int));
 
-    GpuDeviceBuffer<int> permutation_buf(static_cast<size_t>(N_active));
-    GpuDeviceBuffer<int> assignment_buf(static_cast<size_t>(N_active));
-    GpuDeviceBuffer<float> scale_buf(static_cast<size_t>(N_active));
+    int*   permutation_ptr = moe_ws.permutation(N_active);
+    int*   assignment_ptr  = moe_ws.assignment(N_active);
+    float* scale_ptr       = moe_ws.scale(N_active);
 
     launch_moe_compute_assignments_kernel(
-        weights.raw_data(), offsets_buf.get(), workspace_counters.get(),
-        permutation_buf.get(), assignment_buf.get(), scale_buf.get(), rows,
+        weights.raw_data(), offsets_ptr, workspace_counters_ptr,
+        permutation_ptr, assignment_ptr, scale_ptr, rows,
         num_experts);
 
     // Permuted input: contiguous by expert.
     Tensor permuted_input({N_active, dim}, Device::GPU);
-    launch_moe_gather_rows_kernel(x.raw_data(), permutation_buf.get(),
+    launch_moe_gather_rows_kernel(x.raw_data(), permutation_ptr,
                                    permuted_input.raw_data(), N_active, dim);
 
     // AUDIT #4+#5: single D2H of permutation_buf, then O(N_active)
     // population of saved_moe_rows_.  This replaces the old O(rows ×
     // num_experts × log num_experts) host-side partial_sort.
-    cudaMemcpy(saved_moe_permutation_host_.data(), permutation_buf.get(),
+    cudaMemcpy(saved_moe_permutation_host_.data(), permutation_ptr,
                static_cast<size_t>(N_active) * sizeof(int),
                cudaMemcpyDeviceToHost);
     // Reserve per-expert capacity to avoid push_back reallocations.
@@ -1489,7 +1608,7 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     }
 
     launch_moe_scatter_add_weighted_kernel(
-        permuted_output.raw_data(), permutation_buf.get(), scale_buf.get(),
+        permuted_output.raw_data(), permutation_ptr, scale_ptr,
         output_accum.raw_data(), N_active, dim);
 
     return output_accum.reshape(x.shape.dims);
@@ -1662,22 +1781,25 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
     // can drive the same routing the forward pass used.
     Tensor weights_gpu = saved_moe_weights_.to(Device::GPU);
 
-    GpuDeviceBuffer<int> counts_buf(static_cast<size_t>(num_experts));
-    cudaMemset(counts_buf.get(), 0,
-               static_cast<size_t>(num_experts) * sizeof(int));
-    launch_moe_count_per_expert_kernel(weights_gpu.raw_data(), counts_buf.get(),
+    // Reuse the persistent MoE workspace — same struct as forward.
+    // Most allocations are no-ops because forward already grew the
+    // buffers to peak size in this step; backward typically hits the
+    // workspace at the same N_active that forward set up.
+    MoeWorkspace& moe_ws = moe_workspace();
+    int* counts_ptr  = moe_ws.counts(num_experts);
+    int* offsets_ptr = moe_ws.offsets(num_experts);
+    cudaMemset(counts_ptr, 0, static_cast<size_t>(num_experts) * sizeof(int));
+    launch_moe_count_per_expert_kernel(weights_gpu.raw_data(), counts_ptr,
                                         rows, num_experts);
-
-    GpuDeviceBuffer<int> offsets_buf(static_cast<size_t>(num_experts + 1));
-    launch_moe_exclusive_scan_small_kernel(counts_buf.get(), offsets_buf.get(),
+    launch_moe_exclusive_scan_small_kernel(counts_ptr, offsets_ptr,
                                             num_experts);
 
     std::vector<int> counts_host(static_cast<size_t>(num_experts), 0);
     std::vector<int> offsets_host(static_cast<size_t>(num_experts + 1), 0);
-    cudaMemcpy(counts_host.data(), counts_buf.get(),
+    cudaMemcpy(counts_host.data(), counts_ptr,
                static_cast<size_t>(num_experts) * sizeof(int),
                cudaMemcpyDeviceToHost);
-    cudaMemcpy(offsets_host.data(), offsets_buf.get(),
+    cudaMemcpy(offsets_host.data(), offsets_ptr,
                static_cast<size_t>(num_experts + 1) * sizeof(int),
                cudaMemcpyDeviceToHost);
     const int N_active = offsets_host[static_cast<size_t>(num_experts)];
@@ -1687,22 +1809,22 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
         return grad_accum;
     }
 
-    GpuDeviceBuffer<int> workspace_counters(static_cast<size_t>(num_experts));
-    cudaMemset(workspace_counters.get(), 0,
+    int* workspace_counters_ptr = moe_ws.workspace_counters(num_experts);
+    cudaMemset(workspace_counters_ptr, 0,
                static_cast<size_t>(num_experts) * sizeof(int));
 
-    GpuDeviceBuffer<int> permutation_buf(static_cast<size_t>(N_active));
-    GpuDeviceBuffer<int> assignment_buf(static_cast<size_t>(N_active));
-    GpuDeviceBuffer<float> scale_buf(static_cast<size_t>(N_active));
+    int*   permutation_ptr = moe_ws.permutation(N_active);
+    int*   assignment_ptr  = moe_ws.assignment(N_active);
+    float* scale_ptr       = moe_ws.scale(N_active);
 
     launch_moe_compute_assignments_kernel(
-        weights_gpu.raw_data(), offsets_buf.get(), workspace_counters.get(),
-        permutation_buf.get(), assignment_buf.get(), scale_buf.get(), rows,
+        weights_gpu.raw_data(), offsets_ptr, workspace_counters_ptr,
+        permutation_ptr, assignment_ptr, scale_ptr, rows,
         num_experts);
 
     // Gather dy into permuted layout (contiguous by expert).
     Tensor permuted_dy({N_active, dim}, Device::GPU);
-    launch_moe_gather_rows_kernel(dy.raw_data(), permutation_buf.get(),
+    launch_moe_gather_rows_kernel(dy.raw_data(), permutation_ptr,
                                    permuted_dy.raw_data(), N_active, dim);
 
     // Apply per-slot router-weight scaling in-place via multiply-by-vector.
@@ -1742,7 +1864,7 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
         // a device tensor for mul.
         std::vector<float> slot_scales(static_cast<size_t>(count), 0.0f);
         cudaMemcpy(slot_scales.data(),
-                   scale_buf.get() + static_cast<size_t>(offset),
+                   scale_ptr + static_cast<size_t>(offset),
                    static_cast<size_t>(count) * sizeof(float),
                    cudaMemcpyDeviceToHost);
         Tensor scale_col_host({count, 1}, Device::CPU);
@@ -1779,17 +1901,13 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
 
     // Scatter-add the per-slot grads back into grad_accum.  Pass a
     // unit-scale tensor because the per-slot scaling was already
-    // applied above on the dy side.
-    GpuDeviceBuffer<float> unit_scale(static_cast<size_t>(N_active));
-    {
-        std::vector<float> ones(static_cast<size_t>(N_active), 1.0f);
-        cudaMemcpy(unit_scale.get(), ones.data(),
-                   static_cast<size_t>(N_active) * sizeof(float),
-                   cudaMemcpyHostToDevice);
-    }
+    // applied above on the dy side.  unit_scale is owned by the
+    // workspace and pre-filled with 1.0f — H2D copy only on first
+    // call or when N_active grows past the prior peak.
+    float* unit_scale_ptr = moe_ws.unit_scale(N_active);
     launch_moe_scatter_add_weighted_kernel(
-        permuted_grad_input.raw_data(), permutation_buf.get(),
-        unit_scale.get(), grad_accum.raw_data(), N_active, dim);
+        permuted_grad_input.raw_data(), permutation_ptr,
+        unit_scale_ptr, grad_accum.raw_data(), N_active, dim);
 
     return grad_accum;
 }
@@ -2450,6 +2568,22 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             used_gpu_exact_forward = true;
         }
 #endif
+        // ── Saved tensors for backward ─────────────────────────────
+        // These need q_rot / k_rot / v_heads on the host (the existing
+        // Attention::backward at jamba.cpp:3130+ consumes them as CPU
+        // tensors via saved_*_.cpu()).  We must compute them either way
+        // so backward can run.
+        //
+        // BUT: previously this whole block also ran the FULL CPU
+        // quadratic attention (~250 M ops/layer for batch=32, seq=160,
+        // 8 heads, head_dim=64) AND then THREW THE RESULT AWAY when the
+        // GPU exact-attention kernel had already succeeded (line ~2563
+        // selects `exact_forward_gpu` when `used_gpu_exact_forward`).
+        // For 6 attention-eligible layers per step that wasted
+        // ~1.5 B CPU ops/step — the single largest cause of the
+        // observed ~24 s/step on Colab T4.  Fix: keep the cheap setup
+        // (D2H, KV split, RoPE) so backward can run, and gate the
+        // expensive attention loops behind `if (!used_gpu_exact_forward)`.
         Tensor q_host = (q_flat.get_device() == Device::GPU) ? q_flat.cpu() : q_flat;
         Tensor kv_host = (kv_flat.get_device() == Device::GPU) ? kv_flat.cpu() : kv_flat;
         Tensor k_flat({batch_size, seq_len, kv_dim}, Device::CPU);
@@ -2483,72 +2617,78 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         Tensor v_heads = v_flat.reshape({batch_size, seq_len, n_kv_heads, head_dim});
         auto [q_rot, k_rot] = apply_rope(q_heads, k_heads, 0);
 
+        // Allocate output_heads — only filled by the CPU loop below
+        // when the GPU path did NOT run.  When GPU ran, output_heads
+        // stays unwritten and is discarded; `exact_forward_gpu` is
+        // what gets returned from out_proj below.
         Tensor output_heads({batch_size, seq_len, n_heads, head_dim}, q_rot.get_device());
-        float* out_ptr = output_heads.data();
-        const float* q_ptr = q_rot.data();
-        const float* k_ptr = k_rot.data();
-        const float* v_ptr = v_heads.data();
-        std::vector<float> scores(static_cast<size_t>(seq_len), 0.0f);
-        std::vector<float> probs(static_cast<size_t>(seq_len), 0.0f);
+        if (!used_gpu_exact_forward) {
+            float* out_ptr = output_heads.data();
+            const float* q_ptr = q_rot.data();
+            const float* k_ptr = k_rot.data();
+            const float* v_ptr = v_heads.data();
+            std::vector<float> scores(static_cast<size_t>(seq_len), 0.0f);
+            std::vector<float> probs(static_cast<size_t>(seq_len), 0.0f);
 
-        for (int batch = 0; batch < batch_size; ++batch) {
-            const int valid_len = std::clamp(saved_valid_lengths_[static_cast<size_t>(batch)], 0, seq_len);
-            for (int head = 0; head < n_heads; ++head) {
-                const int kv_head = std::min(head / kv_group_size, n_kv_heads - 1);
-                for (int i = 0; i < seq_len; ++i) {
-                    const size_t out_row_offset =
-                        (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
-                        static_cast<size_t>(head_dim);
-                    if (i >= valid_len) {
-                        std::fill_n(out_ptr + out_row_offset, head_dim, 0.0f);
-                        continue;
-                    }
+            for (int batch = 0; batch < batch_size; ++batch) {
+                const int valid_len = std::clamp(saved_valid_lengths_[static_cast<size_t>(batch)], 0, seq_len);
+                for (int head = 0; head < n_heads; ++head) {
+                    const int kv_head = std::min(head / kv_group_size, n_kv_heads - 1);
+                    for (int i = 0; i < seq_len; ++i) {
+                        const size_t out_row_offset =
+                            (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
+                            static_cast<size_t>(head_dim);
+                        if (i >= valid_len) {
+                            std::fill_n(out_ptr + out_row_offset, head_dim, 0.0f);
+                            continue;
+                        }
 
-                    float max_s = -1e30f;
-                    for (int j = 0; j < seq_len; ++j) {
-                        float score = -1e9f;
-                        if (j < valid_len && j <= i) {
-                            float dot = 0.0f;
-                            const size_t q_offset =
-                                (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
-                                static_cast<size_t>(head_dim);
-                            const size_t k_offset =
-                                (((static_cast<size_t>(batch) * seq_len + j) * n_kv_heads) +
-                                 kv_head) *
-                                static_cast<size_t>(head_dim);
-                            for (int dim = 0; dim < head_dim; ++dim) {
-                                dot += q_ptr[q_offset + dim] * k_ptr[k_offset + dim];
+                        float max_s = -1e30f;
+                        for (int j = 0; j < seq_len; ++j) {
+                            float score = -1e9f;
+                            if (j < valid_len && j <= i) {
+                                float dot = 0.0f;
+                                const size_t q_offset =
+                                    (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
+                                    static_cast<size_t>(head_dim);
+                                const size_t k_offset =
+                                    (((static_cast<size_t>(batch) * seq_len + j) * n_kv_heads) +
+                                     kv_head) *
+                                    static_cast<size_t>(head_dim);
+                                for (int dim = 0; dim < head_dim; ++dim) {
+                                    dot += q_ptr[q_offset + dim] * k_ptr[k_offset + dim];
+                                }
+                                score = dot * scale;
                             }
-                            score = dot * scale;
+                            scores[static_cast<size_t>(j)] = score;
+                            max_s = std::max(max_s, score);
                         }
-                        scores[static_cast<size_t>(j)] = score;
-                        max_s = std::max(max_s, score);
-                    }
 
-                    float sum_exp = 0.0f;
-                    for (int j = 0; j < seq_len; ++j) {
-                        float value =
-                            (j < valid_len && j <= i) ? std::exp(scores[static_cast<size_t>(j)] - max_s)
-                                                      : 0.0f;
-                        probs[static_cast<size_t>(j)] = value;
-                        sum_exp += value;
-                    }
-                    const float inv_sum = 1.0f / std::max(sum_exp, 1e-9f);
-                    for (int j = 0; j < seq_len; ++j) {
-                        probs[static_cast<size_t>(j)] *= inv_sum;
-                    }
-
-                    for (int dim = 0; dim < head_dim; ++dim) {
-                        float acc = 0.0f;
-                        for (int j = 0; j < valid_len; ++j) {
-                            const size_t v_offset =
-                                (((static_cast<size_t>(batch) * seq_len + j) * n_kv_heads) +
-                                 kv_head) *
-                                    static_cast<size_t>(head_dim) +
-                                static_cast<size_t>(dim);
-                            acc += probs[static_cast<size_t>(j)] * v_ptr[v_offset];
+                        float sum_exp = 0.0f;
+                        for (int j = 0; j < seq_len; ++j) {
+                            float value =
+                                (j < valid_len && j <= i) ? std::exp(scores[static_cast<size_t>(j)] - max_s)
+                                                          : 0.0f;
+                            probs[static_cast<size_t>(j)] = value;
+                            sum_exp += value;
                         }
-                        out_ptr[out_row_offset + static_cast<size_t>(dim)] = acc;
+                        const float inv_sum = 1.0f / std::max(sum_exp, 1e-9f);
+                        for (int j = 0; j < seq_len; ++j) {
+                            probs[static_cast<size_t>(j)] *= inv_sum;
+                        }
+
+                        for (int dim = 0; dim < head_dim; ++dim) {
+                            float acc = 0.0f;
+                            for (int j = 0; j < valid_len; ++j) {
+                                const size_t v_offset =
+                                    (((static_cast<size_t>(batch) * seq_len + j) * n_kv_heads) +
+                                     kv_head) *
+                                        static_cast<size_t>(head_dim) +
+                                    static_cast<size_t>(dim);
+                                acc += probs[static_cast<size_t>(j)] * v_ptr[v_offset];
+                            }
+                            out_ptr[out_row_offset + static_cast<size_t>(dim)] = acc;
+                        }
                     }
                 }
             }
@@ -2559,7 +2699,12 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         saved_v_heads_ = v_heads;
         saved_attn_probs_ = Tensor();
 
-        Tensor output_2d = output_heads.reshape({batch_size, seq_len, d_model});
+        // When the GPU kernel produced `exact_forward_gpu`, hand it
+        // straight to out_proj — no reshape of CPU output_heads needed
+        // (it's empty/garbage in that branch).
+        Tensor output_2d = used_gpu_exact_forward
+                               ? Tensor()
+                               : output_heads.reshape({batch_size, seq_len, d_model});
         Tensor projected_input = used_gpu_exact_forward
                                      ? exact_forward_gpu
                                      : ((original_device == Device::GPU) ? output_2d.to(Device::GPU)
