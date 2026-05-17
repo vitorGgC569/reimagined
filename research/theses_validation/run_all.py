@@ -19,6 +19,10 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+# Eager datasets import before torch — Windows segfault workaround;
+# see common/data.py docstring for details.
+import datasets  # eager, before torch  # noqa: F401
+
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
