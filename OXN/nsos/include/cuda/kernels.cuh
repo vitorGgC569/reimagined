@@ -54,6 +54,22 @@ void launch_adamw_update_kernel(float *weights, const float *grad, float *m,
 
 // New Phase 5 Kernels
 void launch_relu_kernel(float *out, const float *in, int n);
+
+// LEARN S1 (BitNet b1.58 2B4T 2026): Squared ReLU activation.
+//   forward:  out[i] = max(0, in[i])^2
+//   backward: in_grad[i] = grad_out[i] * 2 * max(0, in[i])
+// Squared ReLU is the activation BitNet b1.58 ships with because SwiGLU
+// in low-precision (ternary, FP8) suffers occasional activation spikes
+// that overflow the dynamic range and diverge loss after extended
+// training.  Squared ReLU has comparable expressive power to SwiGLU at
+// our scale (40M-80M) while remaining numerically stable in quantized
+// regimes.  Both forward and backward are pure elementwise so we ship
+// dedicated kernels — fusing forward+grad with the BitLinear matmul
+// would be the next-level fusion, deferred to a future pass.
+void launch_squared_relu_kernel(float *out, const float *in, int n);
+void launch_squared_relu_backward_kernel(float *in_grad, const float *grad_out,
+                                          const float *pre_activation, int n);
+
 void launch_clamp_kernel(float *out, const float *in, float min_val,
                          float max_val, int n);
 void launch_norm_kernel(float *d_sum_sq, const float *in, int n);

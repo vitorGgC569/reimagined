@@ -865,6 +865,66 @@ extern "C" void launch_relu_kernel(float *out, const float *in, int n) {
   relu_kernel<<<blocks, threads>>>(out, in, n);
 }
 
+// ── Squared ReLU (LEARN S1) ──────────────────────────────────────────────
+// Activation:  f(x) = max(0, x)^2
+// Used in BitNet b1.58 2B4T as the FFN activation because SwiGLU in
+// low-precision regimes (ternary, FP8) suffers occasional activation
+// spikes that overflow dynamic range and diverge loss after extended
+// training (~hundreds of billions of tokens).  Squared ReLU has
+// comparable expressive power to SwiGLU at moderate scale (1B-2B
+// params) and is numerically stable in quantized regimes.
+//
+// The forward computes y = relu(x) * relu(x) but more cheaply: one
+// load, one max, one multiply.  The result is in [0, +infty) and is
+// monotonically increasing for x > 0 with slope 2x (vs ReLU's slope 1).
+__global__ void squared_relu_kernel(float *out, const float *in, int n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    const float v = fmaxf(0.0f, in[idx]);
+    out[idx] = v * v;
+  }
+}
+
+extern "C" void launch_squared_relu_kernel(float *out, const float *in, int n) {
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  squared_relu_kernel<<<blocks, threads>>>(out, in, n);
+}
+
+// Squared ReLU backward.
+//
+// Given pre_activation x and grad_out dL/dy where y = squared_relu(x):
+//   dL/dx = dL/dy * dy/dx
+//   dy/dx = d(max(0,x)^2)/dx
+//         = 2 * max(0, x)   for x > 0
+//         = 0               for x <= 0
+//
+// We multiply IN PLACE into in_grad (which on entry holds dL/dy from
+// the next layer's backward; on exit holds dL/dx for this activation).
+__global__ void squared_relu_backward_kernel(float *in_grad,
+                                              const float *grad_out,
+                                              const float *pre_activation,
+                                              int n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    const float x = pre_activation[idx];
+    const float relu_x = fmaxf(0.0f, x);
+    // grad_out may alias in_grad — read it first, write last.
+    const float dy = grad_out[idx];
+    in_grad[idx] = dy * 2.0f * relu_x;
+  }
+}
+
+extern "C" void launch_squared_relu_backward_kernel(float *in_grad,
+                                                     const float *grad_out,
+                                                     const float *pre_activation,
+                                                     int n) {
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  squared_relu_backward_kernel<<<blocks, threads>>>(in_grad, grad_out,
+                                                     pre_activation, n);
+}
+
 __global__ void kaiming_uniform_kernel(float *data, int n, float limit,
                                        unsigned long long seed) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;

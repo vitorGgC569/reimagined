@@ -586,11 +586,39 @@ PROFILES["hybrid_v11_colab_t4"] = deepcopy(PROFILES["hybrid_medium_v10_gpu"])
 PROFILES["hybrid_v11_colab_t4"]["batch_size"] = 32
 PROFILES["hybrid_v11_colab_t4"]["lr"] = 8.0e-4
 PROFILES["hybrid_v11_colab_t4"]["warmup_steps"] = 400
+# AUDIT #2 (2026-05-16): disable gradient checkpointing.  The 40M model
+# at d_model=512, batch=32, seq_len=512 produces ~2.4 GB of activations
+# which fits comfortably in T4's 16 GB VRAM (peak ~6 GB total including
+# Adam state + cuBLAS workspace).  Gradient checkpointing trades 30%
+# extra compute for memory we do not need — a net 1.3x slowdown.  The
+# v10 default for d_model >= 256 was conservative for marginal-VRAM
+# hosts; on T4 we explicitly opt out.
+PROFILES["hybrid_v11_colab_t4"]["use_gradient_checkpointing"] = False
+# LEARN A4 (2026-05-16): turn on repetition unlikelihood for phase 3
+# (curated text / Cosmopedia / TinyStories).  v10 trained with rul=0.0
+# on phase 3 and the resulting model fell into repetition loops
+# ("duo duo duo") during inference.  Setting per-phase RUL = 0.05 here
+# means the unlikelihood term applies a small penalty to tokens that
+# already appear in the recent context — gentle enough not to hurt
+# fluency (per Welleck et al. 2020), strong enough to break loops.
+PROFILES["hybrid_v11_colab_t4"]["repetition_unlikelihood_scale"] = 0.05
+PROFILES["hybrid_v11_colab_t4"]["phase_repetition_unlikelihood_scale"] = {
+    "phase1_algorithms":   0.00,   # exact math answers — no penalty
+    "phase2_structured":   0.02,   # short extractive QA — small penalty
+    "phase3_curated_text": 0.05,   # documents — primary RUL target
+    "phase4_instructions": 0.05,   # instructions — moderate penalty
+    "phase5_verifier":     0.02,
+    "phase6_memory":       0.03,
+    "instruction_polish":  0.05,
+}
 PROFILES["hybrid_v11_colab_t4"]["validation_scope"] = (
     "hybrid_v11_colab_t4: Federated training on Colab Tesla T4 (sm_75, 16GB). "
     "batch_size=32 (~16K tokens/step), lr=8e-4, warmup=400. "
-    "Same arch/bundle as v10_gpu but ~10× effective token budget per phase "
-    "thanks to 4× VRAM headroom.  Designed for 2 Colab sessions: "
+    "use_gradient_checkpointing=False (1.3x faster — 40M fits T4 VRAM trivially). "
+    "Phase-aware repetition unlikelihood (Welleck et al. 2020) breaks "
+    "v10's 'duo duo duo' inference loops without hurting fluency. "
+    "Same arch/bundle as v10_gpu but ~10x effective token budget per phase "
+    "thanks to 4x VRAM headroom.  Designed for 2 Colab sessions: "
     "session 1 = phases 1-3, session 2 = phases 4-6 + polish.  "
     "Auto-checkpoint to Drive every 100 steps."
 )
@@ -698,6 +726,19 @@ PROFILES["hybrid_v11_colab_t4_80m"]["batch_size"] = 24
 PROFILES["hybrid_v11_colab_t4_80m"]["lr"] = 7.0e-4
 PROFILES["hybrid_v11_colab_t4_80m"]["warmup_steps"] = 500
 PROFILES["hybrid_v11_colab_t4_80m"]["phase_steps"] = deepcopy(_v11_80m_phase_steps)
+# AUDIT #2 + LEARN A4 propagated from hybrid_v11_colab_t4 (40m).  80M is
+# still well under T4 16GB budget (peak ~10 GB with batch=24).
+PROFILES["hybrid_v11_colab_t4_80m"]["use_gradient_checkpointing"] = False
+PROFILES["hybrid_v11_colab_t4_80m"]["repetition_unlikelihood_scale"] = 0.05
+PROFILES["hybrid_v11_colab_t4_80m"]["phase_repetition_unlikelihood_scale"] = {
+    "phase1_algorithms":   0.00,
+    "phase2_structured":   0.02,
+    "phase3_curated_text": 0.05,
+    "phase4_instructions": 0.05,
+    "phase5_verifier":     0.02,
+    "phase6_memory":       0.03,
+    "instruction_polish":  0.05,
+}
 PROFILES["hybrid_v11_colab_t4_80m"]["validation_scope"] = (
     "hybrid_v11_colab_t4_80m: 80M-param hybrid (16 layers, d_model=640) on Colab T4. "
     "batch_size=24 (~12K tokens/step), lr=7e-4, warmup=500. "

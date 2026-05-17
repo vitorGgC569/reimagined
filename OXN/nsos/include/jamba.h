@@ -207,6 +207,32 @@ private:
   Tensor saved_ff_hidden_pre_;
   Tensor saved_moe_weights_;
   std::vector<std::vector<int>> saved_moe_rows_;
+  // LEARN S1 (squared ReLU backward): per-expert pre-activation cache.
+  // The forward MoE path saves the output of expert_gate_up BEFORE the
+  // squared_relu activation, indexed by expert id.  Backward reads
+  // these to apply squared_relu_backward correctly (dx = dy * 2 *
+  // max(0, pre)).  Pre-existing code went straight from expert_down
+  // backward to expert_gate_up backward without ANY activation
+  // gradient, which silently broke the chain rule for both ReLU and
+  // squared_relu — only the sign was preserved, magnitude was wrong.
+  // This vector is sized to num_experts and only the entries that
+  // actually got non-empty input during forward are populated.
+  std::vector<Tensor> saved_moe_pre_activations_;
+  // AUDIT #4+#5: cache of GPU routing outputs.  Forward populates
+  // these from the device buffers (one small D2H copy each).  Backward
+  // reuses them instead of re-launching the count/scan/assignment
+  // kernels and re-syncing host arrays.  Both are host-side, so they
+  // outlive the GpuDeviceBuffer scope from forward_moe_gpu_batched.
+  //
+  // saved_moe_permutation_host_[k] is the source row id at slot k
+  //   (slots are ordered by expert; experts in [0, num_experts)).
+  // saved_moe_offsets_host_[e]   is the start slot for expert e
+  // saved_moe_offsets_host_[e+1] is the end slot for expert e
+  // saved_moe_counts_host_[e]    is offsets[e+1] - offsets[e]
+  std::vector<int> saved_moe_permutation_host_;
+  std::vector<int> saved_moe_offsets_host_;
+  std::vector<int> saved_moe_counts_host_;
+  int saved_moe_n_active_ = 0;
   LayerAuditCollector* audit_collector_ = nullptr;
 public:
   std::unique_ptr<Attention> attn_layer;

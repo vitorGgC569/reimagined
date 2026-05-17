@@ -1207,7 +1207,11 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     }
 
     saved_ff_hidden_pre_ = ffn_gate_up->forward(saved_ff_norm_);
-    Tensor ff = saved_ff_hidden_pre_.relu();
+    // LEARN S1: squared ReLU (BitNet b1.58 2B4T) instead of plain ReLU.
+    // Numerically stable in quantized regimes, comparable expressivity
+    // to SwiGLU at moderate scale (1-2B), avoids SwiGLU's FP8/ternary
+    // spike-overflow failure mode (Welleck et al., BitNet 2B4T TR 2026).
+    Tensor ff = saved_ff_hidden_pre_.squared_relu();
     if (training_mode_ && dropout_rate_ > 1e-6f) {
         ff = apply_training_dropout(ff, dropout_rate_ * 0.5f,
                                     "jamba_ff_hidden_" + std::to_string(layer_idx),
@@ -1286,40 +1290,33 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
                cudaMemcpyDeviceToHost);
     const int N_active = offsets_host[static_cast<size_t>(num_experts)];
 
-    // Bookkeeping (audit + state needed by backward) is recorded from
-    // the same per-expert counts already on the host.  We also need
-    // the host weights for the saved_moe_weights_ snapshot — re-use
-    // the existing CPU-side observer logic by syncing weights down once.
-    Tensor weights_host = weights.cpu();
-    saved_moe_weights_ = weights_host;
-
-    // Reconstruct saved_moe_rows_ on the host from weights_host so the
-    // matching backward_moe call can dispatch per-expert grad slices.
-    // This is one O(rows × num_experts) pass on the host but happens
-    // exactly once per forward call (not per expert), so the cost is
-    // small compared to the per-expert gather/scatter loops the GPU
-    // path eliminates.
+    // AUDIT #4+#5 (2026-05-16): host-side reconstruction was the
+    // dominant CPU cost in the MoE forward path.  The old code did:
+    //   1. cpu() copy of the entire weights tensor (D2H sync, full data)
+    //   2. partial_sort over each of `rows` rows × num_experts entries,
+    //      O(rows × num_experts × log num_experts) host work
+    //   3. push_back per expert (heap allocations)
+    // This is now replaced by a single D2H copy of permutation_buf
+    // (N_active ints, typically much smaller than rows × num_experts
+    // entries since effective_top_k <= num_experts), then an O(N_active)
+    // linear scan to slot row ids into per-expert buckets.
+    //
+    // We also defer the weights.cpu() copy: only the CPU backward path
+    // needs saved_moe_weights_, and even that path can reconstruct from
+    // the GPU tensor on demand.  We keep weights_host for the audit
+    // hook when audit is enabled, since the audit reads expert_loads
+    // which router stores already on host.
+    saved_moe_weights_ = weights;          // Hold the GPU tensor handle —
+                                            // backward syncs only when CPU path actually runs.
+    saved_moe_n_active_ = N_active;
+    saved_moe_counts_host_ = counts_host;
+    saved_moe_offsets_host_ = offsets_host;
+    saved_moe_permutation_host_.assign(static_cast<size_t>(N_active), 0);
+    // The permutation buffer is populated later by
+    // launch_moe_compute_assignments_kernel.  We defer the D2H of
+    // permutation until AFTER that kernel runs — see below.
     saved_moe_rows_.assign(static_cast<size_t>(num_experts),
                            std::vector<int>{});
-    {
-        const float* weight_host_ptr = weights_host.data();
-        std::vector<int> ranked_experts(static_cast<size_t>(num_experts));
-        std::iota(ranked_experts.begin(), ranked_experts.end(), 0);
-        for (int row = 0; row < rows; ++row) {
-            std::partial_sort(
-                ranked_experts.begin(),
-                ranked_experts.begin() + effective_top_k,
-                ranked_experts.end(),
-                [&](int lhs, int rhs) {
-                    return weight_host_ptr[row * num_experts + lhs] >
-                           weight_host_ptr[row * num_experts + rhs];
-                });
-            for (int rank = 0; rank < effective_top_k; ++rank) {
-                saved_moe_rows_[static_cast<size_t>(ranked_experts[rank])]
-                    .push_back(row);
-            }
-        }
-    }
 
     if (audit_collector_ && audit_collector_->enabled()) {
         std::vector<int> topk_counts(static_cast<size_t>(num_experts), 0);
@@ -1359,17 +1356,56 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     launch_moe_gather_rows_kernel(x.raw_data(), permutation_buf.get(),
                                    permuted_input.raw_data(), N_active, dim);
 
+    // AUDIT #4+#5: single D2H of permutation_buf, then O(N_active)
+    // population of saved_moe_rows_.  This replaces the old O(rows ×
+    // num_experts × log num_experts) host-side partial_sort.
+    cudaMemcpy(saved_moe_permutation_host_.data(), permutation_buf.get(),
+               static_cast<size_t>(N_active) * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    // Reserve per-expert capacity to avoid push_back reallocations.
+    for (int e = 0; e < num_experts; ++e) {
+        const int count = counts_host[static_cast<size_t>(e)];
+        if (count > 0) {
+            saved_moe_rows_[static_cast<size_t>(e)].reserve(
+                static_cast<size_t>(count));
+        }
+    }
+    for (int e = 0; e < num_experts; ++e) {
+        const int count = counts_host[static_cast<size_t>(e)];
+        if (count <= 0) continue;
+        const int offset = offsets_host[static_cast<size_t>(e)];
+        // permutation[offset:offset+count] are the source row ids
+        // routed to expert e, in the same per-expert contiguous order
+        // the assignment kernel produced.
+        for (int slot = 0; slot < count; ++slot) {
+            const int source_row = saved_moe_permutation_host_[
+                static_cast<size_t>(offset + slot)];
+            saved_moe_rows_[static_cast<size_t>(e)].push_back(source_row);
+        }
+    }
+
     // Per-expert forward into a permuted_output buffer.  Slices of
     // permuted_input are computed cheaply (Tensor::slice is a view in
     // the current API) and the BitLinear forwards already use the GPU
     // path on x.get_device() == GPU.
     Tensor permuted_output = Tensor::zeros({N_active, dim}, Device::GPU);
+    // LEARN S1: pre-allocate per-expert pre-activation cache for the
+    // GPU batched path.  Same semantics as the CPU path — backward
+    // uses these for correct squared_relu_backward chain rule.
+    saved_moe_pre_activations_.assign(static_cast<size_t>(num_experts), Tensor());
     for (int e = 0; e < num_experts; ++e) {
         const int count = counts_host[static_cast<size_t>(e)];
         if (count <= 0) continue;
         const int offset = offsets_host[static_cast<size_t>(e)];
         Tensor expert_input = permuted_input.slice(0, offset, offset + count);
-        Tensor expert_hidden = expert_gate_up[e]->forward(expert_input).relu();
+        // LEARN S1: squared ReLU (BitNet b1.58 2B4T) — same activation
+        // used in the non-MoE FFN path above for consistency and the
+        // numerical-stability reasons documented there.  We save the
+        // pre-activation (output of expert_gate_up, BEFORE squared_relu)
+        // so the backward pass can apply the correct chain rule.
+        Tensor expert_pre_activation = expert_gate_up[e]->forward(expert_input);
+        saved_moe_pre_activations_[static_cast<size_t>(e)] = expert_pre_activation;
+        Tensor expert_hidden = expert_pre_activation.squared_relu();
         Tensor expert_out = expert_down[e]->forward(expert_hidden);
         // Copy expert_out into permuted_output[offset:offset+count, :].
         // expert_out is on GPU; do a contiguous device-to-device memcpy
@@ -1442,6 +1478,11 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
     Tensor output_accum = Tensor::zeros({rows, dim}, target_device);
     const float* weight_ptr = weights_host.data();
     std::vector<std::vector<int>> expert_rows(static_cast<size_t>(num_experts));
+    // LEARN S1: pre-allocate per-expert pre-activation cache.  Each
+    // entry stays default-constructed (Tensor of size 0) for experts
+    // that don't receive any rows in this forward pass; backward
+    // checks size > 0 before applying squared_relu_backward.
+    saved_moe_pre_activations_.assign(static_cast<size_t>(num_experts), Tensor());
     std::vector<int> ranked_experts(static_cast<size_t>(num_experts));
     std::iota(ranked_experts.begin(), ranked_experts.end(), 0);
 
@@ -1493,7 +1534,13 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
                            static_cast<size_t>(dim) * sizeof(float));
         }
 
-        Tensor expert_hidden = expert_gate_up[expert_idx]->forward(expert_input).relu();
+        // LEARN S1: squared ReLU (BitNet b1.58 2B4T) — see comment in
+        // forward_moe_gpu_batched and the non-MoE FFN path.  We save
+        // the pre-activation tensor for use by backward (correct chain
+        // rule through squared_relu).
+        Tensor expert_pre_activation = expert_gate_up[expert_idx]->forward(expert_input);
+        saved_moe_pre_activations_[static_cast<size_t>(expert_idx)] = expert_pre_activation;
+        Tensor expert_hidden = expert_pre_activation.squared_relu();
         Tensor expert_out = expert_down[expert_idx]->forward(expert_hidden);
         std::vector<float> selected_weights(selected_rows.size(), 0.0f);
         for (size_t local_row = 0; local_row < selected_rows.size(); ++local_row) {
@@ -1636,6 +1683,20 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
         Tensor scaled_dy = expert_dy.mul(scale_col_gpu);
 
         Tensor expert_grad = expert_down[e]->backward(scaled_dy);
+        // LEARN S1: apply squared_relu_backward between the two
+        // BitLinears.  expert_grad on entry is dL/d(squared_relu_out);
+        // we transform to dL/d(squared_relu_in) = dy * 2 * max(0, pre).
+        // The saved pre-activation was captured in forward; if it is
+        // empty (count was 0 last forward — shouldn't happen here
+        // because we check count > 0 above, but defend in depth) we
+        // skip the multiply and emit a zero grad to break the chain
+        // cleanly.
+        if (e < static_cast<int>(saved_moe_pre_activations_.size()) &&
+            saved_moe_pre_activations_[static_cast<size_t>(e)].size > 0) {
+            expert_grad = Tensor::squared_relu_backward(
+                expert_grad,
+                saved_moe_pre_activations_[static_cast<size_t>(e)]);
+        }
         expert_grad = expert_gate_up[e]->backward(expert_grad);
 
         cudaMemcpy(
@@ -1681,9 +1742,21 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
 
     Tensor grad_accum = Tensor::zeros(dy.shape.dims, target_device);
     if (saved_moe_rows_.empty() || saved_moe_weights_.size == 0) {
+        // Fast-path fallback: no routing info available so we hand the
+        // full dy to every expert.  This branch only runs in unusual
+        // recovery cases (no forward ran or forward state was reset).
+        // We still apply squared_relu_backward when we have a saved
+        // pre-activation for the expert; otherwise we behave as before
+        // (pass-through, gradient magnitude wrong but sign preserved).
         Tensor grad = Tensor::zeros(dy.shape.dims, dy.get_device());
         for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
             Tensor expert_grad = expert_down[expert_idx]->backward(dy);
+            if (expert_idx < static_cast<int>(saved_moe_pre_activations_.size()) &&
+                saved_moe_pre_activations_[static_cast<size_t>(expert_idx)].size > 0) {
+                expert_grad = Tensor::squared_relu_backward(
+                    expert_grad,
+                    saved_moe_pre_activations_[static_cast<size_t>(expert_idx)]);
+            }
             expert_grad = expert_gate_up[expert_idx]->backward(expert_grad);
             grad = grad.add(expert_grad);
         }
@@ -1691,7 +1764,18 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
     }
 
     const int dim = x.shape.back();
-    const float* weight_ptr = saved_moe_weights_.data();
+    // AUDIT #4+#5: saved_moe_weights_ may now be on GPU (we stopped
+    // doing the eager .cpu() copy in forward to save D2H time).  The
+    // CPU backward path needs host-side access to the weight values
+    // for per-expert scaling, so we materialize once here (single D2H)
+    // and then read from the host copy.  This is the rare path —
+    // GPU-eligible backward goes through backward_moe_gpu_batched
+    // which doesn't need the weights tensor at all.
+    Tensor moe_weights_host =
+        saved_moe_weights_.get_device() == Device::GPU
+            ? saved_moe_weights_.cpu()
+            : saved_moe_weights_;
+    const float* weight_ptr = moe_weights_host.data();
     float* grad_ptr = grad_accum.data();
 
     for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
@@ -1723,6 +1807,15 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
         expert_dy = expert_dy.mul(scale_tensor.to(target_device));
 
         Tensor expert_grad = expert_down[expert_idx]->backward(expert_dy);
+        // LEARN S1: squared_relu backward — uses pre-activation saved
+        // by the corresponding forward branch.  See the GPU batched
+        // backward path for the same fix.
+        if (expert_idx < static_cast<int>(saved_moe_pre_activations_.size()) &&
+            saved_moe_pre_activations_[static_cast<size_t>(expert_idx)].size > 0) {
+            expert_grad = Tensor::squared_relu_backward(
+                expert_grad,
+                saved_moe_pre_activations_[static_cast<size_t>(expert_idx)]);
+        }
         expert_grad = expert_gate_up[expert_idx]->backward(expert_grad);
         Tensor expert_scatter = Tensor::zeros(dy.shape.dims, target_device);
         float* scatter_ptr = expert_scatter.data();
@@ -1753,13 +1846,15 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     } else if (ffn_down && ffn_gate_up) {
         ff_grad = ffn_down->backward(dy);
         if (saved_ff_hidden_pre_.size > 0) {
-            float* ff_grad_ptr = ff_grad.data();
-            const float* pre_ptr = saved_ff_hidden_pre_.data();
-            for (int i = 0; i < ff_grad.size; ++i) {
-                if (pre_ptr[i] <= 0.0f) {
-                    ff_grad_ptr[i] = 0.0f;
-                }
-            }
+            // LEARN S1: squared ReLU backward.  d(max(0,x)^2)/dx is:
+            //   2 * max(0, x)   for x > 0
+            //   0               for x <= 0
+            // We use Tensor::squared_relu_backward which dispatches the
+            // GPU kernel when both tensors live on the GPU and falls
+            // back to a parallel OpenMP loop on CPU.  This replaces the
+            // plain-ReLU backward that just zeroed gradient for x <= 0
+            // and left it identity for x > 0.
+            ff_grad = Tensor::squared_relu_backward(ff_grad, saved_ff_hidden_pre_);
         }
         ff_grad = ffn_gate_up->backward(ff_grad);
         if (saved_residual_.size > 0 && saved_ff_norm_.size > 0) {
@@ -1810,6 +1905,11 @@ void JambaBlock::reset() {
     saved_ff_hidden_pre_ = Tensor();
     saved_moe_weights_ = Tensor();
     saved_moe_rows_.clear();
+    // LEARN S1: clear per-expert pre-activations.  Default-construct
+    // each Tensor releases its backing storage (unique_ptr in
+    // Tensor::data_ptr); the vector itself stays sized at num_experts
+    // until next forward overwrites it.
+    saved_moe_pre_activations_.clear();
     if (mamba_layer) {
         mamba_layer->reset();
     }

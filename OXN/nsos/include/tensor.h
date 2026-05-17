@@ -120,6 +120,22 @@ public:
     Tensor transpose() const;
     
     Tensor relu() const;
+    // LEARN S1 (BitNet b1.58 2B4T): Squared ReLU activation.
+    //   forward:  y = max(0, x)^2
+    //   backward: dx = dy * 2 * max(0, x)
+    // Used as the FFN/MoE activation because SwiGLU under low-precision
+    // (ternary BitLinear / FP8) can spike and overflow the dynamic
+    // range, causing loss divergence after extended training.  Squared
+    // ReLU is numerically stable in quantized regimes and gives
+    // comparable expressive power to SwiGLU at moderate parameter
+    // counts (1-2B params, validated by BitNet b1.58 2B4T technical
+    // report 2026).
+    Tensor squared_relu() const;
+    // Backward for squared_relu.  Returns dx = dy * 2 * max(0, pre).
+    // pre_activation is the value BEFORE squared_relu was applied
+    // (typically saved during forward).  dy is the upstream gradient.
+    static Tensor squared_relu_backward(const Tensor& dy,
+                                         const Tensor& pre_activation);
     Tensor sigmoid() const;
     Tensor softmax(int dim = -1) const;
     Tensor rmsnorm(float eps = 1e-6f) const;
