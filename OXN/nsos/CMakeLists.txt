@@ -12,6 +12,11 @@ option(NSOS_BUILD_CIRCUIT_TOOLS "Build the circuit trainer executable" ON)
 option(NSOS_BUILD_CLI "Build the official NSOS CLI" ON)
 option(NSOS_BUILD_API "Build the official NSOS HTTP API server" ON)
 option(NSOS_BUILD_OXTAMEM "Build the copied OxtaMem engine with Cargo when available" ON)
+# OPT-IN profiler: builds nsos_profiler.lib + nsos_profile_tool exe.
+# Default OFF so production / Colab training builds DON'T link the
+# profiler code.  Enable explicitly with -DNSOS_BUILD_PROFILER=ON
+# when running architectural analysis sessions.
+option(NSOS_BUILD_PROFILER "Build the standalone inference profiler tool" OFF)
 option(NSOS_ENABLE_TURBOQUANT "Enable external TurboQuant integration when configured" ON)
 option(NSOS_CUDA_ALLOW_UNSUPPORTED_COMPILER "Allow nvcc to compile with an unsupported host MSVC version" OFF)
 option(NSOS_ENABLE_NATIVE_OPTIMIZATIONS "Enable host-specific CPU tuning flags such as -march=native" OFF)
@@ -231,6 +236,36 @@ if (NSOS_BUILD_API)
     if (WIN32)
         target_link_libraries(nsos_api_server PRIVATE ws2_32)
     endif()
+endif()
+
+# ──────────────────────────────────────────────────────────────────────
+# NSOS Profiler — opt-in module for architectural analysis sessions.
+# Builds a static library `nsos_profiler` with the cycle counters,
+# event ring buffer, cache probe, and the hook callbacks that the
+# main `nsos_core` calls via function pointers (default null, set at
+# runtime by nsos_profiler_install_hooks()).  Production training
+# builds leave NSOS_BUILD_PROFILER=OFF and never link this code.
+# ──────────────────────────────────────────────────────────────────────
+if (NSOS_BUILD_PROFILER)
+    add_library(nsos_profiler STATIC
+        src/profiler/inference_profiler.cpp
+        src/profiler/cache_probe.cpp
+        src/profiler/jamba_profiler_hooks.cpp
+    )
+    target_include_directories(nsos_profiler PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    # The profiler exposes a thin pybind module so the Python driver
+    # can attach/detach/drain without re-importing nsos_ext.  We build
+    # it as a separate Python module so production users never see it.
+    if (NSOS_BUILD_PYTHON)
+        pybind11_add_module(nsos_profiler_ext src/profiler/profiler_bindings.cpp)
+        target_link_libraries(nsos_profiler_ext PRIVATE
+            nsos_profiler
+            nsos_core
+        )
+    endif()
+    message(STATUS "NSOS Profiler enabled — static lib + nsos_profiler_ext built")
 endif()
 
 if (NSOS_BUILD_OXTAMEM)

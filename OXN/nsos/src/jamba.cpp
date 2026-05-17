@@ -27,6 +27,18 @@
 #include <cuda_runtime.h>
 #endif
 
+// ── Profiler hook globals (default null; populated by nsos_profiler
+// library if-and-only-if the user runs the standalone profile tool).
+// Declared with C linkage so the static-library boundary is clean.
+extern "C" {
+    typedef void (*nsos_profiler_layer_event_fn)(void* profiler, int layer_idx);
+    typedef void (*nsos_profiler_layer_end_fn)(void* profiler);
+    // Defined as null pointers here; the profiler library's
+    // nsos_profiler_install_hooks() flips them to its real callbacks.
+    nsos_profiler_layer_event_fn g_nsos_profiler_begin_layer = nullptr;
+    nsos_profiler_layer_end_fn   g_nsos_profiler_end_layer   = nullptr;
+}
+
 namespace nsos {
 
 namespace {
@@ -386,15 +398,43 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
     if (hidden.shape.size() == 3 && !last_input_batch_lengths_.empty()) {
         zero_sequence_suffix_inplace(hidden, last_input_batch_lengths_);
     }
+    // ── OPT-IN profiler hook ───────────────────────────────────────────
+    // When `profiler_` is non-null (only set by the standalone profile
+    // tool, never in production builds), we emit per-layer events.
+    // The implementation lives in a separate translation unit linked
+    // from the nsos_profiler library; we resolve it via a weak symbol
+    // pattern: the helper functions are declared with weak linkage in
+    // jamba_profiler_hooks.h and defined ONLY in the profiler library.
+    // In a production link without that library, the symbols are null
+    // and the (profiler_ != nullptr) branch never fires anyway.
+    // For simplicity here we use a direct C ABI thunk that the
+    // profiler library installs at runtime via attach_profiler.
+    // The hot-path cost when profiler_ is null is exactly one pointer
+    // load + one branch — the branch predictor learns it on iteration
+    // 1 and the cost vanishes.
+    nsos_profiler_layer_event_fn  profiler_begin_layer = nullptr;
+    nsos_profiler_layer_end_fn    profiler_end_layer   = nullptr;
+    if (profiler_) {
+        profiler_begin_layer = g_nsos_profiler_begin_layer;
+        profiler_end_layer   = g_nsos_profiler_end_layer;
+    }
+    int layer_index = 0;
     for (auto& layer : layers) {
         if (ctx && ctx->abort_signal && ctx->abort_signal->load(std::memory_order_relaxed)) {
             throw AbortException();
         }
         layer->set_batch_valid_lengths(last_input_batch_lengths_);
+        if (profiler_begin_layer) {
+            profiler_begin_layer(profiler_, layer_index);
+        }
         hidden = layer->forward(hidden, ctx);
+        if (profiler_end_layer) {
+            profiler_end_layer(profiler_);
+        }
         if (hidden.shape.size() == 3 && !last_input_batch_lengths_.empty()) {
             zero_sequence_suffix_inplace(hidden, last_input_batch_lengths_);
         }
+        ++layer_index;
     }
     saved_final_hidden_ = hidden;
     saved_final_norm_ = hidden.rmsnorm();

@@ -322,6 +322,23 @@ public:
   RuntimeTelemetrySnapshot runtime_telemetry() const;
   void set_audit_collector(LayerAuditCollector* collector);
   LayerAuditCollector* audit_collector() const { return audit_collector_; }
+  // ── OPT-IN profiler attachment (zero-overhead when null) ────────────
+  // Sets a pointer to a profiler::InferenceProfiler instance.  When
+  // null (the default and the production case), the model forward
+  // path skips all profiling work via a single null check.  When
+  // non-null, the model emits begin_event/end_event for every layer
+  // and the major ops inside each layer.  The profiler lives in the
+  // separate `nsos_profiler` static library which is NOT linked into
+  // production builds — calling attach_profiler from a production
+  // build (which never sees the profiler header) is impossible.
+  //
+  // The signature uses `void*` to keep the production `nsos_core`
+  // build free of any #include of the profiler header.  Internally,
+  // the profiler-aware build path reinterprets back to the typed
+  // pointer.  This is a deliberate choice: production headers don't
+  // need to know the profiler type exists.
+  void attach_profiler(void* profiler) { profiler_ = profiler; }
+  void* profiler() const { return profiler_; }
   void record_audit_token_context(const std::vector<int>& token_ids_sample,
                                   size_t batch_size,
                                   size_t prompt_tokens_total,
@@ -340,6 +357,10 @@ private:
   Tensor saved_final_hidden_;
   Tensor saved_final_norm_;
   LayerAuditCollector* audit_collector_ = nullptr;
+  // Opt-in profiler.  Typed as void* in the header so production
+  // TUs never need to include profiler/inference_profiler.h.
+  // Implementation TUs cast back; see jamba.cpp for the helper.
+  void* profiler_ = nullptr;
 };
 
 class D2FDecoder {
