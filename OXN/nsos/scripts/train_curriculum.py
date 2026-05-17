@@ -3386,7 +3386,20 @@ def compute_official_holdout_score(results: Dict[str, Dict]) -> Dict[str, float]
 
 
 def main() -> int:
+    # ── Boot heartbeats ───────────────────────────────────────────────
+    # The startup path between `parse_args()` and the first
+    # `logger.log(...)` involves: importing nsos_ext (CUDA libs init,
+    # 30-90 s on first run), tokenizer load, GPU probe, and JambaModel
+    # construction (allocates GPU memory + initializes weights).  When
+    # this is launched as a subprocess inside Jupyter/Colab, those
+    # heavy steps run silent unless we explicitly flush print() calls
+    # with the `[boot]` prefix so the user can tell WHICH step is slow.
+    # Without these heartbeats, "9 minutes silent" was indistinguishable
+    # from "hung in CUDA init" vs "hung in JambaModel ctor" vs "running
+    # fine but output buffered".
+    print("[boot] train_curriculum.py main() entered", flush=True)
     args = parse_args()
+    print(f"[boot] parsed args; profile={args.profile} device={args.device} bundle_dir={args.bundle_dir}", flush=True)
     EVAL_RUNTIME_OPTIONS.update({
         "masked_batch_size": max(int(args.eval_masked_batch_size), 1),
         "generation_probe_samples": max(int(args.generation_probe_samples), 0),
@@ -3401,12 +3414,17 @@ def main() -> int:
     layer_audit = None
     session_log_path = args.session_log or (run_dir / "session.log")
     logger = RunLogger(args.progress_mode, session_log_path)
+    print(f"[boot] RunLogger ready; session.log -> {session_log_path}", flush=True)
 
     try:
         maybe_enable_hybrid_resume_cuda_safe_mode(args, profile, logger)
         build_dir = detect_build_dir(args.build_dir)
+        print(f"[boot] build_dir resolved -> {build_dir}", flush=True)
+        print(f"[boot] importing nsos_ext (CUDA libs init can take 30-90 s on first import)...", flush=True)
         nsos = load_nsos(build_dir)
+        print(f"[boot] nsos_ext imported OK", flush=True)
 
+        print(f"[boot] ensuring bundle at {args.bundle_dir} (rebuild={args.rebuild_curriculum})...", flush=True)
         tokenizer_path = ensure_bundle(
             args.repo_root,
             args.bundle_dir,
@@ -3415,12 +3433,14 @@ def main() -> int:
             rebuild=args.rebuild_curriculum,
             phase_sizes=profile.get("phase_sizes"),
         )
+        print(f"[boot] bundle OK -> tokenizer artifact at {tokenizer_path}", flush=True)
 
         tokenizer = nsos.Tokenizer()
         tokenizer.load(str(tokenizer_path))
         tokenizer.add_special_tokens(SPECIAL_TOKENS)
         tokenizer.save_pack(str(run_dir / "tokenizer.nsos"))
         eos_token_id = tokenizer.encode("<|endoftext|>")[0]
+        print(f"[boot] tokenizer loaded (vocab={tokenizer.vocab_size}); tokenizer.nsos written", flush=True)
 
         if args.device == "gpu":
             device = nsos.Device.GPU
@@ -3430,13 +3450,17 @@ def main() -> int:
             device = nsos.Device.GPU if os.name == "nt" else nsos.Device.CPU
 
         if device == nsos.Device.GPU and hasattr(nsos, "fast_gpu_supported"):
+            print("[boot] probing fast_gpu_supported()...", flush=True)
             if not nsos.fast_gpu_supported():
                 logger.log(
                     "[device] Fast GPU path unavailable on this CUDA/toolkit/GPU combination; "
                     "falling back to CPU for correctness and throughput."
                 )
                 device = nsos.Device.CPU
+            else:
+                print("[boot] fast_gpu_supported() = True", flush=True)
 
+        print("[boot] building model_config + effective schedule...", flush=True)
         model_config = build_model_config(nsos, profile, tokenizer.vocab_size, device)
         model_config_dict = model_config_to_dict(model_config)
         effective_schedule = build_effective_schedule(profile, model_config_dict)
@@ -3452,14 +3476,24 @@ def main() -> int:
             json.dumps(OFFICIAL_SUPPORT_MATRIX, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        print("[boot] effective_model_config.json + effective_schedule.json + support_matrix.json written", flush=True)
         logger.log(
             f"[profile] requested={args.profile} canonical={canonical_profile} "
             f"family={effective_schedule['profile_family']} dominant={effective_schedule['dominant_stack']}"
         )
         logger.log(f"[profile] scope={effective_schedule['validation_scope']}")
 
+        device_label = "GPU" if device == nsos.Device.GPU else "CPU"
+        print(
+            f"[boot] constructing JambaModel ({profile['layers']} layers, d_model={profile['d_model']}, "
+            f"vocab={tokenizer.vocab_size}, device={device_label}) — allocates device memory + initializes weights, "
+            f"this is the canonical 'silent' window on first run...",
+            flush=True,
+        )
         model = nsos.JambaModel(model_config, device)
+        print("[boot] JambaModel constructed; moving to device...", flush=True)
         model.to(device)
+        print(f"[boot] model on {device_label}", flush=True)
         audit_min_layer_coverage = (
             int(args.audit_min_layer_coverage)
             if int(args.audit_min_layer_coverage) > 0
@@ -3496,6 +3530,7 @@ def main() -> int:
                 )
                 model.load(str(args.resume_model), False)
                 logger.log(f"[resume] partial checkpoint load ok: {args.resume_model}")
+        print(f"[boot] constructing Trainer (lr={profile['lr']}, warmup={profile['warmup_steps']})...", flush=True)
         trainer = nsos.Trainer(model, profile["lr"])
         trainer.weight_decay = profile["weight_decay"]
         trainer.max_grad_norm = profile["max_grad_norm"]
@@ -3525,6 +3560,11 @@ def main() -> int:
             scheduler.quantized_precision_bits = int(qat_cfg.get("quantized_precision_bits", 2))
             scheduler.ternary_regularization = float(qat_cfg.get("ternary_regularization", 0.0))
         trainer.configure_progressive_qat(scheduler)
+        print(
+            f"[boot] Trainer configured (total_training_steps={trainer.total_training_steps}, "
+            f"qat={'on' if qat_enabled else 'off'}); preparing summary + entering phase loop next.",
+            flush=True,
+        )
 
         summary = {
             "profile": canonical_profile,
@@ -3810,11 +3850,30 @@ def main() -> int:
         # AUDIT #8: open the LOCAL metrics file for writing.  Periodic
         # _flush_metrics_to_run_dir() copies it to the (possibly slow)
         # run_dir at phase boundaries.
+        print(
+            f"[boot] entering phase loop: order={execution_phase_order} "
+            f"(per-phase tokenization is the canonical 'first 2-3 min silent' window)",
+            flush=True,
+        )
         with metrics_local_path.open("w", encoding="utf-8") as metrics_file:
             for phase_index, phase_name in enumerate(execution_phase_order):
+                print(
+                    f"[boot] phase {phase_index + 1}/{len(execution_phase_order)} = {phase_name}: "
+                    f"loading rows from bundle...",
+                    flush=True,
+                )
                 train_rows = curriculum_texts_for_phase(args.bundle_dir, phase_name, "train")
                 eval_rows = curriculum_texts_for_phase(args.bundle_dir, phase_name, "eval")
+                print(
+                    f"[boot] phase {phase_name}: tokenizing {len(train_rows)} train rows "
+                    f"(BPE on Python ≈ 1-3 min for 30K+ rows)...",
+                    flush=True,
+                )
                 train_tokens = build_token_stream(tokenizer, train_rows, "<|endoftext|>")
+                print(
+                    f"[boot] phase {phase_name}: tokenized to {len(train_tokens):,} tokens; eval_rows={len(eval_rows)}",
+                    flush=True,
+                )
                 max_steps = args.override_phase_steps or profile["phase_steps"][phase_name]
                 phase_lr_scale = float(profile.get("phase_lr_scale", {}).get(phase_name, 1.0))
                 phase_repeat_scale = phase_repetition_scale(profile, phase_name)
