@@ -141,6 +141,63 @@ cublasHandle_t cublas_handle() {
     return gpu_blas_handle_storage();
 }
 
+// AUDIT (post BATCH 4): the mixed-precision GEMM path used to do
+//   cudaMalloc(a_low); cudaMalloc(b_low); <gemm>; cudaFree; cudaFree;
+// per matmul call.  Each cudaMalloc/cudaFree pair costs ~1-10 ms AND
+// forces an implicit stream synchronization — which on a 12-layer
+// model with ~400 matmuls per training step burned 2-8 s/step of pure
+// allocator overhead, completely masking the Tensor Core speedup that
+// the user enabled with NSOS_MIXED_PRECISION=bf16.
+//
+// This workspace caches the BF16/FP16 staging buffers across all
+// matmul calls and only reallocates when a larger tensor shape comes
+// through (geometric 2× growth so we don't churn on minor changes).
+// Single static instance is safe because the training loop is single-
+// threaded; if we ever go multi-threaded we'd promote to thread_local.
+struct GemmLowpWorkspace {
+    void* a_ptr = nullptr;
+    void* b_ptr = nullptr;
+    size_t a_capacity = 0;  // bytes
+    size_t b_capacity = 0;  // bytes
+    // Ensure both buffers hold at least the requested bytes.  Returns
+    // false if cudaMalloc failed (caller should fall through to FP32
+    // for this single call rather than crash).
+    bool ensure(size_t a_bytes, size_t b_bytes) {
+        if (a_bytes > a_capacity) {
+            if (a_ptr) { cudaFree(a_ptr); a_ptr = nullptr; }
+            const size_t cap = (a_capacity == 0)
+                ? a_bytes
+                : std::max(a_bytes, a_capacity * 2);
+            if (cudaMalloc(&a_ptr, cap) != cudaSuccess) {
+                a_ptr = nullptr;
+                a_capacity = 0;
+                return false;
+            }
+            a_capacity = cap;
+        }
+        if (b_bytes > b_capacity) {
+            if (b_ptr) { cudaFree(b_ptr); b_ptr = nullptr; }
+            const size_t cap = (b_capacity == 0)
+                ? b_bytes
+                : std::max(b_bytes, b_capacity * 2);
+            if (cudaMalloc(&b_ptr, cap) != cudaSuccess) {
+                b_ptr = nullptr;
+                b_capacity = 0;
+                return false;
+            }
+            b_capacity = cap;
+        }
+        return true;
+    }
+};
+// We never free these on shutdown — CUDA context teardown reclaims
+// the memory, and freeing static buffers during destruction risks
+// touching an already-torn-down CUDA context.
+GemmLowpWorkspace& gemm_lowp_workspace() {
+    static GemmLowpWorkspace ws;
+    return ws;
+}
+
 void sync_cuda() {
     const cudaError_t launch_status = cudaGetLastError();
     if (launch_status != cudaSuccess) {
@@ -620,13 +677,16 @@ Tensor Tensor::matmul(const Tensor& other) const {
                      : static_cast<size_t>(batch) * static_cast<size_t>(k) *
                            static_cast<size_t>(n));
 
-            void* a_low_ptr = nullptr;
-            void* b_low_ptr = nullptr;
-            cudaError_t alloc_a =
-                cudaMalloc(&a_low_ptr, total_a_elems * bytes_per_lp);
-            cudaError_t alloc_b =
-                cudaMalloc(&b_low_ptr, total_b_elems * bytes_per_lp);
-            if (alloc_a == cudaSuccess && alloc_b == cudaSuccess) {
+            // Get cached staging buffers from the workspace (resized
+            // on demand, reused across calls).  Replaces the per-
+            // matmul cudaMalloc/cudaFree pair that was burning 2-8 s
+            // per training step on a 12-layer model.
+            GemmLowpWorkspace& ws = gemm_lowp_workspace();
+            if (ws.ensure(total_a_elems * bytes_per_lp,
+                          total_b_elems * bytes_per_lp)) {
+                void* a_low_ptr = ws.a_ptr;
+                void* b_low_ptr = ws.b_ptr;
+
                 // Cast A and B to lower precision.  Reuse our
                 // existing float->bf16 / float->fp16 cast kernel if
                 // available; else use cuBLAS's BLAS-internal cast via
@@ -669,14 +729,15 @@ Tensor Tensor::matmul(const Tensor& other) const {
                         accumulate_type,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                     "cublasGemmStridedBatchedEx");
-                cudaFree(a_low_ptr);
-                cudaFree(b_low_ptr);
+                // No cudaFree — buffers are owned by the workspace and
+                // outlive this call.  sync_cuda() still runs to surface
+                // any kernel-launch errors via the LastError API.
                 sync_cuda();
                 return result;
             }
-            // Fall through to FP32 path if low-precision alloc failed.
-            if (a_low_ptr) cudaFree(a_low_ptr);
-            if (b_low_ptr) cudaFree(b_low_ptr);
+            // ws.ensure() failed (rare — only on cudaMalloc OOM).
+            // Fall through to the FP32 cublasSgemmStridedBatched path
+            // below; correctness preserved, just slower for this call.
         }
 
         // AUDIT #3 (2026-05-16): use cublasSgemmStridedBatched to fuse
