@@ -27,6 +27,10 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
+# Eager datasets import before torch — Windows segfault workaround;
+# see common/data.py docstring for details.
+import datasets  # eager, before torch  # noqa: F401
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

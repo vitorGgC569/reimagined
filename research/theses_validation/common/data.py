@@ -9,8 +9,23 @@ We use character-level tokenization (not BPE) because:
 
 For tests that benefit from larger vocab (e.g. KAN MoE), wrap this with a
 BPE pre-tokenizer at the call site — the loader is intentionally minimal.
+
+CRITICAL IMPORT ORDER (Windows + torch 2.6 + datasets 4.8 known issue):
+Importing `datasets` AFTER `torch` segfaults with ACCESS_VIOLATION in
+the pyarrow runtime on some Windows + Python 3.11 + torch 2.6 combos
+(reproduced on the user's GTX 1050 Ti dev box).  Importing `datasets`
+first works.  We do the eager import at module load below so anyone
+who does `from common.data import ...` from a script that already
+imported torch picks up our prior `datasets` import in sys.modules.
+
+If you're maintaining this and remove the eager import, make sure the
+TOP of every test file does `import datasets` before any torch-touching
+import.
 """
 from __future__ import annotations
+
+# Eager datasets import BEFORE torch — see docstring above.
+import datasets as _datasets_eager  # noqa: F401
 
 import random
 import re
