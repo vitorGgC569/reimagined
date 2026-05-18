@@ -3866,7 +3866,7 @@ def main() -> int:
                 eval_rows = curriculum_texts_for_phase(args.bundle_dir, phase_name, "eval")
                 print(
                     f"[boot] phase {phase_name}: tokenizing {len(train_rows)} train rows "
-                    f"(BPE on Python ≈ 1-3 min for 30K+ rows)...",
+                    f"(BPE on Python ~1-3 min for 30K+ rows)...",
                     flush=True,
                 )
                 train_tokens = build_token_stream(tokenizer, train_rows, "<|endoftext|>")
