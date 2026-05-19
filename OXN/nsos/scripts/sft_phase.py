@@ -247,6 +247,15 @@ def main() -> int:
     # ── Load tokenizer ──────────────────────────────────────────────────
     tokenizer = nsos.Tokenizer()
     tokenizer.load(str(args.tokenizer))
+    # Register ChatML markers idempotently — SFT bundles built by
+    # build_sft_bundle.py format prompts with <|im_start|>/<|im_end|>;
+    # without registration BPE would split each marker into many
+    # subtokens, defeating the SFT loss mask boundary.
+    try:
+        from chatml import register_special_tokens
+        register_special_tokens(tokenizer)
+    except ImportError:
+        pass  # chatml module added in VISION Phase 2; legacy runs without it still work
     eos_token_id = tokenizer.encode("<|endoftext|>")[0]
     print(f"[sft] tokenizer vocab_size={tokenizer.vocab_size} eos={eos_token_id}")
 
