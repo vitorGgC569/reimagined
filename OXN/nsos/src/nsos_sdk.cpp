@@ -990,7 +990,36 @@ bool InferenceEngine::try_load_model_pack(const std::string& path,
     this->tokenizer.load(tokenizer_path.string());
     this->model->load(weights_path.string());
     if (has_edge_linear) {
-        this->model->load_edge_linear_pack(edge_linear_path.string(), false);
+        // VISION #3 (Quantized Inference): when an edge_linear pack is
+        // available in the bundle, the WHOLE POINT of the project is to
+        // serve from 1.58-bit packed weights at inference, not from
+        // residual FP32 weights.  The historical default here was
+        // `false` (keep FP32 alongside the edge pack, use FP32 in
+        // forward, treat edge pack as a reference for the audit hook),
+        // which meant the 1.58-bit edge claim was a memory format
+        // statement only — actual serving still cost FP32 RAM + bandwidth.
+        //
+        // The right default is to RELEASE FP32 after loading the edge
+        // pack, so the runtime is genuinely operating in ternary.  Users
+        // who need the FP32 reference path for parity testing can opt
+        // back in by setting NSOS_KEEP_FP32_WEIGHTS=1 in the environment.
+        bool keep_fp32 = false;
+        if (const char* env = std::getenv("NSOS_KEEP_FP32_WEIGHTS")) {
+            std::string s(env);
+            keep_fp32 = (s == "1" || s == "true" || s == "TRUE" || s == "yes");
+        }
+        const bool release_fp32 = !keep_fp32;
+        this->model->load_edge_linear_pack(edge_linear_path.string(), release_fp32);
+        if (release_fp32) {
+            std::cerr << "[InferenceEngine] edge pack loaded; FP32 linear weights "
+                      << "released (1.58-bit inference mode).  Set "
+                      << "NSOS_KEEP_FP32_WEIGHTS=1 to keep both."
+                      << std::endl;
+        } else {
+            std::cerr << "[InferenceEngine] edge pack loaded; FP32 weights retained "
+                      << "(reference mode, opt-in via NSOS_KEEP_FP32_WEIGHTS=1)."
+                      << std::endl;
+        }
     }
     this->loaded_from_pack_ = true;
     return true;
