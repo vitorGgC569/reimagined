@@ -148,6 +148,11 @@ private:
   Tensor cached_gpu_packed_weights_;
   uint64_t cached_gpu_packed_version_ = 0;
   bool gpu_packed_inference_enabled_ = false;
+
+  // T-MAC block-sparse heat map, lazily computed on first opt-in use.
+  // Cleared on any operation that invalidates packed_weights.  See
+  // include/lut_tmac.h.
+  std::vector<uint8_t> cached_heat_map_;
 };
 
 } // namespace nsos

@@ -42,6 +42,7 @@ set(NSOS_CORE_SOURCES
     src/mamba2.cpp
     src/bitlinear.cpp
     src/bitnet_adapter.cpp
+    src/lut_tmac.cpp
     src/embedding.cpp
     src/kan.cpp
     src/ttt_layer.cpp
@@ -305,6 +306,16 @@ if (NSOS_BUILD_TESTS)
     add_executable(test_bitlinear tests/test_bitlinear.cpp)
     target_link_libraries(test_bitlinear PRIVATE nsos_core)
     add_test(NAME test_bitlinear COMMAND test_bitlinear)
+
+    add_executable(test_lut_tmac tests/test_lut_tmac.cpp)
+    target_link_libraries(test_lut_tmac PRIVATE nsos_core)
+    add_test(NAME test_lut_tmac COMMAND test_lut_tmac)
+
+    # Microbench — not wired into ctest because it's a perf measurement,
+    # not a correctness gate.  Built so `cmake --build` produces the
+    # executable; run manually to compare LUT vs scalar reference.
+    add_executable(bench_lut_tmac tests/bench_lut_tmac.cpp)
+    target_link_libraries(bench_lut_tmac PRIVATE nsos_core)
 
     add_executable(test_bitnet_integrated tests/test_bitnet_integrated.cpp)
     target_link_libraries(test_bitnet_integrated PRIVATE nsos_core)

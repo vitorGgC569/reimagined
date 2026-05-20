@@ -2,6 +2,7 @@
 #include "../include/bitnet_adapter.h"
 #include "../include/bitnet_gpu_dispatch.h"
 #include "../include/hadamard.h"
+#include "../include/lut_tmac.h"
 #include "nsos_sdk.h"
 #include <algorithm>
 #include <cmath>
@@ -213,7 +214,23 @@ Tensor BitLinear::gemm_158bit_ultra(const Tensor &x_q,
   Tensor y({M, N}, Device::CPU);
   const float* magnitude_ptr = fuse_output_affine ? magnitude.data.data() : nullptr;
   const float* bias_ptr = fuse_output_affine && use_bias ? bias.data.data() : nullptr;
-  
+
+  // T-MAC opt-in path (LUT-style ternary GEMM with block-sparse skip).
+  // See include/lut_tmac.h + docs/LUT_TMAC_DESIGN.md.  When the env var
+  // NSOS_TMAC_LUT_GEMM=1 is set AND the weight shape is compatible
+  // (in_features % 4 == 0), we route here.  Falls back to the existing
+  // gemm_158bit_i8 / gemm_158bit_lut path otherwise.  Numerical
+  // equivalence is verified by tests/test_lut_tmac.cpp.
+  if (lut_tmac::env_opt_in() && lut_tmac::format_supported(in_features)) {
+    if (cached_heat_map_.empty()) {
+      cached_heat_map_ = lut_tmac::compute_heat_map(packed_weights, N, in_features);
+    }
+    lut_tmac::gemm_158bit_lut_tmac(
+        x_q, packed_weights, cached_heat_map_, act_scales, weight_scale, y,
+        magnitude_ptr, bias_ptr, fuse_output_affine && use_bias);
+    return y;
+  }
+
   if (!unpacked_weights_i8.empty()) {
     BitNetAdapter::gemm_158bit_i8(x_q, unpacked_weights_i8, unpacked_weight_row_sums,
                                   act_scales, weight_scale, y, magnitude_ptr, bias_ptr,
@@ -223,7 +240,7 @@ Tensor BitLinear::gemm_158bit_ultra(const Tensor &x_q,
                                    magnitude_ptr, bias_ptr,
                                    fuse_output_affine && use_bias);
   }
-  
+
   return y;
 }
 

@@ -1,0 +1,190 @@
+// Microbench: LUT-TMAC kernel vs scalar reference.
+//
+// Times both paths on the same shapes / zero-density grid used in
+// test_lut_tmac.cpp.  Reports wall time per iter + speedup.
+//
+// Honest scope: comparing LUT-TMAC against the SCALAR REFERENCE
+// (`reference_gemm` — straightforward triple loop, no SIMD).  This
+// tells us if the LUT + heat-map trick actually helps over a naive
+// impl.  It does NOT tell us if LUT-TMAC beats the existing SIMD
+// production path `gemm_158bit_ultra` — that comparison requires
+// linking BitNetAdapter and is a separate bench (TODO).
+//
+// Build via tests CMake target `bench_lut_tmac`.  Run with no args.
+
+#include "../include/lut_tmac.h"
+#include "../include/tensor.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <vector>
+
+namespace {
+
+// Scalar reference — same as in tests/test_lut_tmac.cpp.
+static void reference_gemm(const float* input, const uint8_t* packed,
+                            const std::vector<float>& act_scales,
+                            float weight_scale, float* out,
+                            int B, int K, int N) {
+    for (int b = 0; b < B; ++b) {
+        const float* x = input + b * K;
+        float* y = out + b * N;
+        const float as = act_scales[static_cast<size_t>(b)];
+        for (int n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                const int idx = n * K + k;
+                const int byte_idx = idx >> 2;
+                const int shift = (idx & 0x3) << 1;
+                const uint8_t code = (packed[byte_idx] >> shift) & 0x3u;
+                if (code == 0u) {
+                    acc -= x[k];
+                } else if (code == 2u) {
+                    acc += x[k];
+                }
+                // code == 1u → zero, no-op
+            }
+            y[n] = acc * as * weight_scale;
+        }
+    }
+}
+
+static void random_packed(std::vector<uint32_t>& packed, int N, int K,
+                            int seed, float zero_density) {
+    std::mt19937 rng(static_cast<uint32_t>(seed));
+    const int total = N * K;
+    const int word_count = (total + 15) / 16;
+    packed.assign(static_cast<size_t>(word_count), 0u);
+    uint8_t* p = reinterpret_cast<uint8_t*>(packed.data());
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    for (int i = 0; i < total; ++i) {
+        uint8_t code;
+        if (u(rng) < zero_density) {
+            code = 1;
+        } else {
+            code = (u(rng) < 0.5f) ? 0 : 2;
+        }
+        const int byte_idx = i >> 2;
+        const int shift = (i & 0x3) << 1;
+        p[byte_idx] = static_cast<uint8_t>(p[byte_idx] | (code << shift));
+    }
+}
+
+struct BenchResult {
+    int B, K, N;
+    float zero_density;
+    double scalar_ms;
+    double lut_ms;
+    double speedup;
+    double heat_map_sparsity;
+};
+
+static BenchResult bench_one(int B, int K, int N, float zero_density,
+                              int iters, int warmup) {
+    using namespace nsos;
+    std::mt19937 rng(42u);
+    std::uniform_real_distribution<float> u(-1.5f, 1.5f);
+
+    Tensor input({B, K}, Device::CPU);
+    for (int i = 0; i < B * K; ++i) input.data()[i] = u(rng);
+
+    std::vector<uint32_t> packed;
+    random_packed(packed, N, K, 7 * B + 13 * K + N, zero_density);
+    const uint8_t* packed_ptr = reinterpret_cast<const uint8_t*>(packed.data());
+
+    std::vector<float> act_scales(static_cast<size_t>(B));
+    for (int i = 0; i < B; ++i) act_scales[i] = 0.5f + u(rng) * 0.1f;
+    const float weight_scale = 0.7f;
+
+    std::vector<float> y_ref(static_cast<size_t>(B * N));
+    Tensor y_lut({B, N}, Device::CPU);
+
+    // Precompute heat-map ONCE (would be cached at the layer level in real model).
+    const auto hm = lut_tmac::compute_heat_map(packed, N, K);
+    const auto hm_stats = lut_tmac::heat_map_stats(hm, N, K);
+
+    // ── Warmup ────────────────────────────────────────────────────
+    for (int w = 0; w < warmup; ++w) {
+        reference_gemm(input.data(), packed_ptr, act_scales, weight_scale,
+                        y_ref.data(), B, K, N);
+        lut_tmac::gemm_158bit_lut_tmac(input, packed, hm, act_scales,
+                                         weight_scale, y_lut);
+    }
+
+    // ── Time scalar reference ─────────────────────────────────────
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < iters; ++it) {
+        reference_gemm(input.data(), packed_ptr, act_scales, weight_scale,
+                        y_ref.data(), B, K, N);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    const double scalar_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
+    // ── Time LUT-TMAC ─────────────────────────────────────────────
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < iters; ++it) {
+        lut_tmac::gemm_158bit_lut_tmac(input, packed, hm, act_scales,
+                                         weight_scale, y_lut);
+    }
+    t1 = std::chrono::high_resolution_clock::now();
+    const double lut_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
+    BenchResult r;
+    r.B = B; r.K = K; r.N = N;
+    r.zero_density = zero_density;
+    r.scalar_ms = scalar_ms;
+    r.lut_ms = lut_ms;
+    r.speedup = scalar_ms / std::max(lut_ms, 1e-9);
+    r.heat_map_sparsity = hm_stats.sparsity;
+    return r;
+}
+
+}  // namespace
+
+int main() {
+    std::printf("=== LUT-TMAC microbench (scalar reference vs LUT) ===\n");
+    std::printf("  %-22s  %-10s  %-10s  %-10s  %-10s\n",
+                "shape (B,K,N) zd", "scalar ms", "lut ms", "speedup", "hm sparsity");
+    std::printf("  %s\n", std::string(78, '-').c_str());
+
+    // Shapes representative of NSOS hybrid linear layers.
+    struct Shape { int B, K, N; float zd; int iters; int warmup; };
+    const std::vector<Shape> shapes = {
+        // Small (decode-style: B=1)
+        {1, 128,  512,  0.30f, 200, 5},
+        {1, 256,  1024, 0.30f, 100, 5},
+        {1, 512,  2048, 0.30f, 50,  3},
+        {1, 1024, 4096, 0.30f, 20,  2},
+        // Larger batch (prefill / training)
+        {8, 256,  1024, 0.30f, 50,  3},
+        {16, 512, 2048, 0.30f, 20,  2},
+        {32, 256, 1024, 0.30f, 20,  2},
+        // Sparsity sweep at fixed shape (where LUT-TMAC's heat-map should shine)
+        {1, 1024, 4096, 0.00f, 20,  2},
+        {1, 1024, 4096, 0.50f, 20,  2},
+        {1, 1024, 4096, 0.80f, 20,  2},
+        {1, 1024, 4096, 0.95f, 20,  2},
+    };
+
+    int wins = 0, losses = 0;
+    double sum_speedup = 0.0;
+
+    for (const auto& s : shapes) {
+        auto r = bench_one(s.B, s.K, s.N, s.zd, s.iters, s.warmup);
+        std::printf("  (%2d,%4d,%4d) zd=%.2f  %9.4f   %9.4f   %7.2fx     %5.1f%%\n",
+                    r.B, r.K, r.N, r.zero_density,
+                    r.scalar_ms, r.lut_ms, r.speedup,
+                    r.heat_map_sparsity * 100.0);
+        if (r.speedup >= 1.0) ++wins; else ++losses;
+        sum_speedup += r.speedup;
+    }
+
+    std::printf("\n");
+    std::printf("  Summary: %d wins / %d losses across %zu shapes,  geo-mean ~%.2fx\n",
+                wins, losses, shapes.size(), sum_speedup / shapes.size());
+    return 0;
+}
