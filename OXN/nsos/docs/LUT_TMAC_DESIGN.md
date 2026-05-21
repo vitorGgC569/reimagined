@@ -64,6 +64,30 @@ At GEMM time:
 - After QAT convergence, zero density can reach 40-60% in some layers (the ternary distribution shifts toward zero as the model finds saturation)
 - Even 30% block-sparse buys back the 15% LUT construction overhead AND adds more
 
+## ⚠️ Bench result (2026-05-20) — LUT-TMAC SLOWER than production SIMD
+
+The 4-way microbench `bench_lut_tmac.exe` (with pre-quantized input so
+all four paths compute identical math) measured on local x86 (MSVC release):
+
+| LUT-TMAC vs … | geo-mean speedup | wins / losses |
+|---|---|---|
+| Scalar reference (naive triple loop) | **3.31×** | 11 / 0 |
+| Old scalar LUT (`BitNetAdapter::gemm_158bit_lut`) | **0.75×** (LUT-TMAC LOSES 25%) | 0 / 11 |
+| **SIMD AVX2 prod path (`BitNetAdapter::gemm_158bit_i8`)** | **0.05×** (LUT-TMAC LOSES 20×) | 0 / 11 |
+
+Why LUT-TMAC loses:
+- Old scalar LUT is branchless, cache-friendly `acc += x[k] * kDecodeLut[code]`.
+  Building+probing 81-entry per-row LUTs has overhead the old loop doesn't amortize.
+- SIMD AVX2 processes 16-32 int8 weights per instruction (VPMADDUBSW).
+  LUT-TMAC is scalar — the 20× ratio matches AVX2 lane width × IPC.
+
+**Decision**: kernel stays **opt-in only**, marked experimental.
+Useful niches: hosts without AVX2 (old x86, some ARM), or as a building
+block for non-SIMD targets (FPGA, MCU).  Not promoted to default.
+
+The bench infrastructure (`tests/bench_lut_tmac.cpp`) becomes the
+canonical perf gate for any future ternary kernel proposal.
+
 ## Output format compatibility
 
 The new kernel is **opt-in**, gated on the `NSOS_TMAC_LUT_GEMM` env var.  Default = off (uses existing `gemm_158bit_i8` SIMD kernel) so nothing changes for users who don't set the flag.
