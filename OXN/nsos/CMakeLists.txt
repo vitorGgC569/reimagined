@@ -43,6 +43,7 @@ set(NSOS_CORE_SOURCES
     src/bitlinear.cpp
     src/bitnet_adapter.cpp
     src/lut_tmac.cpp
+    src/lut_cas.cpp
     src/embedding.cpp
     src/kan.cpp
     src/ttt_layer.cpp
@@ -316,6 +317,11 @@ if (NSOS_BUILD_TESTS)
     # executable; run manually to compare LUT vs scalar reference.
     add_executable(bench_lut_tmac tests/bench_lut_tmac.cpp)
     target_link_libraries(bench_lut_tmac PRIVATE nsos_core)
+
+    # Content-addressed ternary storage — round-trip + multi-matrix dedup
+    add_executable(test_lut_cas tests/test_lut_cas.cpp)
+    target_link_libraries(test_lut_cas PRIVATE nsos_core)
+    add_test(NAME test_lut_cas COMMAND test_lut_cas)
 
     add_executable(test_bitnet_integrated tests/test_bitnet_integrated.cpp)
     target_link_libraries(test_bitnet_integrated PRIVATE nsos_core)
