@@ -139,6 +139,13 @@ int main(int argc, char* argv[]) {
         if (has_flag(argc, argv, "--allow-pack-absolute-paths")) {
             server_config.allow_pack_absolute_paths = true;
         }
+        if (has_flag(argc, argv, "--allow-cors")) {
+            // Inject CORS headers so the Oxta browser UI (file://, localhost:3000, etc.)
+            // can call /generate without Same-Origin Policy blocking the request.
+            // Only use on local dev or trusted private network — never on a public server
+            // without a proper CORS allow-list in front.
+            server_config.allow_cors = true;
+        }
         if (has_flag(argc, argv, "--trust-proxy-headers")) {
             server_config.trust_proxy_headers = true;
         }

@@ -52,6 +52,10 @@ struct HttpApiServerConfig {
     size_t max_train_text_bytes = 64 * 1024;
     std::string pack_output_root = "artifacts/model_packs";
     bool allow_pack_absolute_paths = false;
+    // When true, inject CORS headers that allow any origin (Access-Control-Allow-Origin: *).
+    // Enable with --allow-cors when the UI is served from a different origin (file://, dev server, etc.).
+    // Never enable on a public-facing server without understanding the implications.
+    bool allow_cors = false;
 };
 
 class HttpApiServer {

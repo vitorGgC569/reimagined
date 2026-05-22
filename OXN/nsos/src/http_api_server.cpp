@@ -586,13 +586,32 @@ std::vector<std::string> json_string_array(const JsonValue& object, const std::s
     return out;
 }
 
+// build_http_response is called for every outgoing response.
+// When config_.allow_cors is set, CORS headers replace the same-origin
+// defaults so the Oxta browser UI (served from file:// or a dev server)
+// can call /generate without preflight failures.
+// The config_ pointer is a file-scope accessor set once on server init.
+static const HttpApiServerConfig* g_response_config = nullptr;
+
 std::string build_http_response(const HttpResponse& response) {
     std::map<std::string, std::string> headers = response.headers;
     headers.try_emplace("X-Content-Type-Options", "nosniff");
     headers.try_emplace("X-Frame-Options", "DENY");
     headers.try_emplace("Referrer-Policy", "no-referrer");
-    headers.try_emplace("Cross-Origin-Resource-Policy", "same-origin");
-    headers.try_emplace("Cross-Origin-Opener-Policy", "same-origin");
+    const bool allow_cors = g_response_config && g_response_config->allow_cors;
+    if (allow_cors) {
+        // Permissive CORS — only use in local dev or trusted LAN.
+        headers["Access-Control-Allow-Origin"]  = "*";
+        headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+        headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+        headers["Access-Control-Max-Age"]        = "86400";
+        // Override same-origin policies when CORS is active.
+        headers["Cross-Origin-Resource-Policy"]  = "cross-origin";
+        headers["Cross-Origin-Opener-Policy"]    = "unsafe-none";
+    } else {
+        headers.try_emplace("Cross-Origin-Resource-Policy", "same-origin");
+        headers.try_emplace("Cross-Origin-Opener-Policy", "same-origin");
+    }
     std::ostringstream raw;
     raw << "HTTP/1.1 " << response.status_code << ' ' << response.status_text << "\r\n";
     raw << "Content-Type: " << response.content_type << "\r\n";
@@ -1177,7 +1196,10 @@ std::string server_metrics_json(const HttpApiServer& server, uint64_t uptime_ms,
 } // namespace
 
 HttpApiServer::HttpApiServer(InferenceEngine& engine, HttpApiServerConfig config)
-    : engine_(engine), config_(std::move(config)), server_socket_(kInvalidSocket) {}
+    : engine_(engine), config_(std::move(config)), server_socket_(kInvalidSocket) {
+    // Wire global config pointer used by build_http_response for CORS injection.
+    g_response_config = &config_;
+}
 
 HttpApiServer::~HttpApiServer() {
     stop();
@@ -1472,11 +1494,25 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
 
     total_requests_.fetch_add(1);
     const HttpRequest& request = read_result.request;
+
+    // Handle CORS preflight: browsers send OPTIONS before cross-origin POST.
+    // Respond 204 with CORS headers (build_http_response will inject them
+    // when config_.allow_cors is true, so a 204 body-less response suffices).
+    if (request.method == "OPTIONS") {
+        HttpResponse response;
+        response.status_code = 204;
+        response.status_text = "No Content";
+        response.body = "";
+        response.headers["X-Request-ID"] = std::to_string(request_id);
+        send_all(client_socket, build_http_response(response));
+        return;
+    }
+
     if (request.method != "GET" && request.method != "POST") {
         HttpResponse response = make_error_response(405, "Method Not Allowed", request_id,
                                                     "method_not_allowed",
-                                                    "only GET and POST are supported");
-        response.headers["Allow"] = "GET, POST";
+                                                    "only GET, POST, and OPTIONS are supported");
+        response.headers["Allow"] = "GET, POST, OPTIONS";
         send_all(client_socket, build_http_response(response));
         return;
     }
