@@ -1,0 +1,58 @@
+<Window x:Class="OContabil.Views.NewUserDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Novo Usuario" Height="460" Width="420"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        Background="{DynamicResource BgPrimary}"
+        Icon="/Assets/logo.png"
+        FontFamily="Segoe UI">
+    <Border Margin="24" Background="{DynamicResource BgCard}"
+            CornerRadius="8" BorderBrush="{DynamicResource Border}"
+            BorderThickness="1" Padding="28,24">
+        <StackPanel>
+            <TextBlock Text="Criar Usuario" FontSize="16" FontWeight="SemiBold"
+                       Foreground="{DynamicResource TextPrimary}" Margin="0,0,0,4"/>
+            <TextBlock Text="Defina credenciais e nivel de acesso" FontSize="11"
+                       Foreground="{DynamicResource TextMuted}" Margin="0,0,0,20"/>
+
+            <!-- Nome -->
+            <TextBlock Text="Nome Completo *" FontSize="11.5" FontWeight="Medium"
+                       Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,5"/>
+            <TextBox x:Name="txtFullName" Style="{DynamicResource InputBox}" Margin="0,0,0,14"/>
+
+            <!-- Username -->
+            <TextBlock Text="Nome de Usuario *" FontSize="11.5" FontWeight="Medium"
+                       Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,5"/>
+            <TextBox x:Name="txtUsername" Style="{DynamicResource InputBox}" Margin="0,0,0,14"/>
+
+            <!-- Senha -->
+            <TextBlock Text="Senha *" FontSize="11.5" FontWeight="Medium"
+                       Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,5"/>
+            <PasswordBox x:Name="txtPassword" Style="{DynamicResource InputPassword}" Margin="0,0,0,14"/>
+
+            <!-- Perfil -->
+            <TextBlock Text="Perfil de Acesso" FontSize="11.5" FontWeight="Medium"
+                       Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,5"/>
+            <ComboBox x:Name="cmbRole" Padding="8,6" FontSize="11.5" Margin="0,0,0,20"
+                      Background="{DynamicResource BgInput}" Foreground="{DynamicResource TextPrimary}">
+                <ComboBoxItem Tag="Operador">Operador</ComboBoxItem>
+                <ComboBoxItem Tag="Visualizador">Visualizador</ComboBoxItem>
+                <ComboBoxItem Tag="Admin">Administrador</ComboBoxItem>
+            </ComboBox>
+
+            <!-- Error -->
+            <TextBlock x:Name="txtError" Text="" FontSize="11"
+                       Foreground="{DynamicResource Error}" Margin="0,0,0,8"
+                       Visibility="Collapsed"/>
+
+            <!-- Buttons -->
+            <DockPanel>
+                <Button Style="{DynamicResource BtnGhost}" Content="Cancelar"
+                        Click="OnCancel" DockPanel.Dock="Right" Margin="8,0,0,0"/>
+                <Button Style="{DynamicResource BtnPrimary}" Content="Criar"
+                        Click="OnSave" DockPanel.Dock="Right" HorizontalAlignment="Right"/>
+            </DockPanel>
+        </StackPanel>
+    </Border>
+</Window>

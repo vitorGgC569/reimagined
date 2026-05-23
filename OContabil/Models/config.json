@@ -1,0 +1,26 @@
+{
+  "return_dict": true,
+  "output_hidden_states": false,
+  "dtype": null,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "architectures": null,
+  "id2label": {
+    "0": "LABEL_0",
+    "1": "LABEL_1"
+  },
+  "label2id": {
+    "LABEL_0": 0,
+    "LABEL_1": 1
+  },
+  "problem_type": null,
+  "_name_or_path": "",
+  "transformers_version": "5.1.0",
+  "_attn_implementation_autoset": true,
+  "model_type": "extractor",
+  "model_name": "microsoft/deberta-v3-base",
+  "max_width": 8,
+  "counting_layer": "count_lstm_v2",
+  "token_pooling": "first",
+  "output_attentions": false
+}

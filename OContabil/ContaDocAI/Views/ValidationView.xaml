@@ -1,0 +1,117 @@
+<UserControl x:Class="ContaDocAI.Views.ValidationView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Loaded="OnLoaded">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- ═══ Nav Bar ═══ -->
+        <DockPanel Grid.Row="0" Margin="0,0,0,12">
+            <StackPanel Orientation="Horizontal">
+                <Button x:Name="btnPrev" Style="{StaticResource BtnSecondary}" Content="← Anterior"
+                        Click="OnPrevClick" Padding="12,6"/>
+                <TextBlock x:Name="txtPosition" Text="1 de 3" FontSize="13" VerticalAlignment="Center"
+                           Foreground="{StaticResource TextSecondaryBrush}" Margin="12,0"/>
+                <Button x:Name="btnNext" Style="{StaticResource BtnSecondary}" Content="Proximo →"
+                        Click="OnNextClick" Padding="12,6"/>
+            </StackPanel>
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right"
+                        VerticalAlignment="Center">
+                <Border Background="{StaticResource ElevatedBrush}" CornerRadius="4" Padding="6,3" Margin="4,0">
+                    <TextBlock Text="Ctrl+Enter  validar" FontSize="9" Foreground="{StaticResource TextTertiaryBrush}" FontFamily="Consolas"/>
+                </Border>
+                <Border Background="{StaticResource ElevatedBrush}" CornerRadius="4" Padding="6,3" Margin="4,0">
+                    <TextBlock Text="Ctrl+→  proximo" FontSize="9" Foreground="{StaticResource TextTertiaryBrush}" FontFamily="Consolas"/>
+                </Border>
+            </StackPanel>
+        </DockPanel>
+
+        <!-- ═══ Doc Chips ═══ -->
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12" x:Name="docChips"/>
+
+        <!-- ═══ Split Screen ═══ -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="16"/>
+                <ColumnDefinition Width="360"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Left: Document Viewer -->
+            <Border Grid.Column="0" Style="{StaticResource CardStyle}" Padding="0">
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Background="{StaticResource ElevatedBrush}" Padding="16,10"
+                            CornerRadius="10,10,0,0" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+                        <DockPanel>
+                            <TextBlock x:Name="txtDocName" Text="" FontSize="13" FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                            <Border DockPanel.Dock="Right" Background="{StaticResource InfoBgBrush}" CornerRadius="10"
+                                    Padding="10,3" BorderBrush="#4D3b82f6" BorderThickness="1">
+                                <TextBlock x:Name="txtDocType" Text="" FontSize="10" FontWeight="SemiBold"
+                                           Foreground="{StaticResource InfoBrush}"/>
+                            </Border>
+                        </DockPanel>
+                    </Border>
+                    <Border DockPanel.Dock="Bottom" Background="{StaticResource ElevatedBrush}" Padding="16,8"
+                            CornerRadius="0,0,10,10" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="🟢 Alta (≥90%)" FontSize="10" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,0,12,0"/>
+                            <TextBlock Text="🟡 Media (80-89%)" FontSize="10" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,0,12,0"/>
+                            <TextBlock Text="🔴 Baixa (&lt;80%)" FontSize="10" Foreground="{StaticResource TextTertiaryBrush}"/>
+                        </StackPanel>
+                    </Border>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="20,16">
+                        <TextBlock x:Name="txtOcrContent" FontFamily="Consolas" FontSize="13"
+                                   Foreground="{StaticResource TextPrimaryBrush}" TextWrapping="Wrap"
+                                   LineHeight="24"/>
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+
+            <!-- Right: Extraction Form -->
+            <Border Grid.Column="2" Style="{StaticResource CardStyle}" Padding="0">
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Background="{StaticResource ElevatedBrush}" Padding="16,12"
+                            CornerRadius="10,10,0,0" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+                        <DockPanel>
+                            <StackPanel>
+                                <TextBlock Text="Dados Extraidos" FontSize="14" FontWeight="SemiBold"
+                                           Foreground="{StaticResource TextPrimaryBrush}"/>
+                                <TextBlock x:Name="txtAvgConf" Text="GLiNER 2 · Confianca media: 95%" FontSize="11"
+                                           Foreground="{StaticResource TextTertiaryBrush}"/>
+                            </StackPanel>
+                            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock x:Name="txtOverallConf" Text="95%" FontSize="16" FontWeight="Bold"
+                                           Foreground="{StaticResource SuccessBrush}"/>
+                            </StackPanel>
+                        </DockPanel>
+                    </Border>
+
+                    <!-- Footer Buttons -->
+                    <Border DockPanel.Dock="Bottom" Background="{StaticResource ElevatedBrush}" Padding="12,10"
+                            CornerRadius="0,0,10,10" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+                        <DockPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <Button Style="{StaticResource BtnSecondary}" Content="❌ Rejeitar" Click="OnReject" Padding="10,6" Margin="0,0,6,0"/>
+                                <Button Style="{StaticResource BtnSecondary}" Content="⏩ Pular" Click="OnSkip" Padding="10,6"/>
+                            </StackPanel>
+                            <Button DockPanel.Dock="Right" Style="{StaticResource BtnSuccess}"
+                                    Content="✅  Validar e Proximo" Click="OnValidate" Padding="14,8"
+                                    HorizontalAlignment="Right"/>
+                        </DockPanel>
+                    </Border>
+
+                    <!-- Form Fields -->
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="16,12">
+                        <StackPanel x:Name="fieldsPanel"/>
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</UserControl>

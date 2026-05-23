@@ -1,0 +1,39 @@
+using System.IO;
+using System.Text;
+
+namespace OContabil.Services;
+
+/// <summary>
+/// Extração de texto leve para arquivos comuns (txt/xml/csv/json).
+/// Para PDFs e imagens delegamos ao bridge Python (com OCR), pois requer
+/// runtimes externos. Esta classe é usada apenas como insumo para o motor
+/// ONNX nativo quando ele está ativo.
+/// </summary>
+public static class DocumentTextExtractor
+{
+    private static readonly string[] _textExtensions = { ".txt", ".xml", ".csv", ".json", ".ofx", ".rem", ".ret" };
+
+    public static bool CanReadNatively(string path)
+    {
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        return _textExtensions.Contains(ext);
+    }
+
+    public static async Task<string> ReadAsync(string path, CancellationToken ct = default)
+    {
+        if (!File.Exists(path)) return string.Empty;
+
+        var encodings = new[] { Encoding.UTF8, Encoding.Latin1, Encoding.GetEncoding(1252) };
+        foreach (var enc in encodings)
+        {
+            try
+            {
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new StreamReader(stream, enc, detectEncodingFromByteOrderMarks: true);
+                return await reader.ReadToEndAsync(ct);
+            }
+            catch { }
+        }
+        return string.Empty;
+    }
+}
