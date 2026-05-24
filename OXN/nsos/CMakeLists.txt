@@ -308,6 +308,14 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_bitlinear PRIVATE nsos_core)
     add_test(NAME test_bitlinear COMMAND test_bitlinear)
 
+    # Cherry-pick #2 (Slender-Mamba head-to-toe quantization).
+    # Tests the slender forward path on Embedding: cache lifecycle,
+    # round-trip bounds, STE backward routing, and edge cases.
+    # See docs/SLENDER_INTEGRATION.md.
+    add_executable(test_slender_embedding tests/test_slender_embedding.cpp)
+    target_link_libraries(test_slender_embedding PRIVATE nsos_core)
+    add_test(NAME test_slender_embedding COMMAND test_slender_embedding)
+
     add_executable(test_lut_tmac tests/test_lut_tmac.cpp)
     target_link_libraries(test_lut_tmac PRIVATE nsos_core)
     add_test(NAME test_lut_tmac COMMAND test_lut_tmac)
