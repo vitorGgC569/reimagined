@@ -36,6 +36,16 @@ struct ModelConfig {
     bool use_moe = false;
     int moe_period = 6;
     int moe_slot = 5;
+    // ── Nemotron K·m invariant tuning (Cherry-pick #4) ──
+    // When > 0, overrides the default expert FFN intermediate dimension
+    // (otherwise computed as d_model * 4).  Use this to apply the K·m
+    // invariant from Nemotron 3 Super (Sec 2.1.1, Principle 3):
+    // increase num_experts_per_token AND decrease moe_expert_hidden_dim
+    // proportionally, holding K × m fixed to preserve quality while
+    // reducing memory bandwidth in MoE inference.
+    // See docs/NEMOTRON_KM_INTEGRATION.md for the principle + tested values.
+    // Default 0 preserves the existing dm * 4 behavior exactly.
+    int moe_expert_hidden_dim = 0;
 
     // TTT schedule
     // Defaults stay conservative for product paths; TTT is research-only unless a

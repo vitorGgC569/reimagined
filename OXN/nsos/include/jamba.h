@@ -158,7 +158,13 @@ public:
              int configured_top_k,
              bool exact_attention_training,
              float dropout_rate = 0.0f,
-             bool use_gradient_checkpointing = false);
+             bool use_gradient_checkpointing = false,
+             // ── Nemotron K·m invariant (Cherry-pick #4) ──
+             // When > 0, overrides the default expert FFN intermediate
+             // dimension (m).  Default 0 means use the historical d_model*4
+             // value, preserving byte-for-byte the existing behavior.
+             // See OXN/nsos/docs/NEMOTRON_KM_INTEGRATION.md.
+             int configured_expert_hidden_dim = 0);
   ~JambaBlock();
   Tensor forward(const Tensor &x, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);

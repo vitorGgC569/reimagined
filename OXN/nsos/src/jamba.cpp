@@ -492,7 +492,9 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             model_config_.num_experts_per_token,
             use_exact_attention_training,
             model_config_.dropout,
-            model_config_.use_gradient_checkpointing));
+            model_config_.use_gradient_checkpointing,
+            // Nemotron K·m invariant (Cherry-pick #4).  0 = default dm*4.
+            model_config_.moe_expert_hidden_dim));
     }
 
     value_head = std::make_unique<BitLinear>(d_model, vocab_size);
@@ -1295,7 +1297,8 @@ JambaBlock::JambaBlock(int dm,
                        int configured_top_k,
                        bool exact_attention_training,
                        float dropout_rate,
-                       bool use_gradient_checkpointing)
+                       bool use_gradient_checkpointing,
+                       int configured_expert_hidden_dim)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
@@ -1304,7 +1307,14 @@ JambaBlock::JambaBlock(int dm,
       d_model(dm),
       num_experts(std::max(configured_experts, 1)),
       dropout_rate_(std::clamp(dropout_rate, 0.0f, 0.95f)) {
-    const int hidden_dim = dm * 4;
+    // Nemotron K·m invariant: if configured_expert_hidden_dim > 0, use it
+    // as the m parameter (expert FFN intermediate dim).  Otherwise fall
+    // back to the historical dm * 4 default to preserve byte-for-byte
+    // compatibility with existing trained checkpoints and profiles.
+    // See OXN/nsos/docs/NEMOTRON_KM_INTEGRATION.md.
+    const int hidden_dim = (configured_expert_hidden_dim > 0)
+                           ? configured_expert_hidden_dim
+                           : dm * 4;
 
     if (is_ttt) {
         ttt_layer = std::make_unique<TTTLayer>(dm, hidden_dim);

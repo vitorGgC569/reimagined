@@ -118,6 +118,10 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("use_moe", &ModelConfig::use_moe)
         .def_readwrite("moe_period", &ModelConfig::moe_period)
         .def_readwrite("moe_slot", &ModelConfig::moe_slot)
+        // Cherry-pick #4: Nemotron K·m invariant — override of default
+        // expert FFN intermediate dim (m).  Default 0 = dm * 4 (existing behavior).
+        // See OXN/nsos/docs/NEMOTRON_KM_INTEGRATION.md.
+        .def_readwrite("moe_expert_hidden_dim", &ModelConfig::moe_expert_hidden_dim)
         .def_readwrite("use_ttt", &ModelConfig::use_ttt)
         .def_readwrite("ttt_period", &ModelConfig::ttt_period)
         .def_readwrite("ttt_slot", &ModelConfig::ttt_slot)
