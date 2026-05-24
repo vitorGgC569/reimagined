@@ -700,6 +700,11 @@ _v11_80m_model_config = {
     "num_experts_per_token": 2,
     "moe_period": 3,
     "moe_slot": 3,
+    # Cherry-pick #4 (Nemotron K·m invariant): expert FFN intermediate dim.
+    # 0 = use historical default of d_model * 4 = 640 * 4 = 2560.
+    # Override in variants below (_km_A, _km_B, _km_C) to test the
+    # K · m invariant.  See docs/NEMOTRON_KM_INTEGRATION.md.
+    "moe_expert_hidden_dim": 0,
     "use_ttt": False,
     "ttt_period": 64,
     "ttt_slot": 63,
@@ -753,6 +758,52 @@ PROFILES["hybrid_v11_colab_t4_80m"]["validation_scope"] = (
     "batch_size=24 (~12K tokens/step), lr=7e-4, warmup=500. "
     "Targets ~1.6B tokens across phases. Wall time: ~24h split across "
     "2-3 sessions of 8-12h.  Auto-checkpoint to Drive every 100 steps."
+)
+
+# ── Nemotron K·m invariant ablation variants (Cherry-pick #4) ─────────────
+# Three configurations holding K · m = 5120 fixed (matches baseline above
+# at K=2, m=2560).  See OXN/nsos/docs/NEMOTRON_KM_INTEGRATION.md.
+# Run all three side-by-side in a smoke ablation to empirically pick the
+# winner before committing to the long pre-training run.
+# Theory predicts ordering (best to worst): _km_C > _km_A ≈ _km_B > baseline.
+
+# Variant A — more sparse routing.  K doubled, m halved (Principle 5: more
+# expert combinations → higher quality at same compute).
+PROFILES["hybrid_v11_colab_t4_80m_km_A"] = deepcopy(PROFILES["hybrid_v11_colab_t4_80m"])
+PROFILES["hybrid_v11_colab_t4_80m_km_A"]["model_config"] = deepcopy(_v11_80m_model_config)
+PROFILES["hybrid_v11_colab_t4_80m_km_A"]["model_config"]["num_experts_per_token"] = 4
+PROFILES["hybrid_v11_colab_t4_80m_km_A"]["model_config"]["moe_expert_hidden_dim"] = 1280
+# K · m = 4 × 1280 = 5120 (invariant held)
+PROFILES["hybrid_v11_colab_t4_80m_km_A"]["validation_scope"] = (
+    "Nemotron K·m ablation A: K=4, m=1280, N=8.  K·m=5120 (matches baseline). "
+    "Tests Principle 5 (more expert combinations at same compute)."
+)
+
+# Variant B — more total experts at same K.  N doubled, m kept, K kept.
+# This BREAKS the K·m invariant nominally (still K·m=5120) but adds
+# parameter count via more experts.  Mostly tests Principle 5 from the
+# other axis (more N, same K).
+PROFILES["hybrid_v11_colab_t4_80m_km_B"] = deepcopy(PROFILES["hybrid_v11_colab_t4_80m"])
+PROFILES["hybrid_v11_colab_t4_80m_km_B"]["model_config"] = deepcopy(_v11_80m_model_config)
+PROFILES["hybrid_v11_colab_t4_80m_km_B"]["model_config"]["num_experts"] = 16
+# Default m (0 = dm*4 = 2560), default K=2.  N doubled.
+PROFILES["hybrid_v11_colab_t4_80m_km_B"]["validation_scope"] = (
+    "Nemotron K·m ablation B: K=2, m=2560, N=16.  More total experts, same K. "
+    "Tests Principle 5 (combinatorial expansion via N alone)."
+)
+
+# Variant C — combination of A and B.  K doubled, m halved, N doubled.
+# Should be the theoretically strongest variant: maximizes combinations
+# while keeping per-expert compute small.
+PROFILES["hybrid_v11_colab_t4_80m_km_C"] = deepcopy(PROFILES["hybrid_v11_colab_t4_80m"])
+PROFILES["hybrid_v11_colab_t4_80m_km_C"]["model_config"] = deepcopy(_v11_80m_model_config)
+PROFILES["hybrid_v11_colab_t4_80m_km_C"]["model_config"]["num_experts"] = 16
+PROFILES["hybrid_v11_colab_t4_80m_km_C"]["model_config"]["num_experts_per_token"] = 4
+PROFILES["hybrid_v11_colab_t4_80m_km_C"]["model_config"]["moe_expert_hidden_dim"] = 1280
+# K · m = 4 × 1280 = 5120 (invariant held); N=16 (doubled).
+PROFILES["hybrid_v11_colab_t4_80m_km_C"]["validation_scope"] = (
+    "Nemotron K·m ablation C: K=4, m=1280, N=16.  Full sparse expansion. "
+    "Theory predicts strongest of the three variants."
 )
 
 # ── hybrid_v11_colab_a100_80m ─────────────────────────────────────────────
