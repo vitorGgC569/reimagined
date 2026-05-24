@@ -72,6 +72,32 @@ public:
   bool slender_quantization_enabled() const { return slender_quantization_; }
 
  private:
+  // ── Slender forward helpers (Phase 2 implementation) ──
+  // Lazily quantizes the weight matrix to ternary {-1, 0, +1} when the
+  // current weight.version differs from slender_cached_weight_version_.
+  // Also computes the per-tensor scale β = max(mean(|W|), ε) and stores
+  // it in slender_cached_beta_.  Cheap when the cache is hot (single
+  // version comparison), O(V·D) when cold (full pass over the weight
+  // matrix to build the cached ternary representation).
+  //
+  // PRECONDITION: weight.data must be on Device::CPU when this is called.
+  // Slender on GPU is Phase 7 (future); for now we fall back to CPU when
+  // the user opts into slender + GPU — see forward_batch() dispatch.
+  void ensure_slender_cache_() const;
+
+  // Computes a single Slender forward over the flat batched indices.
+  // Performs: ternary lookup → LayerNorm → per-token 8-bit activation
+  // quantization → dequantization back to float, exactly as described
+  // in equations 7-13 of Yu et al. 2025 Sec 3.3.
+  //
+  // Output shape: [batch_size, max_seq_len, embedding_dim] on CPU.
+  // Out-of-range token IDs (id < 0 or id >= vocab_size) zero their
+  // row, matching the behavior of the existing FP32 path.
+  Tensor slender_forward_cpu_(
+      const std::vector<std::vector<int>>& indices_batch,
+      int batch_size,
+      int max_seq_len) const;
+
   // Cherry-pick #2 (Slender) state.  Default false preserves byte-for-byte the
   // existing FP32 embedding behavior — no risk of regression on the current
   // pipeline without explicit opt-in via set_slender_quantization(true).

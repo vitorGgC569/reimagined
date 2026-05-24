@@ -213,11 +213,11 @@ Quando todos esses bullets estão check, merge `feature/cherry-picks-3` → `mai
 - ✅ Código de referência inspecionado (`Bitembedding.py` em Slender-Mamba repo)
 - ✅ Branch criada: `feature/cherry-picks-3`
 - ✅ Tag de safety criada: `oxta-pre-cherrypicks-2026-05-24`
-- ✅ **Header changes (Fase 1)** — `embedding.h` extendido com `set_slender_quantization(bool)` + estado privado. Compila limpo, zero impacto comportamental no path default.
-- ⬜ Forward quantizado (Fase 2) — próximo passo
-- ⬜ Backward STE (Fase 3)
-- ⬜ Output projection (Fase 4)
-- ⬜ Tests (Fase 5)
+- ✅ **Header changes (Fase 1)** — `embedding.h` extendido com `set_slender_quantization(bool)` + estado privado. Compila limpo, zero impacto comportamental no path default. (Revisão Fase 1: cache fields renomeados pra precisão semântica; thread-safety contract documentado.)
+- ✅ **Forward quantizado (Fase 2)** — `embedding.cpp` ganhou `ensure_slender_cache_()` (lazy ternarização com versionamento via `weight.version`) + `slender_forward_cpu_()` (equações 9-13 do paper, paralelizado via OpenMP). Dispatch em `forward_batch()` ativa Slender quando flag on. ~180 linhas adicionadas. GPU path lança erro claro indicando que é Phase 7 (não implementado).
+- ✅ **Backward STE (Fase 3)** — backward FP32 existente JÁ É o STE correto matematicamente (paper Sec 3.3 último parágrafo confirma). Adicionado bloco de documentação no topo de `backward_batch()` explicando: (a) `∂y/∂W ≈ scatter at index` sob STE, (b) cache invalidation automática via `weight.version` bump pelo trainer após optimizer step. Zero código novo, design correto preservado.
+- ✅ **Output projection (Fase 4)** — `JambaModel` já usa `BitLinear` em `value_head` (lm_head) na linha `jamba.cpp:500`. Slender requer head também ternário; este requisito já estava satisfeito antes de Slender existir, por escolha de arquitetura original. Nada a fazer.
+- ⬜ Tests (Fase 5) — próximo
 - ⬜ Ablation Colab (Fase 6)
 - ⬜ Backward STE (Fase 3)
 - ⬜ Output projection (Fase 4)
