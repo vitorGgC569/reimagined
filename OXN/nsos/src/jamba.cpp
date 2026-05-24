@@ -1307,17 +1307,29 @@ JambaBlock::JambaBlock(int dm,
       d_model(dm),
       num_experts(std::max(configured_experts, 1)),
       dropout_rate_(std::clamp(dropout_rate, 0.0f, 0.95f)) {
-    // Nemotron K·m invariant: if configured_expert_hidden_dim > 0, use it
-    // as the m parameter (expert FFN intermediate dim).  Otherwise fall
-    // back to the historical dm * 4 default to preserve byte-for-byte
-    // compatibility with existing trained checkpoints and profiles.
-    // See OXN/nsos/docs/NEMOTRON_KM_INTEGRATION.md.
-    const int hidden_dim = (configured_expert_hidden_dim > 0)
-                           ? configured_expert_hidden_dim
-                           : dm * 4;
+    // Two distinct hidden dimensions kept separate so the Nemotron K·m
+    // override only affects MoE experts (its semantic scope), not TTT or
+    // regular FFN layers.
+    //
+    // - default_ffn_hidden: historical dm * 4 used by TTT, regular FFN, and
+    //   as the fallback for MoE experts when no override is set.
+    //
+    // - moe_expert_hidden: only differs from default when the user enables
+    //   the Nemotron K·m invariant tuning by setting
+    //   ModelConfig::moe_expert_hidden_dim > 0.  In that case we use the
+    //   override ONLY for MoE expert BitLinear sizing.
+    //
+    // This separation matters because the field is named "moe_expert_hidden_dim"
+    // and the paper (Nemotron 3 Super, Sec 2.1.1) defines m as the MoE
+    // expert FFN intermediate dimension specifically — it is not a general
+    // FFN-width knob.  See OXN/nsos/docs/NEMOTRON_KM_INTEGRATION.md.
+    const int default_ffn_hidden = dm * 4;
+    const int moe_expert_hidden = (configured_expert_hidden_dim > 0)
+                                  ? configured_expert_hidden_dim
+                                  : default_ffn_hidden;
 
     if (is_ttt) {
-        ttt_layer = std::make_unique<TTTLayer>(dm, hidden_dim);
+        ttt_layer = std::make_unique<TTTLayer>(dm, default_ffn_hidden);
     } else if (is_attention) {
         attn_layer = std::make_unique<Attention>(dm, std::max(query_heads, 1), 512,
                                                  std::max(kv_heads, 1));
@@ -1335,12 +1347,12 @@ JambaBlock::JambaBlock(int dm,
         router = std::make_unique<MoERouter>(
             dm, num_experts, std::clamp(configured_top_k, 1, num_experts));
         for (int j = 0; j < num_experts; ++j) {
-            expert_gate_up.push_back(std::make_unique<BitLinear>(dm, hidden_dim));
-            expert_down.push_back(std::make_unique<BitLinear>(hidden_dim, dm));
+            expert_gate_up.push_back(std::make_unique<BitLinear>(dm, moe_expert_hidden));
+            expert_down.push_back(std::make_unique<BitLinear>(moe_expert_hidden, dm));
         }
     } else {
-        ffn_gate_up = std::make_unique<BitLinear>(dm, hidden_dim);
-        ffn_down = std::make_unique<BitLinear>(hidden_dim, dm);
+        ffn_gate_up = std::make_unique<BitLinear>(dm, default_ffn_hidden);
+        ffn_down = std::make_unique<BitLinear>(default_ffn_hidden, dm);
     }
 }
 

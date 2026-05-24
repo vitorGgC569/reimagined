@@ -72,20 +72,36 @@ public:
   bool slender_quantization_enabled() const { return slender_quantization_; }
 
  private:
-  // Cherry-pick #2 state.  Default false preserves byte-for-byte the existing
-  // FP32 embedding behavior — no risk of regression on the current pipeline.
+  // Cherry-pick #2 (Slender) state.  Default false preserves byte-for-byte the
+  // existing FP32 embedding behavior — no risk of regression on the current
+  // pipeline without explicit opt-in via set_slender_quantization(true).
   bool slender_quantization_ = false;
 
-  // Cached ternary weight matrix.  Recomputed when slender_quantization_ is
-  // true AND the underlying weight version changes (or on first use).  Avoids
-  // re-quantizing the entire vocab × dim matrix on every forward pass when
-  // weights are static between optimizer steps.
+  // Cached ternary weight matrix.  Recomputed lazily when (a) the cache is
+  // empty or (b) the underlying `weight.version` differs from the cached
+  // `slender_cached_weight_version_`.  The version is bumped automatically
+  // by Trainer::step() via Parameter::mark_updated() after each optimizer
+  // update (see src/trainer.cpp:814,836), so the cache stays coherent
+  // without manual invalidation calls.
   //
-  // Stored as a flat int8 vector { -1, 0, +1 } of length vocab_size * embedding_dim.
-  // ~ 4900 × 640 = ~3MB for a typical 80M Mamba model.  Trivially fits any device.
-  mutable std::vector<int8_t> slender_packed_weights_;
-  mutable float slender_beta_ = 0.0f;
-  mutable uint64_t slender_weight_version_ = 0;  // Bump when weights update
+  // Layout: flat std::vector<int8_t> of length vocab_size * embedding_dim,
+  // values strictly ∈ {-1, 0, +1}.  This is NOT bit-packed (that would be
+  // ~vocab_dim/4 bytes); we keep it unpacked for fast direct lookup, since
+  // total size is small: ~3 MB for 4900 × 640 = 3.1 M entries.  Bit-packing
+  // is a future optimization once we measure that the linear scan dominates.
+  //
+  // β (slender_cached_beta_) is the per-tensor scale: max(mean(|W|), ε) per
+  // equation 8 of the paper.  Cached to avoid recomputing on every forward.
+  //
+  // Thread-safety note: these mutable fields are NOT protected by a mutex.
+  // The contract is that forward()/forward_batch() are not called concurrently
+  // with weight updates from the optimizer.  This matches the existing
+  // contract of Parameter::data — there is no concurrent read/write protection
+  // anywhere else in the runtime.  Inference replicas use independent
+  // Embedding instances (see InferenceEngine replica creation).
+  mutable std::vector<int8_t> slender_cached_weights_;
+  mutable float slender_cached_beta_ = 0.0f;
+  mutable uint64_t slender_cached_weight_version_ = 0;
 };
 
 } // namespace nsos
