@@ -316,6 +316,14 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_slender_embedding PRIVATE nsos_core)
     add_test(NAME test_slender_embedding COMMAND test_slender_embedding)
 
+    # Cherry-pick #1 (bitmamba UNPACK_LUT + AVX2 SIMD).
+    # Tests gemm_158bit_lut SIMD path: small deterministic, env routing,
+    # scalar tail handling, high zero-density sparse weights.
+    # See docs/BITMAMBA_LUT_INTEGRATION.md.
+    add_executable(test_bitmamba_lut tests/test_bitmamba_lut.cpp)
+    target_link_libraries(test_bitmamba_lut PRIVATE nsos_core)
+    add_test(NAME test_bitmamba_lut COMMAND test_bitmamba_lut)
+
     add_executable(test_lut_tmac tests/test_lut_tmac.cpp)
     target_link_libraries(test_lut_tmac PRIVATE nsos_core)
     add_test(NAME test_lut_tmac COMMAND test_lut_tmac)
