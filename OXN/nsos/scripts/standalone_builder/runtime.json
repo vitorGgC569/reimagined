@@ -1,0 +1,37 @@
+{
+  "_comment": "Runtime configuration for the standalone trainer. All values are tuned for the target hardware envelope. Edit at your own risk.",
+  "version": "1.0",
+  "model": {
+    "num_layers": 20,
+    "d_model": 1024,
+    "vocab_size": 8192,
+    "max_context_tokens": 1024,
+    "n_heads": 16,
+    "n_kv_heads": 4,
+    "sliding_window": 4096,
+    "attention_period": 2,
+    "attention_slot": 2,
+    "use_moe": true,
+    "num_experts": 8,
+    "num_experts_per_token": 2,
+    "moe_period": 3,
+    "moe_slot": 3,
+    "moe_expert_hidden_dim": 0,
+    "use_gradient_checkpointing": true,
+    "use_exact_attention_training": true,
+    "use_flash_attn": false,
+    "dropout": 0.0,
+    "batch_size": 12
+  },
+  "training": {
+    "seed": 1337,
+    "target_steps": 50000,
+    "warmup_steps": 700,
+    "learning_rate": 0.00055,
+    "weight_decay": 0.003,
+    "max_grad_norm": 0.9,
+    "checkpoint_every_steps": 100,
+    "log_every_steps": 25,
+    "max_doc_chars": 4096
+  }
+}
