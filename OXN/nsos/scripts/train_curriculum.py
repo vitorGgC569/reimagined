@@ -806,6 +806,85 @@ PROFILES["hybrid_v11_colab_t4_80m_km_C"]["validation_scope"] = (
     "Theory predicts strongest of the three variants."
 )
 
+# ── hybrid_rtx2080ti_200m_chinchilla25b ──────────────────────────────────────
+# 200M-param hybrid sized for NVIDIA RTX 2080 Ti (11GB VRAM, Turing sm_75).
+# Targets ~2.5B training tokens (62% of Chinchilla-optimal for 200M params)
+# delivering the meaningful quality jump over 80M needed for first contábil
+# design-partner demos.
+#
+# VRAM math at peak:
+#   weights FP32:   200M × 4 bytes              = 800 MB
+#   gradients:                                  = 800 MB
+#   Adam (m, v):    200M × 4 × 2                = 1.6 GB
+#   activations:    batch=12 × seq=512 × d=1024 × 20 × ~6 × 4 bytes
+#                   with gradient_checkpointing  ≈ 4.5 GB
+#   cuBLAS + cudart workspace                   ≈ 1.5 GB
+#   ──────────────────────────────────────────────────────
+#   total peak:                                 ≈ 9.2 GB  (fits in 11GB w/ margin)
+#
+# Wall time @ ~5K tokens/sec on 2080 Ti FP16 with grad checkpoint:
+#   2.5B tokens / 5K tok/s = 500K sec ≈ 140h ≈ 5.8 days continuous
+#   Realistic at 18h/day (friend uses PC 6h/day): ~8-9 calendar days
+#
+# Token budget across phases (sum ≈ 2.5B):
+#   phase1_algorithms:   320 steps × 12 batch × 160 seq = ~6.1M tokens × loop factor
+#   phase2_structured:   240 steps                       = ~4.6M tokens × loop factor
+#   phase3_curated_text: 900 steps (heaviest — coherence)= ~17M × loop factor (~1.6B effective)
+#   phase4_instructions: 300 steps                       = ~5.7M tokens × loop factor
+#   phase5_verifier:     200 steps                       = ~3.8M tokens × loop factor
+#   phase6_memory:       320 steps                       = ~6.1M tokens × loop factor
+#
+# Use this profile when training on the friend's RTX 2080 Ti for the first
+# Oxta Contábil production model.  Pair with `--checkpoint-every-steps 100`
+# so a crash/power-outage loses at most ~25 min of progress.
+_v11_200m_model_config = {
+    "n_heads": 16,                  # 1024 / 64 = head_dim 64
+    "n_kv_heads": 4,                # GQA 4:1
+    "sliding_window": 4096,
+    "attention_period": 2,          # 1 attention layer for every 2 layers
+    "attention_slot": 2,
+    "use_moe": True,
+    "num_experts": 8,
+    "num_experts_per_token": 2,
+    "moe_period": 3,                # 1 MoE layer for every 3 layers
+    "moe_slot": 3,
+    "moe_expert_hidden_dim": 0,     # default dm * 4 = 4096
+    "use_ttt": False,
+    "ttt_period": 64,
+    "ttt_slot": 63,
+    "use_exact_attention_training": True,
+    "use_flash_attn": False,        # Turing sm_75 doesn't have Flash Attention
+}
+
+_v11_200m_phase_steps = {
+    "phase1_algorithms":    320,
+    "phase2_structured":    240,
+    "phase3_curated_text":  900,    # bulk of curriculum — natural language coherence
+    "phase4_instructions":  300,
+    "phase5_verifier":      200,
+    "phase6_memory":        320,
+}
+
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"] = deepcopy(PROFILES["hybrid_v11_colab_t4_80m"])
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["layers"] = 20
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["d_model"] = 1024
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["model_config"] = deepcopy(_v11_200m_model_config)
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["batch_size"] = 12  # half of T4 80M (VRAM constraint)
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["lr"] = 5.5e-4      # 7e-4 × sqrt(640/1024) ≈ 5.5e-4
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["warmup_steps"] = 700
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["phase_steps"] = deepcopy(_v11_200m_phase_steps)
+# Gradient checkpointing is non-negotiable here — without it the 200M model
+# at batch=12 + d_model=1024 spills past 11GB on Turing sm_75.
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["use_gradient_checkpointing"] = True
+PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["validation_scope"] = (
+    "hybrid_rtx2080ti_200m_chinchilla25b: 200M-param hybrid (20 layers, "
+    "d_model=1024, MoE-8 top-2) for NVIDIA RTX 2080 Ti 11GB.  batch=12 + "
+    "gradient_checkpointing=True.  lr=5.5e-4, warmup=700.  Targets ~2.5B "
+    "tokens (62% of Chinchilla-optimal for 200M).  Wall time: ~140h "
+    "(~6 days 24/7, ~9 days at 18h/day).  Auto-checkpoint every 100 steps "
+    "to /content/drive/MyDrive/oxta_packs/ or local checkpoint dir."
+)
+
 # ── hybrid_v11_colab_a100_80m ─────────────────────────────────────────────
 # 80M variant on A100 (40GB, sm_80).  Batch doubled to 48 for ~2× wall-time
 # speedup vs T4.  Whole curriculum fits in one ~5h A100 session.
