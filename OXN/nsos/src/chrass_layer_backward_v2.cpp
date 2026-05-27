@@ -22,16 +22,22 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
   const float *gy_ptr = grad_output.data();
   const float *x_ptr = input.data();
   float *gx_ptr = grad_input.data();
+  const float *w_ptr = values_param.data.data();
+  const int nnz_count = values_param.data.size;
 
   // Prepare Bias Gradients (Accumulate over batch)
   Tensor d_bias = Tensor::zeros({dim}, bias.data.get_device());
   float *db_ptr = d_bias.data();
 
-  // Reset Sparse Weight Gradients
-  // grad_values is aligned with 'values'
-  if (grad_values.size() != values.size())
-    grad_values.resize(values.size());
-  std::fill(grad_values.begin(), grad_values.end(), 0.0f);
+  // Reset Sparse Weight Gradients in values_param.grad.
+  // Lazy-allocate if first backward call.
+  if (values_param.grad.size != nnz_count) {
+    values_param.grad = Tensor::zeros({nnz_count}, bias.data.get_device());
+  } else {
+    std::memset(values_param.grad.data(), 0,
+                static_cast<size_t>(nnz_count) * sizeof(float));
+  }
+  float *gw_ptr = values_param.grad.data();
 
 // Backward Pass:
 // y = Wx + b
@@ -81,7 +87,7 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
 
       for (int i = start; i < end; ++i) {
         int c = col_indices[i];
-        float w = values[i];
+        float w = w_ptr[i];
         gx_row[c] += w * g_val;
       }
     }
@@ -99,24 +105,22 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
       // Bias Grad
       db_ptr[r] += grad;
 
-      // Weight Grad
+      // Weight Grad -> values_param.grad
       int start = row_ptr[r];
       int end = row_ptr[r + 1];
       for (int i = start; i < end; ++i) {
         int c = col_indices[i];
         // dL/dW_{rc} = gy[r] * x[c]
-        grad_values[i] += grad * x_row[c];
+        gw_ptr[i] += grad * x_row[c];
       }
     }
   }
 
   // Gradient Clipping for Weights (Stability)
-  // Norm-based or Value-based? Value based per Chrass spec.
-  for (auto &g : grad_values) {
-    if (g > 1.0f)
-      g = 1.0f;
-    if (g < -1.0f)
-      g = -1.0f;
+  // Value-clip in-place on values_param.grad
+  for (int i = 0; i < nnz_count; ++i) {
+    if (gw_ptr[i] > 1.0f) gw_ptr[i] = 1.0f;
+    if (gw_ptr[i] < -1.0f) gw_ptr[i] = -1.0f;
   }
 
   // Update Bias Grad
