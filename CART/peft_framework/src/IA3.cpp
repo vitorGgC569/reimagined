@@ -38,7 +38,7 @@ Tensor IA3Layer::forward(const Tensor& input) {
     return result;
 }
 
-void IA3Layer::backward(const Tensor& upstream_grad) {
+Tensor IA3Layer::backward(const Tensor& upstream_grad) {
     if (!m_pre_scale_output) {
         throw std::runtime_error("Forward pass must be performed before backward pass.");
     }
@@ -54,10 +54,32 @@ void IA3Layer::backward(const Tensor& upstream_grad) {
     }
     m_grad_L = std::make_unique<Tensor>(grad_L_val);
 
-    // We don't compute grad_X or grad_W0 because W0 is frozen and we usually don't backprop
-    // further in these PEFT benchmarks (or it's implied).
-    // But strictly speaking dL/dX should be computed if we stack layers.
-    // For now, focusing on the parameter gradient.
+    // dL/dX = (upstream_grad * L) @ W0^T
+    // Forward: Y = (X @ W0) * L  (broadcasting L over batch)
+    //   pre_scale[i,k] = sum_n X[i,n] * W0[k,n]   (W0 is [output, input])
+    //   Y[i,k]         = pre_scale[i,k] * L[0,k]
+    // Backward:
+    //   dY/dX[i,n]     = sum_k W0[k,n] * L[0,k] * upstream_grad[i,k]
+    int batch = upstream_grad.getRows();
+    Tensor grad_X(batch, m_input_dim);
+    if (m_W0) {
+        for (int i = 0; i < batch; ++i) {
+            for (int n = 0; n < m_input_dim; ++n) {
+                float sum = 0.0f;
+                for (int k = 0; k < m_output_dim; ++k) {
+                    sum += m_W0->at(k, n) * m_L->at(0, k) * upstream_grad.at(i, k);
+                }
+                grad_X.at(i, n) = sum;
+            }
+        }
+    } else {
+        // No base weights -> can't propagate; return zeros, sized for the
+        // caller's convenience (matches batch x input_dim).
+        for (int i = 0; i < batch; ++i)
+            for (int n = 0; n < m_input_dim; ++n)
+                grad_X.at(i, n) = 0.0f;
+    }
+    return grad_X;
 }
 
 void IA3Layer::update(float learning_rate) {

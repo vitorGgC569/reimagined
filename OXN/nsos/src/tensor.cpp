@@ -368,10 +368,27 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
         if (raw_ptr) {
             int device_id = 0;
             if (cudaGetDevice(&device_id) == cudaSuccess) {
+                // CUDA 13 changed the cudaMemAdvise signature: the trailing
+                // int device id became a struct cudaMemLocation.  Bridge
+                // both APIs with a single CUDART_VERSION guard so the same
+                // source compiles cleanly under 12.x and 13.x toolkits.
+#if CUDART_VERSION >= 13000
+                cudaMemLocation loc_dev;
+                loc_dev.type = cudaMemLocationTypeDevice;
+                loc_dev.id   = device_id;
+                cudaMemLocation loc_host;
+                loc_host.type = cudaMemLocationTypeHost;
+                loc_host.id   = 0;
+                cudaMemAdvise(raw_ptr, size * sizeof(float),
+                              cudaMemAdviseSetAccessedBy, loc_dev);
+                cudaMemAdvise(raw_ptr, size * sizeof(float),
+                              cudaMemAdviseSetAccessedBy, loc_host);
+#else
                 cudaMemAdvise(raw_ptr, size * sizeof(float),
                               cudaMemAdviseSetAccessedBy, device_id);
                 cudaMemAdvise(raw_ptr, size * sizeof(float),
                               cudaMemAdviseSetAccessedBy, cudaCpuDeviceId);
+#endif
             }
             (void)cudaGetLastError();
         }
@@ -435,6 +452,24 @@ Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev) {
     float* dst = t.data();
     for (int i = 0; i < t.size; ++i) {
         dst[i] = dist(tensor_rng());
+    }
+    return t;
+}
+
+Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev,
+                               uint64_t seed) {
+    if (seed == 0) {
+        // Preserve historical behavior for seed=0 (un-seeded path).
+        return kaiming_uniform(s, dev);
+    }
+    Tensor t(s, dev);
+    float fan_in = s.empty() ? 1.0f : static_cast<float>(s.back());
+    float bound = std::sqrt(6.0f / std::max(fan_in, 1.0f));
+    std::uniform_real_distribution<float> dist(-bound, bound);
+    std::mt19937 local_rng(static_cast<uint32_t>(seed));
+    float* dst = t.data();
+    for (int i = 0; i < t.size; ++i) {
+        dst[i] = dist(local_rng);
     }
     return t;
 }

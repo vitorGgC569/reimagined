@@ -28,7 +28,7 @@ public:
     uint64_t state_;
     float cached_gaussian_;
 
-    TTTLayer(int dim, int hidden, float lr = 0.001f);
+    TTTLayer(int dim, int hidden, float lr = 0.001f, uint64_t seed = 0);
     
     Tensor forward(const Tensor &x);
     Tensor backward(const Tensor &g);

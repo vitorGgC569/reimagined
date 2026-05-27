@@ -1,0 +1,82 @@
+[Copia/cola isso na mensagem que vai junto com o link do WeTransfer/Drive]
+
+----------------------------------------------------------------
+
+Fala mano, tudo bom?
+
+Mandando o arquivo. E o OxtaTrainer_v1.7z (10,35 GB).
+
+PRA RODAR:
+
+1. Baixa o arquivo (vai uns 30-60 min dependendo da net).
+
+2. Descompacta com o 7-Zip (ou WinRAR) numa pasta com pelo menos
+   80 GB livres. Recomendo D:\OxtaTrainer\ ou C:\OxtaTrainer\.
+   Vai virar uma pasta de 12 GB chamada OxtaTrainer_v1.
+
+3. Antes de abrir, confere que sua placa de video aparece:
+   - Aperta Windows+R, digita "cmd", da Enter
+   - Roda: nvidia-smi
+   - Se aparecer "RTX 2080 Ti" e versao do driver >= 535, ta tudo certo
+   - Se o driver for menor que 535, atualiza primeiro pelo GeForce Experience
+
+4. Abre a pasta OxtaTrainer_v1 e da DUPLO CLIQUE em OxtaTrainer.exe.
+
+   Vai aparecer uma janela preta. Isso e normal, NAO FECHE.
+
+   Os primeiros 30-90 segundos parece travado — e a GPU inicializando.
+   Depois disso vai comecar a mostrar "step=1/50000  loss=X.XX".
+
+5. Deixa rodando. Vai durar ~6 dias se voce nao usar o PC pra mais nada,
+   ou ~9-10 dias se usar normalmente durante o dia. Pode pausar com Ctrl+C
+   (perde no maximo 25 min do ultimo checkpoint) e retomar depois com
+   duplo-clique de novo — ele continua de onde parou.
+
+   IMPORTANTE: tenta deixar rodar CONTINUO o maximo possivel. Cada vez
+   que voce pausa e retoma, o treino "treme" uns 30 minutos pra
+   reestabilizar. Se rodar 6 dias sem parar, fica perfeito.
+
+6. Quando aparecer:
+
+       ============================================================
+        Treino completo em X.Xh
+       ============================================================
+
+   Vai na pasta output\final_pack\ — esses sao os arquivos do modelo.
+   Zipa a pasta inteira e me manda de volta pelo mesmo canal
+   (vai ter uns 100 MB, pode ate por anexo de email).
+
+   A pasta output\checkpoints\ pode jogar fora — sao so estados
+   intermediarios que ocupam ~2-3 GB. Eu so preciso do final_pack\.
+
+SE DER ERRO:
+
+- "CUDA out of memory": algum outro programa ta usando GPU.
+  Fecha jogos, navegadores com aceleracao, OBS, Discord overlay, etc.
+
+- "GPU muito antiga": esse build foi compilado pra RTX 20-series.
+  Se voce trocou de placa, me avisa.
+
+- "no kernel image is available": driver desatualizado. Atualiza
+  pra >= 535.
+
+- O programa fechou sozinho: provavelmente queda de luz ou crash.
+  Roda OxtaTrainer.exe de novo, ele retoma do ultimo checkpoint.
+  Voce perde no maximo 25 min.
+
+- GPU passou de 85C constante: para 30 min pra esfriar, abre o
+  gabinete, limpa poeira. Em cima do treino contínuo, ar
+  condicionado / ventilador no PC ajuda muito.
+
+CONSUMO DE ENERGIA:
+
+O programa limita a GPU em 220W (de 250W) pra ficar mais fria.
+6 dias contínuos = ~32 kWh = ~R$ 25-30 na conta. Combinamos depois
+o ressarcimento.
+
+QUALQUER DUVIDA me chama no [WhatsApp/Discord/Telegram - escolhe].
+Manda print da janela ou cola o texto do erro.
+
+Valeu de coracao por isso, mano. Esse modelo nao existiria sem voce.
+
+----------------------------------------------------------------

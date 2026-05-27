@@ -1,4 +1,4 @@
-"""prepare_data.py — bake the data/ folder for the standalone bundle.
+"""prepare_data.py - bake the data/ folder for the standalone bundle.
 
 This script is run by you (the maintainer) on your dev machine, NOT by the
 friend.  It downloads the source datasets, normalizes them into the layout
@@ -90,12 +90,15 @@ def run_download_step(culturax_gb: int, scratch_dir: Path) -> Path:
 
 
 def normalize_culturax(raw_dir: Path, dest_dir: Path, compress: bool) -> List[Path]:
-    """Copy CulturaX shards into dest with generic names + optional compression."""
-    print(f"[step 2/4] normalizing CulturaX shards ...")
-    shards = sorted(raw_dir.glob("culturax_ptbr_shard_*.jsonl"))
+    """Copy pre-training shards (CulturaX or FineWeb-2 fallback) into dest
+    with generic names + optional zstd compression.  Uses rglob so shards
+    are found whether they live in raw_dir/ or in raw_dir/culturax_ptbr/."""
+    print(f"[step 2/4] normalizing pre-training shards ...")
+    shards = sorted(raw_dir.rglob("culturax_ptbr_shard_*.jsonl"))
     if not shards:
-        print(f"  no CulturaX shards found in {raw_dir} — skipping")
+        print(f"  no pre-training shards found under {raw_dir} -- skipping")
         return []
+    print(f"  found {len(shards)} shards under {raw_dir}")
 
     out_files: List[Path] = []
     for idx, shard in enumerate(shards):
@@ -117,7 +120,7 @@ def normalize_culturax(raw_dir: Path, dest_dir: Path, compress: bool) -> List[Pa
             shutil.copy2(shard, dest_path)
         out_files.append(dest_path)
         print(f"  shard {idx + 1}/{len(shards)}: "
-              f"{shard.stat().st_size / 1024**2:.1f}MB → "
+              f"{shard.stat().st_size / 1024**2:.1f}MB -> "
               f"{dest_path.stat().st_size / 1024**2:.1f}MB"
               + (" (compressed)" if compress else ""))
     return out_files
@@ -177,7 +180,7 @@ def normalize_br_taxqa(raw_dir: Path, dest_dir: Path) -> List[Path]:
                     fout.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
                     count += 1
 
-    print(f"  wrote {count} documents → {out_path.relative_to(dest_dir.parent.parent)}")
+    print(f"  wrote {count} documents -> {out_path.relative_to(dest_dir.parent.parent)}")
     return [out_path]
 
 
@@ -220,26 +223,50 @@ def normalize_simple_datasets(raw_dir: Path, dest_dir: Path) -> List[Path]:
                 if len(text) >= 200:
                     fout.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
                     count += 1
-        print(f"  {name} → {generic_name}: {count} docs")
+        print(f"  {name} -> {generic_name}: {count} docs")
         out_files.append(out_path)
     return out_files
 
 
 def copy_bundle(dest_root: Path) -> Path:
-    """Copy the distillation_bundle_v11 tokenizer file into bundle/."""
+    """Copy the tokenizer into bundle/, searching distillation_bundle_v{N}
+    in descending version order so we use the newest one available.
+
+    Privacy note: we deliberately copy ONLY tokenizer_8192.ox3 (opaque
+    binary).  The matching .json sidecar exposes phase weights + training
+    composition (algorithms / instructions / verifier / memory) that
+    would leak project intent -- keep it on the maintainer machine only.
+    """
     print(f"[step 3/4] copying tokenizer bundle ...")
-    src_bundle = REPO_NSOS_ROOT / "scripts" / "distillation_bundle_v11"
-    src_tokenizer = src_bundle / "tokenizer_8192.ox3"
-    if not src_tokenizer.exists():
-        print(f"  WARNING: bundle not found at {src_bundle}")
-        print(f"  You need to extract distillation_bundle_v11.zip into {src_bundle.parent}/")
-        print(f"  Continuing without bundle — trainer will fail at runtime until you fix this.")
-        return src_bundle
+
+    scripts_dir = REPO_NSOS_ROOT / "scripts"
+    # Search v11 -> v10 -> ... -> v2 -> unversioned, take the first hit.
+    search_paths = (
+        [scripts_dir / f"distillation_bundle_v{n}" for n in range(11, 1, -1)]
+        + [scripts_dir / "distillation_bundle"]
+    )
+
+    src_tokenizer = None
+    src_bundle = None
+    for cand in search_paths:
+        cand_tok = cand / "tokenizer_8192.ox3"
+        if cand_tok.exists():
+            src_tokenizer = cand_tok
+            src_bundle = cand
+            break
+
+    if src_tokenizer is None:
+        print(f"  WARNING: no tokenizer found in any distillation_bundle_v*")
+        print(f"  Searched: {[p.name for p in search_paths]}")
+        print(f"  Continuing without bundle -- trainer will fail at runtime.")
+        return scripts_dir / "distillation_bundle_v11"
+
     dest_bundle = dest_root / "bundle"
     dest_bundle.mkdir(parents=True, exist_ok=True)
     dest_tok = dest_bundle / "tokenizer_8192.ox3"
     shutil.copy2(src_tokenizer, dest_tok)
-    print(f"  tokenizer: {src_tokenizer.stat().st_size / 1024**2:.1f}MB → {dest_tok.relative_to(dest_root.parent)}")
+    print(f"  source:    {src_bundle.name}/")
+    print(f"  tokenizer: {src_tokenizer.stat().st_size / 1024**2:.2f}MB -> {dest_tok.relative_to(dest_root.parent)}")
     return dest_tok
 
 

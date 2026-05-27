@@ -1045,6 +1045,8 @@ bool InferenceEngine::load_model(const std::string& path, const ModelConfig& con
 
     this->model = std::make_unique<JambaModel>(this->config, device);
     this->trainer = std::make_unique<Trainer>(this->model.get(), 0.001f);
+    // Wire Pantheon VIB-style regularizer (0 = OFF, default).
+    this->trainer->pantheon_vib_beta = this->config.pantheon_vib_beta;
     this->model->set_training_mode(false);
 
     if (!path.empty()) {

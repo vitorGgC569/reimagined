@@ -1,6 +1,30 @@
 #include "../include/BitPacking.hpp"
 #include <iostream>
-#include <immintrin.h>
+#if defined(__AVX2__) || defined(_M_X64) || defined(__x86_64__)
+#  include <immintrin.h>
+#endif
+
+// __int128 is GCC/Clang extension; MSVC needs manual 128-bit shift register.
+// We provide a small portable Buf128 that has the same semantics as the
+// original unsigned __int128 usage (only |=, <<, >>=64 by 64 are needed).
+#if !defined(__SIZEOF_INT128__) && !defined(__GNUC__) && !defined(__clang__)
+struct AionBuf128 {
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    // buffer |= (val << shift), where shift ∈ [0, 127]
+    inline void or_shifted(uint64_t val, int shift) {
+        if (shift >= 64) {
+            hi |= (val << (shift - 64));
+        } else {
+            lo |= (val << shift);
+            if (shift > 0) hi |= (val >> (64 - shift));
+        }
+    }
+    inline uint64_t low64() const { return lo; }
+    inline void shift_right_64() { lo = hi; hi = 0; }
+};
+#  define AION_USE_PORTABLE_128 1
+#endif
 
 namespace Aion {
 
@@ -9,63 +33,40 @@ namespace Aion {
     // 32 * 2 bits = 64 bits.
     // Input: 32 ints. Output: 1 uint64.
 
+    // pack_2bit_avx2: kept as forward-declared no-op for ABI compatibility.
+    // The AVX2 implementation was never finished -- author left dead `break`
+    // followed by a scalar stub that never wrote to output.  Real users of
+    // 2-bit packing should call BitPacker::pack_scalar(in, out, n, 2).
+    // Removed __int128 leftover so MSVC builds.
     void pack_2bit_avx2(const uint32_t* in, uint64_t* out, size_t n) {
-        // Process 32 elements at a time
-        size_t i = 0;
-#ifdef __AVX2__
-        for (; i + 32 <= n; i += 32) {
-            // Load 32 integers (4 AVX registers)
-            __m256i v0 = _mm256_loadu_si256((__m256i*)(in + i));
-            __m256i v1 = _mm256_loadu_si256((__m256i*)(in + i + 8));
-            __m256i v2 = _mm256_loadu_si256((__m256i*)(in + i + 16));
-            __m256i v3 = _mm256_loadu_si256((__m256i*)(in + i + 24));
-
-            // Assume values are 0,1,2,3 (2 bits). Mask just in case?
-            // Bit manipulation to pack is complex in AVX2 without bit-shuffle.
-            // But we can do it with shifts and ORs.
-            // Goal: Pack 8 ints (256 bits) -> 16 bits.
-            // Then 4 * 16 = 64 bits.
-
-            // This requires heavy shuffling.
-            // Faster scalar fallback might beat naive AVX shuffle spam unless expertly tuned.
-            // Given "Expert rigorous", let's use the SCALAR loop but with the 128-bit fix I applied before.
-            // BUT the prompt asks for "Optimized AVX2".
-
-            // Let's implement a clean scalar loop that compiles to efficient assembly (bswap/shifts).
-            // Manual AVX2 bit packing is notoriously hard without AVX-512 (vpmovdb etc).
-
-            // However, we can use _mm256_sllv_epi32 logic if we want.
-            // Let's stick to the 128-bit safe scalar implementation I wrote previously as the "Safe" fix.
-            // AVX2 for bit-packing 2-bit is non-trivial and prone to bugs if not tested on hw.
-            // The "Real AVX2" requirement might be satisfied by `bitlinear_avx2.cpp` logic.
-            // Here in BitPacking.cpp, let's ensure safety first.
-
-            // Fallback to scalar loop below.
-            break;
-        }
-#endif
-        // Safe Scalar Implementation using 128-bit accumulator
-        size_t out_idx = 0;
-        unsigned __int128 buffer = 0;
-        int bits_in_buffer = 0;
-        int bits = 2; // Specialized for 2-bit? No, generic.
-
-        // Re-implement generic scalar loop
-        // Warning: Function signature is `pack_scalar(..., int bits)`.
-        // I need to put this inside pack_scalar.
+        BitPacker::pack_scalar(in, out, n, 2);
     }
 
     void BitPacker::pack_scalar(const uint32_t* in, uint64_t* out, size_t n, int bits) {
         size_t out_idx = 0;
-        unsigned __int128 buffer = 0;
+#ifdef AION_USE_PORTABLE_128
+        AionBuf128 buffer;
         int bits_in_buffer = 0;
-
         for (size_t i = 0; i < n; ++i) {
             uint64_t val = (uint64_t)(in[i] & ((1ULL << bits) - 1));
-
+            buffer.or_shifted(val, bits_in_buffer);
+            bits_in_buffer += bits;
+            while (bits_in_buffer >= 64) {
+                out[out_idx++] = buffer.low64();
+                buffer.shift_right_64();
+                bits_in_buffer -= 64;
+            }
+        }
+        if (bits_in_buffer > 0) {
+            out[out_idx] = buffer.low64();
+        }
+#else
+        unsigned __int128 buffer = 0;
+        int bits_in_buffer = 0;
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t val = (uint64_t)(in[i] & ((1ULL << bits) - 1));
             buffer |= ((unsigned __int128)val << bits_in_buffer);
             bits_in_buffer += bits;
-
             while (bits_in_buffer >= 64) {
                 out[out_idx++] = (uint64_t)buffer;
                 buffer >>= 64;
@@ -75,6 +76,7 @@ namespace Aion {
         if (bits_in_buffer > 0) {
             out[out_idx] = (uint64_t)buffer;
         }
+#endif
     }
 
     void BitPacker::pack_avx512(const uint32_t* in, void* out, size_t n, int bits) {

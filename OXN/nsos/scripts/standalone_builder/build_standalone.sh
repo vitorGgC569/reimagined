@@ -97,8 +97,9 @@ echo ""
 echo "[3/7] Staging..."
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
-cp "$HERE/trainer_main.py"       "$STAGE_DIR/"
-cp "$HERE/pyinstaller_spec.spec" "$STAGE_DIR/"
+cp "$HERE/trainer_main.py"        "$STAGE_DIR/"
+cp "$HERE/pyinstaller_spec.spec"  "$STAGE_DIR/"
+cp "$HERE/rthook_cuda_dlls.py"    "$STAGE_DIR/"
 
 # ── 4) Prepare data ─────────────────────────────────────────────────────
 echo ""
@@ -116,7 +117,11 @@ python3 -m pip install --quiet --upgrade pyinstaller zstandard
 echo ""
 echo "[5/7 cont] Running PyInstaller..."
 export NSOS_EXT_PYD="$NSOS_SO"
-export CUDA_DIR="$CUDA_HOME"
+# Pick the CUDA toolkit that nsos_ext.so was actually linked against.
+# Allow the maintainer to override via NSOS_CUDA_DIR; otherwise fall back
+# to CUDA_HOME (the version used to build).
+export CUDA_DIR="${NSOS_CUDA_DIR:-$CUDA_HOME}"
+echo "  CUDA_DIR for bundle: $CUDA_DIR"
 
 pushd "$STAGE_DIR" >/dev/null
 python3 -m PyInstaller pyinstaller_spec.spec \

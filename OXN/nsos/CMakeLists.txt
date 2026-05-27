@@ -54,6 +54,7 @@ set(NSOS_CORE_SOURCES
     src/nsos_mpi.cpp
     src/globals.cpp
     src/holographic.cpp
+    src/chrass_layer_v2.cpp
     src/mcts_reasoning.cpp
     src/causal_memory_store.cpp
     src/oxtamem_ffi.cpp
@@ -323,6 +324,45 @@ if (NSOS_BUILD_TESTS)
     add_executable(test_bitmamba_lut tests/test_bitmamba_lut.cpp)
     target_link_libraries(test_bitmamba_lut PRIVATE nsos_core)
     add_test(NAME test_bitmamba_lut COMMAND test_bitmamba_lut)
+
+    # CHRASS validation battery (2026-05-25).
+    # Tests ChrassLayer v2 exhaustively: forward correctness vs dense
+    # reference, backward shapes + identity check + sparse support,
+    # gradcheck (numerical vs analytical), edge cases (empty/complete/
+    # self-loops/negatives/1x1), saturation clamps, NaN/Inf robustness,
+    # determinism, AdamW step, topology preservation, 3-layer stack
+    # integration, 256x256 perf budget.
+    add_executable(test_chrass_validation tests/test_chrass_validation.cpp)
+    target_link_libraries(test_chrass_validation PRIVATE nsos_core)
+    add_test(NAME test_chrass_validation COMMAND test_chrass_validation)
+
+    # TTT validation battery (2026-05-25).
+    # Deepens test_ttt_layer_kernel.cpp.  Validates: training_mode toggle,
+    # reset/snapshot/restore, Hamiltonian on/off, friction/temperature
+    # hyperparams, long-sequence stability, BitLinear integration,
+    # determinism across instances.
+    add_executable(test_ttt_validation tests/test_ttt_validation.cpp)
+    target_link_libraries(test_ttt_validation PRIVATE nsos_core)
+    add_test(NAME test_ttt_validation COMMAND test_ttt_validation)
+
+    # JambaModel + CHRASS end-to-end smoke (2026-05-25).
+    # Confirms use_chrass=true wires CHRASS into every block, forward and
+    # backward complete without NaN/Inf, parameters() exposes chrass weights,
+    # and CHRASS params receive gradient during training step.
+    add_executable(test_jamba_with_chrass tests/test_jamba_with_chrass.cpp)
+    target_link_libraries(test_jamba_with_chrass PRIVATE nsos_core)
+    add_test(NAME test_jamba_with_chrass COMMAND test_jamba_with_chrass)
+
+    # CHRASS overhead benchmark — mede custo de params + latência ON vs OFF.
+    add_executable(bench_chrass_overhead tests/bench_chrass_overhead.cpp)
+    target_link_libraries(bench_chrass_overhead PRIVATE nsos_core)
+
+    # Pantheon VIB integration smoke (2026-05-25).
+    # Verifies pantheon_vib_beta is wired in Trainer and produces a
+    # measurable, gradient-propagating effect without breaking training.
+    add_executable(test_pantheon_vib_integration tests/test_pantheon_vib_integration.cpp)
+    target_link_libraries(test_pantheon_vib_integration PRIVATE nsos_core)
+    add_test(NAME test_pantheon_vib_integration COMMAND test_pantheon_vib_integration)
 
     add_executable(test_lut_tmac tests/test_lut_tmac.cpp)
     target_link_libraries(test_lut_tmac PRIVATE nsos_core)

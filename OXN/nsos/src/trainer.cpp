@@ -1302,6 +1302,35 @@ float Trainer::train_step(const std::vector<int>& tokens,
     Context ctx;
     Tensor logits = model->forward_ids(inputs, &ctx);
     auto [loss, grad] = logits.cross_entropy(resolved_targets);
+
+    // ── Pantheon VIB-style L2 regularizer on logits ──────────────────────
+    // When pantheon_vib_beta > 0, add beta * 0.5 * mean(logits^2) to the
+    // loss and the corresponding gradient term (beta * logits / N) to the
+    // grad tensor before backward.  This is a degenerate VIB compression
+    // (variational layer not needed); pulls logits toward zero while CE
+    // still pulls them toward correct targets.  See PANTHEON_VALIDATION_REPORT.
+    if (this->pantheon_vib_beta > 0.0f && logits.size > 0) {
+        const float beta = this->pantheon_vib_beta;
+        const int N = logits.size;
+        const Device dev = logits.get_device();
+        // CPU copy for scalar reduction (safe regardless of device).
+        Tensor logits_cpu = (dev == Device::CPU) ? logits : logits.to(Device::CPU);
+        const float* lh = logits_cpu.data();
+        double sumsq = 0.0;
+        for (int i = 0; i < N; ++i) sumsq += (double)lh[i] * lh[i];
+        const float l2_term = beta * 0.5f *
+            static_cast<float>(sumsq / static_cast<double>(std::max(N, 1)));
+        loss += l2_term;
+        // Build l2_grad on CPU, ship to grad's device, then add element-wise.
+        Tensor l2_grad_cpu = Tensor::zeros(logits.shape.dims, Device::CPU);
+        float* lg = l2_grad_cpu.data();
+        const float scale = beta / static_cast<float>(std::max(N, 1));
+        for (int i = 0; i < N; ++i) lg[i] = scale * lh[i];
+        Tensor l2_grad = (grad.get_device() == Device::CPU)
+                            ? l2_grad_cpu
+                            : l2_grad_cpu.to(grad.get_device());
+        grad = grad.add(l2_grad);
+    }
     model->backward_external(grad, ctx);
     apply_qat_regularization(*this);
     apply_moe_aux_regularization(*this);

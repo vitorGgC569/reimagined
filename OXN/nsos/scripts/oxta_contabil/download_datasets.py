@@ -80,10 +80,39 @@ except ImportError as exc:
 
 DATASETS = {
     "culturax_ptbr": {
+        # Primary: CulturaX (gated since 2024 — needs HF_TOKEN + accepted license).
+        # Fallbacks: high-quality public PT-BR corpora that DON'T need auth.
+        # The streaming loop tries the primary first; on auth/access failure it
+        # falls through the list in order.  Filename prefix follows source so
+        # downstream normalization can identify provenance.
         "hf_id":         "uonlp/CulturaX",
         "config":        "pt",
         "split":         "train",
-        "license":       "ODC-BY-1.0",
+        "text_field":    "text",
+        "streaming_fallbacks": [
+            {
+                "hf_id":      "HuggingFaceFW/fineweb-2",
+                "config":     "por_Latn",
+                "split":      "train",
+                "text_field": "text",
+                "note":       "FineWeb-2 Portuguese (Latin script) — high-quality filtered web, no auth required",
+            },
+            {
+                "hf_id":      "allenai/c4",
+                "config":     "pt",
+                "split":      "train",
+                "text_field": "text",
+                "note":       "mC4 Portuguese — raw Common Crawl, no auth required",
+            },
+            {
+                "hf_id":      "wikimedia/wikipedia",
+                "config":     "20231101.pt",
+                "split":      "train",
+                "text_field": "text",
+                "note":       "Wikipedia PT snapshot — smaller (~3GB) but high quality, no auth required",
+            },
+        ],
+        "license":       "ODC-BY-1.0 (CulturaX); fallbacks vary — see LICENSES.md",
         "commercial":    True,
         "purpose":       "Pre-training continuation in Brazilian Portuguese",
         "size_full":     "~300GB compressed (full pt subset)",
@@ -139,11 +168,14 @@ DATASETS = {
     },
 
     "lener_br": {
-        # Brazilian legal NER. Primary route is the academic mirror;
-        # community uploads exist on HF under varied IDs.
-        "hf_id":         "peluz/lener_br",
-        "fallback_ids":  ["lener_br", "neuralmind/lener_br"],
-        "config":        None,
+        # Brazilian legal NER. Primary academic mirrors broke once
+        # `datasets` removed legacy-script support.  The `eduagarcia/portuguese_benchmark`
+        # mirror packages LeNER-Br as a static Parquet config that works on
+        # modern `datasets` versions without HF_TOKEN.  Falling back to legacy
+        # IDs keeps the door open for users with older `datasets` installs.
+        "hf_id":         "eduagarcia/portuguese_benchmark",
+        "config":        "LeNER-Br",
+        "fallback_ids":  ["peluz/lener_br", "lener_br", "neuralmind/lener_br"],
         "split":         "train",
         "license":       "CC-BY-4.0",
         "commercial":    True,
@@ -216,27 +248,72 @@ def now_iso() -> str:
 # Per-dataset fetchers
 # ─────────────────────────────────────────────────────────────────────
 
+def _stream_open(hf_id: str, config: Optional[str], split: str):
+    """Open a streaming dataset, returning (iter, error_msg or None)."""
+    try:
+        ds = load_dataset(hf_id, config, split=split, streaming=True)
+        # Force the first item so auth/gating errors surface here, not later.
+        it = iter(ds)
+        first = next(it)
+        # Re-create the stream so the first item isn't lost.
+        ds2 = load_dataset(hf_id, config, split=split, streaming=True)
+        return iter(ds2), None
+    except StopIteration:
+        return None, "empty dataset"
+    except Exception as exc:
+        return None, str(exc)
+
+
 def fetch_culturax(name: str, info: Dict[str, Any], dst_root: Path,
                    target_bytes: int, max_shards: int,
                    filter_fiscal: bool) -> Dict[str, Any]:
     """
-    CulturaX is huge — we stream a sampled subset and write parquet shards
-    of fiscal-enriched text.  Stops when total written bytes >= target.
+    Stream a pre-training corpus and write JSONL shards of fiscal-enriched
+    text.  Tries info["hf_id"] first, then each entry in
+    info["streaming_fallbacks"] (since the primary CulturaX dataset is
+    gated and may not load).  Stops when written bytes >= target_bytes.
     """
     out = dst_root / name
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{name}] streaming {info['hf_id']} (config={info['config']!r}) …")
-    print(f"[{name}] target ≈ {human_bytes(target_bytes)}, "
+    candidates = [{
+        "hf_id":      info["hf_id"],
+        "config":     info.get("config"),
+        "split":      info.get("split", "train"),
+        "text_field": info.get("text_field", "text"),
+    }] + [dict(entry) for entry in info.get("streaming_fallbacks", [])]
+
+    chosen = None
+    chosen_iter = None
+    attempts: List[str] = []
+    for cand in candidates:
+        print(f"[{name}] trying {cand['hf_id']} (config={cand['config']!r}) ...")
+        it, err = _stream_open(cand["hf_id"], cand["config"], cand["split"])
+        if it is not None:
+            chosen = cand
+            chosen_iter = it
+            print(f"[{name}]   OK -- using {cand['hf_id']}")
+            if cand.get("note"):
+                print(f"[{name}]   note: {cand['note']}")
+            break
+        snippet = (err or "?")[:160].replace("\n", " ")
+        attempts.append(f"{cand['hf_id']}: {snippet}")
+        print(f"[{name}]   FAILED ({snippet})")
+
+    if chosen is None:
+        return {
+            "status": "error",
+            "error":  "all pre-training candidates failed",
+            "attempts": attempts,
+        }
+
+    print(f"[{name}] target = {human_bytes(target_bytes)}, "
           f"keyword up-sample={'on' if filter_fiscal else 'off'}")
 
-    try:
-        ds = load_dataset(
-            info["hf_id"], info["config"],
-            split=info["split"], streaming=True,
-        )
-    except Exception as exc:
-        return {"status": "error", "error": f"load_dataset failed: {exc}"}
+    # Filename prefix derived from the chosen source for clear provenance.
+    prefix = re.sub(r"[^a-zA-Z0-9]+", "_",
+                    f"{chosen['hf_id']}_{chosen['config'] or 'default'}").strip("_").lower()
+    text_field = chosen["text_field"]
 
     written_bytes = 0
     written_docs = 0
@@ -252,6 +329,8 @@ def fetch_culturax(name: str, info: Dict[str, Any], dst_root: Path,
         nonlocal shard_idx, shard_bytes, shard_lines
         if not shard_lines:
             return
+        # Keep the legacy `culturax_ptbr_shard_*.jsonl` filename pattern so
+        # prepare_data.py's normalize step finds shards regardless of source.
         shard_path = out / f"culturax_ptbr_shard_{shard_idx:04d}.jsonl"
         with shard_path.open("w", encoding="utf-8") as f:
             f.writelines(shard_lines)
@@ -262,8 +341,8 @@ def fetch_culturax(name: str, info: Dict[str, Any], dst_root: Path,
         shard_bytes = 0
 
     try:
-        for row in ds:
-            text = row.get("text", "")
+        for row in chosen_iter:
+            text = row.get(text_field, "") if isinstance(row, dict) else ""
             if not text or len(text) < 200:
                 continue
 
@@ -296,17 +375,21 @@ def fetch_culturax(name: str, info: Dict[str, Any], dst_root: Path,
                 break
 
     except KeyboardInterrupt:
-        print(f"\n[{name}]   interrupted by user, flushing partial shard …")
+        print(f"\n[{name}]   interrupted by user, flushing partial shard ...")
     finally:
         flush_shard()
 
     return {
         "status":       "ok",
+        "source":       chosen["hf_id"],
+        "source_config": chosen.get("config"),
+        "shard_prefix": prefix,
         "bytes":        written_bytes,
         "docs":         written_docs,
         "fiscal_docs":  fiscal_docs,
         "shards":       shard_idx,
         "filter_applied": filter_fiscal,
+        "attempts":     attempts,  # empty if primary worked
     }
 
 

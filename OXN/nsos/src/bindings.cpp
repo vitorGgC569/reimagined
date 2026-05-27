@@ -125,6 +125,17 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("use_ttt", &ModelConfig::use_ttt)
         .def_readwrite("ttt_period", &ModelConfig::ttt_period)
         .def_readwrite("ttt_slot", &ModelConfig::ttt_slot)
+        // CHRASS topological injection (2026-05-25 wiring).
+        // See OXN/nsos/docs/CHRASS_VALIDATION_REPORT.md.
+        .def_readwrite("use_chrass", &ModelConfig::use_chrass)
+        .def_readwrite("chrass_density", &ModelConfig::chrass_density)
+        .def_readwrite("chrass_seed", &ModelConfig::chrass_seed)
+        // Pantheon VIB-style L2 regularizer (2026-05-25 wiring).
+        // See OXN/nsos/docs/PANTHEON_VALIDATION_REPORT.md.
+        .def_readwrite("pantheon_vib_beta", &ModelConfig::pantheon_vib_beta)
+        // Slender embedding head-to-toe quantization (2026-05-25 wiring).
+        // See OXN/nsos/docs/SLENDER_INTEGRATION.md.
+        .def_readwrite("use_slender_embedding", &ModelConfig::use_slender_embedding)
         .def_readwrite("use_gradient_checkpointing", &ModelConfig::use_gradient_checkpointing)
         .def_readwrite("dropout", &ModelConfig::dropout)
         .def_readwrite("mcts_simulations", &ModelConfig::mcts_simulations)

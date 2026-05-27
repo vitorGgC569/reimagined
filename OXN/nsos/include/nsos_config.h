@@ -54,6 +54,40 @@ struct ModelConfig {
     int ttt_period = 8;
     int ttt_slot = 3;
 
+    // ── CHRASS topological injection (2026-05-25 wiring) ──
+    // When enabled, each JambaBlock instantiates a ChrassLayer that runs
+    // IN PARALLEL with the FFN/MoE path on the post-norm activations and
+    // its output is added to the block residual.  The block becomes:
+    //     out = x + drop(mixer(norm(x))) + drop(ffn(norm(x))) + drop(chrass(norm(x)))
+    // Adjacency for each block is a random sparse matrix with density
+    // `chrass_density` (0..1), seeded by `chrass_seed + layer_idx` for
+    // determinism across runs.  Validated standalone at 26/26 tests
+    // (see docs/CHRASS_VALIDATION_REPORT.md).  Set use_chrass=false (default)
+    // to preserve byte-exact existing behavior.
+    bool use_chrass = false;
+    float chrass_density = 0.10f;  // 10% nonzero edges in adjacency
+    uint32_t chrass_seed = 0x0CDA55u;
+
+    // ── Pantheon VIB-style compression regularizer (2026-05-25 wiring) ──
+    // When > 0, Trainer adds beta * 0.5 * mean(logits^2) to the cross-entropy
+    // loss, with the corresponding gradient (beta * logits / N) added to the
+    // backward grad before model->backward_external.  This is a degenerate
+    // case of Variational Information Bottleneck applied directly to logits
+    // (no variational layer needed) — pulls logits toward zero, encouraging
+    // confident but compressed representations.  Full VIB with per-feature
+    // mean+log_var (using pantheon::physics::InformationBottleneck) is a
+    // Phase 2 enhancement requiring additional gradient routing.
+    // Default 0.0 preserves byte-exact existing behavior.
+    // See docs/PANTHEON_VALIDATION_REPORT.md.
+    float pantheon_vib_beta = 0.0f;
+
+    // ── Slender embedding head-to-toe quantization (2026-05-25 wiring) ──
+    // When true, JambaModel calls embedding->set_slender_quantization(true)
+    // after construction.  Forward path then uses slender_forward_cpu_,
+    // which ternary-quantizes the embedding lookup with cached weights.
+    // Validated standalone via test_slender_embedding (4 tests PASS).
+    bool use_slender_embedding = false;
+
     // Training Settings
     bool use_gradient_checkpointing = false;
     float dropout = 0.0f;

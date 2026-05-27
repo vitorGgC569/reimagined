@@ -46,6 +46,10 @@ struct BitLinearPackedState {
 class BitLinear {
 public:
   BitLinear(int in, int out, bool b = true);
+  // Seeded variant — guarantees reproducible weight init for the same seed.
+  // Required by TTTLayer (and any other consumer that needs determinism
+  // between instances).  Seed=0 falls back to the un-seeded path.
+  BitLinear(int in, int out, bool b, uint64_t seed);
 
   void set_precision_mode(int bits);
   void set_mixed_precision(bool enabled) {

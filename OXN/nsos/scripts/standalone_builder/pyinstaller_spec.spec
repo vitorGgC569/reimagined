@@ -31,7 +31,10 @@ if not CUDA_DIR:
         "  Set CUDA_DIR to your CUDA Toolkit root (e.g. C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.5)."
     )
 
-CUDA_BIN = Path(CUDA_DIR) / "bin"
+# CUDA 12.x ships runtime DLLs in <CUDA_DIR>/bin; CUDA 13.x moved them to
+# <CUDA_DIR>/bin/x64.  Check both so the spec works across toolkit versions.
+_CUDA_DIR = Path(CUDA_DIR)
+CUDA_BIN_CANDIDATES = [_CUDA_DIR / "bin", _CUDA_DIR / "bin" / "x64"]
 
 # ── CUDA runtime DLLs to bundle ────────────────────────────────────────────
 # nsos_ext.pyd depends on a small set of CUDA libraries.  We bundle them
@@ -46,12 +49,25 @@ CUDA_DLL_PATTERNS = [
 ]
 
 cuda_binaries = []
-for pattern in CUDA_DLL_PATTERNS:
-    for dll in CUDA_BIN.glob(pattern):
-        cuda_binaries.append((str(dll), "."))  # destination = root of bundle
+seen_dlls = set()
+for cuda_bin in CUDA_BIN_CANDIDATES:
+    if not cuda_bin.is_dir():
+        continue
+    for pattern in CUDA_DLL_PATTERNS:
+        for dll in cuda_bin.glob(pattern):
+            if dll.name.lower() in seen_dlls:
+                continue
+            seen_dlls.add(dll.name.lower())
+            cuda_binaries.append((str(dll), "."))  # destination = root of bundle
 
 if not cuda_binaries:
-    print(f"WARNING: no CUDA DLLs matched {CUDA_DLL_PATTERNS} in {CUDA_BIN}")
+    print(
+        f"WARNING: no CUDA DLLs matched {CUDA_DLL_PATTERNS} in any of "
+        f"{[str(p) for p in CUDA_BIN_CANDIDATES]}"
+    )
+else:
+    print(f"INFO: bundling {len(cuda_binaries)} CUDA DLLs: "
+          f"{[Path(p).name for p, _ in cuda_binaries]}")
 
 # ── Native engine module ───────────────────────────────────────────────────
 # We add it as a binary so PyInstaller doesn't try to analyze its imports
@@ -81,7 +97,7 @@ a = Analysis(
         "zstandard",
     ],
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=["rthook_cuda_dlls.py"],
     excludes=EXCLUDES,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

@@ -105,6 +105,38 @@ def check_environment() -> None:
     log("  ok")
 
 
+# Compute-capability targets baked into the .pyd at build time.  The kernels
+# bundled here were compiled for sm_75 (Turing -- RTX 2080 / 2080 Ti / T4 /
+# Quadro RTX, and Tesla T4).  Newer cards (Ampere sm_8x, Ada sm_89, Hopper
+# sm_9x) can JIT from the embedded PTX, but older cards (Pascal sm_61 like
+# GTX 1050/1060/1070/1080, Maxwell sm_5x, Kepler sm_3x) cannot run sm_75
+# kernels and can't be JIT'd backwards either.  Better to refuse at startup
+# than to die mid-training with "no kernel image" errors.
+SUPPORTED_COMPUTE_CAPS_MIN = (7, 5)  # sm_75 inclusive
+SUPPORTED_GPU_NAMES_FALLBACK = (
+    # Match these substrings if compute_cap query fails.
+    "RTX 20", "RTX 30", "RTX 40", "RTX A", "T4", "T1000", "Quadro RTX",
+    "A100", "A40", "A10", "A30", "L4", "L40", "H100", "H200",
+)
+
+
+def _query_compute_cap(name_hint: str) -> Optional[tuple]:
+    """Ask nvidia-smi for compute capability.  Returns (major, minor) or None."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        first = r.stdout.strip().split("\n")[0].strip()
+        if "." in first:
+            major, minor = first.split(".", 1)
+            return (int(major), int(minor))
+    except Exception:
+        pass
+    return None
+
+
 def check_gpu() -> Dict[str, str]:
     banner("Verificando GPU")
     try:
@@ -124,6 +156,32 @@ def check_gpu() -> Dict[str, str]:
         log(f"  GPU:       {info['name']}")
         log(f"  driver:    {info['driver']}")
         log(f"  VRAM:      {info['memory_mb']} MB")
+
+        # Compute capability gate -- refuse to start if too old.
+        cc = _query_compute_cap(info["name"])
+        if cc is not None:
+            log(f"  compute:   sm_{cc[0]}{cc[1]}")
+            min_major, min_minor = SUPPORTED_COMPUTE_CAPS_MIN
+            if (cc[0], cc[1]) < (min_major, min_minor):
+                log(f"")
+                log(f"ERRO: GPU muito antiga para esta build.")
+                log(f"  Detectado:  sm_{cc[0]}{cc[1]} ({info['name']})")
+                log(f"  Necessario: sm_{min_major}{min_minor} ou mais novo")
+                log(f"  ")
+                log(f"  Esta build foi compilada para arquitetura Turing (RTX 20-series).")
+                log(f"  Cartoes mais antigos (GTX 10xx Pascal, GTX 9xx Maxwell) nao rodam.")
+                log(f"  Cartoes mais novos (RTX 30xx, 40xx) devem funcionar via JIT.")
+                sys.exit(3)
+        else:
+            # Fallback: heuristic match on GPU name
+            name_upper = info["name"].upper()
+            matches = any(p.upper() in name_upper for p in SUPPORTED_GPU_NAMES_FALLBACK)
+            if not matches:
+                log(f"")
+                log(f"AVISO: nao consegui verificar compute_cap; nome da GPU "
+                    f"({info['name']!r}) nao esta na lista conhecida.")
+                log(f"  Vou tentar rodar mesmo assim, mas se houver erro 'no kernel "
+                    f"image' contacte o operador.")
         return info
     except (subprocess.SubprocessError, FileNotFoundError) as exc:
         log(f"ERRO: GPU NVIDIA nao encontrada. nvidia-smi falhou: {exc}")
@@ -153,8 +211,43 @@ def apply_runtime_env() -> None:
 
 
 # ── Native module load ─────────────────────────────────────────────────────
+def _register_dll_search_paths() -> None:
+    """Python 3.8+ on Windows restricts DLL lookup for native extensions.
+    The bundled CUDA runtime DLLs sit beside the .pyd inside _internal/, so
+    register that directory (and the bundle root, just in case) so the
+    loader can resolve cudart64_*.dll / cublas64_*.dll without leaning on
+    PATH or requiring CUDA Toolkit on the user's PC."""
+    if not hasattr(os, "add_dll_directory"):
+        return  # not Windows; nothing to do
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        candidates += [exe_dir, exe_dir / "_internal"]
+    # Also expose any CUDA Toolkit install present on the machine as a
+    # last-resort fallback (useful when running this script directly during
+    # dev, not bundled).
+    for env_var in ("CUDA_PATH", "CUDA_HOME"):
+        val = os.environ.get(env_var)
+        if val:
+            candidates.append(Path(val) / "bin")
+    seen = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if not resolved.is_dir() or resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            os.add_dll_directory(str(resolved))
+        except (OSError, FileNotFoundError):
+            pass
+
+
 def load_engine_module():
     banner("Carregando engine nativo (init CUDA ~30-90s na primeira vez)")
+    _register_dll_search_paths()
     try:
         import nsos_ext  # noqa
         log(f"  engine carregado de {nsos_ext.__file__}")

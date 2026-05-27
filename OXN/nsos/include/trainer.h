@@ -61,6 +61,10 @@ public:
     float eos_loss_scale = 0.35f;
     float repetition_unlikelihood_scale = 0.0f;
     float moe_aux_loss_scale = 0.01f;
+    // Pantheon VIB-style logits L2 regularizer (2026-05-25 wiring).
+    // When > 0, adds beta * 0.5 * mean(logits^2) to loss + grad contribution.
+    // 0.0 = OFF (default).  Validated standalone Pantheon battery 14/14 PASS.
+    float pantheon_vib_beta = 0.0f;
     int warmup_steps = 20;
     int global_step_count = 0;
     int total_training_steps = 1000; // Valor base para o scheduler de LR

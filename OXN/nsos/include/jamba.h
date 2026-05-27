@@ -3,6 +3,7 @@
 
 #include "autograd.h"
 #include "bitlinear.h"
+#include "chrass_layer_v2.h"
 #include "embedding.h"
 #include "mamba2.h"
 #include "mcts_reasoning.h"
@@ -164,7 +165,16 @@ public:
              // dimension (m).  Default 0 means use the historical d_model*4
              // value, preserving byte-for-byte the existing behavior.
              // See OXN/nsos/docs/NEMOTRON_KM_INTEGRATION.md.
-             int configured_expert_hidden_dim = 0);
+             int configured_expert_hidden_dim = 0,
+             // ── CHRASS topological injection (2026-05-25) ──
+             // When true, instantiate a ChrassLayer of size d_model with a
+             // random sparse adjacency at construction.  The layer runs
+             // IN PARALLEL with FFN/MoE and its output is added to the
+             // block residual.  Validated standalone at 26/26 tests; see
+             // OXN/nsos/docs/CHRASS_VALIDATION_REPORT.md.
+             bool use_chrass = false,
+             float chrass_density = 0.10f,
+             uint32_t chrass_seed = 0u);
   ~JambaBlock();
   Tensor forward(const Tensor &x, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
@@ -256,6 +266,8 @@ public:
   std::unique_ptr<MoERouter> router;
   std::vector<std::unique_ptr<BitLinear>> expert_gate_up, expert_down;
   std::unique_ptr<BitLinear> ffn_gate_up, ffn_down;
+  // ── CHRASS slot (parallel with FFN) — nullopt unless use_chrass=true ──
+  std::unique_ptr<ChrassLayer> chrass_layer;
 };
 
 class JambaModel : public Module {

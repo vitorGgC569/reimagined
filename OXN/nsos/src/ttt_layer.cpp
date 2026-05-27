@@ -77,14 +77,19 @@ void copy_float_bytes_device_safe(float* dst,
 
 } // namespace
 
-TTTLayer::TTTLayer(int dim, int hidden, float lr)
+TTTLayer::TTTLayer(int dim, int hidden, float lr, uint64_t seed)
     : dim(dim),
       hidden(hidden),
       learning_rate(lr),
-      w_k(std::make_unique<BitLinear>(dim, hidden)),
-      w_v(std::make_unique<BitLinear>(dim, hidden)),
-      w_out(std::make_unique<BitLinear>(hidden, dim)),
-      state_(0x9e3779b97f4a7c15ULL),
+      // Seed propagation: each BitLinear gets seed+offset for distinct init
+      // but reproducible across instances.  seed=0 falls back to un-seeded.
+      w_k(std::make_unique<BitLinear>(dim, hidden, true,
+                                      seed == 0 ? 0u : seed + 1u)),
+      w_v(std::make_unique<BitLinear>(dim, hidden, true,
+                                      seed == 0 ? 0u : seed + 2u)),
+      w_out(std::make_unique<BitLinear>(hidden, dim, true,
+                                        seed == 0 ? 0u : seed + 3u)),
+      state_(seed == 0 ? 0x9e3779b97f4a7c15ULL : seed),
       cached_gaussian_(0.0f) {
     momentum_ = Tensor::zeros({hidden, dim}, Device::CPU);
     grad_accum_ = Tensor::zeros({hidden, dim}, Device::CPU);

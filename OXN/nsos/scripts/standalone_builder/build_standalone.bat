@@ -133,6 +133,7 @@ if exist "%STAGE_DIR%" rmdir /s /q "%STAGE_DIR%"
 mkdir "%STAGE_DIR%"
 xcopy /Y "%HERE%trainer_main.py"          "%STAGE_DIR%\"  >nul
 xcopy /Y "%HERE%pyinstaller_spec.spec"    "%STAGE_DIR%\"  >nul
+xcopy /Y "%HERE%rthook_cuda_dlls.py"      "%STAGE_DIR%\"  >nul
 echo   stage: %STAGE_DIR%
 
 REM ── 4) Prepare data (download + bake) ──────────────────────────────────
@@ -152,7 +153,21 @@ python -m pip install --quiet --upgrade pyinstaller zstandard
 echo.
 echo [5/7 cont] Running PyInstaller...
 set "NSOS_EXT_PYD=%NSOS_PYD%"
-set "CUDA_DIR=%CUDA_PATH%"
+
+REM ── Pick the CUDA toolkit version that nsos_ext.pyd was actually linked
+REM against.  CUDA_PATH may point at a newer toolkit than the one the .pyd
+REM uses (e.g. system PATH has v13.2 but .pyd links cudart64_12.dll).  We
+REM prefer NSOS_CUDA_DIR if the maintainer set it, else CUDA_PATH_V12_9 if
+REM the v12.9 toolkit is installed, else fall back to CUDA_PATH and let
+REM the spec print a warning if no DLLs match.
+if defined NSOS_CUDA_DIR (
+    set "CUDA_DIR=%NSOS_CUDA_DIR%"
+) else if defined CUDA_PATH_V12_9 (
+    set "CUDA_DIR=%CUDA_PATH_V12_9%"
+) else (
+    set "CUDA_DIR=%CUDA_PATH%"
+)
+echo   CUDA_DIR for bundle: %CUDA_DIR%
 
 pushd "%STAGE_DIR%"
 python -m PyInstaller pyinstaller_spec.spec ^

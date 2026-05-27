@@ -70,6 +70,30 @@ BitLinear::BitLinear(int in, int out, bool b)
       tequila.dynamic_biases = Tensor::zeros({out});
 }
 
+// Seeded ctor — identical to the un-seeded version except for the
+// kaiming_uniform call.  When seed=0, falls through to the existing
+// un-seeded path for byte-exact backwards compatibility.
+BitLinear::BitLinear(int in, int out, bool b, uint64_t seed)
+    : in_features(in), out_features(out), use_bias(b),
+      weight((seed == 0)
+                ? Tensor::kaiming_uniform({out, in})
+                : Tensor::kaiming_uniform({out, in}, Device::CPU, seed),
+             "weight"),
+      magnitude(Tensor::ones({out}, Device::CPU), "magnitude"),
+      bias(Tensor::zeros({out}), "bias"),
+      flat_alpha(Tensor::ones({in}), "flat_alpha"),
+      flat_beta(Tensor::zeros({in}), "flat_beta") {
+
+  packed_stride = (in_features + 15) / 16;
+  repack_weights();
+
+  loqa.A = Parameter(Tensor::zeros({in, 32}), "loqa_A");
+  loqa.B = Parameter(Tensor::zeros({32, out}), "loqa_B");
+
+  tequila.deadzone_mask = Tensor::zeros({out, in});
+      tequila.dynamic_biases = Tensor::zeros({out});
+}
+
 void BitLinear::invalidate_cached_materialized_weights() {
   cached_gpu_weight_ = Tensor();
   cached_gpu_weight_version = 0;

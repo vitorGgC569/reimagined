@@ -167,6 +167,13 @@ public:
     static Tensor ones(const TensorShape& s, Device dev = Device::CPU) { return Tensor(s.dims, dev, 1.0f); }
     static Tensor random(const std::vector<int>& s, Device dev = Device::CPU);
     static Tensor kaiming_uniform(const std::vector<int>& s, Device dev = Device::CPU);
+    // Seeded variant — uses a LOCAL mt19937 (does NOT touch tensor_rng global
+    // state).  Required for determinism between instances when constructing
+    // layers in sequence (e.g., TTTLayer's 3 BitLinears, or A/B probes that
+    // need two models to produce identical initializations).  Seed=0 falls
+    // back to the un-seeded variant for backwards compatibility.
+    static Tensor kaiming_uniform(const std::vector<int>& s, Device dev,
+                                  uint64_t seed);
     static Tensor xavier_uniform(const std::vector<int>& s, Device dev = Device::CPU);
     static Tensor from_scalar(float val, Device dev = Device::CPU);
     static Tensor eye(int n, Device dev = Device::CPU);

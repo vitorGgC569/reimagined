@@ -469,6 +469,12 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
     const bool use_exact_attention_training = model_config_.use_exact_attention_training;
 
     embedding = std::make_unique<Embedding>(vocab_size, d_model);
+    // Slender head-to-toe quantization (opt-in, 2026-05-25 wiring).
+    // When true, the Embedding uses ternary-quantized lookup via
+    // slender_forward_cpu_ instead of the dense float path.
+    if (model_config_.use_slender_embedding) {
+        embedding->set_slender_quantization(true);
+    }
 
     for (int i = 0; i < num_layers; ++i) {
         const int layer_one_based = i + 1;
@@ -494,7 +500,11 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             model_config_.dropout,
             model_config_.use_gradient_checkpointing,
             // Nemotron K·m invariant (Cherry-pick #4).  0 = default dm*4.
-            model_config_.moe_expert_hidden_dim));
+            model_config_.moe_expert_hidden_dim,
+            // CHRASS topological injection (2026-05-25).  off by default.
+            model_config_.use_chrass,
+            model_config_.chrass_density,
+            model_config_.chrass_seed));
     }
 
     value_head = std::make_unique<BitLinear>(d_model, vocab_size);
@@ -1298,7 +1308,10 @@ JambaBlock::JambaBlock(int dm,
                        bool exact_attention_training,
                        float dropout_rate,
                        bool use_gradient_checkpointing,
-                       int configured_expert_hidden_dim)
+                       int configured_expert_hidden_dim,
+                       bool use_chrass,
+                       float chrass_density,
+                       uint32_t chrass_seed)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
@@ -1307,6 +1320,17 @@ JambaBlock::JambaBlock(int dm,
       d_model(dm),
       num_experts(std::max(configured_experts, 1)),
       dropout_rate_(std::clamp(dropout_rate, 0.0f, 0.95f)) {
+
+    // CHRASS slot (parallel with FFN/MoE).  Each layer gets a distinct
+    // random adjacency derived from (chrass_seed + layer_idx).  Self-loops
+    // excluded; weights uniform [-1,1]; row-normalized inside ctor.
+    if (use_chrass && dm > 1) {
+        const float density = std::clamp(chrass_density, 0.0f, 1.0f);
+        const uint32_t layer_seed = chrass_seed + static_cast<uint32_t>(li);
+        auto adj = ChrassLayer::random_adjacency(dm, density, layer_seed);
+        chrass_layer = std::make_unique<ChrassLayer>(dm, adj);
+    }
+
     // Two distinct hidden dimensions kept separate so the Nemotron K·m
     // override only affects MoE experts (its semantic scope), not TTT or
     // regular FFN layers.
@@ -1400,6 +1424,20 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
                                         "jamba_moe_" + std::to_string(layer_idx),
                                         layer_idx * 17 + 2);
         }
+        // ── CHRASS parallel slot (after FFN dropout, before residual add) ──
+        if (chrass_layer && saved_ff_norm_.size > 0) {
+            const auto& s = saved_ff_norm_.shape;
+            int total_lead = 1;
+            std::vector<int> orig_shape;
+            for (size_t i = 0; i < s.size(); ++i) {
+                orig_shape.push_back(s[i]);
+                if (i + 1 < s.size()) total_lead *= s[i];
+            }
+            Tensor flat = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
+            Tensor c_out = chrass_layer->forward(flat);
+            Tensor c_unflat = c_out.reshape(orig_shape);
+            ff = ff.add(c_unflat);
+        }
         Tensor output = saved_residual_.add(ff);
         if (audit_collector_ && audit_collector_->enabled()) {
             const double latency_ms =
@@ -1429,6 +1467,20 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         ff = apply_training_dropout(ff, dropout_rate_,
                                     "jamba_ff_out_" + std::to_string(layer_idx),
                                     layer_idx * 17 + 4);
+    }
+    // ── CHRASS parallel slot (FFN path) ──
+    if (chrass_layer && saved_ff_norm_.size > 0) {
+        const auto& s = saved_ff_norm_.shape;
+        int total_lead = 1;
+        std::vector<int> orig_shape;
+        for (size_t i = 0; i < s.size(); ++i) {
+            orig_shape.push_back(s[i]);
+            if (i + 1 < s.size()) total_lead *= s[i];
+        }
+        Tensor flat = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
+        Tensor c_out = chrass_layer->forward(flat);
+        Tensor c_unflat = c_out.reshape(orig_shape);
+        ff = ff.add(c_unflat);
     }
     Tensor output = saved_residual_.add(ff);
     if (audit_collector_ && audit_collector_->enabled()) {
@@ -2049,6 +2101,23 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     Tensor ff_grad;
     if (is_moe) {
         ff_grad = backward_moe(dy, ctx, "L" + std::to_string(layer_idx), saved_ff_norm_);
+        // CHRASS parallel: its grad w.r.t. saved_ff_norm adds to ff_grad
+        // before the shared rmsnorm_backward.  Reshape dy + saved_ff_norm
+        // to 2D, run chrass.backward, reshape result back.
+        if (chrass_layer && saved_ff_norm_.size > 0) {
+            const auto& s = saved_ff_norm_.shape;
+            int total_lead = 1;
+            std::vector<int> orig_shape;
+            for (size_t i = 0; i < s.size(); ++i) {
+                orig_shape.push_back(s[i]);
+                if (i + 1 < s.size()) total_lead *= s[i];
+            }
+            Tensor dy_flat = dy.reshape({total_lead, orig_shape.back()});
+            Tensor x_flat  = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
+            Tensor c_grad_flat = chrass_layer->backward(dy_flat, x_flat);
+            Tensor c_grad = c_grad_flat.reshape(orig_shape);
+            ff_grad = ff_grad.add(c_grad);
+        }
         if (saved_residual_.size > 0 && saved_ff_norm_.size > 0) {
             ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
         }
@@ -2066,6 +2135,21 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
             ff_grad = Tensor::squared_relu_backward(ff_grad, saved_ff_hidden_pre_);
         }
         ff_grad = ffn_gate_up->backward(ff_grad);
+        // CHRASS parallel (FFN path)
+        if (chrass_layer && saved_ff_norm_.size > 0) {
+            const auto& s = saved_ff_norm_.shape;
+            int total_lead = 1;
+            std::vector<int> orig_shape;
+            for (size_t i = 0; i < s.size(); ++i) {
+                orig_shape.push_back(s[i]);
+                if (i + 1 < s.size()) total_lead *= s[i];
+            }
+            Tensor dy_flat = dy.reshape({total_lead, orig_shape.back()});
+            Tensor x_flat  = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
+            Tensor c_grad_flat = chrass_layer->backward(dy_flat, x_flat);
+            Tensor c_grad = c_grad_flat.reshape(orig_shape);
+            ff_grad = ff_grad.add(c_grad);
+        }
         if (saved_residual_.size > 0 && saved_ff_norm_.size > 0) {
             ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
         }
@@ -2188,6 +2272,11 @@ std::vector<Parameter*> JambaBlock::parameters() {
         auto ff_down = ffn_down->parameters();
         prefix_parameter_names(ff_down, "ffn_down.");
         params.insert(params.end(), ff_down.begin(), ff_down.end());
+    }
+    if (chrass_layer) {
+        auto chrass_params = chrass_layer->parameters();
+        prefix_parameter_names(chrass_params, "chrass.");
+        params.insert(params.end(), chrass_params.begin(), chrass_params.end());
     }
     for (size_t index = 0; index < expert_gate_up.size(); ++index) {
         auto& expert = expert_gate_up[index];
