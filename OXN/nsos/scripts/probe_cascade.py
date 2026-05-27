@@ -188,6 +188,31 @@ def main() -> int:
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Slender GPU guard ────────────────────────────────────────────────
+    # Slender ensure_slender_cache_ requires weight.data on CPU; GPU path is
+    # Phase 7 (unimplemented).  If --cuda + --use-slender, the loop produces
+    # NaN every step.  Detect and abort early with a clear message so the
+    # report is honest about the skip rather than a wall of identical errors.
+    if args.use_slender and args.cuda:
+        skip_report = {
+            "label": args.label,
+            "skipped": True,
+            "reason": "Slender GPU path not implemented (Phase 7).  Rerun without --cuda or without --use-slender.",
+            "config": {
+                "use_chrass": args.use_chrass, "use_ttt": args.use_ttt,
+                "vib_beta": args.vib_beta, "use_slender": args.use_slender,
+                "use_moe": args.use_moe,
+            },
+            "loss": {"all": [], "initial_50": float("nan"), "final_100": float("nan"), "min": float("nan")},
+            "timing": {"ms_per_step": 0, "build_s": 0, "train_s": 0},
+            "steps_completed": 0,
+        }
+        out = args.out_dir / f"probe_{args.label}_s{args.seed}.json"
+        out.write_text(json.dumps(skip_report, indent=2))
+        print(f"[SKIP] {args.label}: Slender + CUDA incompatible. Wrote skip-report to {out}")
+        return 0
+
     eng_mod = _import_nsos_ext()
 
     flags_summary = []

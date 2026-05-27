@@ -60,6 +60,13 @@ def main() -> int:
     rows = []
     for lbl, r in reports.items():
         all_l = r["loss"]["all"]
+        if not all_l or r.get("skipped"):
+            # Skipped run (e.g., Slender + GPU): write placeholder row.
+            print(f"  [SKIP row for {lbl}: " + r.get("reason", "no loss data") + "]")
+            rows.append({"label": lbl, "init": float("nan"), "final": float("nan"),
+                         "min": float("nan"), "msps": 0.0, "delta_pct": float("nan"),
+                         "d": float("nan"), "skipped": True})
+            continue
         init = statistics.fmean(all_l[:50]) if len(all_l) >= 50 else float("nan")
         final = statistics.fmean(all_l[-100:]) if len(all_l) >= 100 else float("nan")
         mn = min(all_l) if all_l else float("nan")
