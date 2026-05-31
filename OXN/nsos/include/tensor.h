@@ -196,8 +196,18 @@ public:
     }
     void add_grad(const Tensor& g) {
         if (!grad) grad = std::make_shared<Tensor>(Tensor::zeros(shape.dims, device));
-        Tensor new_grad = grad->add(g);
-        grad->copy_from(new_grad);
+        // In-place accumulation (no per-call allocation) on CPU; GPU falls back
+        // to the tensor add path which handles device memory.
+        if (grad->get_device() == Device::CPU && g.get_device() == Device::CPU &&
+            grad->size == g.size) {
+            float* gp = grad->data();
+            const float* sp = g.data();
+            const int n = grad->size;
+            for (int i = 0; i < n; ++i) gp[i] += sp[i];
+        } else {
+            Tensor new_grad = grad->add(g);
+            grad->copy_from(new_grad);
+        }
     }
 };
 

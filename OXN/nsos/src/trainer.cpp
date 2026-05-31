@@ -151,10 +151,6 @@ void restore_staged_tensor(Tensor& dst, const Tensor& staged) {
     dst = (staged.get_device() == dst_device) ? staged.clone() : staged.to(dst_device);
 }
 
-bool trainer_prefers_reference_training_path(const Trainer& trainer) {
-    return trainer.model != nullptr;
-}
-
 bool auxiliary_stack_requested(const Trainer& trainer) {
     return trainer.phase_scheduler.auxiliary_stack_enabled &&
            (trainer.phase_scheduler.auxiliary_session_adapt_enabled ||
@@ -628,26 +624,36 @@ void apply_progressive_qat_phase(Trainer& trainer) {
     const bool quantized_active =
         scheduler_enabled &&
         trainer.global_step_count >= effective.qat_start_step;
-    const bool quantized_runtime_active =
-        quantized_active && !trainer_prefers_reference_training_path(trainer);
-    const bool transition_active =
-        scheduler_enabled &&
-        trainer.global_step_count >= effective.semantic_warmup_steps &&
-        trainer.global_step_count < effective.qat_start_step;
-
-    int precision_bits = 8;
-    if (quantized_active) {
-        precision_bits = std::max(trainer.phase_scheduler.quantized_precision_bits, 2);
-    } else if (transition_active) {
-        precision_bits = 4;
-    }
 
     for (BitLinear* layer : bitlinear_layers) {
         if (!layer) {
             continue;
         }
-        layer->set_precision_mode(precision_bits);
-        layer->set_reference_path(!quantized_runtime_active);
+        // BitNet b1.58 = ternary weights + int8 activations.  The packed CPU
+        // kernel derives the activation range from precision_bits; packed
+        // inference uses 8-bit, so quantized training must too (train ==
+        // inference numerics).  Weights are ternary via the packed kernel
+        // regardless of this value.
+        layer->set_precision_mode(8);
+
+        // True quantized training: once the quantized phase is active, route
+        // the forward through the REAL packed ternary kernel and back-propagate
+        // with a straight-through estimator onto the FP32 latent weights.  GPU
+        // layers keep the float reference path (there is no packed CPU kernel
+        // for device tensors; the dp4a path is inference-only), so QAT on GPU
+        // still trains in float.
+        const bool on_gpu = layer->has_full_precision_weight() &&
+                            layer->weight.data.get_device() == Device::GPU;
+        // Sensitive projections (e.g. Mamba dt/B/C) stay on the float path to
+        // preserve the mixed-precision design.
+        const bool train_quantized =
+            quantized_active && !on_gpu && !layer->quantization_sensitive();
+        layer->set_reference_path(!train_quantized);
+        if (train_quantized) {
+            // Re-quantize the current latent weights so the forward multiplies
+            // up-to-date ternary codes (the optimizer just updated them).
+            layer->repack_weights();
+        }
     }
 }
 
@@ -1191,6 +1197,11 @@ float train_supervised_batch_impl(Trainer& trainer,
             throw std::runtime_error("train_supervised_batch expects rank-3 logits from batched forward");
         }
 
+        // SSA learned block-selector: distill this forward's dense per-block
+        // attention mass into ssa_wsel_ (self-contained SGD; no-op unless sparse
+        // attention is enabled and per-head Q/K were saved by the exact path).
+        trainer.model->accumulate_sparse_selector_grads();
+
         const int batch_size = logits.shape[0];
         const int rows = logits.shape[1];
         const int vocab = logits.shape[2];
@@ -1301,6 +1312,8 @@ float Trainer::train_step(const std::vector<int>& tokens,
     model->reset_session();
     Context ctx;
     Tensor logits = model->forward_ids(inputs, &ctx);
+    // SSA learned block-selector distillation (no-op unless sparse attention is on).
+    model->accumulate_sparse_selector_grads();
     auto [loss, grad] = logits.cross_entropy(resolved_targets);
 
     // ── Pantheon VIB-style L2 regularizer on logits ──────────────────────
@@ -1464,6 +1477,8 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
                 model->reset_session();
                 Context ctx;
                 Tensor logits = model->forward_ids_batch(chunk_inputs, &ctx);
+                // SSA learned block-selector distillation (no-op unless sparse on).
+                model->accumulate_sparse_selector_grads();
                 auto [loss, grad] = logits.cross_entropy(chunk_targets);
                 model->backward_external(grad, ctx);
 

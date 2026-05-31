@@ -1,4 +1,5 @@
 #include "http_api_server.h"
+#include "nsos/determinism.h"
 
 #include <chrono>
 #include <filesystem>
@@ -7,6 +8,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdlib>
+#include <omp.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -226,6 +229,17 @@ int main() {
     HttpApiServer* active_server = nullptr;
     HttpApiServer* active_reloaded_server = nullptr;
     try {
+        // Determinism: a fixed global seed makes the tiny circuit model's init
+        // reproducible (the tensor_rng() fix makes a global seed honor-able),
+        // and a single OpenMP thread removes float reduction-order variance.
+        // Together they make this train+accuracy gate deterministic instead of
+        // flaky.  (DeterminismManager is internally mutex-guarded; safe here.)
+        omp_set_num_threads(1);
+        uint64_t circuit_seed = 7ull;  // a seed that converges deterministically
+        if (const char* seed_env = std::getenv("NSOS_TEST_SEED")) {
+            circuit_seed = std::strtoull(seed_env, nullptr, 10);
+        }
+        nsos::determinism::DeterminismManager::instance().set_global_seed(circuit_seed);
         const std::string host = "127.0.0.1";
         const std::string auth_token = "circuit-secret";
         const std::vector<std::string> auth_headers = {

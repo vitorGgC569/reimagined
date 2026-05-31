@@ -114,7 +114,12 @@ PROFILES: Dict[str, Dict] = {
             "phase6_memory": 16,
         },
         "qat": {
-            "enabled": False,
+            # True BitNet b1.58 quantization-aware training: after an FP32
+            # semantic warmup, the forward runs through the real packed ternary
+            # kernel and back-propagates with a straight-through estimator onto
+            # the FP32 latent weights (see src/bitlinear.cpp).  Use --disable_qat
+            # to fall back to FP32 training + post-training quantization.
+            "enabled": True,
             "semantic_warmup_steps": 12,
             "qat_start_step": 36,
             "quantized_precision_bits": 2,
@@ -163,7 +168,10 @@ PROFILES: Dict[str, Dict] = {
             "phase6_memory": 0.90,
         },
         "qat": {
-            "enabled": False,
+            # True BitNet b1.58 QAT (real packed ternary kernel + STE on FP32
+            # latent weights).  Long FP32 warmup before quantizing.  Use
+            # --disable_qat to fall back to FP32 + post-training quantization.
+            "enabled": True,
             "semantic_warmup_steps": 160,
             "qat_start_step": 320,
             "quantized_precision_bits": 2,

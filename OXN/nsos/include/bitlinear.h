@@ -61,6 +61,16 @@ public:
   void set_reference_path(bool use) { use_reference_path = use; }
   bool reference_path_enabled() const { return use_reference_path; }
 
+  // Quantization-sensitive layers (e.g. Mamba's dt/B/C "sensitive" input
+  // projection) are kept on the float reference path during quantization-aware
+  // training, preserving the mixed-precision design: ternary weights for the
+  // robust projections, higher precision for the sensitive SSM scan
+  // parameters.  The QAT scheduler in trainer.cpp honors this flag.
+  void set_quantization_sensitive(bool sensitive) {
+    quantization_sensitive_ = sensitive;
+  }
+  bool quantization_sensitive() const { return quantization_sensitive_; }
+
   // Opts the GPU forward path into the __dp4a-accelerated 1.58-bit
   // dispatch (see src/bitnet_gpu_dispatch.cpp).  This is INFERENCE-ONLY:
   // backward and gradient computation continue to use the float matmul
@@ -105,6 +115,7 @@ private:
   bool use_tequila = false;
   bool use_flatquant = true;
   bool use_reference_path = true;
+  bool quantization_sensitive_ = false;
 
   NormStrategy norm_strategy = NormStrategy::RMS_PERI;
   float weight_scale = 1.0f;

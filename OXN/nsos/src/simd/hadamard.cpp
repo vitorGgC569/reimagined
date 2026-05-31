@@ -1,6 +1,7 @@
 #include "simd_dispatch.h"
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #ifdef __AVX2__
@@ -67,9 +68,12 @@ void fwht_cpu(float *a, int n) {
 
 // In-place Hadamard transform wrapper
 void hadamard_transform(float *data, int batch, int dim) {
-  // Check if dim is power of 2
-  if ((dim & (dim - 1)) != 0) {
-    return; // dim must be power of 2
+  // The Fast Walsh-Hadamard Transform is only defined for power-of-two dims.
+  // Silently returning the input unchanged (the previous behavior) corrupted
+  // the math while looking like success; fail loudly instead.
+  if (dim <= 0 || (dim & (dim - 1)) != 0) {
+    throw std::invalid_argument(
+        "hadamard_transform requires dim to be a positive power of 2");
   }
 
   // Parallelize across batch dimension with OpenMP

@@ -1,5 +1,6 @@
 #include "../include/tensor.h"
 #include "../include/nsos_arena.h"
+#include "../include/nsos_math.h"
 #include "../include/nsos/determinism.h"
 #include "../include/tensor_iterator.h"
 #include "../include/cuda/gpu_utils.h"
@@ -64,9 +65,13 @@ std::mt19937& tensor_rng() {
     const uint64_t seed_version = manager.get_seed_version();
 
     if (global_seed != 0 && seed_version != seen_version) {
-        auto op_rng = manager.get_rng_for_operation(
-            "tensor", "random", static_cast<uint64_t>(
-                std::hash<std::thread::id>{}(std::this_thread::get_id())));
+        // Deterministic path: derive the generator purely from the global seed
+        // + seed version (NO thread id), so unseeded random/kaiming/xavier init
+        // is reproducible across runs (determinism is a project gate).  Under
+        // parallel init, threads then share a stream; for strict per-instance
+        // determinism under parallelism use the seeded factories
+        // (e.g. kaiming_uniform(shape, dev, seed)).
+        auto op_rng = manager.get_rng_for_operation("tensor", "random", 0u);
         std::seed_seq seed{
             static_cast<uint32_t>(op_rng()),
             static_cast<uint32_t>(op_rng()),
@@ -823,6 +828,21 @@ Tensor Tensor::matmul(const Tensor& other) const {
     }
 #endif
 
+    // CPU: BLIS-style blocked GEMM (MathOps::gemm) per batch -- same contiguous
+    // row-major layout the naive loop below assumes, but an order of magnitude
+    // faster.  beta=0 overwrites the freshly-allocated result.  The naive loop is
+    // kept as a fallback for any non-CPU data that reaches here.
+    if (device == Device::CPU) {
+        for (int batch_idx = 0; batch_idx < batch; ++batch_idx) {
+            const float* a_batch = a_ptr + static_cast<size_t>(batch_idx) * m * k;
+            const float* b_batch =
+                b_ptr + (other_batch == 1 ? 0 : static_cast<size_t>(batch_idx) * k * n);
+            float* out_batch = out_ptr + static_cast<size_t>(batch_idx) * m * n;
+            MathOps::gemm(m, n, k, 1.0f, a_batch, k, b_batch, n, 0.0f, out_batch, n);
+        }
+        return result;
+    }
+
 #pragma omp parallel for
     for (int row_index = 0; row_index < batch * m; ++row_index) {
         const int batch_idx = row_index / m;
@@ -870,17 +890,27 @@ Tensor Tensor::transpose(int dim0, int dim1) const {
     }
 #endif
 
-    std::vector<int> idx = make_indices(rank);
+    // Direct stride math: decompose the output flat index into coordinates,
+    // swap dim0/dim1 to recover the source coordinates, and index the source
+    // via its precomputed strides.  The previous version allocated a
+    // std::vector (src_idx) AND called get() (which recomputes a flat index)
+    // for every element.
+    std::vector<int> idx(rank);
+    const float* src = data();
+    float* dst = result.data();
     for (int flat = 0; flat < result.size; ++flat) {
         int remaining = flat;
         for (int d = rank - 1; d >= 0; --d) {
             idx[d] = remaining % out_dims[d];
             remaining /= out_dims[d];
         }
-
-        std::vector<int> src_idx = idx;
-        std::swap(src_idx[dim0], src_idx[dim1]);
-        result.data()[flat] = get(src_idx);
+        std::swap(idx[dim0], idx[dim1]);
+        size_t src_flat = 0;
+        for (int d = 0; d < rank; ++d) {
+            src_flat += static_cast<size_t>(idx[d]) * shape.strides[d];
+        }
+        dst[flat] = src[src_flat];
+        std::swap(idx[dim0], idx[dim1]);
     }
 
     return result;
@@ -1297,12 +1327,18 @@ Tensor Tensor::reshape(std::vector<int> new_shape) const {
         new_shape[inferred_index] = size / static_cast<int>(known_product);
     }
 
+    // reshape/squeeze/unsqueeze return a VIEW: the result shares the same
+    // underlying data buffer (O(1), no copy).  We deliberately drop the
+    // parent's gradient here -- it carries the parent's shape and would
+    // otherwise be a grad aliased to a mismatched shape (a real footgun).
+    // Use clone() when an independent, copy-backed tensor is required.
     Tensor reshaped = *this;
     TensorShape new_tensor_shape(new_shape);
     if (static_cast<int>(new_tensor_shape.numel()) != size) {
         throw std::runtime_error("Reshape size mismatch");
     }
     reshaped.shape = new_tensor_shape;
+    reshaped.grad = nullptr;
     return reshaped;
 }
 
@@ -1417,7 +1453,8 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const 
     if (use_gpu_fast_path(*this, grad) && x_norm.get_device() == Device::GPU &&
         gpu_custom_kernels_supported()) {
         launch_rmsnorm_backward_kernel(dx.raw_data(), grad.raw_data(),
-                                        x_norm.raw_data(), outer, inner);
+                                        x_norm.raw_data(), raw_data(),
+                                        outer, inner);
         sync_cuda();
         return dx;
     }
@@ -1425,17 +1462,29 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const 
 
     const float* g = grad.data();
     const float* y = x_norm.data();
+    const float* x = data();  // *this is the original pre-norm input
     float* dx_ptr = dx.data();
+    const float eps = 1e-6f;  // matches the rmsnorm() forward default
 #pragma omp parallel for
     for (int i = 0; i < outer; ++i) {
+        float sum_sq = 0.0f;
         float dot = 0.0f;
         for (int j = 0; j < inner; ++j) {
+            const float xv = x[i * inner + j];
+            sum_sq += xv * xv;
             dot += g[i * inner + j] * y[i * inner + j];
         }
         dot /= std::max(inner, 1);
+        // Exact RMSNorm Jacobian: dx = (1/rms) * (g - y * mean(g.y)), with
+        // rms = sqrt(mean(x^2) + eps).  The prior version omitted the 1/rms
+        // factor -- scaling EVERY gradient flowing back through an RMSNorm by
+        // rms, a real magnitude error in the training backward.
+        const float inv_rms = 1.0f / std::sqrt(
+            sum_sq / static_cast<float>(std::max(inner, 1)) + eps);
         for (int j = 0; j < inner; ++j) {
             // Projeção ortogonal removendo a variância (Jacobiano Aproximado RMS)
-            dx_ptr[i * inner + j] = g[i * inner + j] - y[i * inner + j] * dot;
+            dx_ptr[i * inner + j] =
+                (g[i * inner + j] - y[i * inner + j] * dot) * inv_rms;
         }
     }
     return dx;

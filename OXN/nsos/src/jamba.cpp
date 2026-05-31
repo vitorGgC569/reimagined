@@ -1,4 +1,5 @@
 #include "../include/jamba.h"
+#include "../include/sparse_attention.h"
 #include "../include/layer_audit.h"
 #include "../include/jamba_utils.h"
 #include "../include/nsos_serializer.h"
@@ -47,7 +48,7 @@ namespace {
 constexpr int kStableMoEExperts = 8;
 constexpr int kStableTopKExperts = 2;
 constexpr uint32_t kEdgePackMagic = 0x31454744; // DGE1
-constexpr uint32_t kEdgePackVersion = 1;
+constexpr uint32_t kEdgePackVersion = 2;  // v2: per-layer sensitivity byte + float weights for quantization-sensitive layers
 
 #ifdef USE_CUDA
 // RAII wrapper for a contiguous GPU device buffer of typed elements.
@@ -504,7 +505,9 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             // CHRASS topological injection (2026-05-25).  off by default.
             model_config_.use_chrass,
             model_config_.chrass_density,
-            model_config_.chrass_seed));
+            model_config_.chrass_seed,
+            // KAN FFN (non-MoE blocks).  off by default.
+            model_config_.use_kan));
     }
 
     value_head = std::make_unique<BitLinear>(d_model, vocab_size);
@@ -627,10 +630,38 @@ std::vector<BitLinear*> JambaModel::collect_bitlinear_layers() {
 
 void JambaModel::set_reference_path(bool use_reference_path) {
     for (BitLinear* layer : collect_bitlinear_layers()) {
-        if (layer) {
-            layer->set_reference_path(use_reference_path);
+        if (!layer) {
+            continue;
+        }
+        // Sensitive projections always stay on the float reference path; never
+        // route them through the ternary kernel.
+        if (!use_reference_path && layer->quantization_sensitive()) {
+            layer->set_reference_path(true);
+            continue;
+        }
+        layer->set_reference_path(use_reference_path);
+    }
+}
+
+void JambaModel::set_sparse_attention(bool enabled, int block_size,
+                                      int top_k_blocks, int local_blocks,
+                                      int sink_blocks) {
+    for (auto& block : layers) {
+        if (block && block->attn_layer) {
+            block->attn_layer->set_sparse_attention(
+                enabled, block_size, top_k_blocks, local_blocks, sink_blocks);
         }
     }
+}
+
+float JambaModel::accumulate_sparse_selector_grads() {
+    float total = 0.0f;
+    for (auto& block : layers) {
+        if (block && block->attn_layer) {
+            total += block->attn_layer->accumulate_selector_distill_grad();
+        }
+    }
+    return total;
 }
 
 void JambaModel::set_gpu_packed_inference(bool enabled) {
@@ -695,7 +726,10 @@ void JambaModel::set_moe_inference_top_k(int k) {
 
 void JambaModel::release_full_precision_linear_weights() {
     for (BitLinear* layer : collect_bitlinear_layers()) {
-        if (layer) {
+        // Keep quantization-sensitive projections (e.g. Mamba dt/B/C) in float:
+        // releasing them would force the ternary path at inference, breaking the
+        // mixed-precision design that QAT preserved during training.
+        if (layer && !layer->quantization_sensitive()) {
             layer->release_full_precision_weight();
         }
     }
@@ -717,6 +751,8 @@ void JambaModel::save_edge_linear_pack(const std::string& path) {
         if (!layer) {
             throw std::runtime_error("Null BitLinear layer while exporting edge pack");
         }
+        const uint8_t sensitive = layer->quantization_sensitive() ? 1u : 0u;
+        write_pod(out, sensitive);
         const BitLinearPackedState state = layer->export_packed_state();
         write_pod(out, static_cast<int32_t>(state.in_features));
         write_pod(out, static_cast<int32_t>(state.out_features));
@@ -727,6 +763,19 @@ void JambaModel::save_edge_linear_pack(const std::string& path) {
         write_vector(out, state.bias);
         write_vector(out, state.flat_alpha);
         write_vector(out, state.flat_beta);
+        if (sensitive) {
+            // Mixed precision: store the FP32 latent weights so the sensitive
+            // projection (e.g. Mamba dt/B/C) loads back on the float reference
+            // path, matching how QAT trained it.
+            Tensor w = layer->weight.data.get_device() == Device::GPU
+                           ? layer->weight.data.cpu()
+                           : layer->weight.data;
+            if (w.size == 0) {
+                throw std::runtime_error(
+                    "Sensitive BitLinear has no float weights to export to edge pack");
+            }
+            write_vector(out, std::vector<float>(w.data(), w.data() + w.size));
+        }
     }
 
     if (!out) {
@@ -757,6 +806,7 @@ void JambaModel::load_edge_linear_pack(const std::string& path,
     }
 
     for (uint32_t index = 0; index < expected_layers; ++index) {
+        const uint8_t sensitive = read_pod<uint8_t>(in);
         BitLinearPackedState state;
         state.in_features = read_pod<int32_t>(in);
         state.out_features = read_pod<int32_t>(in);
@@ -777,7 +827,37 @@ void JambaModel::load_edge_linear_pack(const std::string& path,
         state.bias = read_vector<float>(in, state.use_bias ? max_out : 0, "bias");
         state.flat_alpha = read_vector<float>(in, max_in_out, "flat_alpha");
         state.flat_beta = read_vector<float>(in, max_in_out, "flat_beta");
-        linear_layers[index]->import_packed_state(state, device, release_full_precision);
+
+        BitLinear* layer = linear_layers[index];
+        if (sensitive) {
+            // Restore the float reference path for the sensitive projection so
+            // inference uses the same mixed-precision numerics QAT trained on.
+            const std::vector<float> wfloat =
+                read_vector<float>(in, max_in_out, "sensitive_weight");
+            const std::vector<int> wshape = {state.out_features, state.in_features};
+            layer->weight.data = Tensor(wshape, device);
+            layer->weight.data.copy_from(
+                Tensor::from_blob(const_cast<float*>(wfloat.data()), wshape,
+                                  Device::CPU)
+                    .to(device));
+            layer->weight.mark_updated();
+            layer->magnitude.data = Tensor({state.out_features}, device);
+            layer->magnitude.data.copy_from(
+                Tensor::from_blob(const_cast<float*>(state.magnitude.data()),
+                                  {state.out_features}, Device::CPU)
+                    .to(device));
+            if (state.use_bias && !state.bias.empty()) {
+                layer->bias.data = Tensor({state.out_features}, device);
+                layer->bias.data.copy_from(
+                    Tensor::from_blob(const_cast<float*>(state.bias.data()),
+                                      {state.out_features}, Device::CPU)
+                        .to(device));
+            }
+            layer->repack_weights();         // keep the packed cache consistent
+            layer->set_reference_path(true);  // float matmul, NOT ternary
+        } else {
+            layer->import_packed_state(state, device, release_full_precision);
+        }
     }
 
     set_reference_path(!release_full_precision);
@@ -982,8 +1062,12 @@ Tensor JambaModel::reason(const Tensor& x, int num_simulations) {
     // Usa a representação latente como estado raiz do MCTS
     // O evaluator chama forward_embedding para pontuar cada estado explorado
     MCTSConfig cfg;
-    cfg.num_simulations = std::max(num_simulations, 1);
-    cfg.max_depth       = 8;
+    // Route MCTS budget from ModelConfig (was: hardcoded max_depth=8 / arg-only,
+    // so mcts_depth was dead config). The function arg overrides num_simulations
+    // when > 0; depth comes from config.
+    cfg.num_simulations = num_simulations > 0 ? num_simulations
+                                              : std::max(model_config_.mcts_simulations, 1);
+    cfg.max_depth       = std::max(model_config_.mcts_depth, 1);
     cfg.num_children_per_expansion = 3;
     cfg.c_puct_init     = 1.15f;
     cfg.use_noise       = true;
@@ -1311,7 +1395,8 @@ JambaBlock::JambaBlock(int dm,
                        int configured_expert_hidden_dim,
                        bool use_chrass,
                        float chrass_density,
-                       uint32_t chrass_seed)
+                       uint32_t chrass_seed,
+                       bool use_kan)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
@@ -1374,6 +1459,10 @@ JambaBlock::JambaBlock(int dm,
             expert_gate_up.push_back(std::make_unique<BitLinear>(dm, moe_expert_hidden));
             expert_down.push_back(std::make_unique<BitLinear>(moe_expert_hidden, dm));
         }
+    } else if (use_kan) {
+        // KAN FFN: a single Kolmogorov-Arnold layer (learnable RBF activations)
+        // replaces the dense gate-up -> squared-ReLU -> down FFN.
+        kan_ffn = std::make_unique<BitFastKANLayer>(dm, dm);
     } else {
         ffn_gate_up = std::make_unique<BitLinear>(dm, default_ffn_hidden);
         ffn_down = std::make_unique<BitLinear>(default_ffn_hidden, dm);
@@ -1451,18 +1540,25 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         return output;
     }
 
-    saved_ff_hidden_pre_ = ffn_gate_up->forward(saved_ff_norm_);
-    // LEARN S1: squared ReLU (BitNet b1.58 2B4T) instead of plain ReLU.
-    // Numerically stable in quantized regimes, comparable expressivity
-    // to SwiGLU at moderate scale (1-2B), avoids SwiGLU's FP8/ternary
-    // spike-overflow failure mode (Welleck et al., BitNet 2B4T TR 2026).
-    Tensor ff = saved_ff_hidden_pre_.squared_relu();
-    if (training_mode_ && dropout_rate_ > 1e-6f) {
-        ff = apply_training_dropout(ff, dropout_rate_ * 0.5f,
-                                    "jamba_ff_hidden_" + std::to_string(layer_idx),
-                                    layer_idx * 17 + 3);
+    Tensor ff;
+    if (kan_ffn) {
+        // KAN FFN: a single Kolmogorov-Arnold layer replaces the dense
+        // gate-up -> squared-ReLU -> down path (handles rank-3 natively).
+        ff = kan_ffn->forward(saved_ff_norm_);
+    } else {
+        saved_ff_hidden_pre_ = ffn_gate_up->forward(saved_ff_norm_);
+        // LEARN S1: squared ReLU (BitNet b1.58 2B4T) instead of plain ReLU.
+        // Numerically stable in quantized regimes, comparable expressivity
+        // to SwiGLU at moderate scale (1-2B), avoids SwiGLU's FP8/ternary
+        // spike-overflow failure mode (Welleck et al., BitNet 2B4T TR 2026).
+        Tensor ff_hidden = saved_ff_hidden_pre_.squared_relu();
+        if (training_mode_ && dropout_rate_ > 1e-6f) {
+            ff_hidden = apply_training_dropout(ff_hidden, dropout_rate_ * 0.5f,
+                                        "jamba_ff_hidden_" + std::to_string(layer_idx),
+                                        layer_idx * 17 + 3);
+        }
+        ff = ffn_down->forward(ff_hidden);
     }
-    ff = ffn_down->forward(ff);
     if (training_mode_ && dropout_rate_ > 1e-6f) {
         ff = apply_training_dropout(ff, dropout_rate_,
                                     "jamba_ff_out_" + std::to_string(layer_idx),
@@ -2121,6 +2217,26 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
         if (saved_residual_.size > 0 && saved_ff_norm_.size > 0) {
             ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
         }
+    } else if (kan_ffn) {
+        ff_grad = kan_ffn->backward(dy);
+        // CHRASS parallel (KAN path) — same injection as the dense FFN.
+        if (chrass_layer && saved_ff_norm_.size > 0) {
+            const auto& s = saved_ff_norm_.shape;
+            int total_lead = 1;
+            std::vector<int> orig_shape;
+            for (size_t i = 0; i < s.size(); ++i) {
+                orig_shape.push_back(s[i]);
+                if (i + 1 < s.size()) total_lead *= s[i];
+            }
+            Tensor dy_flat = dy.reshape({total_lead, orig_shape.back()});
+            Tensor x_flat  = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
+            Tensor c_grad_flat = chrass_layer->backward(dy_flat, x_flat);
+            Tensor c_grad = c_grad_flat.reshape(orig_shape);
+            ff_grad = ff_grad.add(c_grad);
+        }
+        if (saved_residual_.size > 0 && saved_ff_norm_.size > 0) {
+            ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
+        }
     } else if (ffn_down && ffn_gate_up) {
         ff_grad = ffn_down->backward(dy);
         if (saved_ff_hidden_pre_.size > 0) {
@@ -2233,6 +2349,9 @@ void JambaBlock::to(Device dev) {
     if (ffn_down) {
         ffn_down->to(dev);
     }
+    if (kan_ffn) {
+        kan_ffn->to(dev);
+    }
     for (auto& expert : expert_gate_up) {
         expert->to(dev);
     }
@@ -2272,6 +2391,11 @@ std::vector<Parameter*> JambaBlock::parameters() {
         auto ff_down = ffn_down->parameters();
         prefix_parameter_names(ff_down, "ffn_down.");
         params.insert(params.end(), ff_down.begin(), ff_down.end());
+    }
+    if (kan_ffn) {
+        auto kan_params = kan_ffn->parameters();
+        prefix_parameter_names(kan_params, "kan_ffn.");
+        params.insert(params.end(), kan_params.begin(), kan_params.end());
     }
     if (chrass_layer) {
         auto chrass_params = chrass_layer->parameters();
@@ -2472,6 +2596,9 @@ Attention::Attention(int d, int n, int l, int n_kv)
       max_seq_len(4096),
       theta(10000.0f) {
     precompute_freqs_cis();
+    // Learned block-selection routing, initialised to identity so SSA
+    // selection starts as the mean-key heuristic and is then trained.
+    ssa_wsel_ = Parameter(Tensor::eye(head_dim), "attn.ssa_wsel");
 }
 
 void Attention::precompute_freqs_cis() {
@@ -3281,8 +3408,66 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         std::vector<float> token_scores(static_cast<size_t>(cached_tokens_), 0.0f);
         for (int h = 0; h < n_heads; ++h) {
             const int kv_head = std::min(h / kv_group_size, n_kv_heads - 1);
+            // SSA (opt-in, default OFF): select top-k content blocks + local
+            // window + sinks over the paged KV cache and mask out the rest so
+            // the softmax below attends only to the selected tokens.  Block
+            // means are recomputed per step (correct; an incremental-mean
+            // cache is the documented speedup follow-up).
+            std::vector<char> ssa_active;
+            if (sparse_enabled_ && cached_tokens_ > 0) {
+                const int bs = std::max(ssa_block_size_, 1);
+                const int nb = (cached_tokens_ + bs - 1) / bs;
+                const int cur = nb - 1;
+                const size_t kvo =
+                    static_cast<size_t>(kv_head) * static_cast<size_t>(head_dim);
+                std::vector<float> bscore(static_cast<size_t>(nb), 0.0f);
+                std::vector<char> bsel(static_cast<size_t>(nb), 0);
+                for (int b = 0; b < nb; ++b) {
+                    const int bstart = b * bs;
+                    const int bend = std::min((b + 1) * bs, cached_tokens_);
+                    const float inv_cnt =
+                        1.0f / static_cast<float>(std::max(bend - bstart, 1));
+                    float acc = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        float mean_k = 0.0f;
+                        for (int t = bstart; t < bend; ++t)
+                            mean_k += kv_cache_token_ptr(key_cache_buffer_, t)[kvo + d];
+                        acc += q_rot_ptr[h * head_dim + d] * (mean_k * inv_cnt);
+                    }
+                    bscore[static_cast<size_t>(b)] = acc * scale;
+                }
+                for (int b = 0; b < std::min(std::max(ssa_sink_blocks_, 0), nb); ++b)
+                    bsel[static_cast<size_t>(b)] = 1;
+                for (int b = std::max(0, cur - std::max(ssa_local_blocks_, 0) + 1);
+                     b <= cur; ++b)
+                    bsel[static_cast<size_t>(b)] = 1;
+                if (ssa_top_k_blocks_ > 0) {
+                    std::vector<std::pair<float, int>> cand;
+                    for (int b = 0; b < nb; ++b)
+                        if (!bsel[static_cast<size_t>(b)])
+                            cand.emplace_back(bscore[static_cast<size_t>(b)], b);
+                    const int kk =
+                        std::min(ssa_top_k_blocks_, static_cast<int>(cand.size()));
+                    std::partial_sort(
+                        cand.begin(), cand.begin() + kk, cand.end(),
+                        [](const std::pair<float, int>& a,
+                           const std::pair<float, int>& b) { return a.first > b.first; });
+                    for (int z = 0; z < kk; ++z)
+                        bsel[static_cast<size_t>(cand[static_cast<size_t>(z)].second)] = 1;
+                }
+                ssa_active.assign(static_cast<size_t>(cached_tokens_), 0);
+                for (int b = 0; b < nb; ++b)
+                    if (bsel[static_cast<size_t>(b)])
+                        for (int t = b * bs;
+                             t < std::min((b + 1) * bs, cached_tokens_); ++t)
+                            ssa_active[static_cast<size_t>(t)] = 1;
+            }
             float max_s = -1e30f;
             for (int t = 0; t < cached_tokens_; ++t) {
+                if (!ssa_active.empty() && !ssa_active[static_cast<size_t>(t)]) {
+                    token_scores[static_cast<size_t>(t)] = -1e30f;
+                    continue;
+                }
                 float dot = 0.0f;
                 const float* cached_key_token = kv_cache_token_ptr(key_cache_buffer_, t);
                 const size_t kv_offset =
@@ -3327,6 +3512,45 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         }
         std::vector<float> scores(seq_len * seq_len, 0.0f);
         for (int h = 0; h < n_heads; ++h) {
+        if (sparse_enabled_) {
+          // SSA: content-dependent block selection for this head (subq.ai).
+          // Reuses the validated sparse_selective_attention component.  With
+          // top_k covering all causal blocks this is identical to the dense
+          // path below; with a smaller top_k it skips unselected blocks.
+          SparseAttentionConfig ssa_cfg;
+          ssa_cfg.block_size = ssa_block_size_;
+          ssa_cfg.top_k_blocks = ssa_top_k_blocks_;
+          ssa_cfg.local_blocks = ssa_local_blocks_;
+          ssa_cfg.sink_blocks = ssa_sink_blocks_;
+          ssa_cfg.scale = scale;
+          const int kv_head_s = std::min(h / kv_group_size, n_kv_heads - 1);
+          Tensor Qh({seq_len, head_dim}, Device::CPU);
+          Tensor Kh({seq_len, head_dim}, Device::CPU);
+          Tensor Vh({seq_len, head_dim}, Device::CPU);
+          float* qp = Qh.data();
+          float* kp = Kh.data();
+          float* vp = Vh.data();
+          for (int t = 0; t < seq_len; ++t) {
+            for (int dd = 0; dd < head_dim; ++dd) {
+              qp[t * head_dim + dd] =
+                  q_rot_ptr[t * n_heads * head_dim + h * head_dim + dd];
+              kp[t * head_dim + dd] =
+                  k_rot_ptr[t * n_kv_heads * head_dim + kv_head_s * head_dim + dd];
+              vp[t * head_dim + dd] =
+                  v_ptr[t * n_kv_heads * head_dim + kv_head_s * head_dim + dd];
+            }
+          }
+          Tensor Oh = sparse_selective_attention(Qh, Kh, Vh, ssa_cfg, nullptr,
+                                                 &ssa_wsel_.data);
+          const float* op = Oh.data();
+          for (int t = 0; t < seq_len; ++t) {
+            for (int dd = 0; dd < head_dim; ++dd) {
+              out_ptr[t * n_heads * head_dim + h * head_dim + dd] =
+                  op[t * head_dim + dd];
+            }
+          }
+          continue;
+        }
         // Extrair cabeça h de q_rot, k_rot, v3: cada um [seq, head_dim]
         // Calcular scores: [seq, seq] = Q_h @ K_h^T * scale
         std::fill(scores.begin(), scores.end(), 0.0f);
@@ -3655,6 +3879,141 @@ std::vector<Parameter*> Attention::parameters() {
         params.insert(params.end(), out.begin(), out.end());
     }
     return params;
+}
+
+float Attention::accumulate_selector_distill_grad() {
+    // Learned block selection trained by distilling the DENSE attention's
+    // per-block MASS into the scorer: the selector learns to predict which
+    // blocks dense attention attends to, so hard top-k by (Wsel @ q).block_mean
+    // picks the right blocks.  Cross-entropy(target_mass, softmax(scores)) with
+    // the exact gradient (pred - mass); self-contained SGD on ssa_wsel_ to keep
+    // it decoupled from the main optimizer.  Returns the CE loss (0 if the
+    // exact-training forward's per-head tensors are unavailable).
+    if (!sparse_enabled_) {
+        return 0.0f;  // selector only drives selection when sparse attention is opt-in
+    }
+    if (saved_q_rot_.size == 0 || saved_k_rot_.size == 0) {
+        return 0.0f;
+    }
+    const auto& qs = saved_q_rot_.shape.dims;  // [B, S, nH, hd]
+    const auto& ks = saved_k_rot_.shape.dims;  // [B, S, nKV, hd]
+    if (qs.size() != 4 || ks.size() != 4) {
+        return 0.0f;
+    }
+    const int S = qs[1];
+    const int nH = qs[2];
+    const int d = qs[3];
+    const int nKV = ks[2];
+    if (S <= 0 || d != head_dim) {
+        return 0.0f;
+    }
+    const int Bsz = std::max(ssa_block_size_, 1);
+    const int nb = (S + Bsz - 1) / Bsz;
+    if (nb < 2) {
+        return 0.0f;  // selection only meaningful with >= 2 blocks
+    }
+
+    const float* qp = saved_q_rot_.data();
+    const float* kp = saved_k_rot_.data();
+    const float* W = ssa_wsel_.data.data();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(d));
+
+    Tensor dWsel({d, d}, Device::CPU);  // zero-filled
+    float* dw = dWsel.data();
+    double loss_sum = 0.0;
+    long count = 0;
+
+    std::vector<float> bmean(static_cast<size_t>(nb) * d, 0.0f);
+    std::vector<float> attn(static_cast<size_t>(S), 0.0f);
+    std::vector<float> mass(static_cast<size_t>(nb), 0.0f);
+    std::vector<float> score(static_cast<size_t>(nb), 0.0f);
+    std::vector<float> pred(static_cast<size_t>(nb), 0.0f);
+    std::vector<float> qsel(static_cast<size_t>(d), 0.0f);
+
+    for (int h = 0; h < nH; ++h) {
+        const int kvh = std::min(h / std::max(kv_group_size, 1), nKV - 1);
+        std::fill(bmean.begin(), bmean.end(), 0.0f);
+        for (int b = 0; b < nb; ++b) {
+            const int st = b * Bsz;
+            const int en = std::min((b + 1) * Bsz, S);
+            for (int j = st; j < en; ++j) {
+                const size_t kb = ((static_cast<size_t>(j) * nKV) + kvh) * d;
+                for (int c = 0; c < d; ++c)
+                    bmean[static_cast<size_t>(b) * d + c] += kp[kb + c];
+            }
+            const float inv = 1.0f / static_cast<float>(std::max(en - st, 1));
+            for (int c = 0; c < d; ++c) bmean[static_cast<size_t>(b) * d + c] *= inv;
+        }
+        for (int i = 0; i < S; ++i) {
+            const int ncand = i / Bsz + 1;  // causal: blocks 0..i/Bsz visible
+            if (ncand < 2) continue;
+            const size_t qb = ((static_cast<size_t>(i) * nH) + h) * d;
+            // TARGET: dense attention's per-block mass over j <= i.
+            float mx = -1e30f;
+            for (int j = 0; j <= i; ++j) {
+                const size_t kb = ((static_cast<size_t>(j) * nKV) + kvh) * d;
+                float dv = 0.0f;
+                for (int c = 0; c < d; ++c) dv += qp[qb + c] * kp[kb + c];
+                attn[static_cast<size_t>(j)] = dv * scale;
+                mx = std::max(mx, attn[static_cast<size_t>(j)]);
+            }
+            float sm = 0.0f;
+            for (int j = 0; j <= i; ++j) {
+                attn[static_cast<size_t>(j)] = std::exp(attn[static_cast<size_t>(j)] - mx);
+                sm += attn[static_cast<size_t>(j)];
+            }
+            const float invsm = 1.0f / (sm + 1e-20f);
+            for (int b = 0; b < ncand; ++b) mass[static_cast<size_t>(b)] = 0.0f;
+            for (int j = 0; j <= i; ++j)
+                mass[static_cast<size_t>(j / Bsz)] += attn[static_cast<size_t>(j)] * invsm;
+            // PREDICTED: softmax over candidate blocks of (Wsel @ q) . block_mean.
+            for (int a = 0; a < d; ++a) {
+                float acc = 0.0f;
+                for (int c = 0; c < d; ++c)
+                    acc += W[static_cast<size_t>(a) * d + c] * qp[qb + c];
+                qsel[static_cast<size_t>(a)] = acc;
+            }
+            float smx = -1e30f;
+            for (int b = 0; b < ncand; ++b) {
+                float sc = 0.0f;
+                for (int c = 0; c < d; ++c)
+                    sc += qsel[static_cast<size_t>(c)] * bmean[static_cast<size_t>(b) * d + c];
+                score[static_cast<size_t>(b)] = sc;
+                smx = std::max(smx, sc);
+            }
+            float ssm = 0.0f;
+            for (int b = 0; b < ncand; ++b) {
+                pred[static_cast<size_t>(b)] = std::exp(score[static_cast<size_t>(b)] - smx);
+                ssm += pred[static_cast<size_t>(b)];
+            }
+            const float invssm = 1.0f / (ssm + 1e-20f);
+            for (int b = 0; b < ncand; ++b) {
+                pred[static_cast<size_t>(b)] *= invssm;
+                loss_sum += -static_cast<double>(mass[static_cast<size_t>(b)]) *
+                            std::log(pred[static_cast<size_t>(b)] + 1e-20f);
+            }
+            ++count;
+            // CE+softmax grad: dL/dscore[b] = pred[b] - mass[b].
+            // dq_sel[a] = sum_b (pred-mass)[b] * block_mean[b][a];
+            // dWsel[a][c] += dq_sel[a] * q[c].
+            for (int a = 0; a < d; ++a) {
+                float dqa = 0.0f;
+                for (int b = 0; b < ncand; ++b)
+                    dqa += (pred[static_cast<size_t>(b)] - mass[static_cast<size_t>(b)]) *
+                           bmean[static_cast<size_t>(b) * d + a];
+                for (int c = 0; c < d; ++c)
+                    dw[static_cast<size_t>(a) * d + c] += dqa * qp[qb + c];
+            }
+        }
+    }
+    if (count == 0) {
+        return 0.0f;
+    }
+    const float lr = 0.1f;
+    const float invc = 1.0f / static_cast<float>(count);
+    float* w = ssa_wsel_.data.data();
+    for (int i = 0; i < ssa_wsel_.data.size; ++i) w[i] -= lr * dw[i] * invc;
+    return static_cast<float>(loss_sum / count);
 }
 
 void Attention::collect_bitlinear_layers(std::vector<BitLinear*>& out) {

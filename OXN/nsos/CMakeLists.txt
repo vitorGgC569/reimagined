@@ -72,14 +72,22 @@ set(NSOS_CORE_SOURCES
     src/numerical_guard.cpp
     src/turboquant_fallback.cpp
     src/bitnet_gpu_dispatch.cpp
+    src/sparse_attention.cpp
  )
 
 if (MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/O2> $<$<COMPILE_LANGUAGE:CXX>:/EHsc> $<$<COMPILE_LANGUAGE:CXX>:/openmp>)
 else()
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O3> $<$<COMPILE_LANGUAGE:CXX>:-fopenmp>)
-    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-mavx> $<$<COMPILE_LANGUAGE:CXX>:-mfma>)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|x64)$")
+        # The core SIMD layer (nsos_simd.h SimdPacket<float>) uses AVX/FMA
+        # intrinsics, so the default core requires a Haswell-class CPU.  Build
+        # with -DNSOS_BASELINE_X86=ON for a portable binary that runs on pre-AVX
+        # CPUs: nsos_simd.h then falls back to the scalar packet path and the
+        # AVX2 BitLinear kernels stay isolated + runtime-dispatched.
+        if (NOT NSOS_BASELINE_X86)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-mavx> $<$<COMPILE_LANGUAGE:CXX>:-mfma>)
+        endif()
     endif()
     if (NSOS_ENABLE_NATIVE_OPTIMIZATIONS)
         add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native>)
@@ -308,6 +316,31 @@ if (NSOS_BUILD_TESTS)
     add_executable(test_bitlinear tests/test_bitlinear.cpp)
     target_link_libraries(test_bitlinear PRIVATE nsos_core)
     add_test(NAME test_bitlinear COMMAND test_bitlinear)
+
+    # SSA - Subquadratic Sparse Attention (subq.ai research validation).
+    # Parity with dense attention, content-selection retrieval vs fixed window,
+    # and subquadratic attended-pair / FLOP accounting.
+    add_executable(test_sparse_attention tests/test_sparse_attention.cpp)
+    target_link_libraries(test_sparse_attention PRIVATE nsos_core)
+    add_test(NAME test_sparse_attention COMMAND test_sparse_attention)
+
+    # Validates the BLIS-style MathOps::gemm against the naive matmul before
+    # wiring it into the production path (#7).
+    add_executable(test_gemm_parity tests/test_gemm_parity.cpp)
+    target_link_libraries(test_gemm_parity PRIVATE nsos_core)
+    add_test(NAME test_gemm_parity COMMAND test_gemm_parity)
+
+    # MoE gradient flow (rewritten against the current expert_gate_up/expert_down
+    # API; the old version referenced a stale KAN-expert members member).
+    add_executable(test_moe_training tests/test_moe_training.cpp)
+    target_link_libraries(test_moe_training PRIVATE nsos_core)
+    add_test(NAME test_moe_training COMMAND test_moe_training)
+
+    # Subsystem wiring: KAN FFN (use_kan) forward/backward/params + use_kan=false
+    # regression, and Self-Healer reachable from the live model.
+    add_executable(test_systems_wiring tests/test_systems_wiring.cpp)
+    target_link_libraries(test_systems_wiring PRIVATE nsos_core)
+    add_test(NAME test_systems_wiring COMMAND test_systems_wiring)
 
     # Cherry-pick #2 (Slender-Mamba head-to-toe quantization).
     # Tests the slender forward path on Embedding: cache lifecycle,

@@ -121,10 +121,19 @@ void BitLinear::pack_weights(const Tensor &w_float) {
   packed_weights.assign(packed_word_count, 0u);
   
   this->weight_scale = w_float.norm() / (std::sqrt((float)w_float.shape.numel()) + 1e-8f);
-  
-  // Call optimized packing from Adapter
-  BitNetAdapter::pack_weights_microsoft_style(w_float.data(), 
-                                             reinterpret_cast<uint8_t*>(packed_weights.data()), 
+
+  // Canonical NSOS ternary rule — single source of truth.  Quantize with
+  // quantize_weights() (t = clamp(round(W / scale), -1, +1), scale =
+  // ||W|| / sqrt(numel)) and pack the resulting {-1,0,+1} codes.  This makes
+  // the packed weights identical to quantize_weights() and to the QAT
+  // regularizer target, so quantized training (STE) and packed inference
+  // share exactly one quantization rule.
+  Tensor ternary_codes = quantize_weights(w_float);
+
+  // Pack the {-1,0,+1} codes.  The adapter's +-0.25 raw threshold maps the
+  // exact integer codes to their 2-bit values losslessly.
+  BitNetAdapter::pack_weights_microsoft_style(ternary_codes.data(),
+                                             reinterpret_cast<uint8_t*>(packed_weights.data()),
                                              N, K);
   BitNetAdapter::unpack_weights_microsoft_style_to_i8(
       packed_weights, N, K, unpacked_weights_i8);
@@ -269,7 +278,9 @@ Tensor BitLinear::gemm_158bit_ultra(const Tensor &x_q,
 }
 
 Tensor BitLinear::forward(const Tensor &input) {
-  saved_input = input;
+  // Clone so the activation saved for backward (rmsnorm_backward, STE) can
+  // never be corrupted by an in-place mutation of the caller's input buffer.
+  saved_input = input.clone();
   int M = input.shape.numel() / in_features;
   Tensor x = input;
   if (norm_strategy == NormStrategy::RMS_PERI ||
@@ -654,19 +665,100 @@ Tensor BitLinear::backward(const Tensor &grad) {
     return dx.reshape(saved_input.shape.dims);
   }
 
-  // dW = grad^T @ input -> [out_features, in_features]
-  Tensor dW = grad_2d.transpose().matmul(input_2d);
-
+  // ── NON-REFERENCE PATH: straight-through estimator (STE) backward for the
+  // packed ternary forward.  The real integer kernel ran in the forward; this
+  // back-propagates onto the FP32 latent parameters.  The forward computed:
+  //   x_norm = rmsnorm(input)                                   [saved_x_norm]
+  //   xt     = flatquant(x_norm)             (if use_flatquant)
+  //   xt     = hadamard(xt)                  (if use_hadamard)
+  //   x_q    = round(xt / act_scale)         [saved_x_quant], act_scale [saved_act_scales]
+  //   w_t    = ternary(W) in {-1,0,+1}       [unpacked_weights_i8], scale = weight_scale
+  //   pre    = (x_q * act_scale) @ (w_t * weight_scale)^T   (+ loqa(input) if active)
+  //   out    = pre * magnitude + bias
+  // STE treats both quantizers as identity for gradient flow; gradients
+  // accumulate into the latent FP32 weight / magnitude / bias / flat params.
   if (weight.data.size == 0) {
     throw std::runtime_error(
-        "BitLinear backward requires full precision weights; packed-only "
-        "BitLinear is inference-only");
+        "BitLinear STE backward requires latent full-precision weights; "
+        "packed-only BitLinear is inference-only");
+  }
+  if (saved_x_quant.size == 0) {
+    throw std::runtime_error(
+        "BitLinear STE backward: missing saved quantized activations "
+        "(forward did not run the packed path)");
   }
 
-  // dx = grad @ W -> [M, in_features]
-  Tensor dx = grad_2d.matmul(weight.data);
+  // Reconstruct the exact dequantized activation the forward multiplied:
+  //   act_dequant[i,k] = x_q[i,k] * act_scale[i]
+  Tensor act_dequant({M, in_features}, Device::CPU);
+  {
+    float *a = act_dequant.data();
+    const float *xq = saved_x_quant.data();
+    for (int i = 0; i < M; ++i) {
+      const float s = i < static_cast<int>(saved_act_scales.size())
+                          ? saved_act_scales[static_cast<size_t>(i)]
+                          : 1.0f;
+      const size_t base = static_cast<size_t>(i) * static_cast<size_t>(in_features);
+      for (int k = 0; k < in_features; ++k) {
+        a[base + static_cast<size_t>(k)] =
+            xq[base + static_cast<size_t>(k)] * s;
+      }
+    }
+  }
+  // Reconstruct the effective ternary weight the forward multiplied:
+  //   w_eff[j,k] = ternary[j,k] * weight_scale
+  Tensor w_eff({out_features, in_features}, Device::CPU);
+  {
+    float *we = w_eff.data();
+    const size_t total =
+        static_cast<size_t>(out_features) * static_cast<size_t>(in_features);
+    if (unpacked_weights_i8.size() == total) {
+      for (size_t i = 0; i < total; ++i) {
+        we[i] = static_cast<float>(unpacked_weights_i8[i]) * weight_scale;
+      }
+    } else {
+      // Fallback: derive ternary from the latent weights with the canonical
+      // NSOS rule (identical to quantize_weights / pack_weights).
+      const float *w = weight.data.data();
+      const float scale = weight_scale + 1e-8f;
+      for (size_t i = 0; i < total; ++i) {
+        const float v = w[i] / scale;
+        we[i] = (v > 0.5f ? 1.0f : (v < -0.5f ? -1.0f : 0.0f)) * weight_scale;
+      }
+    }
+  }
 
-  // Apply Tequila: boost gradients for near-zero (dead-zone) weights
+  // LoQA contributes to the pre-magnitude output (it adds loqa(input)).
+  Tensor loqa_out;
+  if (loqa.active) {
+    loqa_out = input_2d.matmul(loqa.A.data).matmul(loqa.B.data); // [M, out]
+  }
+
+  // Recover `pre` (gemm output before the magnitude/bias affine) for the exact
+  // magnitude gradient.  The fused forward folds the affine into the gemm, so
+  // recompute the un-fused gemm from the saved quantized activation.
+  Tensor pre_2d =
+      gemm_158bit_ultra(saved_x_quant, saved_act_scales, false)
+          .reshape({M, out_features});
+  Tensor pre_full =
+      (loqa.active && loqa_out.size > 0) ? pre_2d.add(loqa_out) : pre_2d;
+
+  // d_magnitude[j] = Sum_i grad[i,j] * pre_full[i,j]   (exact)
+  magnitude.add_grad(grad_2d.mul(pre_full).sum(0));
+
+  // d_bias = Sum_i grad[i,j]
+  if (use_bias) {
+    bias.add_grad(grad_2d.sum(0));
+  }
+
+  // Gradient into the pre-magnitude output.
+  Tensor grad_pre = grad_2d.mul(magnitude.data);
+
+  // Weight gradient (STE through ternary): dW = grad_pre^T @ act_dequant.
+  Tensor dW = grad_pre.transpose().matmul(act_dequant);
+
+  // Tequila dead-zone gradient boost (opt-in): help near-zero latent weights
+  // escape the ternary dead band.
   if (use_tequila) {
     float *dw_ptr = dW.data();
     const float *w_ptr = weight.data.data();
@@ -676,106 +768,72 @@ Tensor BitLinear::backward(const Tensor &grad) {
         dw_ptr[i] *= 1.5f;
     }
   }
-
-  // STE (Straight-Through Estimator) for ternary quantization:
-  // Zero out weight gradients where weights are in the "dead zone" of ternary
-  // quantization but keep gradients flowing for weights that are clearly +1,
-  // -1, or near the boundary
+  // STE clip: stop pushing latent weights already saturated past the ternary
+  // band (|W / scale| > 1) so they do not drift unboundedly.
   {
     float *dw_ptr = dW.data();
     const float *w_ptr = weight.data.data();
-    float scale = weight_scale + 1e-8f;
+    const float scale = weight_scale + 1e-8f;
 #pragma omp parallel for
     for (int i = 0; i < (int)dW.size; ++i) {
-      float normalized = w_ptr[i] / scale;
-      // STE: clip gradients for weights outside the quantization range [-1, 1]
-      if (std::abs(normalized) > 1.0f) {
+      if (std::abs(w_ptr[i] / scale) > 1.0f) {
         dw_ptr[i] = 0.0f;
       }
     }
   }
-
-  // Accumulate weight gradient (THIS WAS MISSING - training-fatal bug)
   weight.add_grad(dW);
 
-  // Magnitude gradient: d_magnitude = sum over rows of (grad * quantized_output
-  // / old_magnitude) Simplified: magnitude scales the entire output
-  // per-channel, so d_mag[j] = sum_i(grad[i,j] * output_before_mag[i,j])
-  {
-    Tensor d_mag = Tensor::zeros({out_features}, Device::CPU);
-    float *dm_ptr = d_mag.data();
-    const float *g_ptr = grad_2d.data();
-    const float *m_ptr = magnitude.data.data();
-    // d_magnitude[j] = sum_i(grad[i,j] * output[i,j] / magnitude[j])
-    // Since output = gemm_result * magnitude, output/magnitude = gemm_result
-    // We need saved gemm result, but we can approximate:
-    // Just use the chain rule: output[i,j] = gemm[i,j] * mag[j]
-    // d_mag[j] = sum_i(d_out[i,j] * gemm[i,j])
-    // For stability, accumulate grad * (output / mag) ≈ grad *
-    // input_contribution
-    for (int i = 0; i < M; ++i) {
-      for (int j = 0; j < out_features; ++j) {
-        // grad[i,j] * (output[i,j] / magnitude[j]) -> but we lost output
-        // Safe approximation: magnitude gradient via accumulation
-        dm_ptr[j] += g_ptr[i * out_features + j];
-      }
-    }
-    // Scale by average weight contribution
-    float avg_scale = weight_scale;
-    for (int j = 0; j < out_features; ++j) {
-      dm_ptr[j] *= avg_scale;
-    }
-    magnitude.add_grad(d_mag);
+  // LoQA adapter backward (its input is the raw layer input; its output is
+  // scaled by magnitude in the forward, so it uses grad_pre).
+  Tensor dx_loqa;
+  if (loqa.active) {
+    Tensor inputA = input_2d.matmul(loqa.A.data);             // [M, r]
+    Tensor dB = inputA.transpose().matmul(grad_pre);          // [r, out]
+    loqa.B.add_grad(dB);
+    Tensor gradBt = grad_pre.matmul(loqa.B.data.transpose()); // [M, r]
+    Tensor dA = input_2d.transpose().matmul(gradBt);          // [in, r]
+    loqa.A.add_grad(dA);
+    dx_loqa = gradBt.matmul(loqa.A.data.transpose());         // [M, in] (wrt raw input)
   }
 
-  // Bias gradient
-  if (use_bias)
-    bias.add_grad(grad_2d.sum(0));
+  // Gradient into the (flatquant/hadamard-transformed) activation, STE through
+  // the int8 activation quantizer: uses the effective ternary weight.
+  Tensor d_act = grad_pre.matmul(w_eff); // [M, in]
 
-  // LoQA adapter backward: output += input @ A @ B
-  // d_A = input^T @ grad @ B^T, d_B = A^T @ input^T @ grad
-  if (loqa.active) {
-    // d_loqa_out = grad (same as d_output for the additive path)
-    // loqa_out = input @ A @ B
-    // d_B = (input @ A)^T @ grad = A^T @ input^T @ grad
-    Tensor inputA = input_2d.matmul(loqa.A.data);   // [M, 32]
-    Tensor dB = inputA.transpose().matmul(grad_2d); // [32, out_features]
-    loqa.B.add_grad(dB);
+  // Reverse the Hadamard transform (orthonormal -> self-inverse).  Off by
+  // default (use_hadamard=false); applied symmetrically when enabled.
+  if (use_hadamard) {
+    d_act = d_act.clone();
+    hadamard_transform(d_act.data(), M, in_features);
+  }
 
-    // d_A = input^T @ (grad @ B^T)
-    Tensor gradBt = grad_2d.matmul(loqa.B.data.transpose()); // [M, 32]
-    Tensor dA = input_2d.transpose().matmul(gradBt); // [in_features, 32]
-    loqa.A.add_grad(dA);
+  // Reverse FlatQuant: xt = alpha * x_norm + beta, on the pre-flatquant
+  // activation x_norm (= rmsnorm(input), or input itself if no norm).
+  Tensor dx;
+  if (use_flatquant) {
+    Tensor x_norm = (norm_strategy == NormStrategy::RMS_PERI ||
+                     norm_strategy == NormStrategy::RMS_PRE)
+                        ? saved_x_norm
+                        : saved_input;
+    if (x_norm.shape.dims.size() != 2) {
+      x_norm = x_norm.reshape({M, in_features});
+    }
+    flat_alpha.add_grad(d_act.mul(x_norm).sum(0));
+    flat_beta.add_grad(d_act.sum(0));
+    dx = d_act.mul(flat_alpha.data);
+  } else {
+    dx = d_act;
+  }
 
-    // dx contribution from LoQA path: d_input += grad @ B^T @ A^T
-    Tensor dx_loqa = gradBt.matmul(loqa.A.data.transpose()); // [M, in_features]
+  // Add the LoQA input-gradient (it bypasses flatquant; its input is raw).
+  if (loqa.active && dx_loqa.size > 0) {
     dx = dx.add(dx_loqa);
   }
 
-  // Backprop through FlatQuant: x_flat = alpha * x + beta
-  // dx = d_flat * alpha
-  // d_alpha = d_flat * x (sum over batch)
-  // d_beta = d_flat (sum over batch)
-  if (use_flatquant) {
-    // Current 'dx' acts as d_flat because it came from gemm backward relative
-    // to quant input And quant input was the result of flatquant. We need
-    // x_original (before flatquant).
-    Tensor x_orig = (norm_strategy != NormStrategy::RMS_PERI &&
-                     norm_strategy != NormStrategy::RMS_PRE)
-                        ? saved_input
-                        : saved_x_norm;
-    if (x_orig.shape.dims.size() != 2) {
-      x_orig = x_orig.reshape({M, in_features});
-    }
-
-    Tensor d_alpha = dx.mul(x_orig).sum(0);
-    Tensor d_beta = dx.sum(0);
-
-    flat_alpha.add_grad(d_alpha);
-    flat_beta.add_grad(d_beta);
-
-    // Update dx to propagate backward through the scaling: dx_new = dx * alpha
-    dx = dx.mul(flat_alpha.data);
+  // Reverse RMSNorm back to the layer input.
+  if (norm_strategy == NormStrategy::RMS_PERI ||
+      norm_strategy == NormStrategy::RMS_PRE) {
+    dx = saved_input.rmsnorm_backward(dx, saved_x_norm);
   }
 
   return dx.reshape(saved_input.shape.dims);

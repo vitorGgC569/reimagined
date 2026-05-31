@@ -111,7 +111,12 @@ Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
       in_proj_sensitive(d_model_value, d_model_value, true),
       out_proj(d_model_value, d_model_value, true),
       A(Tensor::ones({d_model_value}, Device::CPU), "mamba.A"),
-      D(Tensor::ones({d_model_value}, Device::CPU), "mamba.D") {}
+      D(Tensor::ones({d_model_value}, Device::CPU), "mamba.D") {
+  // dt/B/C come from the "sensitive" projection; keep it on the float path
+  // during QAT (mixed precision: ternary robust + out_proj, higher-precision
+  // SSM scan parameters).  See trainer.cpp apply_progressive_qat_phase.
+  in_proj_sensitive.set_quantization_sensitive(true);
+}
 
 float Mamba2SSD::softplus_stable(float x) {
     if (x > 20.0f) {

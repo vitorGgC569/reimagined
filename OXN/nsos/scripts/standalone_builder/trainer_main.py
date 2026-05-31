@@ -31,6 +31,7 @@ import json
 import os
 import platform
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -142,7 +143,7 @@ def check_gpu() -> Dict[str, str]:
     try:
         import subprocess
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+            ["nvidia-smi", "--query-gpu=name,driver_version,memory.total,memory.free,memory.used",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10, check=True,
         )
@@ -152,10 +153,23 @@ def check_gpu() -> Dict[str, str]:
             "name": parts[0] if len(parts) > 0 else "?",
             "driver": parts[1] if len(parts) > 1 else "?",
             "memory_mb": parts[2] if len(parts) > 2 else "?",
+            "free_mb": parts[3] if len(parts) > 3 else "?",
+            "used_mb": parts[4] if len(parts) > 4 else "?",
         }
-        log(f"  GPU:       {info['name']}")
-        log(f"  driver:    {info['driver']}")
-        log(f"  VRAM:      {info['memory_mb']} MB")
+
+        def _gb(mb: str) -> str:
+            try:
+                return f"{float(mb) / 1024:.1f} GB"
+            except (TypeError, ValueError):
+                return "? GB"
+
+        log(f"  GPU:        {info['name']}")
+        log(f"  driver:     {info['driver']}")
+        log(f"  VRAM total: {info['memory_mb']} MB ({_gb(info['memory_mb'])})  <- VRAM dedicada real (a que a CUDA usa)")
+        log(f"  VRAM livre: {info['free_mb']} MB ({_gb(info['free_mb'])})")
+        log(f"  VRAM usada: {info['used_mb']} MB")
+        log(f"  nota: os 'GB' nas Propriedades do Windows = dedicada + compartilhada (RAM);")
+        log(f"        o numero que importa para o treino e o 'VRAM total' acima.")
 
         # Compute capability gate -- refuse to start if too old.
         cc = _query_compute_cap(info["name"])
@@ -319,6 +333,83 @@ def iter_documents(file_path: Path):
                     continue
 
 
+# ── Streaming document provider (bounded RAM) ──────────────────────────────
+def stream_documents(files, min_len=200, buffer_size=8192, seed=1337):
+    """Yield documents lazily through a bounded shuffle buffer, cycling epochs
+    forever.  Keeps RAM ~constant (a few thousand docs) instead of loading the
+    whole dataset into a Python list -- which was pinning the box at ~98% RAM
+    and freezing it / killing AnyDesk."""
+    import random as _random
+    rng = _random.Random(seed)
+    while True:                       # cycle epochs forever
+        order = list(files)
+        rng.shuffle(order)
+        buf = []
+        for fp in order:
+            for text in iter_documents(fp):
+                if len(text) >= min_len:
+                    buf.append(text)
+                    if len(buf) >= buffer_size:
+                        rng.shuffle(buf)
+                        for d in buf:
+                            yield d
+                        buf = []
+        if buf:
+            rng.shuffle(buf)
+            for d in buf:
+                yield d
+
+
+def log_gpu_status(tag=""):
+    """Log GPU utilization + VRAM via nvidia-smi, so it's obvious the GPU is hot."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            util, used, total = (p.strip() for p in out.stdout.strip().splitlines()[0].split(","))
+            log(f"  [GPU{(' ' + tag) if tag else ''}] uso={util}%  VRAM={used}/{total} MB")
+    except Exception:
+        pass
+
+
+def _dump_gpu_processes():
+    """List the processes currently holding VRAM (to spot zombie runs)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5)
+        body = out.stdout.strip()
+        if body:
+            for line in body.splitlines():
+                log(f"     VRAM em uso por: {line.strip()}")
+        else:
+            log("     (nenhum processo segurando a GPU agora)")
+    except Exception:
+        pass
+
+
+def log_ram_status(tag=""):
+    """Log system RAM load via the Win32 API (no extra dependency)."""
+    try:
+        import ctypes
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExt", ctypes.c_ulonglong)]
+        s = _MS(); s.dwLength = ctypes.sizeof(_MS)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s))
+        used = (s.ullTotalPhys - s.ullAvailPhys) / 1024**3
+        total = s.ullTotalPhys / 1024**3
+        log(f"  [RAM{(' ' + tag) if tag else ''}] uso={s.dwMemoryLoad}%  ({used:.1f}/{total:.1f} GB)")
+    except Exception:
+        pass
+
+
 # ── Resume support ─────────────────────────────────────────────────────────
 def find_latest_checkpoint() -> Optional[Path]:
     """Return the most recently modified checkpoint .bin, if any."""
@@ -362,38 +453,49 @@ def run_training(cfg: Dict[str, Any], engine_module) -> int:
 
     engine = engine_module.InferenceEngine()
 
+    # Confirm the GPU is free + has headroom BEFORE we try to allocate the model.
+    log_gpu_status("antes de init")
+    log_ram_status("antes de init")
+
     # Resume or fresh init
     resume_path = find_latest_checkpoint()
-    if resume_path is not None:
-        log(f"  retomando de {resume_path.relative_to(ROOT)}")
-        ok = engine.load_model(str(resume_path), mcfg)
-    else:
-        log(f"  init fresh com {mcfg.num_layers} layers, d={mcfg.d_model}")
-        ok = engine.load_model("", mcfg)
+    try:
+        if resume_path is not None:
+            log(f"  retomando de {resume_path.relative_to(ROOT)}")
+            ok = engine.load_model(str(resume_path), mcfg)
+        else:
+            log(f"  init fresh com {mcfg.num_layers} layers, d={mcfg.d_model}")
+            ok = engine.load_model("", mcfg)
+    except Exception as exc:
+        log(f"ERRO: load_model lancou {type(exc).__name__}: {exc}")
+        log("  -> em geral e VRAM ocupada por um processo-zumbi de um run travado.")
+        log("  -> rode 'nvidia-smi', mate processos python que ainda seguram a GPU")
+        log("     (ou reinicie a maquina) e tente de novo. Estado atual da GPU:")
+        log_gpu_status("na falha")
+        _dump_gpu_processes()
+        return 1
 
     if not ok:
         log("ERRO: engine.load_model retornou False")
+        log_gpu_status("na falha (ok=False)")
+        _dump_gpu_processes()
         return 1
 
     log(f"  memory after init: {engine.get_memory_usage()}")
+    log_gpu_status("apos carregar modelo")
+    log_ram_status("apos carregar modelo")
 
-    # ── Load datasets to memory in chunks
-    banner("Carregando datasets")
+    # ── Datasets: STREAM from disk. Do NOT load every doc into a Python list --
+    # that pinned the box at ~98% RAM and froze the machine / killed AnyDesk.
+    # A bounded shuffle buffer keeps RAM roughly constant regardless of dataset
+    # size, and the generator cycles epochs forever.
+    banner("Preparando datasets (streaming, RAM controlada)")
     files = enumerate_training_data()
-    docs: List[str] = []
-    for fp in files:
-        for text in iter_documents(fp):
-            if len(text) >= 200:  # filter micro-fragments
-                docs.append(text)
-    log(f"  total documentos carregados: {len(docs):,}")
-    if not docs:
-        log("ERRO: nenhum documento valido apos filtro")
-        return 1
-
-    import random
-    seed = cfg.get("training", {}).get("seed", 1337)
-    random.seed(seed)
-    random.shuffle(docs)
+    seed = int(cfg.get("training", {}).get("seed", 1337))
+    shuffle_buffer = int(cfg.get("training", {}).get("shuffle_buffer_docs", 8192))
+    log(f"  modo: streaming on-demand (buffer {shuffle_buffer} docs)")
+    log_ram_status("apos enumerar datasets")
+    doc_stream = stream_documents(files, min_len=200, buffer_size=shuffle_buffer, seed=seed)
 
     # ── Training loop
     banner("Iniciando treino")
@@ -410,12 +512,13 @@ def run_training(cfg: Dict[str, Any], engine_module) -> int:
 
     losses: List[float] = []
     t_start = time.time()
-    doc_idx = 0
+
+    log_gpu_status("antes do treino")   # confirm the GPU is loaded and about to be used
+    log_ram_status("antes do treino")
 
     for step in range(1, target_steps + 1):
         t0 = time.time()
-        doc = docs[doc_idx % len(docs)]
-        doc_idx += 1
+        doc = next(doc_stream)
 
         try:
             result = engine.train_text(doc[:max_doc_chars])
@@ -435,6 +538,8 @@ def run_training(cfg: Dict[str, Any], engine_module) -> int:
             eta_h = (target_steps - step) * (elapsed / step) / 3600
             log(f"  step={step:>5d}/{target_steps}  loss={avg:.3f}  "
                 f"step_t={step_dt:.2f}s  eta={eta_h:.1f}h")
+            log_gpu_status()   # uso=% confirms the GPU is hot; VRAM tracks the budget
+            log_ram_status()   # should stay flat/low now that we stream
 
         if step % checkpoint_every == 0:
             ckpt = CHECKPOINTS_DIR / f"step_{step:08d}.bin"

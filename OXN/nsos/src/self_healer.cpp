@@ -260,4 +260,22 @@ bool NeuralSelfHealer::verify(const std::vector<int> &tokens,
   return report.success;
 }
 
+std::vector<int> generate_with_self_healing(JambaModel& model,
+                                            const std::vector<int>& prompt,
+                                            int max_tokens,
+                                            HealingReport& report,
+                                            const HealingConfig& cfg) {
+  NeuralSelfHealer healer(cfg);
+  D2FDecoder decoder(&model);
+  healer.set_logits_extractor([&model](const std::vector<int>& ids) -> Tensor {
+    Context c;
+    return model.forward_ids(ids, &c);
+  });
+  healer.set_token_decoder([&decoder](const std::vector<int>& p, int max_len, float temp,
+                                      float top_p, int top_k, int eos, Context* ctx) {
+    return decoder.generate(p, max_len, ctx, temp, top_p, top_k, eos);
+  });
+  return healer.generate_healed(prompt, max_tokens, report);
+}
+
 } // namespace nsos

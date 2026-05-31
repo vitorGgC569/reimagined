@@ -88,6 +88,12 @@ struct ModelConfig {
     // Validated standalone via test_slender_embedding (4 tests PASS).
     bool use_slender_embedding = false;
 
+    // ── KAN FFN (Kolmogorov-Arnold) ──
+    // When true, every non-MoE block replaces its dense gate-up -> squared-ReLU
+    // -> down FFN with a single BitFastKANLayer (learnable RBF activations).
+    // Default false preserves the dense-FFN behavior exactly.
+    bool use_kan = false;
+
     // Training Settings
     bool use_gradient_checkpointing = false;
     float dropout = 0.0f;

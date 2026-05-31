@@ -45,8 +45,8 @@ void launch_cross_entropy_kernel(float *d_loss, float *grad,
                                  int batch, int vocab, int grid_x,
                                  int block_dim);
 void launch_rmsnorm_backward_kernel(float *dx, const float *grad,
-                                    const float *x_norm, int outer,
-                                    int inner);
+                                    const float *x_norm, const float *x,
+                                    int outer, int inner);
 void launch_adamw_update_kernel(float *weights, const float *grad, float *m,
                                 float *v, int n, float beta1, float beta2,
                                 float bc1, float bc2, float lr, float eps,

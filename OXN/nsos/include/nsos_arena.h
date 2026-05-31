@@ -8,6 +8,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <cstdlib>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -56,7 +57,11 @@ public:
     void* alloc(size_t bytes, Device dev) {
         if (dev == Device::GPU) {
             #ifdef USE_CUDA
-            void* ptr; cudaMalloc(&ptr, bytes); return ptr;
+            void* ptr = nullptr;
+            if (cudaMalloc(&ptr, bytes) != cudaSuccess) {
+                return nullptr;  // caller must handle null (return was unchecked)
+            }
+            return ptr;
             #else
             return nullptr;
             #endif
@@ -99,8 +104,20 @@ private:
     ArenaBlock* get_thread_block() {
         static thread_local std::unique_ptr<ArenaBlock> t_block = nullptr;
         if (!t_block) {
-            // Memory is automatically released upon thread destruction
-            t_block = std::make_unique<ArenaBlock>(512 * 1024 * 1024); // 512MB per thread
+            // Edge-friendly default.  Was a flat 512MB/thread -> N*512MB
+            // resident under OpenMP, contradicting the edge-first story.
+            // Overridable via NSOS_ARENA_MB.  Overflow beyond this size is
+            // handled by fallback blocks in alloc(), so a smaller arena only
+            // trades a few extra allocations for much lower RSS.
+            size_t arena_bytes = static_cast<size_t>(64) * 1024 * 1024;
+            if (const char* e = std::getenv("NSOS_ARENA_MB")) {
+                const long mb = std::atol(e);
+                if (mb > 0) {
+                    arena_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+                }
+            }
+            // Memory is automatically released upon thread destruction.
+            t_block = std::make_unique<ArenaBlock>(arena_bytes);
         }
         return t_block.get();
     }

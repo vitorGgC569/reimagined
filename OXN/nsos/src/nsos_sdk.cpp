@@ -1899,6 +1899,14 @@ std::unique_ptr<InferenceEngine> InferenceEngine::clone_for_inference() const {
         if (src == nullptr || dst == nullptr) {
             throw std::runtime_error("Inference replica clone encountered null parameter");
         }
+        // After an edge-pack load the source's packed BitLinear weights are
+        // released (empty data) -- and with mixed precision only SOME layers
+        // are released.  Released params are restored on the replica from the
+        // packed state in the BitLinear loop below, so skip them here instead
+        // of failing the shape check.
+        if (src->data.size == 0) {
+            continue;
+        }
         if (src->base_name != dst->base_name || src->data.shape != dst->data.shape) {
             throw std::runtime_error("Inference replica clone parameter layout mismatch at index " +
                                      std::to_string(index));

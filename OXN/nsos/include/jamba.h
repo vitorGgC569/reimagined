@@ -5,6 +5,7 @@
 #include "bitlinear.h"
 #include "chrass_layer_v2.h"
 #include "embedding.h"
+#include "kan.h"
 #include "mamba2.h"
 #include "mcts_reasoning.h"
 #include "memory_system.h"
@@ -66,6 +67,26 @@ public:
   void set_batch_valid_lengths(const std::vector<int>& lengths) {
     active_batch_valid_lengths_ = lengths;
   }
+  // SSA (Subquadratic Sparse Attention) opt-in.  When enabled, the CPU prefill
+  // attention path routes each head through content-dependent block selection
+  // (see sparse_attention.h) instead of full O(n^2) attention.  Default OFF ->
+  // byte-identical to the existing path.
+  void set_sparse_attention(bool enabled, int block_size = 64,
+                            int top_k_blocks = 8, int local_blocks = 1,
+                            int sink_blocks = 1) {
+    sparse_enabled_ = enabled;
+    ssa_block_size_ = block_size > 0 ? block_size : 64;
+    ssa_top_k_blocks_ = top_k_blocks;
+    ssa_local_blocks_ = local_blocks;
+    ssa_sink_blocks_ = sink_blocks;
+  }
+  bool sparse_attention_enabled() const { return sparse_enabled_; }
+  Parameter* sparse_selector_param() { return &ssa_wsel_; }
+  // Trains the learned block selector (ssa_wsel_) by distilling the dense
+  // attention pattern from the last exact-training forward into the sparse
+  // selector.  Accumulates dWsel into ssa_wsel_.grad; returns the distill loss
+  // (0 if the per-head tensors from the forward are unavailable).
+  float accumulate_selector_distill_grad();
   void reset();
   // Public pre-allocation hook for inference paths.  Reserves the KV
   // cache for `total_tokens` slots up-front so the per-token decode
@@ -110,6 +131,13 @@ private:
   Tensor saved_attn_probs_;
   int saved_input_rank_ = 0;
   bool exact_training_path_ = true;
+  // SSA opt-in state (default OFF preserves exact existing behavior).
+  bool sparse_enabled_ = false;
+  int ssa_block_size_ = 64;
+  int ssa_top_k_blocks_ = 8;
+  int ssa_local_blocks_ = 1;
+  int ssa_sink_blocks_ = 1;
+  Parameter ssa_wsel_;  // learned block-selection routing (init identity)
   void precompute_freqs_cis();
   void clear_kv_cache();
   void ensure_kv_cache_capacity(int required_tokens, Device device, int batch_size = 1);
@@ -174,7 +202,10 @@ public:
              // OXN/nsos/docs/CHRASS_VALIDATION_REPORT.md.
              bool use_chrass = false,
              float chrass_density = 0.10f,
-             uint32_t chrass_seed = 0u);
+             uint32_t chrass_seed = 0u,
+             // ── KAN FFN ── when true, a non-MoE block uses a BitFastKANLayer
+             // in place of the dense gate-up/down FFN.
+             bool use_kan = false);
   ~JambaBlock();
   Tensor forward(const Tensor &x, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
@@ -266,6 +297,8 @@ public:
   std::unique_ptr<MoERouter> router;
   std::vector<std::unique_ptr<BitLinear>> expert_gate_up, expert_down;
   std::unique_ptr<BitLinear> ffn_gate_up, ffn_down;
+  // ── KAN FFN slot — non-null only when use_kan=true (replaces ffn_gate_up/down) ──
+  std::unique_ptr<BitFastKANLayer> kan_ffn;
   // ── CHRASS slot (parallel with FFN) — nullopt unless use_chrass=true ──
   std::unique_ptr<ChrassLayer> chrass_layer;
 };
@@ -275,7 +308,6 @@ public:
   std::vector<std::unique_ptr<JambaBlock>> layers;
   std::unique_ptr<Embedding> embedding;
   std::unique_ptr<BitLinear> value_head;
-  std::unique_ptr<MCTSReasoning> mcts;
 
   JambaModel(int num_layers, int d_model, int vocab_size = 128000, Device device = Device::CPU);
   JambaModel(const ModelConfig& config, Device device = Device::CPU);
@@ -301,6 +333,13 @@ public:
   void backward(const Tensor &grad, Context &ctx);
   std::vector<BitLinear*> collect_bitlinear_layers();
   void set_reference_path(bool use_reference_path);
+  // Enable SSA (Subquadratic Sparse Attention) on every attention layer.
+  void set_sparse_attention(bool enabled, int block_size = 64,
+                            int top_k_blocks = 8, int local_blocks = 1,
+                            int sink_blocks = 1);
+  // Accumulate learned-selector (SSA) distillation grads on every attention
+  // layer (call after an exact-training forward).  Returns total distill loss.
+  float accumulate_sparse_selector_grads();
   // Phase 5b deeper: enable/disable the GPU __dp4a packed-inference
   // fast path on every BitLinear in the model in one call.  Safe to
   // toggle at runtime.  Caller is responsible for ensuring weights

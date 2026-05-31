@@ -52,8 +52,19 @@ public:
                 throw std::runtime_error("Gradient shape mismatch for parameter '" + name + "'");
             }
         }
-        Tensor new_grad = grad.add(incoming);
-        grad.copy_from(new_grad);
+        // In-place accumulation (no per-call allocation) on CPU; GPU falls back
+        // to the tensor add path which handles device memory.  This is on the
+        // optimizer hot path (every parameter, every backward).
+        if (grad.get_device() == Device::CPU &&
+            incoming.get_device() == Device::CPU && grad.size == incoming.size) {
+            float* gp = grad.data();
+            const float* ip = incoming.data();
+            const int n = grad.size;
+            for (int i = 0; i < n; ++i) gp[i] += ip[i];
+        } else {
+            Tensor new_grad = grad.add(incoming);
+            grad.copy_from(new_grad);
+        }
     }
 
     void mark_updated() {

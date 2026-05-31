@@ -773,8 +773,8 @@ extern "C" void launch_cross_entropy_kernel(float *d_loss, float *grad,
 }
 
 __global__ void rmsnorm_backward_kernel(float *dx, const float *grad,
-                                        const float *x_norm, int outer,
-                                        int inner) {
+                                        const float *x_norm, const float *x,
+                                        int outer, int inner) {
   int row = blockIdx.x;
   if (row >= outer) {
     return;
@@ -782,32 +782,42 @@ __global__ void rmsnorm_backward_kernel(float *dx, const float *grad,
 
   const float *row_grad = grad + row * inner;
   const float *row_norm = x_norm + row * inner;
+  const float *row_x = x + row * inner;
   float *row_dx = dx + row * inner;
 
   float partial_dot = 0.0f;
+  float partial_sq = 0.0f;
   for (int col = threadIdx.x; col < inner; col += blockDim.x) {
     partial_dot += row_grad[col] * row_norm[col];
+    partial_sq += row_x[col] * row_x[col];  // sum of squares of the pre-norm input
   }
 
   float dot = block_reduce_sum(partial_dot);
+  __syncthreads();  // reuse of shared reduction buffer between the two reduces
+  float sum_sq = block_reduce_sum(partial_sq);
   __shared__ float s_dot;
+  __shared__ float s_inv_rms;
   if (threadIdx.x == 0) {
     s_dot = dot / max(inner, 1);
+    // Exact RMSNorm Jacobian: dx = (1/rms) * (g - y * mean(g.y)), with
+    // rms = sqrt(mean(x^2) + eps).  Mirrors the CPU path in tensor.cpp.
+    s_inv_rms = rsqrtf(sum_sq / (float)max(inner, 1) + 1e-6f);
   }
   __syncthreads();
 
   for (int col = threadIdx.x; col < inner; col += blockDim.x) {
-    row_dx[col] = row_grad[col] - row_norm[col] * s_dot;
+    row_dx[col] = (row_grad[col] - row_norm[col] * s_dot) * s_inv_rms;
   }
 }
 
 extern "C" void launch_rmsnorm_backward_kernel(float *dx, const float *grad,
-                                               const float *x_norm, int outer,
+                                               const float *x_norm,
+                                               const float *x, int outer,
                                                int inner) {
   int threads_per_block = min(
       256, max(WARP_SIZE, ((inner + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE));
-  rmsnorm_backward_kernel<<<outer, threads_per_block>>>(dx, grad, x_norm, outer,
-                                                        inner);
+  rmsnorm_backward_kernel<<<outer, threads_per_block>>>(dx, grad, x_norm, x,
+                                                        outer, inner);
 }
 
 __global__ void adamw_update_kernel(float *weights, const float *grad, float *m,

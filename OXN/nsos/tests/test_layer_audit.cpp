@@ -122,6 +122,16 @@ int main() {
         const std::filesystem::path audit_json = audit_report_path(preserve_audit_report);
         require(engine.save_model_pack(pack_dir.string()), "save_model_pack failed");
 
+        // The model pack bundles an edge (1.58-bit) linear pack, so load_model
+        // releases the FP32 weights and serves ternary by default.  This is a
+        // pack ROUND-TRIP PARITY test (before vs after within 1e-5), which only
+        // makes sense on the FP32 reference path -- opt into it via the
+        // documented escape hatch so we compare like-for-like.
+#if defined(_WIN32)
+        _putenv_s("NSOS_KEEP_FP32_WEIGHTS", "1");
+#else
+        setenv("NSOS_KEEP_FP32_WEIGHTS", "1", 1);
+#endif
         InferenceEngine reloaded;
         require(reloaded.load_model(pack_dir.string(), ModelConfig{}),
                 "reload model pack failed");
