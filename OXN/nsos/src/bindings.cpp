@@ -116,6 +116,7 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("num_experts", &ModelConfig::num_experts)
         .def_readwrite("num_experts_per_token", &ModelConfig::num_experts_per_token)
         .def_readwrite("use_moe", &ModelConfig::use_moe)
+        .def_readwrite("use_kan", &ModelConfig::use_kan)
         .def_readwrite("moe_period", &ModelConfig::moe_period)
         .def_readwrite("moe_slot", &ModelConfig::moe_slot)
         // Cherry-pick #4: Nemotron K·m invariant — override of default
@@ -526,6 +527,29 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def("train_text",
              py::overload_cast<const std::string&>(&InferenceEngine::train_step),
              py::arg("text"))
+        .def("configure_progressive_qat",
+             [](InferenceEngine& e, const TrainPhaseScheduler& s) {
+                 if (!e.trainer)
+                     throw std::runtime_error(
+                         "configure_progressive_qat: engine nao inicializado (chame load_model primeiro)");
+                 e.trainer->configure_progressive_qat(s);
+             },
+             py::arg("scheduler"))
+        .def("progressive_qat_active",
+             [](InferenceEngine& e) {
+                 return e.trainer ? e.trainer->progressive_qat_active() : false;
+             })
+        .def("set_sparse_attention",
+             [](InferenceEngine& e, bool enabled, int block_size, int top_k_blocks,
+                int local_blocks, int sink_blocks) {
+                 if (!e.model)
+                     throw std::runtime_error(
+                         "set_sparse_attention: modelo nao inicializado (chame load_model primeiro)");
+                 e.model->set_sparse_attention(enabled, block_size, top_k_blocks,
+                                               local_blocks, sink_blocks);
+             },
+             py::arg("enabled"), py::arg("block_size") = 64, py::arg("top_k_blocks") = 8,
+             py::arg("local_blocks") = 1, py::arg("sink_blocks") = 1)
         .def("self_heal", py::overload_cast<>(&InferenceEngine::self_heal))
         .def("self_heal_response",
              py::overload_cast<const std::string&, const std::string&>(&InferenceEngine::self_heal),
