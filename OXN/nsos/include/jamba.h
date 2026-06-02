@@ -156,6 +156,11 @@ private:
   std::pair<Tensor, Tensor> apply_rope_backward(const Tensor& grad_q_rot,
                                                 const Tensor& grad_k_rot,
                                                 int start_pos = 0);
+  // Dedicated SSA (sparse attention) forward for the non-streaming rank-1/2/3
+  // paths.  Routes per-head through sparse_selective_attention (GPU kernel when
+  // on device) instead of the dense fast-paths; entered from forward() when
+  // sparse attention is enabled.  Keeps the dense maze untouched.
+  Tensor sparse_forward(const Tensor &input, Context *ctx);
 };
 
 class MoERouter {

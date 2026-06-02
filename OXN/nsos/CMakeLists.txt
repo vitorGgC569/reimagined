@@ -546,11 +546,12 @@ if (NSOS_BUILD_TESTS)
     target_include_directories(test_gpu_parity_sparse_attention PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_sparse_attention COMMAND test_gpu_parity_sparse_attention)
 
-    # NOTE: tests/gpu/test_gpu_parity_jamba_sparse.cpp exists but is intentionally
-    # NOT wired into CTest yet — it is the (currently red) gate for WS-6b.  It
-    # proves SSA is not applied by forward_ids_batch (effect=0 even on CPU): the
-    # batch path in Attention::forward has no sparse branch.  Wire it in once the
-    # batch attention path routes through sparse_selective_attention.
+    # End-to-end: Jamba forward with SSA enabled must match CPU on GPU and must
+    # actually differ from dense (gate for the WS-6b sparse_forward wiring).
+    add_executable(test_gpu_parity_jamba_sparse tests/gpu/test_gpu_parity_jamba_sparse.cpp)
+    target_link_libraries(test_gpu_parity_jamba_sparse PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_jamba_sparse PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_jamba_sparse COMMAND test_gpu_parity_jamba_sparse)
 
     # BitLinear::forward GPU __dp4a inference fast path (Phase 5b).
     add_executable(test_gpu_parity_bitlinear_dp4a tests/gpu/test_gpu_parity_bitlinear_dp4a.cpp)

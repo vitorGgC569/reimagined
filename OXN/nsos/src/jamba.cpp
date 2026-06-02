@@ -2729,6 +2729,162 @@ std::pair<Tensor, Tensor> Attention::apply_rope_backward(const Tensor& grad_q_ro
     return {grad_q, grad_k};
 }
 
+Tensor Attention::sparse_forward(const Tensor& input, Context* ctx) {
+    (void)ctx;
+    const Device original_device = input.get_device();
+
+    Tensor project_input = input;
+    int batch_size = 1;
+    int seq_len = 1;
+    if (input.shape.size() == 1) {
+        project_input = input.reshape({1, 1, d_model});
+        saved_valid_lengths_ = {1};
+    } else if (input.shape.size() == 2) {
+        seq_len = input.shape[0];
+        project_input = input.reshape({1, seq_len, d_model});
+        saved_valid_lengths_ = {seq_len};
+    } else {
+        batch_size = input.shape[0];
+        seq_len = input.shape[1];
+        saved_valid_lengths_ =
+            normalize_valid_lengths(active_batch_valid_lengths_, batch_size, seq_len);
+    }
+    saved_input_rank_ = static_cast<int>(input.shape.size());
+
+    const int kv_dim = n_kv_heads * head_dim;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    Tensor q_flat = q_down_proj->forward(project_input);
+    Tensor kv_flat = kv_down_proj->forward(project_input);
+
+    // Sparse attention math (block selection + softmax) runs on host pointers;
+    // bring projections to CPU for the per-head extraction and for backward
+    // (Attention::backward consumes saved_*_ as CPU tensors).
+    Tensor q_host = q_flat.get_device() == Device::GPU ? q_flat.cpu() : q_flat;
+    Tensor kv_host = kv_flat.get_device() == Device::GPU ? kv_flat.cpu() : kv_flat;
+
+    Tensor k_flat({batch_size, seq_len, kv_dim}, Device::CPU);
+    Tensor v_flat({batch_size, seq_len, kv_dim}, Device::CPU);
+    {
+        const float* kv_ptr = kv_host.data();
+        float* k_ptr = k_flat.data();
+        float* v_ptr = v_flat.data();
+        const size_t token_stride = static_cast<size_t>(2 * kv_dim);
+        for (int batch = 0; batch < batch_size; ++batch) {
+            for (int token = 0; token < seq_len; ++token) {
+                const size_t in_off =
+                    (static_cast<size_t>(batch) * seq_len + token) * token_stride;
+                const size_t out_off =
+                    (static_cast<size_t>(batch) * seq_len + token) *
+                    static_cast<size_t>(kv_dim);
+                std::memcpy(k_ptr + out_off, kv_ptr + in_off,
+                            static_cast<size_t>(kv_dim) * sizeof(float));
+                std::memcpy(v_ptr + out_off, kv_ptr + in_off + static_cast<size_t>(kv_dim),
+                            static_cast<size_t>(kv_dim) * sizeof(float));
+            }
+        }
+    }
+
+    Tensor q_heads = q_host.reshape({batch_size, seq_len, n_heads, head_dim});
+    Tensor k_heads = k_flat.reshape({batch_size, seq_len, n_kv_heads, head_dim});
+    Tensor v_heads = v_flat.reshape({batch_size, seq_len, n_kv_heads, head_dim});
+    auto [q_rot, k_rot] = apply_rope(q_heads, k_heads, 0);
+
+    saved_q_rot_ = q_rot;
+    saved_k_rot_ = k_rot;
+    saved_v_heads_ = v_heads;
+    saved_attn_probs_ = Tensor();
+
+    SparseAttentionConfig cfg;
+    cfg.block_size = ssa_block_size_;
+    cfg.top_k_blocks = ssa_top_k_blocks_;
+    cfg.local_blocks = ssa_local_blocks_;
+    cfg.sink_blocks = ssa_sink_blocks_;
+    cfg.scale = scale;
+
+    // Learned block-selection routing, materialised on the compute device so the
+    // GPU kernel path can score blocks with it (empty/unmatched shape -> raw q).
+    Tensor wsel_dev;
+    const Tensor* wsel_ptr = nullptr;
+    if (ssa_wsel_.data.size > 0) {
+        if (original_device == Device::GPU) {
+            wsel_dev = ssa_wsel_.data.get_device() == Device::GPU
+                           ? ssa_wsel_.data
+                           : ssa_wsel_.data.to(Device::GPU);
+        } else {
+            wsel_dev = ssa_wsel_.data.get_device() == Device::GPU
+                           ? ssa_wsel_.data.cpu()
+                           : ssa_wsel_.data;
+        }
+        wsel_ptr = &wsel_dev;
+    }
+
+    Tensor output_heads({batch_size, seq_len, n_heads, head_dim}, Device::CPU);
+    std::fill_n(output_heads.data(),
+                static_cast<size_t>(batch_size) * seq_len * n_heads * head_dim, 0.0f);
+    float* out_ptr = output_heads.data();
+    const float* q_ptr = q_rot.data();
+    const float* k_ptr = k_rot.data();
+    const float* v_ptr = v_heads.data();
+
+    for (int batch = 0; batch < batch_size; ++batch) {
+        const int valid_len =
+            std::clamp(saved_valid_lengths_[static_cast<size_t>(batch)], 0, seq_len);
+        if (valid_len <= 0) continue;
+        for (int head = 0; head < n_heads; ++head) {
+            const int kv_head = std::min(head / kv_group_size, n_kv_heads - 1);
+            Tensor Qh({valid_len, head_dim}, Device::CPU);
+            Tensor Kh({valid_len, head_dim}, Device::CPU);
+            Tensor Vh({valid_len, head_dim}, Device::CPU);
+            float* qh = Qh.data();
+            float* kh = Kh.data();
+            float* vh = Vh.data();
+            for (int t = 0; t < valid_len; ++t) {
+                const size_t q_off =
+                    (((static_cast<size_t>(batch) * seq_len + t) * n_heads) + head) *
+                    static_cast<size_t>(head_dim);
+                const size_t kv_off =
+                    (((static_cast<size_t>(batch) * seq_len + t) * n_kv_heads) + kv_head) *
+                    static_cast<size_t>(head_dim);
+                for (int dd = 0; dd < head_dim; ++dd) {
+                    qh[static_cast<size_t>(t) * head_dim + dd] = q_ptr[q_off + dd];
+                    kh[static_cast<size_t>(t) * head_dim + dd] = k_ptr[kv_off + dd];
+                    vh[static_cast<size_t>(t) * head_dim + dd] = v_ptr[kv_off + dd];
+                }
+            }
+            Tensor Oh;
+            if (original_device == Device::GPU) {
+                Oh = sparse_selective_attention(Qh.to(Device::GPU), Kh.to(Device::GPU),
+                                                Vh.to(Device::GPU), cfg, nullptr, wsel_ptr)
+                         .cpu();
+            } else {
+                Oh = sparse_selective_attention(Qh, Kh, Vh, cfg, nullptr, wsel_ptr);
+            }
+            const float* oh = Oh.data();
+            for (int t = 0; t < valid_len; ++t) {
+                const size_t o_off =
+                    (((static_cast<size_t>(batch) * seq_len + t) * n_heads) + head) *
+                    static_cast<size_t>(head_dim);
+                for (int dd = 0; dd < head_dim; ++dd) {
+                    out_ptr[o_off + dd] = oh[static_cast<size_t>(t) * head_dim + dd];
+                }
+            }
+        }
+    }
+
+    Tensor output_2d = output_heads.reshape({batch_size, seq_len, d_model});
+    Tensor projected_input =
+        (original_device == Device::GPU) ? output_2d.to(Device::GPU) : output_2d;
+    Tensor projected = out_proj->forward(projected_input);
+    if (saved_input_rank_ == 1) {
+        return projected.reshape({d_model});
+    }
+    if (saved_input_rank_ == 2) {
+        return projected.reshape({seq_len, d_model});
+    }
+    return projected;
+}
+
 Tensor Attention::forward(const Tensor& input, Context* ctx) {
     (void)ctx;
     saved_q_rot_ = Tensor();
@@ -2736,6 +2892,15 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
     saved_v_heads_ = Tensor();
     saved_attn_probs_ = Tensor();
     saved_valid_lengths_.clear();
+    // SSA: route non-streaming forward through the dedicated sparse path.  The
+    // dense fast-paths below do not apply SSA (the batch/rank-3 path is
+    // dense-only), so without this branch a sparse-enabled model silently runs
+    // dense.  Streaming decode keeps the existing per-step path.
+    if (sparse_enabled_ && !streaming_inference_ &&
+        (input.shape.size() == 1 || input.shape.size() == 2 ||
+         input.shape.size() == 3)) {
+        return sparse_forward(input, ctx);
+    }
     if (training_mode_ && exact_training_path_ && !streaming_inference_ &&
         (input.shape.size() == 1 || input.shape.size() == 2 || input.shape.size() == 3)) {
         const Device original_device = input.get_device();
