@@ -48,6 +48,7 @@ set(NSOS_CORE_SOURCES
     src/kan.cpp
     src/ttt_layer.cpp
     src/trainer.cpp
+    src/optimizer_4bit.cpp
     src/layer_audit.cpp
     src/tokenizer.cpp
     src/nsos_sdk.cpp
@@ -206,6 +207,8 @@ if (NSOS_ENABLE_CUDA)
             src/cuda/moe_kernels.cu
             src/cuda/bitnet_kernels.cu
             src/cuda/flash_attention.cu
+            src/cuda/kan_kernels.cu
+            src/cuda/sparse_attention_kernels.cu
         )
         # PUBLIC because tensor.h includes <cuda_runtime.h> when USE_CUDA
         # is defined; tests/CLI/API targets that link nsos_core need to
@@ -424,6 +427,12 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_kan PRIVATE nsos_core)
     add_test(NAME test_kan COMMAND test_kan)
 
+    # 4-bit optimizer states (Li et al. 2023): roundtrip error, zero-point
+    # robustness of v, end-to-end Adam parity vs FP32, ~8x memory saving.
+    add_executable(test_optimizer_4bit tests/test_optimizer_4bit.cpp)
+    target_link_libraries(test_optimizer_4bit PRIVATE nsos_core)
+    add_test(NAME test_optimizer_4bit COMMAND test_optimizer_4bit)
+
     add_executable(test_ttt_layer_kernel tests/test_ttt_layer_kernel.cpp)
     target_link_libraries(test_ttt_layer_kernel PRIVATE nsos_core)
     add_test(NAME test_ttt_layer_kernel COMMAND test_ttt_layer_kernel)
@@ -524,6 +533,24 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gpu_parity_bitnet_dispatch PRIVATE nsos_core)
     target_include_directories(test_gpu_parity_bitnet_dispatch PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_bitnet_dispatch COMMAND test_gpu_parity_bitnet_dispatch)
+
+    # KAN RBF-basis CUDA kernels (forward + backward derivative) parity.
+    add_executable(test_gpu_parity_kan tests/gpu/test_gpu_parity_kan.cpp)
+    target_link_libraries(test_gpu_parity_kan PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_kan PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_kan COMMAND test_gpu_parity_kan)
+
+    # SSA block-sparse attention CUDA kernels parity (raw + learned Wsel router).
+    add_executable(test_gpu_parity_sparse_attention tests/gpu/test_gpu_parity_sparse_attention.cpp)
+    target_link_libraries(test_gpu_parity_sparse_attention PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_sparse_attention PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_sparse_attention COMMAND test_gpu_parity_sparse_attention)
+
+    # NOTE: tests/gpu/test_gpu_parity_jamba_sparse.cpp exists but is intentionally
+    # NOT wired into CTest yet — it is the (currently red) gate for WS-6b.  It
+    # proves SSA is not applied by forward_ids_batch (effect=0 even on CPU): the
+    # batch path in Attention::forward has no sparse branch.  Wire it in once the
+    # batch attention path routes through sparse_selective_attention.
 
     # BitLinear::forward GPU __dp4a inference fast path (Phase 5b).
     add_executable(test_gpu_parity_bitlinear_dp4a tests/gpu/test_gpu_parity_bitlinear_dp4a.cpp)

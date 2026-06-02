@@ -4,6 +4,10 @@
 #include <cmath>
 #include <stdexcept>
 
+#ifdef USE_CUDA
+#include "../include/cuda/kan_kernels.cuh"
+#endif
+
 namespace nsos {
 
 namespace {
@@ -37,6 +41,17 @@ Tensor BitFastKANLayer::compute_basis(const Tensor& flat_input) const {
 
     const int rows = flat_input.shape[0];
     Tensor basis({rows, input_dim * grid_size}, flat_input.get_device());
+
+#ifdef USE_CUDA
+    if (flat_input.get_device() == Device::GPU) {
+        ensure_grid_on_device();
+        cuda::launch_kan_rbf_basis_forward(
+            flat_input.raw_data(), centers_dev_.raw_data(), widths_dev_.raw_data(),
+            basis.raw_data(), rows, input_dim, grid_size);
+        return basis;
+    }
+#endif
+
     const float* x_ptr = flat_input.data();
     float* basis_ptr = basis.data();
 
@@ -53,6 +68,25 @@ Tensor BitFastKANLayer::compute_basis(const Tensor& flat_input) const {
     }
 
     return basis;
+}
+
+void BitFastKANLayer::ensure_grid_on_device() const {
+#ifdef USE_CUDA
+    if (centers_dev_.size == grid_size &&
+        centers_dev_.get_device() == Device::GPU &&
+        widths_dev_.size == grid_size &&
+        widths_dev_.get_device() == Device::GPU) {
+        return;
+    }
+    Tensor c({grid_size}, Device::CPU);
+    Tensor w({grid_size}, Device::CPU);
+    for (int g = 0; g < grid_size; ++g) {
+        c.data()[g] = centers_[g];
+        w.data()[g] = widths_[g];
+    }
+    centers_dev_ = c.to(Device::GPU);
+    widths_dev_ = w.to(Device::GPU);
+#endif
 }
 
 Tensor BitFastKANLayer::forward(const Tensor& x) {
@@ -91,6 +125,22 @@ Tensor BitFastKANLayer::backward(const Tensor& grad) {
     Tensor grad_basis = grad_2d.matmul(rbf_weight.data);
 
     const int rows = saved_input_.shape[0];
+
+#ifdef USE_CUDA
+    if (saved_input_.get_device() == Device::GPU) {
+        ensure_grid_on_device();
+        // grad_input already holds grad_2d @ base_weight; the kernel adds the
+        // RBF term in place.  grad_basis is on GPU (matmul of GPU operands).
+        cuda::launch_kan_rbf_basis_backward(
+            saved_input_.raw_data(), grad_basis.raw_data(),
+            centers_dev_.raw_data(), widths_dev_.raw_data(),
+            grad_input.raw_data(), rows, input_dim, grid_size);
+        return grad.shape.size() == 2
+                   ? grad_input
+                   : grad_input.reshape({grad.shape[0], grad.shape[1], input_dim});
+    }
+#endif
+
     const float* x_ptr = saved_input_.data();
     const float* grad_basis_ptr = grad_basis.data();
     float* grad_input_ptr = grad_input.data();

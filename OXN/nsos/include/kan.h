@@ -25,8 +25,14 @@ private:
     Tensor saved_basis_;
     std::vector<float> centers_;
     std::vector<float> widths_;
+    // Device copies of the (fixed) RBF grid, lazily uploaded on first GPU use
+    // so the CUDA basis kernels can read them.  Mutable: populated from the
+    // const compute_basis path.
+    mutable Tensor centers_dev_;
+    mutable Tensor widths_dev_;
 
     Tensor compute_basis(const Tensor& flat_input) const;
+    void ensure_grid_on_device() const;
 };
 
 } // namespace nsos

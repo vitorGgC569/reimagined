@@ -480,6 +480,9 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("global_step_count", &Trainer::global_step_count)
         .def_readwrite("total_training_steps", &Trainer::total_training_steps)
         .def_readwrite("eos_token_id", &Trainer::eos_token_id)
+        // 4-bit optimizer states (Li et al. 2023): set to 4 to cut optimizer
+        // memory ~8x on the CPU training path (default 32 = FP32 m/v).
+        .def_readwrite("optimizer_state_bits", &Trainer::optimizer_state_bits)
         .def_readwrite("phase_scheduler", &Trainer::phase_scheduler)
         .def_readwrite("last_auxiliary_stats", &Trainer::last_auxiliary_stats)
         .def("configure_progressive_qat", &Trainer::configure_progressive_qat, py::arg("scheduler"))

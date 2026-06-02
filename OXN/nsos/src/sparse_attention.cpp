@@ -6,6 +6,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef USE_CUDA
+#include "cuda/sparse_attention_kernels.cuh"
+#endif
+
 namespace nsos {
 
 Tensor dense_causal_attention(const Tensor& Q, const Tensor& K, const Tensor& V,
@@ -62,6 +66,31 @@ Tensor sparse_selective_attention(const Tensor& Q, const Tensor& K,
   if (scale <= 0.0f) {
     scale = 1.0f / std::sqrt(static_cast<float>(d));
   }
+
+#ifdef USE_CUDA
+  // GPU fast path: all operands on device, no stats requested (stats need
+  // host-side counters), and within the kernel caps (head dim <= 256, top_k
+  // <= 64).  Matches the CPU result within float tolerance (parity-tested).
+  if (Q.get_device() == Device::GPU && K.get_device() == Device::GPU &&
+      V.get_device() == Device::GPU && stats == nullptr && d <= 256 &&
+      cfg.top_k_blocks <= 64) {
+    Tensor route_owned;
+    const Tensor* route_t = &Q;  // default: raw query routes block selection
+    if (Wsel != nullptr && Wsel->shape.size() == 2 && Wsel->shape[0] == d &&
+        Wsel->shape[1] == d) {
+      route_owned = Q.matmul(Wsel->transpose());  // route[i] = Wsel @ q[i]
+      route_t = &route_owned;
+    }
+    Tensor bm({nb, d}, Device::GPU);
+    cuda::launch_sparse_block_means(K.raw_data(), bm.raw_data(), n, d, B);
+    Tensor out_gpu({n, d}, Device::GPU);
+    cuda::launch_sparse_selective_attention(
+        Q.raw_data(), K.raw_data(), V.raw_data(), route_t->raw_data(),
+        bm.raw_data(), out_gpu.raw_data(), n, d, B, cfg.top_k_blocks,
+        cfg.local_blocks, cfg.sink_blocks, scale);
+    return out_gpu;
+  }
+#endif
 
   const float* q = Q.data();
   const float* k = K.data();

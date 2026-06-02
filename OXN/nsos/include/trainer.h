@@ -1,6 +1,7 @@
 #pragma once
 #include "autograd.h"
 #include "jamba.h"
+#include "optimizer_4bit.h"
 #include <vector>
 #include <functional>
 #include <unordered_map>
@@ -70,9 +71,17 @@ public:
     int total_training_steps = 1000; // Valor base para o scheduler de LR
     int eos_token_id = 0;
 
+    // Optimizer-state precision.  32 = FP32 m/v (default, current path).  4 =
+    // 4-bit packed m/v (Li et al. 2023) — ~8x less optimizer memory.  The 4-bit
+    // path engages only for parameters resident on CPU; GPU parameters keep the
+    // FP32 path until the CUDA 4-bit kernel lands (Phase 2).
+    int optimizer_state_bits = 32;
+
     // Buffers de Memória AdamW (M = First Moment, V = Second Moment)
     std::unordered_map<Parameter*, Tensor> m_state;
     std::unordered_map<Parameter*, Tensor> v_state;
+    // 4-bit packed Adam state (used when optimizer_state_bits == 4).
+    std::unordered_map<Parameter*, Quant4OptState> quant_state;
     TrainPhaseScheduler phase_scheduler;
     AuxiliaryStackStats last_auxiliary_stats;
     Trainer(JambaModel* m, float lr = 0.001f);

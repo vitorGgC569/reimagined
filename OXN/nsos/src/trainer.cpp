@@ -752,6 +752,75 @@ float compute_current_lr(const Trainer& trainer) {
     return floor + (trainer.learning_rate - floor) * cosine;
 }
 
+// 4-bit Adam step (Li et al. 2023, "Memory Efficient Optimizers with 4-bit
+// States").  Dequantises the packed m/v state into FP32 scratch, runs the
+// identical Adam update used by the FP32 path below, then re-quantises.  Trades
+// a little compute per step for ~8x less optimizer-state memory.  Engaged only
+// for CPU parameters (the GPU 4-bit kernel is a Phase-2 item); GPU parameters
+// keep the FP32 launch_adamw_update_kernel path.
+static void apply_adam_step_4bit(Trainer& trainer,
+                                 Parameter* p,
+                                 float cur_lr,
+                                 float bc1,
+                                 float bc2) {
+    const int n = p->data.size;
+    Quant4OptState& st = trainer.quant_state[p];
+
+    static thread_local std::vector<float> m_buf;
+    static thread_local std::vector<float> v_buf;
+    m_buf.resize(static_cast<size_t>(n));
+    v_buf.resize(static_cast<size_t>(n));
+
+    if (st.n != n) {
+        // First visit (or a reshape under us): start from zeroed moments.
+        for (int i = 0; i < n; ++i) {
+            m_buf[i] = 0.0f;
+            v_buf[i] = 0.0f;
+        }
+    } else {
+        quant4_load_m(st, m_buf.data(), n);
+        quant4_load_v(st, v_buf.data(), n);
+    }
+
+    float* w = p->data.data();
+    const float* g = p->grad.data();
+    const bool apply_wd =
+        trainer.weight_decay > 0.0f && should_apply_weight_decay(*p);
+
+    for (int i = 0; i < n; ++i) {
+        m_buf[i] = trainer.beta1 * m_buf[i] + (1.0f - trainer.beta1) * g[i];
+        v_buf[i] = trainer.beta2 * v_buf[i] + (1.0f - trainer.beta2) * g[i] * g[i];
+
+        const float m_hat = m_buf[i] / bc1;
+        const float v_hat = v_buf[i] / bc2;
+
+        if (apply_wd) {
+            w[i] -= cur_lr * trainer.weight_decay * w[i];
+        }
+        w[i] -= cur_lr * m_hat / (std::sqrt(v_hat) + trainer.eps);
+    }
+
+    // Treat 2-D states as matrices so v gets the paper's rank-1 normalisation;
+    // fold higher-rank tensors to 2-D by their last dimension (rows<=0 disables
+    // rank-1 and the v path falls back to block-wise abs-max).
+    int rows = 0;
+    int cols = 0;
+    const std::vector<int>& dims = p->data.shape.dims;
+    if (dims.size() >= 2) {
+        cols = dims.back();
+        if (cols > 0 && n % cols == 0) {
+            rows = n / cols;
+        } else {
+            rows = 0;
+            cols = 0;
+        }
+    }
+
+    quant4_store_m(m_buf.data(), n, st);
+    quant4_store_v(v_buf.data(), n, rows, cols, st);
+    p->mark_updated();
+}
+
 void apply_optimizer_step(Trainer& trainer,
                           const std::vector<Parameter*>& params,
                           int accumulation_steps,
@@ -782,6 +851,15 @@ void apply_optimizer_step(Trainer& trainer,
     // branch never fires after warmup.
     for (auto* p : params) {
         if (!p || p->grad.size == 0) continue;
+
+        // 4-bit optimizer states (CPU path).  GPU params fall through to the
+        // FP32 launch_adamw_update_kernel path below until the 4-bit CUDA
+        // kernel lands.
+        if (trainer.optimizer_state_bits == 4 &&
+            p->data.get_device() == Device::CPU) {
+            apply_adam_step_4bit(trainer, p, cur_lr, bc1, bc2);
+            continue;
+        }
 
         auto m_it = trainer.m_state.find(p);
         if (m_it == trainer.m_state.end()) {
