@@ -23,7 +23,12 @@ public static class DocumentTextExtractor
     {
         if (!File.Exists(path)) return string.Empty;
 
-        var encodings = new[] { Encoding.UTF8, Encoding.Latin1, Encoding.GetEncoding(1252) };
+        // .NET 8 não traz a code page 1252 por padrão (GetEncoding(1252) lança sem
+        // CodePagesEncodingProvider). UTF-8 + Latin1 cobrem documentos PT-BR; o 1252
+        // entra só se disponível. Construção guardada — nunca quebra a leitura.
+        Encoding[] encodings;
+        try { encodings = new[] { Encoding.UTF8, Encoding.Latin1, Encoding.GetEncoding(1252) }; }
+        catch { encodings = new[] { Encoding.UTF8, Encoding.Latin1 }; }
         foreach (var enc in encodings)
         {
             try

@@ -5,38 +5,55 @@ using System.Text.RegularExpressions;
 namespace OContabil.Services;
 
 /// <summary>
-/// Fallback determinístico baseado em expressões regulares para documentos
-/// fiscais brasileiros. Não depende de Python nem de ONNX e funciona como
-/// rede de segurança quando os motores principais estão indisponíveis.
+/// Extrator determinístico (rótulo + padrão) para documentos fiscais brasileiros.
+/// Não depende de Python nem de ONNX. Combina busca por rótulo ("Valor: R$ ...")
+/// com padrões fortes (CNPJ validado, R$, datas, chave 44 díg, linha digitável)
+/// por tipo de documento. Toda a extração é guardada — nunca lança — de modo que
+/// um documento legível nunca cai em "Erro" por falha do extrator.
 /// </summary>
 public static class RegexExtractionService
 {
-    private static readonly Regex CnpjRegex = new(@"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", RegexOptions.Compiled);
-    private static readonly Regex CpfRegex = new(@"\d{3}\.?\d{3}\.?\d{3}-?\d{2}", RegexOptions.Compiled);
-    private static readonly Regex DateRegex = new(@"\b(\d{2}/\d{2}/\d{4})\b", RegexOptions.Compiled);
-    private static readonly Regex MoneyRegex = new(@"R\$\s*([\d\.]+,\d{2})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex AccessKeyRegex = new(@"\b\d{44}\b", RegexOptions.Compiled);
-    private static readonly Regex BoletoLineRegex = new(@"\d{47,48}", RegexOptions.Compiled);
+    private const RegexOptions O = RegexOptions.Compiled | RegexOptions.IgnoreCase;
+
+    private static readonly Regex CnpjRx = new(@"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", RegexOptions.Compiled);
+    private static readonly Regex CpfRx = new(@"\d{3}\.?\d{3}\.?\d{3}-?\d{2}", RegexOptions.Compiled);
+    private static readonly Regex DateRx = new(@"\b(\d{2}/\d{2}/\d{4})\b", RegexOptions.Compiled);
+    private static readonly Regex CompetenciaRx = new(@"\b(\d{2}/\d{4})\b", RegexOptions.Compiled);
+    private static readonly Regex MoneyRx = new(@"R\$\s*(\d{1,3}(?:\.\d{3})*,\d{2})", O);
+    private static readonly Regex MoneyBareRx = new(@"\b(\d{1,3}(?:\.\d{3})*,\d{2})\b", RegexOptions.Compiled);
+    private static readonly Regex AccessKeyRx = new(@"\b\d{44}\b", RegexOptions.Compiled);
+    // Linha digitável formatada (5.5 5.6 5.6 1 14) — mais confiável que dígitos crus.
+    private static readonly Regex LinhaFmtRx = new(@"\d{5}\.\d{5}\s+\d{5}\.\d{6}\s+\d{5}\.\d{6}\s+\d\s+\d{14}", RegexOptions.Compiled);
 
     public static GlinerResult Extract(string text, string docType, double threshold)
     {
         if (string.IsNullOrWhiteSpace(text))
             return new GlinerResult { Success = false, Error = "Texto vazio." };
 
-        var fields = docType switch
+        Dictionary<string, object> fields;
+        try
         {
-            "Boleto" => ExtractBoleto(text),
-            "Holerite" => ExtractHolerite(text),
-            "ExtratoBancario" => ExtractExtrato(text),
-            "DARF" => ExtractDarf(text),
-            "DANFE" => ExtractDanfe(text),
-            _ => ExtractNotaFiscal(text)
-        };
+            fields = docType switch
+            {
+                "Boleto" => ExtractBoleto(text),
+                "Holerite" => ExtractHolerite(text),
+                "ExtratoBancario" => ExtractExtrato(text),
+                "DARF" => ExtractDarf(text),
+                "DANFE" => ExtractDanfe(text),
+                _ => ExtractNotaFiscal(text)
+            };
+        }
+        catch
+        {
+            // Nunca falhar por causa do extrator — devolve genérico do que der.
+            fields = ExtractGeneric(text);
+        }
 
-        // Calcula confiança a partir da densidade de campos extraídos.
+        if (fields.Count == 0) fields = ExtractGeneric(text);
+
         var expected = ExpectedFieldsCount(docType);
-        var coverage = expected == 0 ? 0.0 : (double)fields.Count / expected;
-        var confidence = Math.Min(0.95, 0.55 + (coverage * 0.40));
+        var coverage = expected == 0 ? 0.0 : Math.Min(1.0, (double)fields.Count / expected);
+        var confidence = Math.Round(Math.Min(0.95, 0.50 + coverage * 0.45), 4);
 
         var groupKey = docType switch
         {
@@ -56,12 +73,12 @@ public static class RegexExtractionService
             Success = true,
             Model = "regex-fallback",
             Extraction = doc.RootElement.Clone(),
-            AvgConfidence = Math.Round(confidence, 4),
+            AvgConfidence = confidence,
             EntityCount = fields.Count,
             ThresholdUsed = threshold,
             OcrText = text.Length > 1500 ? text[..1500] + "..." : text,
             TextLength = text.Length,
-            Note = "Extracao via regex (fallback)."
+            Note = "Extracao deterministica (rotulo+padrao)."
         };
     }
 
@@ -69,138 +86,300 @@ public static class RegexExtractionService
     {
         "Boleto" => 6,
         "Holerite" => 8,
-        "ExtratoBancario" => 5,
+        "ExtratoBancario" => 6,
         "DARF" => 6,
         "DANFE" => 9,
         _ => 7
     };
 
+    // ── Extractors por tipo ───────────────────────────────────────────────
+
+    private static Dictionary<string, object> ExtractBoleto(string text)
+    {
+        var f = new Dictionary<string, object>();
+
+        // Linha digitável: preferir a formatada; senão a linha rotulada.
+        var linha = LinhaFmtRx.Match(text);
+        string? linhaDig = linha.Success ? Regex.Replace(linha.Value, @"\D", "") : null;
+        if (linhaDig == null)
+        {
+            var lblLine = LineWith(text, "linha digit");
+            if (lblLine != null)
+            {
+                var digits = Regex.Replace(lblLine, @"\D", "");
+                if (digits.Length is >= 47 and <= 48) linhaDig = digits;
+            }
+        }
+        if (linhaDig != null)
+        {
+            AddF(f, "linha_digitavel", linhaDig, 0.92);
+            try
+            {
+                var info = BrasilApiService.ParseBoleto(linhaDig);
+                if (info != null)
+                {
+                    if (info.Value > 0) AddF(f, "valor", "R$ " + info.Value.ToString("N2", PtBr), 0.90);
+                    if (info.DueDate.HasValue) AddF(f, "vencimento", info.DueDate.Value.ToString("dd/MM/yyyy"), 0.88);
+                    if (info.BankCode > 0) AddF(f, "banco", info.BankCode.ToString("D3"), 0.80);
+                }
+            }
+            catch { /* linha não-canônica: segue com extração por rótulo */ }
+        }
+
+        // Por rótulo (sobrepõe / complementa o parse da linha).
+        var valor = Labeled(text, new[] { "valor do documento", "valor do boleto", "valor cobrado", "valor" }, MoneyRx)
+                    ?? LastMoney(text);
+        if (valor != null) SetF(f, "valor", NormMoney(valor), 0.90);
+
+        var venc = Labeled(text, new[] { "vencimento", "data de vencimento" }, DateRx);
+        if (venc != null) SetF(f, "vencimento", venc, 0.90);
+
+        var benef = LabeledText(text, new[] { "beneficiário", "beneficiario", "cedente" });
+        if (benef != null) AddF(f, "beneficiario", benef, 0.82);
+
+        var cnpjBenef = NearLabelCnpj(text, new[] { "beneficiário", "beneficiario", "cedente", "cnpj do beneficiário" })
+                        ?? FirstValidCnpj(text);
+        if (cnpjBenef != null) AddF(f, "cnpj_beneficiario", cnpjBenef, 0.85);
+
+        var banco = LabeledText(text, new[] { "banco" });
+        if (banco != null) SetF(f, "banco", banco, 0.78);
+
+        return f;
+    }
+
     private static Dictionary<string, object> ExtractNotaFiscal(string text)
     {
-        var fields = new Dictionary<string, object>();
+        var f = new Dictionary<string, object>();
 
-        var cnpjs = CnpjRegex.Matches(text).Select(m => m.Value).Distinct().ToList();
-        if (cnpjs.Count > 0) AddField(fields, "cnpj_emitente", cnpjs[0], 0.85);
-        if (cnpjs.Count > 1) AddField(fields, "cnpj_destinatario", cnpjs[1], 0.80);
+        var cnpjs = ValidCnpjs(text);
+        if (cnpjs.Count > 0) AddF(f, "cnpj_emitente", cnpjs[0], 0.88);
+        if (cnpjs.Count > 1) AddF(f, "cnpj_destinatario", cnpjs[1], 0.82);
 
-        var key = AccessKeyRegex.Match(text);
-        if (key.Success) AddField(fields, "chave_acesso", key.Value, 0.92);
+        var emit = LabeledText(text, new[] { "razão social", "razao social", "emitente", "nome/razão social", "remetente" });
+        if (emit != null) AddF(f, "nome_emitente", emit, 0.78);
 
-        var date = DateRegex.Match(text);
-        if (date.Success) AddField(fields, "data_emissao", date.Groups[1].Value, 0.78);
+        var key = AccessKeyRx.Match(text);
+        if (key.Success) AddF(f, "chave_acesso", key.Value, 0.93);
 
-        var money = MoneyRegex.Matches(text);
-        if (money.Count > 0)
-            AddField(fields, "valor_total", money.Cast<Match>().Last().Groups[1].Value, 0.75);
+        var emissao = Labeled(text, new[] { "data de emissão", "data emissão", "emissão", "data de emissao" }, DateRx)
+                      ?? FirstDate(text);
+        if (emissao != null) AddF(f, "data_emissao", emissao, 0.78);
 
-        var numero = Regex.Match(text, @"(?:N[°º]\s*|Nota Fiscal[^\d]*)(\d{4,9})", RegexOptions.IgnoreCase);
-        if (numero.Success) AddField(fields, "numero_nota", numero.Groups[1].Value, 0.70);
+        var total = Labeled(text, new[] { "valor total da nota", "valor total dos produtos", "valor total", "total da nota", "valor da nota" }, MoneyRx)
+                    ?? LastMoney(text);
+        if (total != null) AddF(f, "valor_total", NormMoney(total), 0.78);
 
-        return fields;
+        var numero = Labeled(text, new[] { "nº", "no.", "número", "numero", "nota fiscal nº", "nf-e nº" }, new Regex(@"(\d{1,3}(?:\.\d{3})+|\d{4,9})"));
+        if (numero != null) AddF(f, "numero_nota", numero, 0.70);
+
+        var natureza = LabeledText(text, new[] { "natureza da operação", "natureza da operacao", "natureza" });
+        if (natureza != null) AddF(f, "natureza_operacao", natureza, 0.70);
+
+        return f;
     }
 
     private static Dictionary<string, object> ExtractDanfe(string text)
     {
-        var fields = ExtractNotaFiscal(text);
-        var protocolo = Regex.Match(text, @"PROTOCOLO[^\d]*(\d{15,16})", RegexOptions.IgnoreCase);
-        if (protocolo.Success) AddField(fields, "protocolo_autorizacao", protocolo.Groups[1].Value, 0.85);
-        return fields;
-    }
-
-    private static Dictionary<string, object> ExtractBoleto(string text)
-    {
-        var fields = new Dictionary<string, object>();
-        var digitsOnly = Regex.Replace(text, @"\D", "");
-        var line = BoletoLineRegex.Match(digitsOnly);
-        if (line.Success)
-        {
-            AddField(fields, "linha_digitavel", line.Value, 0.95);
-            var info = BrasilApiService.ParseBoleto(line.Value);
-            if (info != null)
-            {
-                if (info.Value > 0)
-                    AddField(fields, "valor", info.Value.ToString("F2", CultureInfo.InvariantCulture), 0.95);
-                if (info.DueDate.HasValue)
-                    AddField(fields, "vencimento", info.DueDate.Value.ToString("dd/MM/yyyy"), 0.95);
-                if (info.BankCode > 0)
-                    AddField(fields, "banco", info.BankCode.ToString("D3"), 0.85);
-            }
-        }
-        var cnpj = CnpjRegex.Match(text);
-        if (cnpj.Success) AddField(fields, "cnpj_beneficiario", cnpj.Value, 0.80);
-        return fields;
+        var f = ExtractNotaFiscal(text);
+        var protocolo = Labeled(text, new[] { "protocolo de autorização", "protocolo", "protocolo de autorizacao" }, new Regex(@"(\d{15,16})"));
+        if (protocolo != null) AddF(f, "protocolo_autorizacao", protocolo, 0.85);
+        var serie = Labeled(text, new[] { "série", "serie" }, new Regex(@"(\d{1,3})"));
+        if (serie != null) AddF(f, "serie", serie, 0.72);
+        return f;
     }
 
     private static Dictionary<string, object> ExtractHolerite(string text)
     {
-        var fields = new Dictionary<string, object>();
+        var f = new Dictionary<string, object>();
 
-        var cnpj = CnpjRegex.Match(text);
-        if (cnpj.Success) AddField(fields, "cnpj_empregador", cnpj.Value, 0.85);
+        var cnpj = NearLabelCnpj(text, new[] { "empregador", "empresa", "cnpj" }) ?? FirstValidCnpj(text);
+        if (cnpj != null) AddF(f, "cnpj_empregador", cnpj, 0.85);
 
-        var cpf = CpfRegex.Match(text);
-        if (cpf.Success) AddField(fields, "cpf_empregado", cpf.Value, 0.80);
+        var empregador = LabeledText(text, new[] { "empregador", "empresa", "razão social" });
+        if (empregador != null) AddF(f, "empregador", empregador, 0.75);
 
-        var competencia = Regex.Match(text, @"(\d{2}/\d{4})");
-        if (competencia.Success) AddField(fields, "competencia", competencia.Groups[1].Value, 0.85);
+        var empregado = LabeledText(text, new[] { "empregado", "funcionário", "funcionario", "nome do empregado", "colaborador" });
+        if (empregado != null) AddF(f, "empregado", empregado, 0.75);
 
-        var valores = MoneyRegex.Matches(text).Select(m => m.Groups[1].Value).ToList();
-        if (valores.Count >= 1) AddField(fields, "salario_base", valores[0], 0.70);
-        if (valores.Count >= 2) AddField(fields, "total_proventos", valores[^2], 0.70);
-        if (valores.Count >= 1) AddField(fields, "salario_liquido", valores[^1], 0.75);
+        var cpf = Labeled(text, new[] { "cpf do empregado", "cpf" }, CpfRx);
+        if (cpf != null) AddF(f, "cpf_empregado", cpf, 0.80);
 
-        return fields;
+        var comp = Labeled(text, new[] { "competência", "competencia", "referência", "mês/ano", "mes/ano" }, CompetenciaRx) ?? CompetenciaRx.Match(text).Groups[1].Value;
+        if (!string.IsNullOrEmpty(comp)) AddF(f, "competencia", comp, 0.82);
+
+        var liquido = Labeled(text, new[] { "líquido a receber", "liquido a receber", "valor líquido", "salário líquido", "salario liquido", "líquido", "liquido" }, MoneyRx);
+        if (liquido != null) AddF(f, "salario_liquido", NormMoney(liquido), 0.80);
+        var proventos = Labeled(text, new[] { "total de proventos", "total proventos", "proventos" }, MoneyRx);
+        if (proventos != null) AddF(f, "total_proventos", NormMoney(proventos), 0.75);
+        var descontos = Labeled(text, new[] { "total de descontos", "total descontos", "descontos" }, MoneyRx);
+        if (descontos != null) AddF(f, "total_descontos", NormMoney(descontos), 0.75);
+        var baseSal = Labeled(text, new[] { "salário base", "salario base", "salário-base" }, MoneyRx);
+        if (baseSal != null) AddF(f, "salario_base", NormMoney(baseSal), 0.72);
+
+        return f;
     }
 
     private static Dictionary<string, object> ExtractExtrato(string text)
     {
-        var fields = new Dictionary<string, object>();
+        var f = new Dictionary<string, object>();
 
-        var banco = Regex.Match(text, @"\b(BANCO\s+[A-Z\s]+)\b", RegexOptions.IgnoreCase);
-        if (banco.Success) AddField(fields, "banco", banco.Groups[1].Value.Trim(), 0.70);
+        var banco = LabeledText(text, new[] { "banco", "instituição", "instituicao" });
+        if (banco != null) AddF(f, "banco", banco, 0.72);
 
-        var agencia = Regex.Match(text, @"AG[EÊ]NCIA[:\s]*(\d{3,5})", RegexOptions.IgnoreCase);
-        if (agencia.Success) AddField(fields, "agencia", agencia.Groups[1].Value, 0.80);
+        var ag = Labeled(text, new[] { "agência", "agencia" }, new Regex(@"(\d{3,5}(?:-\d)?)"));
+        if (ag != null) AddF(f, "agencia", ag, 0.80);
 
-        var conta = Regex.Match(text, @"CONTA[:\s]*(\d{4,10}-?\d)", RegexOptions.IgnoreCase);
-        if (conta.Success) AddField(fields, "conta", conta.Groups[1].Value, 0.80);
+        var conta = Labeled(text, new[] { "conta corrente", "conta" }, new Regex(@"(\d{4,12}-?\d?)"));
+        if (conta != null) AddF(f, "conta", conta, 0.80);
 
-        var dates = DateRegex.Matches(text);
-        if (dates.Count >= 2)
-        {
-            AddField(fields, "periodo_inicio", dates[0].Value, 0.75);
-            AddField(fields, "periodo_fim", dates[^1].Value, 0.75);
-        }
-        var valores = MoneyRegex.Matches(text);
-        if (valores.Count >= 2)
-        {
-            AddField(fields, "saldo_inicial", valores[0].Groups[1].Value, 0.65);
-            AddField(fields, "saldo_final", valores[^1].Groups[1].Value, 0.65);
-        }
-        return fields;
+        var titular = LabeledText(text, new[] { "titular", "cliente", "correntista" });
+        if (titular != null) AddF(f, "titular", titular, 0.70);
+
+        var dates = DateRx.Matches(text).Select(m => m.Value).Distinct().ToList();
+        if (dates.Count >= 1) AddF(f, "periodo_inicio", dates[0], 0.72);
+        if (dates.Count >= 2) AddF(f, "periodo_fim", dates[^1], 0.72);
+
+        var sIni = Labeled(text, new[] { "saldo inicial", "saldo anterior" }, MoneyRx);
+        if (sIni != null) AddF(f, "saldo_inicial", NormMoney(sIni), 0.72);
+        var sFim = Labeled(text, new[] { "saldo final", "saldo atual", "saldo disponível", "saldo" }, MoneyRx);
+        if (sFim != null) AddF(f, "saldo_final", NormMoney(sFim), 0.72);
+
+        return f;
     }
 
     private static Dictionary<string, object> ExtractDarf(string text)
     {
-        var fields = new Dictionary<string, object>();
-        var codigo = Regex.Match(text, @"C[ÓO]DIGO\s+DA\s+RECEITA[:\s]*(\d{4})", RegexOptions.IgnoreCase);
-        if (codigo.Success) AddField(fields, "codigo_receita", codigo.Groups[1].Value, 0.90);
-        var cnpj = CnpjRegex.Match(text);
-        if (cnpj.Success) AddField(fields, "cnpj_contribuinte", cnpj.Value, 0.85);
-        var date = DateRegex.Match(text);
-        if (date.Success) AddField(fields, "data_vencimento", date.Groups[1].Value, 0.75);
-        var valores = MoneyRegex.Matches(text);
-        if (valores.Count >= 1) AddField(fields, "valor_principal", valores[0].Groups[1].Value, 0.75);
-        if (valores.Count >= 2) AddField(fields, "valor_total", valores[^1].Groups[1].Value, 0.80);
-        return fields;
+        var f = new Dictionary<string, object>();
+
+        var codigo = Labeled(text, new[] { "código da receita", "codigo da receita", "código", "codigo", "receita" }, new Regex(@"\b(\d{4})\b"));
+        if (codigo != null) AddF(f, "codigo_receita", codigo, 0.88);
+
+        var cnpj = FirstValidCnpj(text);
+        if (cnpj != null) AddF(f, "cnpj_contribuinte", cnpj, 0.85);
+
+        var periodo = Labeled(text, new[] { "período de apuração", "periodo de apuracao", "apuração", "apuracao" }, new Regex(@"(\d{2}/\d{2}/\d{4}|\d{2}/\d{4})"));
+        if (periodo != null) AddF(f, "periodo_apuracao", periodo, 0.78);
+
+        var venc = Labeled(text, new[] { "data de vencimento", "vencimento" }, DateRx) ?? FirstDate(text);
+        if (venc != null) AddF(f, "data_vencimento", venc, 0.78);
+
+        var principal = Labeled(text, new[] { "valor principal", "principal" }, MoneyRx);
+        if (principal != null) AddF(f, "valor_principal", NormMoney(principal), 0.78);
+        var multa = Labeled(text, new[] { "multa" }, MoneyRx);
+        if (multa != null) AddF(f, "valor_multa", NormMoney(multa), 0.72);
+        var juros = Labeled(text, new[] { "juros" }, MoneyRx);
+        if (juros != null) AddF(f, "valor_juros", NormMoney(juros), 0.72);
+        var total = Labeled(text, new[] { "valor total", "total a recolher", "total" }, MoneyRx) ?? LastMoney(text);
+        if (total != null) AddF(f, "valor_total", NormMoney(total), 0.80);
+
+        return f;
     }
 
-    private static void AddField(Dictionary<string, object> dict, string key, string value, double confidence)
+    private static Dictionary<string, object> ExtractGeneric(string text)
     {
-        dict[key] = new
+        var f = new Dictionary<string, object>();
+        var cnpj = FirstValidCnpj(text);
+        if (cnpj != null) AddF(f, "cnpj", cnpj, 0.80);
+        var money = LastMoney(text);
+        if (money != null) AddF(f, "valor", NormMoney(money), 0.65);
+        var date = FirstDate(text);
+        if (date != null) AddF(f, "data", date, 0.65);
+        var key = AccessKeyRx.Match(text);
+        if (key.Success) AddF(f, "chave_acesso", key.Value, 0.85);
+        return f;
+    }
+
+    // ── Helpers de rótulo/padrão ──────────────────────────────────────────
+
+    /// <summary>Linha que contém o rótulo (até a quebra de linha).</summary>
+    private static string? LineWith(string text, string label)
+    {
+        var m = Regex.Match(text, Regex.Escape(label) + @"[^\r\n]*", O);
+        return m.Success ? m.Value : null;
+    }
+
+    /// <summary>Primeiro valor (padrão) na linha de um dos rótulos.</summary>
+    private static string? Labeled(string text, string[] labels, Regex value)
+    {
+        foreach (var label in labels)
         {
-            text = value,
-            confidence = Math.Round(confidence, 4)
-        };
+            var line = LineWith(text, label);
+            if (line == null) continue;
+            // Remove o próprio rótulo p/ não capturar dígitos dele.
+            var after = Regex.Replace(line, "^.*?" + Regex.Escape(label), "", O);
+            var vm = value.Match(after);
+            if (vm.Success) return (vm.Groups.Count > 1 ? vm.Groups[1].Value : vm.Value).Trim();
+        }
+        return null;
+    }
+
+    /// <summary>Texto livre após "rótulo:" (limpo, parando em CNPJ/CPF/duplo-espaço).</summary>
+    private static string? LabeledText(string text, string[] labels)
+    {
+        foreach (var label in labels)
+        {
+            var m = Regex.Match(text, Regex.Escape(label) + @"\s*[:\-]\s*([^\r\n]{2,90})", O);
+            if (!m.Success) continue;
+            var v = m.Groups[1].Value.Trim();
+            v = Regex.Split(v, @"\s{2,}|\s+CNPJ\b|\s+CPF\b|\s+C[ÓO]DIGO\b", RegexOptions.IgnoreCase)[0].Trim().TrimEnd('.', ',', ';', '-');
+            if (v.Length >= 2 && !Regex.IsMatch(v, @"^[\d\.\,/\-\s]+$")) return v;
+        }
+        return null;
+    }
+
+    private static List<string> ValidCnpjs(string text) =>
+        CnpjRx.Matches(text).Select(m => m.Value).Where(v => Try(() => Validators.ValidateCnpj(v))).Distinct().ToList();
+
+    private static string? FirstValidCnpj(string text)
+    {
+        var valid = ValidCnpjs(text).FirstOrDefault();
+        if (valid != null) return valid;
+        var m = CnpjRx.Match(text);
+        return m.Success ? m.Value : null;
+    }
+
+    private static string? NearLabelCnpj(string text, string[] labels)
+    {
+        foreach (var label in labels)
+        {
+            var idx = text.IndexOf(label, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) continue;
+            var window = text.Substring(idx, Math.Min(120, text.Length - idx));
+            var m = CnpjRx.Match(window);
+            if (m.Success && Try(() => Validators.ValidateCnpj(m.Value))) return m.Value;
+        }
+        return null;
+    }
+
+    private static string? FirstDate(string text) { var m = DateRx.Match(text); return m.Success ? m.Groups[1].Value : null; }
+
+    private static string? LastMoney(string text)
+    {
+        var m = MoneyRx.Matches(text);
+        if (m.Count > 0) return "R$ " + m[^1].Groups[1].Value;
+        var b = MoneyBareRx.Matches(text);
+        return b.Count > 0 ? "R$ " + b[^1].Groups[1].Value : null;
+    }
+
+    private static string NormMoney(string v)
+    {
+        var m = MoneyBareRx.Match(v);
+        return m.Success ? "R$ " + m.Groups[1].Value : v.Trim();
+    }
+
+    private static readonly CultureInfo PtBr = CultureInfo.GetCultureInfo("pt-BR");
+
+    private static bool Try(Func<bool> f) { try { return f(); } catch { return false; } }
+
+    private static void AddF(Dictionary<string, object> d, string key, string value, double confidence)
+    {
+        if (!d.ContainsKey(key) && !string.IsNullOrWhiteSpace(value))
+            d[key] = new { text = value.Trim(), confidence = Math.Round(confidence, 4) };
+    }
+
+    private static void SetF(Dictionary<string, object> d, string key, string value, double confidence)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+            d[key] = new { text = value.Trim(), confidence = Math.Round(confidence, 4) };
     }
 }

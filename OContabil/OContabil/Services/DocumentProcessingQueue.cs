@@ -289,35 +289,28 @@ public sealed class DocumentProcessingQueue
     {
         try
         {
-            var api = new BrasilApiService();
+            if (string.IsNullOrEmpty(result.OcrText)) return false;
 
-            if (doc.DocumentType == "Boleto" && !string.IsNullOrEmpty(result.OcrText))
+            // Boleto: confirma APENAS via linha digitável FORMATADA e válida.
+            // (Concatenar todos os dígitos do texto gerava casamentos espúrios que
+            // o ParseBoleto aceitava como "válidos" — sobrescrevendo a extração boa
+            // com valores absurdos. Agora cross-validate só CONFIRMA, não sobrescreve.)
+            if (doc.DocumentType == "Boleto")
             {
-                var digitsOnly = Regex.Replace(result.OcrText, @"\D", "");
-                var line = Regex.Match(digitsOnly, @"\d{47,48}");
-                if (line.Success)
+                var fmt = Regex.Match(result.OcrText, @"\d{5}\.\d{5}\s+\d{5}\.\d{6}\s+\d{5}\.\d{6}\s+\d\s+\d{14}");
+                if (fmt.Success)
                 {
-                    var info = BrasilApiService.ParseBoleto(line.Value);
-                    if (info != null && info.IsValid)
-                    {
-                        doc.ExtractedJson = JsonSerializer.Serialize(new
-                        {
-                            valor = info.Value,
-                            vencimento_original = info.DueDate?.ToString("yyyy-MM-dd"),
-                            linha_digitavel = line.Value,
-                            banco = info.BankCode
-                        });
+                    var line = Regex.Replace(fmt.Value, @"\D", "");
+                    var info = BrasilApiService.ParseBoleto(line);
+                    if (info != null && info.IsValid && info.Value is > 0 and < 100_000_000)
                         return true;
-                    }
                 }
             }
 
-            if (!string.IsNullOrEmpty(result.OcrText))
-            {
-                var cnpj = Regex.Match(result.OcrText, @"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}");
-                if (cnpj.Success && Validators.ValidateCnpj(cnpj.Value))
-                    return true;
-            }
+            // Qualquer doc: um CNPJ válido no texto é sinal forte de extração correta.
+            var cnpj = Regex.Match(result.OcrText, @"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}");
+            if (cnpj.Success && Validators.ValidateCnpj(cnpj.Value))
+                return true;
         }
         catch { }
         return false;

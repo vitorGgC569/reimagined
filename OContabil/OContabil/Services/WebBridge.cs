@@ -509,9 +509,16 @@ public sealed class WebBridge
         {
             case JsonValueKind.Object:
                 foreach (var p in el.EnumerateObject())
-                    if ((p.Value.ValueKind == JsonValueKind.String || p.Value.ValueKind == JsonValueKind.Number) &&
-                        keyParts.Any(k => p.Name.Contains(k, StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (!keyParts.Any(k => p.Name.Contains(k, StringComparison.OrdinalIgnoreCase))) continue;
+                    if (p.Value.ValueKind is JsonValueKind.String or JsonValueKind.Number)
                         return p.Value.ToString();
+                    // extração no formato {campo: {text, confidence}}
+                    if (p.Value.ValueKind == JsonValueKind.Object &&
+                        p.Value.TryGetProperty("text", out var tv) &&
+                        tv.ValueKind is JsonValueKind.String or JsonValueKind.Number)
+                        return tv.ToString();
+                }
                 foreach (var p in el.EnumerateObject())
                 {
                     var r = FindIn(p.Value, keyParts);
