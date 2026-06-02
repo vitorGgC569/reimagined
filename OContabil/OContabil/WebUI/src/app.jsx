@@ -215,41 +215,65 @@ function App() {
   const [toast, setToastState] = useState(null);
   const [dataVersion, setDataVersion] = useState(0);
 
-  // Hidrata window.DB com dados reais dos serviços C# após o login (via ponte).
-  // Mantém o mock como fallback quando fora do app (sem WebView2). Mapeia os
-  // campos do backend para o shape que as telas esperam; campos sem origem no
-  // modelo C# ficam com default. Bump em dataVersion força o remount das telas.
+  // Hidrata window.DB com dados reais dos serviços C# (via ponte) após login.
+  // Mantém o mock como fallback fora do WebView2. window.__refreshData re-busca
+  // tudo (usado após upload/reprocessamento). Bump em dataVersion remonta telas.
   useEffect(() => {
     if (!logged) return;
     var b = window.OContabilBridge;
     if (!b || !b.available) return;
     var alive = true;
-    Promise.all([b.call('clients.list'), b.call('documents.list')]).then(function (res) {
-      if (!alive) return;
-      var cr = res[0], dr = res[1];
-      if (cr && cr.ok && Array.isArray(cr.data)) {
-        window.DB.clients = cr.data.map(function (c) {
-          return {
-            id: c.id, nome: c.razaoSocial, fantasia: c.razaoSocial, cnpj: c.cnpj,
-            uf: '—', municipio: '—', regime: c.regime || '—', schemas: [],
-            volume: c.volume || 0, ativo: c.ativo !== false,
-          };
-        });
-      }
-      if (dr && dr.ok && Array.isArray(dr.data)) {
-        var nomeDe = {}; (window.DB.clients || []).forEach(function (c) { nomeDe[c.id] = c.fantasia; });
-        window.DB.documents = dr.data.map(function (d) {
-          return {
-            id: d.id, arquivo: d.arquivo, tipo: d.tipo || '—',
-            cliente: nomeDe[d.clienteId] || '—', numero: String(d.id),
-            status: d.status, confianca: d.confianca,
-            valor: 0, data: null, dataStr: '', serie: '', chave: '', emitente: '',
-          };
-        });
-      }
-      setDataVersion(function (v) { return v + 1; });
-    });
-    return function () { alive = false; };
+
+    function hydrate() {
+      return Promise.all([
+        b.call('clients.list'), b.call('documents.list'), b.call('schemas.list'),
+        b.call('users.list'), b.call('audit.list'), b.call('dashboard.metrics'),
+      ]).then(function (res) {
+        if (!alive) return;
+        var cr = res[0], dr = res[1], sr = res[2], ur = res[3], ar = res[4], mr = res[5];
+
+        if (cr && cr.ok && Array.isArray(cr.data)) {
+          window.DB.clients = cr.data.map(function (c) {
+            return {
+              id: c.id, nome: c.razaoSocial, fantasia: c.razaoSocial, cnpj: c.cnpj,
+              uf: '—', municipio: '—', regime: c.regime || '—', schemas: [],
+              volume: c.volume || 0, ativo: c.ativo !== false,
+            };
+          });
+        }
+        if (dr && dr.ok && Array.isArray(dr.data)) {
+          window.DB.documents = dr.data.map(function (d) {
+            return {
+              id: d.id, arquivo: d.arquivo, tipo: d.tipo || '—',
+              clienteId: d.clienteId, cliente: d.cliente || '—',
+              emitente: d.emitente || '', numero: d.numero || String(d.id),
+              serie: d.serie || '', chave: d.chave || '',
+              valor: d.valor || 0, data: d.data ? new Date(d.data) : new Date(),
+              dataStr: d.dataStr || '', dataHora: d.dataHora || '',
+              status: d.status || 'pendente',
+              confianca: (d.confianca == null ? null : d.confianca),
+              diasParado: (d.diasParado == null ? null : d.diasParado),
+              revisor: d.revisor || null,
+            };
+          });
+        }
+        if (sr && sr.ok && Array.isArray(sr.data)) window.DB.schemas = sr.data;
+        if (ur && ur.ok && Array.isArray(ur.data)) window.DB.users = ur.data;
+        if (ar && ar.ok && Array.isArray(ar.data)) window.DB.auditoria = ar.data;
+        if (mr && mr.ok && mr.data) {
+          var m = mr.data;
+          if (m.kpis) window.DB.kpis = m.kpis;
+          if (m.statusDist) window.DB.statusDist = m.statusDist;
+          if (Array.isArray(m.topClientes)) window.DB.topClientes = m.topClientes;
+          if (Array.isArray(m.confSeries)) window.DB.confSeries = m.confSeries;
+        }
+        setDataVersion(function (v) { return v + 1; });
+      });
+    }
+
+    window.__refreshData = hydrate;
+    hydrate();
+    return function () { alive = false; window.__refreshData = null; };
   }, [logged]);
 
   useEffect(() => { document.documentElement.setAttribute('data-theme', theme); }, [theme]);

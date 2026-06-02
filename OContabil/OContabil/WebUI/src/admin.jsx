@@ -108,15 +108,18 @@ function UsersScreen({ toast }) {
    ============================================================ */
 function SchemasScreen({ toast }) {
   const DB = window.DB;
-  const schemaList = [
-    { id: 's1', nome: 'NF-e Padrão', tipo: 'NF-e', clientes: 7, campos: 12, atualizado: '28/05/2026' },
-    { id: 's2', nome: 'NFS-e Serviços', tipo: 'NFS-e', clientes: 5, campos: 10, atualizado: '30/05/2026' },
-    { id: 's3', nome: 'CT-e Transporte', tipo: 'CT-e', clientes: 3, campos: 14, atualizado: '21/05/2026' },
-    { id: 's4', nome: 'DARF Federal', tipo: 'DARF', clientes: 6, campos: 8, atualizado: '15/05/2026' },
-    { id: 's5', nome: 'Boleto Bancário', tipo: 'Boleto', clientes: 6, campos: 5, atualizado: '12/05/2026' },
-  ];
-  const [sel, setSel] = useState(schemaList[0]);
-  const campos = DB.camposDe({ tipo: sel.tipo, numero: '0', serie: '1', chave: '0'.repeat(44), confianca: 90, valor: 1000, dataStr: '01/05/2026', emitente: 'Exemplo' });
+  const schemaList = (DB.schemas && DB.schemas.length ? DB.schemas : []).map(function (s) {
+    return {
+      id: s.id, nome: s.nome, tipo: s.tipo, sistema: s.sistema,
+      clientes: s.clienteId ? 1 : 0, campos: (s.campos || []).length,
+      fields: s.campos || [], atualizado: s.sistema ? 'sistema (global)' : 'cliente',
+    };
+  });
+  const [sel, setSel] = useState(schemaList[0] || null);
+  if (!sel) return <div style={{ padding: 28, color: 'var(--text-2)', animation: 'om-fade-in .25s ease' }}>Nenhum schema de extração cadastrado.</div>;
+  const campos = (sel.fields || []).map(function (f) {
+    return { campo: f.nome, tipoVal: (f.tipo === 'str' || !f.tipo ? 'texto' : f.tipo), desc: f.desc || '' };
+  });
 
   return (
     <div style={{ animation: 'om-fade-in .25s ease' }}>
@@ -166,7 +169,7 @@ function SchemasScreen({ toast }) {
                     <td style={{ padding: '11px 16px' }}>
                       {obrig ? <span style={{ fontSize: 12, color: 'var(--st-rejected)', fontWeight: 500 }}>Obrigatório</span> : <span style={{ fontSize: 12, color: 'var(--text-3)' }}>Opcional</span>}
                     </td>
-                    <td style={{ padding: '11px 16px', fontSize: 12, color: 'var(--text-2)' }}>{c.tipoVal === 'cnpj' ? 'Dígito verificador' : c.tipoVal === 'moeda' ? '≥ 0,00' : c.tipoVal === 'data' ? 'dd/mm/aaaa' : '—'}</td>
+                    <td style={{ padding: '11px 16px', fontSize: 12, color: 'var(--text-2)' }}>{c.desc || (c.tipoVal === 'cnpj' ? 'Dígito verificador' : c.tipoVal === 'moeda' ? '≥ 0,00' : c.tipoVal === 'data' ? 'dd/mm/aaaa' : '—')}</td>
                     <td style={{ padding: '11px 16px', textAlign: 'right' }}><button style={{ ...miniBtn, width: 28, height: 28 }}><Icon name="lapis" size={13} /></button></td>
                   </tr>
                 );

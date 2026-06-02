@@ -20,6 +20,7 @@ function ExportScreen({ toast }) {
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [done, setDone] = useState(false);
+  const [exportPath, setExportPath] = useState('');
 
   const sel = useMemo(() => DB.documents.filter(d => {
     if (cliente !== 'todos' && d.clienteId !== cliente) return false;
@@ -38,13 +39,19 @@ function ExportScreen({ toast }) {
   const fObj = FORMATOS.find(f => f.id === fmt);
 
   const exportar = () => {
-    setRunning(true); setProgress(0); setDone(false);
-    let p = 0;
-    const t = setInterval(() => {
-      p += Math.random() * 18 + 8;
-      if (p >= 100) { p = 100; clearInterval(t); setProgress(100); setTimeout(() => { setRunning(false); setDone(true); toast('Arquivo ' + fObj.nome + ' gerado localmente'); }, 350); }
-      else setProgress(p);
-    }, 220);
+    setRunning(true); setProgress(35); setDone(false);
+    window.OContabilBridge.call('exports.run', {
+      format: fmt, clienteId: cliente === 'todos' ? 0 : cliente, tipo: tipo, status: status,
+    }).then(function (r) {
+      setProgress(100); setRunning(false);
+      if (r && r.ok && r.data && r.data.canceled) return;
+      if (r && r.ok && r.data) {
+        setExportPath(r.data.path || ''); setDone(true);
+        toast(r.data.note ? r.data.note : (r.data.count + ' documento(s) exportado(s) para CSV'));
+      } else {
+        toast((r && r.error) || 'Falha na exportação');
+      }
+    });
   };
 
   const fieldLabel = { display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 7 };
@@ -170,7 +177,7 @@ function ExportScreen({ toast }) {
                 <span style={{ color: 'var(--st-approved)' }}><Icon name="check" size={17} /></span>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)' }}>Arquivo gerado</div>
-                  <div className="mono" style={{ fontSize: 10.5, color: 'var(--text-2)' }}>export_{fmt}_202605{fObj.ext}</div>
+                  <div className="mono" style={{ fontSize: 10.5, color: 'var(--text-2)', wordBreak: 'break-all' }}>{exportPath ? exportPath.split(/[\\/]/).pop() : 'export.csv'}</div>
                 </div>
                 <Button size="sm" variant="default" icon="download">Abrir</Button>
               </div>

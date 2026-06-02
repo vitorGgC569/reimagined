@@ -136,7 +136,15 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
               { value: 'compact', icon: 'linhasComp', label: '', title: 'Densidade compacta' },
             ]} />
             <Button variant="default" icon="download">Exportar</Button>
-            <Button variant="primary" icon="upload">Importar</Button>
+            <Button variant="primary" icon="upload" onClick={() => {
+              window.OContabilBridge.call('documents.upload', { clienteId: fCliente === 'todos' ? 0 : fCliente }).then(function (r) {
+                if (r && r.ok && r.data && r.data.canceled) return;
+                if (r && r.ok && r.data) {
+                  toast((r.data.enqueued || 0) + ' documento(s) enviado(s) para extração');
+                  if (window.__refreshData) { window.__refreshData(); setTimeout(window.__refreshData, 2500); setTimeout(window.__refreshData, 6000); }
+                } else { toast((r && r.error) || 'Falha ao importar'); }
+              });
+            }}>Importar</Button>
           </div>
         } />
 
