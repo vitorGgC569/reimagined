@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OContabil — Automação fiscal 100% local</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="src/tokens.css" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React + Babel — vendorizados localmente (100% offline, sem CDN) -->
+  <script src="vendor/react.development.js"></script>
+  <script src="vendor/react-dom.development.js"></script>
+  <script src="vendor/babel.min.js"></script>
+
+  <!-- Hooks globais compartilhados entre os scripts babel -->
+  <script>
+    window.useState = React.useState;
+    window.useEffect = React.useEffect;
+    window.useRef = React.useRef;
+    window.useMemo = React.useMemo;
+    window.useCallback = React.useCallback;
+    window.useReducer = React.useReducer;
+  </script>
+
+  <!-- Ponte com os serviços C# (WebView2) -->
+  <script src="bridge.js"></script>
+
+  <!-- Dados (plain JS) -->
+  <script src="src/data.js"></script>
+
+  <!-- Módulos (babel) -->
+  <script type="text/babel" src="src/icons.jsx"></script>
+  <script type="text/babel" src="src/components.jsx"></script>
+  <script type="text/babel" src="src/login.jsx"></script>
+  <script type="text/babel" src="src/dashboard.jsx"></script>
+  <script type="text/babel" src="src/documents.jsx"></script>
+  <script type="text/babel" src="src/review.jsx"></script>
+  <script type="text/babel" src="src/copilot.jsx"></script>
+  <script type="text/babel" src="src/exports.jsx"></script>
+  <script type="text/babel" src="src/clients.jsx"></script>
+  <script type="text/babel" src="src/admin.jsx"></script>
+  <script type="text/babel" src="src/settings.jsx"></script>
+  <script type="text/babel" src="src/app.jsx"></script>
+</body>
+</html>

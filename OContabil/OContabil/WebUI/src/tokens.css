@@ -1,0 +1,164 @@
+/* ============================================================
+   OContabil — Tema "RAZÃO"
+   Light-first, dark derived. Grid 8px. Raio 4–6px.
+   ============================================================ */
+
+:root {
+  /* Base — Tema Razão (claro) */
+  --ink:            #16201C;   /* texto/escuro (quase-preto com leve verde) */
+  --paper:          #FBFAF7;   /* fundo app (off-white quente) */
+  --surface:        #FFFFFF;   /* cards/tabela */
+  --surface-2:      #F5F3EC;   /* superfície elevada sutil */
+  --zebra:          #F4F2EB;   /* zebra de tabela */
+  --subtle:         #EFEDE6;   /* fundo sutil */
+  --hairline:       #DAD7CC;   /* borda 1px */
+  --hairline-2:     #E6E3DA;   /* borda mais fraca */
+  --text:           #16201C;   /* texto primário */
+  --text-2:         #6B6F6A;   /* texto secundário */
+  --text-3:         #9A9C95;   /* texto terciário/placeholder */
+
+  /* Acento institucional — verde-petróleo */
+  --accent:         #0F5D52;
+  --accent-hover:   #0B463E;
+  --accent-weak:    #E4EEEB;   /* fundo fraco do acento */
+  --accent-weak-2:  #D2E4DF;
+  --accent-ink:     #0B463E;   /* texto sobre fundo fraco */
+
+  /* Semânticas — uso EXCLUSIVO em status/confiança */
+  --st-approved:    #2E7D5B;
+  --st-approved-bg: #E6F0EA;
+  --st-review:      #B7791F;
+  --st-review-bg:   #F7EEDB;
+  --st-rejected:    #B4453A;
+  --st-rejected-bg: #F6E5E2;
+  --st-pending:     #6B6F6A;
+  --st-pending-bg:  #ECEAE3;
+  --st-info:        #2F6F8F;
+  --st-info-bg:     #E4EEF3;
+
+  /* Confiança (gradação) */
+  --conf-high:      #2E7D5B;
+  --conf-mid:       #B7791F;
+  --conf-low:       #B4453A;
+
+  /* Sombras — elevação leve e real */
+  --shadow-1: 0 1px 2px rgba(22,32,28,0.06), 0 1px 1px rgba(22,32,28,0.04);
+  --shadow-2: 0 4px 12px rgba(22,32,28,0.08), 0 1px 3px rgba(22,32,28,0.05);
+  --shadow-3: 0 16px 48px rgba(22,32,28,0.16), 0 4px 12px rgba(22,32,28,0.10);
+
+  /* Raio */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+
+  /* Tipografia */
+  --font-sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Densidade da tabela (sobrescrito por [data-density]) */
+  --row-h: 44px;
+  --row-pad-y: 11px;
+  --cell-px: 14px;
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --ink:            #0E1512;
+  --paper:          #11160F;   /* Tinta vira fundo */
+  --surface:        #161C18;
+  --surface-2:      #1C231E;
+  --zebra:          #191F1B;
+  --subtle:         #1B221D;
+  --hairline:       #2C342E;
+  --hairline-2:     #232a25;
+  --text:           #E8E9E2;   /* Papel vira texto */
+  --text-2:         #9DA39B;
+  --text-3:         #6E746C;
+
+  --accent:         #3FA08F;
+  --accent-hover:   #54B6A4;
+  --accent-weak:    #15302B;
+  --accent-weak-2:  #1B3D36;
+  --accent-ink:     #7FCFBF;
+
+  --st-approved:    #4FB286;  --st-approved-bg: #16291F;
+  --st-review:      #D8A23F;  --st-review-bg:   #2C2410;
+  --st-rejected:    #D2685C;  --st-rejected-bg: #2E1916;
+  --st-pending:     #9DA39B;  --st-pending-bg:  #20261F;
+  --st-info:        #5B9DBC;  --st-info-bg:     #14242B;
+
+  --conf-high:      #4FB286;
+  --conf-mid:       #D8A23F;
+  --conf-low:       #D2685C;
+
+  --shadow-1: 0 1px 2px rgba(0,0,0,0.40);
+  --shadow-2: 0 4px 14px rgba(0,0,0,0.45), 0 1px 3px rgba(0,0,0,0.40);
+  --shadow-3: 0 18px 50px rgba(0,0,0,0.60), 0 4px 14px rgba(0,0,0,0.50);
+
+  color-scheme: dark;
+}
+
+[data-density="compact"] {
+  --row-h: 34px;
+  --row-pad-y: 6px;
+  --cell-px: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--paper);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#root { height: 100%; }
+
+/* Números tabulares por padrão onde houver sans */
+body { font-feature-settings: "tnum" 1, "lnum" 1; }
+
+.mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum" 1, "zero" 1;
+  letter-spacing: -0.01em;
+}
+
+/* Foco visível — acessibilidade AA */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+::selection { background: var(--accent-weak-2); color: var(--ink); }
+
+/* Scrollbar discreta */
+*::-webkit-scrollbar { width: 11px; height: 11px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--hairline);
+  border: 3px solid var(--paper);
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+/* Utilidades de animação */
+@keyframes om-fade-in { from { opacity: 1; } to { opacity: 1; } }
+@keyframes om-pop-in { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: none; } }
+@keyframes om-slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes om-spin { to { transform: rotate(360deg); } }
+@keyframes om-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+@keyframes om-shimmer { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}

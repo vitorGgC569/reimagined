@@ -33,10 +33,18 @@
   </ItemGroup>
   <ItemGroup>
     <Resource Include="Assets\logo.png" />
+    <!-- IBM Plex (tema "Razão") — empacotadas no assembly p/ uso 100% offline -->
+    <Resource Include="Fonts\*.ttf" />
   </ItemGroup>
   <ItemGroup>
     <None Update="Scripts\**">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Design web (prototype) embutido + servido via WebView2 (WebShellWindow) -->
+    <Content Include="WebUI\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 </Project>

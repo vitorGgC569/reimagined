@@ -16,6 +16,24 @@ public static class DbInitializer
         SeedAccounts(db);
         SeedDefaultAdmin(db);
         SeedDocumentSchemas(db);
+        SeedDemoClients(db);
+    }
+
+    // Clientes de demonstração — apenas se a base estiver vazia (não-destrutivo).
+    // Dá conteúdo real às telas de Clientes/Documentos ao apresentar a UI nova.
+    private static void SeedDemoClients(AppDbContext db)
+    {
+        if (db.Clients.Any()) return;
+
+        db.Clients.AddRange(
+            new Client { Name = "Marília Comércio de Alimentos Ltda", Cnpj = "12.345.678/0001-90", TaxRegime = "Simples Nacional", DocumentCount = 482, ValidatedCount = 430 },
+            new Client { Name = "Construtora Horizonte Norte S/A", Cnpj = "08.776.443/0001-55", TaxRegime = "Lucro Real", DocumentCount = 367, ValidatedCount = 310 },
+            new Client { Name = "Drogaria São Lucas Eireli", Cnpj = "23.998.112/0001-07", TaxRegime = "Simples Nacional", DocumentCount = 311, ValidatedCount = 298 },
+            new Client { Name = "Transportes Vale do Aço Ltda", Cnpj = "31.554.700/0001-21", TaxRegime = "Lucro Presumido", DocumentCount = 298, ValidatedCount = 240 },
+            new Client { Name = "Estúdio Verde Arquitetura ME", Cnpj = "40.221.889/0001-44", TaxRegime = "Simples Nacional", DocumentCount = 142, ValidatedCount = 120 },
+            new Client { Name = "Padaria e Confeitaria Pão Dourado Ltda", Cnpj = "55.013.226/0001-18", TaxRegime = "Simples Nacional", DocumentCount = 256, ValidatedCount = 233 }
+        );
+        db.SaveChanges();
     }
 
     private static void SeedAccounts(AppDbContext db)

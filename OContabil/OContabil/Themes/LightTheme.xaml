@@ -2,41 +2,43 @@
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
     <!-- ═══════════════════════════════════════════════════════
-         OContabil — Clean Light Corporate Theme
+         OContabil — Tema "RAZÃO" (claro)
+         Verde-petróleo institucional · off-white quente · grid 8px
          ═══════════════════════════════════════════════════════ -->
 
-    <!-- ── Color Palette ─────────────────────────────────── -->
-    <SolidColorBrush x:Key="BgPrimary"     Color="#FFF8FAFC"/>
+    <!-- ── Color Palette (Razão claro) ────────────────────── -->
+    <SolidColorBrush x:Key="BgPrimary"     Color="#FFFBFAF7"/>
     <SolidColorBrush x:Key="BgSidebar"     Color="#FFFFFFFF"/>
     <SolidColorBrush x:Key="BgCard"        Color="#FFFFFFFF"/>
-    <SolidColorBrush x:Key="BgElevated"    Color="#FFFFFFFF"/>
+    <SolidColorBrush x:Key="BgElevated"    Color="#FFF5F3EC"/>
     <SolidColorBrush x:Key="BgInput"       Color="#FFFFFFFF"/>
-    <SolidColorBrush x:Key="BgHover"       Color="#FFF1F5F9"/>
-    <SolidColorBrush x:Key="BgSelected"    Color="#FFE2E8F0"/>
+    <SolidColorBrush x:Key="BgHover"       Color="#FFF4F2EB"/>
+    <SolidColorBrush x:Key="BgSelected"    Color="#FFE4EEEB"/>
 
-    <SolidColorBrush x:Key="Border"        Color="#FFe2e8f0"/>
-    <SolidColorBrush x:Key="BorderHover"   Color="#FFcbd5e1"/>
-    <SolidColorBrush x:Key="BorderFocus"   Color="#FF4f46e5"/>
+    <SolidColorBrush x:Key="Border"        Color="#FFDAD7CC"/>
+    <SolidColorBrush x:Key="BorderHover"   Color="#FF9A9C95"/>
+    <SolidColorBrush x:Key="BorderFocus"   Color="#FF0F5D52"/>
 
-    <SolidColorBrush x:Key="TextPrimary"   Color="#FF0f172a"/>
-    <SolidColorBrush x:Key="TextSecondary" Color="#FF3b4a63"/>
-    <SolidColorBrush x:Key="TextMuted"     Color="#FF6b7fa0"/>
+    <SolidColorBrush x:Key="TextPrimary"   Color="#FF16201C"/>
+    <SolidColorBrush x:Key="TextSecondary" Color="#FF6B6F6A"/>
+    <SolidColorBrush x:Key="TextMuted"     Color="#FF9A9C95"/>
 
-    <SolidColorBrush x:Key="Accent"        Color="#FF4f46e5"/>
-    <SolidColorBrush x:Key="AccentHover"   Color="#FF4338ca"/>
-    <SolidColorBrush x:Key="AccentMuted"   Color="#1A4f46e5"/>
+    <SolidColorBrush x:Key="Accent"        Color="#FF0F5D52"/>
+    <SolidColorBrush x:Key="AccentHover"   Color="#FF0B463E"/>
+    <SolidColorBrush x:Key="AccentMuted"   Color="#FFE4EEEB"/>
 
-    <SolidColorBrush x:Key="Success"       Color="#FF059669"/>
-    <SolidColorBrush x:Key="SuccessBg"     Color="#1A10b981"/>
-    <SolidColorBrush x:Key="Warning"       Color="#FFd97706"/>
-    <SolidColorBrush x:Key="WarningBg"     Color="#1Af59e0b"/>
-    <SolidColorBrush x:Key="Error"         Color="#FFdc2626"/>
-    <SolidColorBrush x:Key="ErrorBg"       Color="#1Aef4444"/>
-    <SolidColorBrush x:Key="Info"          Color="#FF2563eb"/>
-    <SolidColorBrush x:Key="InfoBg"        Color="#1A3b82f6"/>
+    <SolidColorBrush x:Key="Success"       Color="#FF2E7D5B"/>
+    <SolidColorBrush x:Key="SuccessBg"     Color="#FFE6F0EA"/>
+    <SolidColorBrush x:Key="Warning"       Color="#FFB7791F"/>
+    <SolidColorBrush x:Key="WarningBg"     Color="#FFF7EEDB"/>
+    <SolidColorBrush x:Key="Error"         Color="#FFB4453A"/>
+    <SolidColorBrush x:Key="ErrorBg"       Color="#FFF6E5E2"/>
+    <SolidColorBrush x:Key="Info"          Color="#FF2F6F8F"/>
+    <SolidColorBrush x:Key="InfoBg"        Color="#FFE4EEF3"/>
 
-    <!-- ── Typography ────────────────────────────────────── -->
-    <FontFamily x:Key="Font">Segoe UI</FontFamily>
+    <!-- ── Typography (IBM Plex, empacotada) ─────────────── -->
+    <FontFamily x:Key="Font">pack://application:,,,/Fonts/#IBM Plex Sans</FontFamily>
+    <FontFamily x:Key="FontMono">pack://application:,,,/Fonts/#IBM Plex Mono</FontFamily>
 
     <!-- ── Shadows ───────────────────────────────────────── -->
     <DropShadowEffect x:Key="SoftShadow" BlurRadius="20" ShadowDepth="4" Direction="270" Opacity="0.05" Color="#000000" />
