@@ -7,66 +7,35 @@ using FlaUI.Core.AutomationElements;
 using FlaUI.Core.Definitions;
 using FlaUI.Core.Capturing;
 using FlaUI.Core.Input;
+using FlaUI.Core.WindowsAPI;
 using FlaUI.UIA3;
 
-// Runtime validation of the wired WebView2 design: launch, log in via the web
-// form with the seeded admin (drives the real C# AuthService bridge), then
-// navigate every screen and screenshot it to prove real data hydrates.
-// Inputs are React-controlled, so we focus + send real keystrokes (UIA
-// SetValue would not trigger React's onChange).
+// Runtime validation harness for the wired WebView2 UI.
+//   (no args) -> login + navigate every screen, screenshot each (data hydration)
+//   "io"      -> login + upload a real document (GLiNER pipeline) + export CSV
+// React-controlled inputs need real keystrokes; native file dialogs are driven
+// by typing the path into the focused filename field + Enter.
 class Program
 {
     const string Exe = @"C:\Users\Oxta\Desktop\reimagined-main\.claude\worktrees\clever-roentgen-ba007c\OContabil\OContabil\bin\Debug\net8.0-windows\OContabil.exe";
     static readonly string ShotDir = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_shots";
+    const StringComparison OIC = StringComparison.OrdinalIgnoreCase;
 
-    static int Main()
+    static int Main(string[] args)
     {
+        bool io = args.Any(a => a.Equals("io", OIC));
         Directory.CreateDirectory(ShotDir);
-        foreach (var f in Directory.GetFiles(ShotDir, "*.png")) { try { File.Delete(f); } catch { } }
-
         var auto = new UIA3Automation();
         var app = Application.Launch(Exe);
-        Thread.Sleep(13000); // WebView2 init + babel transpile + first render
+        Thread.Sleep(13000);
 
         Window win = null;
         try { win = app.GetMainWindow(auto, TimeSpan.FromSeconds(20)); } catch (Exception e) { Console.WriteLine("win: " + e.Message); }
-        if (win != null) { try { win.Focus(); } catch { } }
-        Shot("w01_login");
+        if (win == null) { Console.WriteLine("sem janela"); auto.Dispose(); return 1; }
+        try { win.Focus(); } catch { }
 
-        if (win != null)
-        {
-            var edits = Retry(() => { var l = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Edit)).ToList(); return l.Count >= 2 ? l : null; }, 14);
-            if (edits != null && edits.Count >= 2)
-            {
-                TypeInto(edits[0], "admin");
-                TypeInto(edits[1], "admin");
-                Console.WriteLine("creds digitadas (" + edits.Count + " campos Edit)");
-            }
-            else Console.WriteLine("inputs nao encontrados: " + (edits?.Count ?? -1));
-            Shot("w02_creds");
-
-            var btn = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button))
-                         .FirstOrDefault(el => (el.Name ?? "").Trim().Equals("Entrar", StringComparison.OrdinalIgnoreCase));
-            if (btn != null) { try { btn.AsButton().Invoke(); } catch { try { btn.Click(); } catch { } } Console.WriteLine("Entrar clicado"); }
-            else Console.WriteLine("botao Entrar nao encontrado");
-            Thread.Sleep(7000); // login + hydrate (6 bridge calls)
-        }
-        Shot("w03_dashboard");
-
-        if (win != null)
-        {
-            string[] alvos = { "Documentos", "Clientes", "Schemas", "Exportações", "Usuários", "Painel" };
-            foreach (var alvo in alvos)
-            {
-                var item = win.FindAllDescendants().FirstOrDefault(el => (el.Name ?? "").Trim().Equals(alvo, StringComparison.OrdinalIgnoreCase));
-                if (item != null)
-                {
-                    try { item.Click(); Thread.Sleep(2400); Shot("w_" + Ascii(alvo)); Console.WriteLine("nav " + alvo); }
-                    catch (Exception e) { Console.WriteLine("nav " + alvo + " falhou: " + e.Message); }
-                }
-                else Console.WriteLine("item nao encontrado: " + alvo);
-            }
-        }
+        Login(win);
+        if (io) UploadExportFlow(win); else NavFlow(win);
 
         try { app.Close(); } catch { }
         try { if (!app.HasExited) app.Kill(); } catch { }
@@ -74,30 +43,93 @@ class Program
         return 0;
     }
 
-    static void TypeInto(AutomationElement el, string text)
+    static void Login(Window win)
     {
+        var edits = Retry(() => { var l = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Edit)).ToList(); return l.Count >= 2 ? l : null; }, 14);
+        if (edits == null) { Console.WriteLine("inputs login nao encontrados"); return; }
+        TypeInto(edits[0], "admin");
+        TypeInto(edits[1], "admin");
+        var btn = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button)).FirstOrDefault(el => (el.Name ?? "").Trim().Equals("Entrar", OIC));
+        if (btn != null) { try { btn.AsButton().Invoke(); } catch { try { btn.Click(); } catch { } } }
+        Console.WriteLine("login enviado");
+        Thread.Sleep(7000);
+    }
+
+    static void NavFlow(Window win)
+    {
+        Shot("w03_dashboard");
+        foreach (var alvo in new[] { "Documentos", "Clientes", "Schemas", "Exportações", "Usuários", "Painel" })
+        {
+            var item = win.FindAllDescendants().FirstOrDefault(el => (el.Name ?? "").Trim().Equals(alvo, OIC));
+            if (item != null) { try { item.Click(); Thread.Sleep(2400); Shot("w_" + Ascii(alvo)); Console.WriteLine("nav " + alvo); } catch (Exception e) { Console.WriteLine("nav " + alvo + ": " + e.Message); } }
+            else Console.WriteLine("item nao encontrado: " + alvo);
+        }
+    }
+
+    static void UploadExportFlow(Window win)
+    {
+        string testDoc = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\boleto_atlantico.txt";
+        string csvOut = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\export_teste.csv";
+        try { if (File.Exists(csvOut)) File.Delete(csvOut); } catch { }
+
+        // ---------- UPLOAD -> GLiNER ----------
+        Nav(win, "Documentos"); Thread.Sleep(1500);
+        var importar = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button)).FirstOrDefault(b => (b.Name ?? "").Trim().Equals("Importar", OIC));
+        if (importar != null)
+        {
+            try { importar.AsButton().Invoke(); } catch { try { importar.Click(); } catch { } }
+            Console.WriteLine("Importar clicado");
+            Thread.Sleep(3000);                 // OpenFileDialog abre (campo Nome focado)
+            Keyboard.Type(testDoc);
+            Thread.Sleep(500);
+            Keyboard.Type(VirtualKeyShort.RETURN);
+            Console.WriteLine("arquivo informado: " + testDoc);
+        }
+        else Console.WriteLine("botao Importar NAO encontrado");
+        Thread.Sleep(14000);                    // enqueue + extracao (ONNX->Python->Regex) + refresh JS (0/2.5/6s)
+        Shot("io1_documentos");
+
+        // ---------- EXPORT -> CSV ----------
+        Nav(win, "Exportações"); Thread.Sleep(1800);
+        // Status -> "Todos os status" via <select> nativo (ComboBox) p/ incluir o doc
         try
         {
-            el.Click();            // click to focus the web input
-            Thread.Sleep(200);
-            Keyboard.Type(text);   // real keystrokes -> React onChange fires
-            Thread.Sleep(200);
+            var combos = win.FindAllDescendants(cf => cf.ByControlType(ControlType.ComboBox)).ToList();
+            Console.WriteLine("combos encontrados: " + combos.Count);
+            var statusCombo = combos.FirstOrDefault(c => { try { return (c.AsComboBox().SelectedItem?.Text ?? "").Contains("aprovados", OIC); } catch { return false; } });
+            if (statusCombo != null) { statusCombo.AsComboBox().Select("Todos os status"); Thread.Sleep(900); Console.WriteLine("status -> Todos os status"); }
+            else Console.WriteLine("combo de status nao achado");
         }
-        catch (Exception e) { Console.WriteLine("type: " + e.Message); }
+        catch (Exception e) { Console.WriteLine("status combo erro: " + e.Message); }
+        var exportar = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button)).FirstOrDefault(b => (b.Name ?? "").Trim().StartsWith("Exportar", OIC));
+        if (exportar != null)
+        {
+            try { exportar.AsButton().Invoke(); } catch { try { exportar.Click(); } catch { } }
+            Console.WriteLine("Exportar clicado");
+            Thread.Sleep(3000);                 // SaveFileDialog
+            Keyboard.Type(csvOut);
+            Thread.Sleep(500);
+            Keyboard.Type(VirtualKeyShort.RETURN);
+            Thread.Sleep(1300);
+            Keyboard.Type(VirtualKeyShort.RETURN); // eventual "substituir?"
+            Console.WriteLine("csv informado: " + csvOut);
+        }
+        else Console.WriteLine("botao Exportar NAO encontrado");
+        Thread.Sleep(3500);
+        Shot("io2_export");
+        Console.WriteLine("CSV existe? " + File.Exists(csvOut) + (File.Exists(csvOut) ? " (" + new FileInfo(csvOut).Length + " bytes)" : ""));
     }
+
+    static void Nav(Window win, string alvo)
+    {
+        var item = win.FindAllDescendants().FirstOrDefault(el => (el.Name ?? "").Trim().Equals(alvo, OIC));
+        if (item != null) { try { item.Click(); } catch { } } else Console.WriteLine("nav alvo nao achado: " + alvo);
+    }
+
+    static void TypeInto(AutomationElement el, string text)
+    { try { el.Click(); Thread.Sleep(200); Keyboard.Type(text); Thread.Sleep(200); } catch (Exception e) { Console.WriteLine("type: " + e.Message); } }
 
     static string Ascii(string s) => s.Replace("ç", "c").Replace("õ", "o").Replace("á", "a").Replace("ú", "u").Replace("ã", "a");
-
-    static void Shot(string n)
-    {
-        try { Capture.Screen().ToFile(Path.Combine(ShotDir, n + ".png")); Console.WriteLine("shot " + n); }
-        catch (Exception e) { Console.WriteLine("shot " + n + ": " + e.Message); }
-    }
-
-    static T Retry<T>(Func<T> f, int sec) where T : class
-    {
-        var end = DateTime.UtcNow.AddSeconds(sec);
-        while (DateTime.UtcNow < end) { try { var r = f(); if (r != null) return r; } catch { } Thread.Sleep(300); }
-        return null;
-    }
+    static void Shot(string n) { try { Capture.Screen().ToFile(Path.Combine(ShotDir, n + ".png")); Console.WriteLine("shot " + n); } catch (Exception e) { Console.WriteLine("shot " + n + ": " + e.Message); } }
+    static T Retry<T>(Func<T> f, int sec) where T : class { var end = DateTime.UtcNow.AddSeconds(sec); while (DateTime.UtcNow < end) { try { var r = f(); if (r != null) return r; } catch { } Thread.Sleep(300); } return null; }
 }

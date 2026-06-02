@@ -375,7 +375,7 @@ public sealed class WebBridge
             email = string.IsNullOrEmpty(u.Email) ? "—" : u.Email,
             papel = u.RoleDisplay,
             ultimoLogin = u.LastLoginAt?.ToString("dd/MM/yyyy HH:mm") ?? "—",
-            status = !u.IsActive ? "bloqueado" : u.MustChangePassword ? "convidado" : "ativo",
+            status = !u.IsActive ? "bloqueado" : u.LastLoginAt == null ? "convidado" : "ativo",
             tentativas = 0,
             mfa = false,
         }).ToList();
