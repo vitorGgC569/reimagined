@@ -250,6 +250,7 @@ public sealed class DocumentProcessingQueue
         }
 
         AutoCategorize(doc, result, db);
+        doc.ValorTotal = ExtractValor(doc.ExtractedJson);
 
         if (doc.Status == DocumentStatus.Validated && doc.Client != null)
             doc.Client.ValidatedCount++;
@@ -332,6 +333,44 @@ public sealed class DocumentProcessingQueue
             }
         }
         catch { }
+    }
+
+    // Valor numérico (R$) a partir do JSON de extração — alimenta a coluna indexada
+    // ValorTotal (consulta por índice). Prefere valor_total sobre valores parciais.
+    private static double? ExtractValor(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        System.Text.Json.JsonDocument d;
+        try { d = System.Text.Json.JsonDocument.Parse(json); } catch { return null; }
+        using (d)
+        {
+            foreach (var key in new[] { "valor_total", "valor_total_nota", "valor_principal", "valor" })
+            {
+                var s = FindKeyText(d.RootElement, key);
+                if (string.IsNullOrWhiteSpace(s)) continue;
+                var t = Regex.Replace(s, @"[^\d,.\-]", "");
+                if (string.IsNullOrEmpty(t)) continue;
+                if (t.Contains(',')) t = t.Replace(".", "").Replace(",", ".");
+                if (double.TryParse(t, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var v))
+                    return v;
+            }
+        }
+        return null;
+    }
+
+    private static string? FindKeyText(System.Text.Json.JsonElement el, string keyPart)
+    {
+        if (el.ValueKind != System.Text.Json.JsonValueKind.Object) return null;
+        foreach (var p in el.EnumerateObject())
+        {
+            if (!p.Name.Contains(keyPart, StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Value.ValueKind is System.Text.Json.JsonValueKind.String or System.Text.Json.JsonValueKind.Number)
+                return p.Value.ToString();
+            if (p.Value.ValueKind == System.Text.Json.JsonValueKind.Object && p.Value.TryGetProperty("text", out var t))
+                return t.ToString();
+        }
+        foreach (var p in el.EnumerateObject()) { var r = FindKeyText(p.Value, keyPart); if (r != null) return r; }
+        return null;
     }
 
     private static void MarkAsError(int docId, string errorMessage)

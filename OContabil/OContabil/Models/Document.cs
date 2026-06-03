@@ -30,6 +30,9 @@ public class Document
 
     public double? ConfidenceScore { get; set; }
 
+    /// <summary>Valor total numérico extraído (R$), indexado para consulta. Null se não houver.</summary>
+    public double? ValorTotal { get; set; }
+
     public string? OcrText { get; set; }
 
     public string? ExtractedJson { get; set; }

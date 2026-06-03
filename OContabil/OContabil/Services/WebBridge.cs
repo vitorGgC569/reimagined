@@ -45,6 +45,9 @@ public sealed class WebBridge
 
             case "exports.run": return ExportsRun(payload);
 
+            case "organize.plan": return OrganizePlan(payload);
+            case "organize.run": return OrganizeRun(payload);
+
             case "schemas.list": return SchemasList();
             case "users.list": return UsersList();
             case "audit.list": return AuditList();
@@ -143,7 +146,7 @@ public sealed class WebBridge
             numero = FindField(json, "numero_nota", "numero", "numero_referencia") ?? d.Id.ToString(),
             serie = FindField(json, "serie") ?? "",
             chave = FindField(json, "chave_acesso", "chave") ?? "",
-            valor = ParseBrl(FindField(json, "valor_total", "valor_total_nota", "valor_principal", "salario_liquido", "valor")),
+            valor = d.ValorTotal ?? ParseBrl(FindField(json, "valor_total", "valor_total_nota", "valor_principal", "salario_liquido", "valor")),
             data = d.UploadedAt.ToString("o"),
             dataStr = d.UploadedAt.ToString("dd/MM/yyyy"),
             dataHora = d.UploadedAt.ToString("dd/MM/yyyy HH:mm"),
@@ -318,6 +321,32 @@ public sealed class WebBridge
             count = docs.Count,
             note = official ? $"Layout oficial {fmt.ToUpperInvariant()} ainda não implementado — dados exportados em CSV." : (string?)null,
         });
+    }
+
+    // ── Organização (estrutura de pastas determinística, sem IA) ──
+    private object OrganizePlan(JsonElement p)
+    {
+        if (!_auth.IsLoggedIn) return Err("sem sessão");
+        int clientId = Int(p, "clienteId");
+        var plan = DocumentOrganizerService.BuildPlan(clientId > 0 ? clientId : (int?)null);
+        return Ok(plan);
+    }
+
+    private object OrganizeRun(JsonElement p)
+    {
+        if (!_auth.IsLoggedIn) return Err("sem sessão");
+        int clientId = Int(p, "clienteId");
+        var dlg = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Escolha a pasta raiz para organizar os documentos",
+        };
+        if (dlg.ShowDialog() != true) return Ok(new { canceled = true });
+
+        var report = DocumentOrganizerService.Organize(dlg.FolderName, clientId > 0 ? clientId : (int?)null);
+        using var db = new AppDbContext();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "files.organize", "Documents", null,
+            $"root={report.Raiz}; ok={report.Organizados}; skip={report.Ignorados}; err={report.Erros}");
+        return Ok(report);
     }
 
     // ── Schemas ──

@@ -54,6 +54,9 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
   const [fTipo, setFTipo] = useState('todos');
   const [fStatus, setFStatus] = useState(initialFilter === 'parados' ? 'parados' : 'todos');
   const [fConf, setFConf] = useState('todos');
+  const [fValor, setFValor] = useState('todos');
+  const [fPeriodo, setFPeriodo] = useState('todos');
+  const [orgOpen, setOrgOpen] = useState(false);
   const [sel, setSel] = useState(new Set());
   const [sort, setSort] = useState({ key: 'data', dir: 'desc' });
 
@@ -76,6 +79,21 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
     { value: 'media', label: 'Média (65–84%)', dot: 'var(--conf-mid)' },
     { value: 'baixa', label: 'Baixa (<65%)', dot: 'var(--conf-low)' },
   ];
+  const valorOpts = [
+    { value: 'todos', label: 'Qualquer valor' },
+    { value: 'ate500', label: 'Até R$ 500' },
+    { value: '500a5k', label: 'R$ 500 – 5.000' },
+    { value: '5ka50k', label: 'R$ 5.000 – 50.000' },
+    { value: 'acima50k', label: 'Acima de R$ 50.000' },
+  ];
+  const periodoOpts = [
+    { value: 'todos', label: 'Qualquer período' },
+    { value: 'hoje', label: 'Hoje' },
+    { value: '7d', label: 'Últimos 7 dias' },
+    { value: '30d', label: 'Últimos 30 dias' },
+    { value: 'mes', label: 'Este mês' },
+    { value: 'ano', label: 'Este ano' },
+  ];
 
   const filtered = useMemo(() => {
     let rows = DB.documents.filter(d => {
@@ -90,9 +108,26 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
         if (fConf === 'media' && (c < 65 || c >= 85)) return false;
         if (fConf === 'baixa' && c >= 65) return false;
       }
+      if (fValor !== 'todos') {
+        const v = d.valor || 0;
+        if (fValor === 'ate500' && !(v <= 500)) return false;
+        if (fValor === '500a5k' && !(v > 500 && v <= 5000)) return false;
+        if (fValor === '5ka50k' && !(v > 5000 && v <= 50000)) return false;
+        if (fValor === 'acima50k' && !(v > 50000)) return false;
+      }
+      if (fPeriodo !== 'todos' && d.data) {
+        const now = new Date();
+        const dt = d.data instanceof Date ? d.data : new Date(d.data);
+        const days = (now - dt) / 86400000;
+        if (fPeriodo === 'hoje' && dt.toDateString() !== now.toDateString()) return false;
+        if (fPeriodo === '7d' && days > 7) return false;
+        if (fPeriodo === '30d' && days > 30) return false;
+        if (fPeriodo === 'mes' && (dt.getMonth() !== now.getMonth() || dt.getFullYear() !== now.getFullYear())) return false;
+        if (fPeriodo === 'ano' && dt.getFullYear() !== now.getFullYear()) return false;
+      }
       if (search) {
         const s = search.toLowerCase();
-        if (!(d.numero.includes(s) || d.cliente.toLowerCase().includes(s) || d.emitente.toLowerCase().includes(s) || d.chave.includes(s.replace(/\s/g, '')) || d.tipo.toLowerCase().includes(s))) return false;
+        if (!(d.numero.includes(s) || d.cliente.toLowerCase().includes(s) || d.emitente.toLowerCase().includes(s) || d.chave.includes(s.replace(/\s/g, '')) || d.tipo.toLowerCase().includes(s) || (/\d/.test(s) && String(Math.round(d.valor || 0)).includes(s.replace(/\D/g, ''))))) return false;
       }
       return true;
     });
@@ -105,10 +140,10 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
       return sort.dir === 'asc' ? r : -r;
     });
     return rows;
-  }, [search, fCliente, fTipo, fStatus, fConf, sort]);
+  }, [search, fCliente, fTipo, fStatus, fConf, fValor, fPeriodo, sort]);
 
-  const activeFilters = [fCliente, fTipo, fStatus, fConf].filter(v => v !== 'todos').length + (search ? 1 : 0);
-  const clearAll = () => { setSearch(''); setFCliente('todos'); setFTipo('todos'); setFStatus('todos'); setFConf('todos'); };
+  const activeFilters = [fCliente, fTipo, fStatus, fConf, fValor, fPeriodo].filter(v => v !== 'todos').length + (search ? 1 : 0);
+  const clearAll = () => { setSearch(''); setFCliente('todos'); setFTipo('todos'); setFStatus('todos'); setFConf('todos'); setFValor('todos'); setFPeriodo('todos'); };
 
   const toggleSel = id => setSel(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const allSel = filtered.length > 0 && filtered.every(d => sel.has(d.id));
@@ -136,6 +171,7 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
               { value: 'compact', icon: 'linhasComp', label: '', title: 'Densidade compacta' },
             ]} />
             <Button variant="default" icon="download">Exportar</Button>
+            <Button variant="default" icon="pasta" onClick={() => setOrgOpen(true)}>Organizar</Button>
             <Button variant="primary" icon="upload" onClick={() => {
               window.OContabilBridge.call('documents.upload', { clienteId: fCliente === 'todos' ? 0 : fCliente }).then(function (r) {
                 if (r && r.ok && r.data && r.data.canceled) return;
@@ -155,6 +191,8 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
         <FilterChip label="Tipo" value={fTipo} options={tipoOpts} onChange={setFTipo} icon="arquivo" />
         <FilterChip label="Status" value={fStatus} options={statusOpts} onChange={setFStatus} icon="ponto" />
         <FilterChip label="Confiança" value={fConf} options={confOpts} onChange={setFConf} icon="escudo" />
+        <FilterChip label="Valor" value={fValor} options={valorOpts} onChange={setFValor} icon="cifra" />
+        <FilterChip label="Período" value={fPeriodo} options={periodoOpts} onChange={setFPeriodo} icon="calendario" />
         {activeFilters > 0 && (
           <button onClick={clearAll} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 34, padding: '0 10px', fontSize: 12.5, background: 'transparent', border: 'none', color: 'var(--text-2)', borderRadius: 6 }}>
             <Icon name="x" size={13} /> Limpar ({activeFilters})
@@ -253,6 +291,130 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
           </div>
         </div>
       </Panel>
+      <OrganizeModal open={orgOpen} onClose={() => setOrgOpen(false)} clienteId={fCliente === 'todos' ? 0 : fCliente} toast={toast} />
+    </div>
+  );
+}
+
+/* ============================================================
+   Organização — estrutura de pastas determinística (sem IA)
+   Empresa / Ano / Mês / Tipo · cópia local, originais preservados
+   ============================================================ */
+function OrganizeModal({ open, onClose, clienteId, toast }) {
+  const [plan, setPlan] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState(null);
+
+  useEffect(() => {
+    if (!open) { setPlan(null); setReport(null); setRunning(false); return; }
+    setLoading(true); setReport(null);
+    window.OContabilBridge.call('organize.plan', { clienteId: clienteId || 0 }).then(function (r) {
+      setLoading(false);
+      if (r && r.ok) setPlan(r.data); else toast((r && r.error) || 'Falha ao planejar organização', 'error');
+    });
+  }, [open, clienteId]);
+
+  const run = () => {
+    setRunning(true);
+    window.OContabilBridge.call('organize.run', { clienteId: clienteId || 0 }).then(function (r) {
+      setRunning(false);
+      if (r && r.ok && r.data && r.data.canceled) return;
+      if (r && r.ok && r.data) { setReport(r.data); toast((r.data.Organizados || 0) + ' arquivo(s) organizado(s)'); }
+      else toast((r && r.error) || 'Falha ao organizar', 'error');
+    });
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} width={620}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '18px 22px', borderBottom: '1px solid var(--hairline)' }}>
+        <span style={{ color: 'var(--accent)' }}><Icon name="pasta" size={20} /></span>
+        <div style={{ flex: 1 }}>
+          <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600, color: 'var(--text)' }}>Organizar arquivos</h2>
+          <p style={{ margin: '2px 0 0', fontSize: 12.5, color: 'var(--text-2)' }}>Estrutura por <span className="mono">Empresa / Ano / Mês / Tipo</span> — cópia local, originais preservados.</p>
+        </div>
+        <button onClick={onClose} style={{ ...miniBtn, width: 30, height: 30 }}><Icon name="x" size={15} /></button>
+      </div>
+
+      <div style={{ padding: 22 }}>
+        {loading && (
+          <div style={{ padding: '28px 0', textAlign: 'center', color: 'var(--text-2)', fontSize: 13, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 9 }}>
+            <Icon name="spinner" size={17} style={{ animation: 'om-spin .8s linear infinite' }} /> Calculando estrutura…
+          </div>
+        )}
+
+        {!loading && report && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', background: 'var(--st-approved-bg)', border: '1px solid ' + 'var(--st-approved)' + '35', borderRadius: 'var(--r-md)' }}>
+              <span style={{ color: 'var(--st-approved)' }}><Icon name="check" size={18} /></span>
+              <div style={{ fontSize: 13, color: 'var(--text)' }}><b>{report.Organizados}</b> organizado(s) · {report.Ignorados} já existentes · {report.Erros} erro(s)</div>
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-2)' }}>Pasta: <span className="mono" style={{ wordBreak: 'break-all', color: 'var(--text)' }}>{report.Raiz}</span></div>
+            {report.Mensagens && report.Mensagens.length > 0 && (
+              <Panel style={{ padding: 12, maxHeight: 140, overflow: 'auto' }}>
+                {report.Mensagens.map((m, i) => <div key={i} style={{ fontSize: 11.5, color: 'var(--st-rejected)', fontFamily: 'var(--font-mono)' }}>{m}</div>)}
+              </Panel>
+            )}
+            <Button variant="default" full onClick={onClose}>Fechar</Button>
+          </div>
+        )}
+
+        {!loading && !report && plan && (
+          plan.Total === 0
+            ? <EmptyState icon="pasta" title="Nada para organizar" desc="Não há documentos com arquivo disponível para o filtro atual." />
+            : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  {[['Documentos', plan.Total], ['Com arquivo', plan.ComArquivo], ['Sem arquivo', plan.SemArquivo]].map(([l, v]) => (
+                    <Panel key={l} style={{ flex: 1, padding: '12px 14px' }}>
+                      <div style={{ fontSize: 11.5, color: 'var(--text-2)' }}>{l}</div>
+                      <div className="mono" style={{ fontSize: 20, fontWeight: 600, color: 'var(--text)' }}>{v}</div>
+                    </Panel>
+                  ))}
+                </div>
+                <div>
+                  <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>Pré-visualização da estrutura</div>
+                  <Panel style={{ padding: 12, maxHeight: 240, overflow: 'auto' }}>
+                    {plan.Arvore.map((emp, i) => <TreeNode key={i} node={emp} level={0} />)}
+                  </Panel>
+                </div>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <Button variant="ghost" onClick={onClose}>Cancelar</Button>
+                  <div style={{ flex: 1 }} />
+                  <Button variant="primary" icon={running ? null : 'pasta'} disabled={running || plan.ComArquivo === 0} onClick={run}>
+                    {running ? 'Organizando…' : 'Escolher pasta e organizar ' + plan.ComArquivo}
+                  </Button>
+                </div>
+                <p style={{ margin: 0, fontSize: 10.5, color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center' }}>
+                  <Icon name="escudo" size={12} /> Arquivos são copiados (originais preservados) — nada sai desta máquina.
+                </p>
+              </div>
+            )
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function TreeNode({ node, level }) {
+  const [open, setOpen] = useState(level < 1);
+  const hasChildren = node.Filhos && node.Filhos.length > 0;
+  return (
+    <div style={{ marginLeft: level * 14 }}>
+      <button onClick={() => hasChildren && setOpen(o => !o)} style={{
+        display: 'flex', alignItems: 'center', gap: 7, width: '100%', padding: '4px', background: 'transparent',
+        border: 'none', color: 'var(--text)', textAlign: 'left', fontSize: 12.5, cursor: hasChildren ? 'pointer' : 'default',
+      }}>
+        {hasChildren
+          ? <span style={{ color: 'var(--text-3)', transform: open ? 'rotate(90deg)' : 'none', display: 'inline-flex', transition: 'transform .12s' }}><Icon name="chevRight" size={12} /></span>
+          : <span style={{ width: 12, display: 'inline-block' }} />}
+        <span style={{ color: level === 0 ? 'var(--accent)' : 'var(--text-3)', display: 'inline-flex' }}>
+          <Icon name={level === 0 ? 'clientes' : level >= 3 ? 'arquivo' : 'pasta'} size={14} />
+        </span>
+        <span style={{ flex: 1, fontWeight: level === 0 ? 600 : 400, color: level === 0 ? 'var(--text)' : 'var(--text-2)' }}>{node.Nome}</span>
+        <span className="mono" style={{ fontSize: 11, color: 'var(--text-3)' }}>{node.Total}</span>
+      </button>
+      {open && hasChildren && node.Filhos.map((c, i) => <TreeNode key={i} node={c} level={level + 1} />)}
     </div>
   );
 }

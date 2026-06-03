@@ -24,6 +24,7 @@ class Program
     static int Main(string[] args)
     {
         bool io = args.Any(a => a.Equals("io", OIC));
+        bool org = args.Any(a => a.Equals("org", OIC));
         Directory.CreateDirectory(ShotDir);
         var auto = new UIA3Automation();
         var app = Application.Launch(Exe);
@@ -35,7 +36,9 @@ class Program
         try { win.Focus(); } catch { }
 
         Login(win);
-        if (io) UploadExportFlow(win); else NavFlow(win);
+        if (org) OrganizeFlow(win);
+        else if (io) UploadExportFlow(win);
+        else NavFlow(win);
 
         try { app.Close(); } catch { }
         try { if (!app.HasExited) app.Kill(); } catch { }
@@ -124,6 +127,44 @@ class Program
     {
         var item = win.FindAllDescendants().FirstOrDefault(el => (el.Name ?? "").Trim().Equals(alvo, OIC));
         if (item != null) { try { item.Click(); } catch { } } else Console.WriteLine("nav alvo nao achado: " + alvo);
+    }
+
+    static void OrganizeFlow(Window win)
+    {
+        string testDoc = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\boleto_atlantico.txt";
+        string root = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_org";
+        try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { }
+
+        Nav(win, "Documentos"); Thread.Sleep(1500);
+        var importar = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button)).FirstOrDefault(b => (b.Name ?? "").Trim().Equals("Importar", OIC));
+        if (importar != null)
+        {
+            try { importar.AsButton().Invoke(); } catch { }
+            Thread.Sleep(3000); Keyboard.Type(testDoc); Thread.Sleep(500); Keyboard.Type(VirtualKeyShort.RETURN);
+            Console.WriteLine("upload p/ ter o que organizar");
+        }
+        Thread.Sleep(14000);
+        Shot("org1_documentos");
+
+        var organizar = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button)).FirstOrDefault(b => (b.Name ?? "").Trim().Equals("Organizar", OIC));
+        if (organizar != null) { try { organizar.AsButton().Invoke(); } catch { } Console.WriteLine("Organizar clicado"); }
+        else Console.WriteLine("botao Organizar NAO encontrado");
+        Thread.Sleep(4500); // organize.plan
+        Shot("org2_preview");
+
+        var go = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button)).FirstOrDefault(b => (b.Name ?? "").Trim().StartsWith("Escolher pasta", OIC));
+        if (go != null)
+        {
+            try { go.AsButton().Invoke(); } catch { }
+            Console.WriteLine("execucao clicada (abre seletor de pasta)");
+            Thread.Sleep(3500);
+            Keyboard.Type(root); Thread.Sleep(600); Keyboard.Type(VirtualKeyShort.RETURN);
+            Thread.Sleep(1500); Keyboard.Type(VirtualKeyShort.RETURN);
+            Thread.Sleep(3500);
+        }
+        else Console.WriteLine("botao executar NAO encontrado");
+        Shot("org3_report");
+        Console.WriteLine("pasta organizada existe? " + Directory.Exists(root));
     }
 
     static void TypeInto(AutomationElement el, string text)

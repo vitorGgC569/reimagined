@@ -9,7 +9,7 @@ namespace OContabil.Data;
 /// </summary>
 public static class SchemaManager
 {
-    private const int CurrentVersion = 4;
+    private const int CurrentVersion = 5;
 
     public static void Apply(AppDbContext db)
     {
@@ -22,6 +22,7 @@ public static class SchemaManager
         if (version < 2) ApplyV2(db);
         if (version < 3) ApplyV3(db);
         if (version < 4) ApplyV4(db);
+        if (version < 5) ApplyV5(db);
 
         WriteCurrentVersion(db, CurrentVersion);
     }
@@ -114,6 +115,17 @@ public static class SchemaManager
     {
         Exec(db, "ALTER TABLE Documents ADD COLUMN FilePath TEXT NULL;");
         Exec(db, "ALTER TABLE Documents ADD COLUMN ChartOfAccountId INTEGER NULL;");
+    }
+
+    // V5 — valor numérico indexável + índices de consulta em Documents
+    // (consulta rápida por valor/tipo/cliente/data — "consulta por índice").
+    private static void ApplyV5(AppDbContext db)
+    {
+        Exec(db, "ALTER TABLE Documents ADD COLUMN ValorTotal REAL NULL;");
+        Exec(db, "CREATE INDEX IF NOT EXISTS IX_Documents_Client ON Documents(ClientId);");
+        Exec(db, "CREATE INDEX IF NOT EXISTS IX_Documents_Type ON Documents(DocumentType);");
+        Exec(db, "CREATE INDEX IF NOT EXISTS IX_Documents_Uploaded ON Documents(UploadedAt);");
+        Exec(db, "CREATE INDEX IF NOT EXISTS IX_Documents_Valor ON Documents(ValorTotal);");
     }
 
     private static void Exec(AppDbContext db, string sql)
