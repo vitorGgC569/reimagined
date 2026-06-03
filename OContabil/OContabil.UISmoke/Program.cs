@@ -17,7 +17,8 @@ using FlaUI.UIA3;
 // by typing the path into the focused filename field + Enter.
 class Program
 {
-    const string Exe = @"C:\Users\Oxta\Desktop\reimagined-main\.claude\worktrees\clever-roentgen-ba007c\OContabil\OContabil\bin\Debug\net8.0-windows\OContabil.exe";
+    static readonly string Exe = Environment.GetEnvironmentVariable("OCONTABIL_EXE")
+        ?? @"C:\Users\Oxta\Desktop\reimagined-main\.claude\worktrees\clever-roentgen-ba007c\OContabil\OContabil\bin\Debug\net8.0-windows\OContabil.exe";
     static readonly string ShotDir = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_shots";
     const StringComparison OIC = StringComparison.OrdinalIgnoreCase;
 
