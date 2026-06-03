@@ -49,7 +49,10 @@ public sealed class WebBridge
             case "organize.run": return OrganizeRun(payload);
 
             case "schemas.list": return SchemasList();
+            case "schemas.create": return SchemasCreate(payload);
+            case "schemas.update": return SchemasUpdate(payload);
             case "users.list": return UsersList();
+            case "users.create": return UsersCreate(payload);
             case "audit.list": return AuditList();
             case "dashboard.metrics": return DashboardMetrics();
 
@@ -178,13 +181,25 @@ public sealed class WebBridge
         };
         if (dlg.ShowDialog() != true) return Ok(new { enqueued = 0, canceled = true });
 
-        int enqueued = 0;
+        int enqueued = 0, rejected = 0;
         var ids = new List<int>();
+        const long maxBytes = 50L * 1024 * 1024; // 50 MB/arquivo (anti-DoS/arquivo gigante)
+        string[] allowed = { ".pdf", ".png", ".jpg", ".jpeg", ".xml", ".ofx", ".txt", ".csv" };
+
         foreach (var filePath in dlg.FileNames)
         {
             try
             {
                 var fi = new FileInfo(filePath);
+                // Validação de entrada: extensão na whitelist + tamanho são (defesa
+                // mesmo o diálogo já filtrando — nunca confiar só no cliente).
+                if (!fi.Exists || !allowed.Contains(fi.Extension.ToLowerInvariant()) || fi.Length <= 0 || fi.Length > maxBytes)
+                {
+                    rejected++;
+                    SafeLog.Warn("upload.reject", $"arquivo rejeitado (tipo/tamanho): {fi.Name}");
+                    continue;
+                }
+
                 using var db = new AppDbContext();
                 var doc = new Document
                 {
@@ -208,10 +223,12 @@ public sealed class WebBridge
             }
             catch (Exception ex)
             {
-                return Err("Erro ao importar: " + ex.Message);
+                // Um arquivo problemático não derruba o lote inteiro (resiliência).
+                SafeLog.Error("upload.item", ex);
+                rejected++;
             }
         }
-        return Ok(new { enqueued, ids });
+        return Ok(new { enqueued, rejected, ids });
     }
 
     private object DocumentsReanalyze(JsonElement p)
@@ -276,6 +293,8 @@ public sealed class WebBridge
 
         using var db = new AppDbContext();
         var q = db.Documents.Include(d => d.Client).AsQueryable();
+        var ids = IntArray(p, "ids");
+        if (ids.Length > 0) q = q.Where(d => ids.Contains(d.Id));
         if (clientId > 0) q = q.Where(d => d.ClientId == clientId);
         if (!string.IsNullOrEmpty(tipo) && tipo != "todos") q = q.Where(d => d.DocumentType == tipo);
         if (status == "aprovado") q = q.Where(d => d.Status == DocumentStatus.Validated);
@@ -498,6 +517,88 @@ public sealed class WebBridge
         return Ok(new { kpis, statusDist, topClientes, confSeries });
     }
 
+    // ── Usuários (criação — admin) ──
+    private object UsersCreate(JsonElement p)
+    {
+        if (_auth.CurrentUser?.Role != Models.UserRole.Admin) return Err("Apenas administradores podem criar usuários.");
+        var nome = Str(p, "nome");
+        var usuario = Str(p, "usuario");
+        var senha = Str(p, "senha");
+        if (string.IsNullOrWhiteSpace(nome) || string.IsNullOrWhiteSpace(usuario) || senha.Length < 6)
+            return Err("Informe nome, login e senha (mín. 6 caracteres).");
+
+        using var db = new AppDbContext();
+        if (db.Users.Any(u => u.Username == usuario)) return Err("Já existe um usuário com esse login.");
+
+        var role = Str(p, "papel") switch
+        {
+            "Administrador" => Models.UserRole.Admin,
+            "Visualizador" => Models.UserRole.Visualizador,
+            _ => Models.UserRole.Operador,
+        };
+        var user = new Models.User
+        {
+            Username = usuario, FullName = nome, Email = Str(p, "email"),
+            PasswordHash = PasswordHasher.Hash(senha), Role = role,
+            IsActive = true, MustChangePassword = true, CreatedAt = DateTime.Now,
+        };
+        db.Users.Add(user);
+        db.SaveChanges();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "user.create", "Users", user.Id, usuario);
+        return Ok(new { id = user.Id });
+    }
+
+    // ── Schemas (criação/edição — apenas não-sistema) ──
+    private object SchemasCreate(JsonElement p)
+    {
+        if (!_auth.IsLoggedIn) return Err("sem sessão");
+        var nome = Str(p, "nome");
+        var tipo = Str(p, "tipo");
+        if (string.IsNullOrWhiteSpace(nome) || string.IsNullOrWhiteSpace(tipo))
+            return Err("Informe nome e tipo do schema.");
+        var cid = Int(p, "clienteId");
+
+        using var db = new AppDbContext();
+        var s = new DocumentSchema
+        {
+            Name = nome,
+            DocumentType = tipo,
+            IsSystem = false,
+            ClientId = cid > 0 ? cid : (int?)null,
+            SchemaJson = BuildSchemaJson(tipo, StrArray(p, "campos")),
+            CreatedAt = DateTime.UtcNow,
+        };
+        db.DocumentSchemas.Add(s);
+        db.SaveChanges();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "schema.create", "DocumentSchemas", s.Id, nome);
+        return Ok(new { id = s.Id });
+    }
+
+    private object SchemasUpdate(JsonElement p)
+    {
+        if (!_auth.IsLoggedIn) return Err("sem sessão");
+        int id = Int(p, "id");
+        using var db = new AppDbContext();
+        var s = db.DocumentSchemas.Find(id);
+        if (s == null) return Err("Schema não encontrado.");
+        if (s.IsSystem) return Err("Schemas do sistema não podem ser editados.");
+        s.SchemaJson = BuildSchemaJson(s.DocumentType, StrArray(p, "campos"));
+        db.SaveChanges();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "schema.update", "DocumentSchemas", s.Id, s.Name);
+        return Ok(new { id });
+    }
+
+    private static string BuildSchemaJson(string tipo, string[] campos)
+    {
+        var group = string.IsNullOrWhiteSpace(tipo) ? "campos" : tipo.ToLowerInvariant().Replace('-', '_').Replace(' ', '_');
+        var fields = campos
+            .Select(c => c.Trim())
+            .Where(c => c.Length > 0)
+            .Select(c => c.Contains("::") ? c : c + "::str::")
+            .ToList();
+        return JsonSerializer.Serialize(new Dictionary<string, List<string>> { [group] = fields });
+    }
+
     // ── helpers ──
     private static object Ok(object data) => new { ok = true, data };
     private static object Err(string error) => new { ok = false, error };
@@ -575,13 +676,7 @@ public sealed class WebBridge
         return double.TryParse(t, NumberStyles.Any, CultureInfo.InvariantCulture, out var v) ? v : 0;
     }
 
-    private static string Csv(string? s)
-    {
-        if (string.IsNullOrEmpty(s)) return "";
-        var needsQuote = s.Contains(';') || s.Contains('"') || s.Contains('\n') || s.Contains('\r');
-        s = s.Replace("\"", "\"\"").Replace("\r", " ").Replace("\n", " ");
-        return needsQuote ? $"\"{s}\"" : s;
-    }
+    private static string Csv(string? s) => SecureCsv.Cell(s);
 
     private static string Str(JsonElement p, string key) =>
         p.ValueKind == JsonValueKind.Object && p.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String
@@ -593,5 +688,28 @@ public sealed class WebBridge
         if (v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n)) return n;
         if (v.ValueKind == JsonValueKind.String && int.TryParse(v.GetString(), out var s)) return s;
         return 0;
+    }
+
+    private static int[] IntArray(JsonElement p, string key)
+    {
+        if (p.ValueKind != JsonValueKind.Object || !p.TryGetProperty(key, out var v) || v.ValueKind != JsonValueKind.Array)
+            return Array.Empty<int>();
+        var list = new List<int>();
+        foreach (var e in v.EnumerateArray())
+        {
+            if (e.ValueKind == JsonValueKind.Number && e.TryGetInt32(out var n)) list.Add(n);
+            else if (e.ValueKind == JsonValueKind.String && int.TryParse(e.GetString(), out var s)) list.Add(s);
+        }
+        return list.ToArray();
+    }
+
+    private static string[] StrArray(JsonElement p, string key)
+    {
+        if (p.ValueKind != JsonValueKind.Object || !p.TryGetProperty(key, out var v) || v.ValueKind != JsonValueKind.Array)
+            return Array.Empty<string>();
+        var list = new List<string>();
+        foreach (var e in v.EnumerateArray())
+            if (e.ValueKind == JsonValueKind.String) list.Add(e.GetString() ?? "");
+        return list.ToArray();
     }
 }

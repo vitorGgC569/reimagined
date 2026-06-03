@@ -61,18 +61,31 @@ public static class DocumentOrganizerService
             return new Report(0, 0, 0, root ?? "", new List<string> { "Pasta raiz inválida." });
 
         try { Directory.CreateDirectory(root); }
-        catch (Exception ex) { return new Report(0, 0, 0, root, new List<string> { "Não foi possível criar a raiz: " + ex.Message }); }
+        catch (Exception ex) { SafeLog.Error("organize.root", ex); return new Report(0, 0, 0, root, new List<string> { "Não foi possível criar a pasta raiz." }); }
+
+        // Resiliência: não inicia sem espaço mínimo em disco.
+        try
+        {
+            var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(root)) ?? "C:\\");
+            if (drive.IsReady && drive.AvailableFreeSpace < 50L * 1024 * 1024)
+                return new Report(0, 0, 0, root, new List<string> { "Espaço em disco insuficiente (< 50 MB)." });
+        }
+        catch { }
 
         foreach (var d in LoadDocs(clientId))
         {
             if (!HasFile(d.doc)) { skip++; continue; }
             try
             {
-                var dir = Path.Combine(root, Safe(d.empresa), Safe(d.ano), Safe(d.mes), Safe(d.tipo));
+                // Confinamento na raiz (anti path-traversal): segmentos vêm de
+                // dados extraídos/nome de arquivo de terceiros — nunca confiáveis.
+                var dir = SecurePath.CombineInside(root, d.empresa, d.ano, d.mes, d.tipo);
+                if (dir == null) { err++; if (msgs.Count < 20) msgs.Add($"{d.doc.Filename}: caminho rejeitado (traversal)"); continue; }
                 Directory.CreateDirectory(dir);
 
-                var name = Safe(Path.GetFileName(d.doc.FilePath!));
+                var name = SecurePath.SanitizeSegment(Path.GetFileName(d.doc.FilePath!));
                 var target = Path.Combine(dir, name);
+                if (!SecurePath.IsInside(root, target)) { err++; continue; }
 
                 if (File.Exists(target))
                 {
@@ -166,12 +179,4 @@ public static class DocumentOrganizerService
         return null;
     }
 
-    private static string Safe(string s)
-    {
-        if (string.IsNullOrEmpty(s)) return "_";
-        foreach (var ch in Path.GetInvalidFileNameChars()) s = s.Replace(ch, '-');
-        s = s.Replace(":", "-").Replace("/", "-").Trim().TrimEnd('.', ' ');
-        if (s.Length == 0) return "_";
-        return s.Length > 120 ? s.Substring(0, 120) : s;
-    }
 }

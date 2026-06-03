@@ -80,16 +80,21 @@ public class GlinerService
             var modelName = AppSettings.GlinerModelName;
             var threshold = AppSettings.GlinerThreshold;
 
-            var args = $"\"{_scriptPath}\" \"{filePath}\" \"{docType}\" \"{modelName}\" {threshold:F2}";
-
-            var psi = new ProcessStartInfo(_pythonPath, args)
+            var psi = new ProcessStartInfo(_pythonPath)
             {
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                UseShellExecute = false,
+                UseShellExecute = false,             // nunca via shell (anti command-injection)
                 CreateNoWindow = true,
                 WorkingDirectory = Path.GetDirectoryName(_scriptPath) ?? ""
             };
+            // Argumentos como LISTA — cada um escapado pelo runtime. Elimina
+            // arg/command-injection via aspas/metacaracteres no caminho do arquivo.
+            psi.ArgumentList.Add(_scriptPath);
+            psi.ArgumentList.Add(filePath);
+            psi.ArgumentList.Add(docType ?? "");
+            psi.ArgumentList.Add(modelName ?? "");
+            psi.ArgumentList.Add(threshold.ToString("F2", System.Globalization.CultureInfo.InvariantCulture));
             psi.Environment["PYTHONIOENCODING"] = "utf-8";
 
             using var process = Process.Start(psi)!;
@@ -97,7 +102,16 @@ public class GlinerService
             var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
             var stderrTask = process.StandardError.ReadToEndAsync(ct);
 
-            await process.WaitForExitAsync(ct);
+            try
+            {
+                await process.WaitForExitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                // Resiliência/sandbox: mata o processo (e filhos) p/ não deixar órfão.
+                try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+                throw;
+            }
 
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
@@ -109,10 +123,11 @@ public class GlinerService
 
             if (string.IsNullOrWhiteSpace(stdout) || !stdout.StartsWith("{"))
             {
+                SafeLog.Warn("gliner.bridge", $"exit={process.ExitCode}; stderr={stderr}");
                 return new GlinerResult
                 {
                     Success = false,
-                    Error = $"Sem resposta válida do bridge (exit {process.ExitCode}). stderr: {stderr}"
+                    Error = "O extrator Python não retornou um resultado válido."
                 };
             }
 
@@ -132,7 +147,8 @@ public class GlinerService
         }
         catch (Exception ex)
         {
-            return new GlinerResult { Success = false, Error = $"Erro ao processar: {ex.Message}" };
+            SafeLog.Error("gliner.process", ex);
+            return new GlinerResult { Success = false, Error = "Falha no extrator Python." };
         }
     }
 }

@@ -1,6 +1,8 @@
 using System.IO;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using OContabil.Models;
+using OContabil.Services;
 
 namespace OContabil.Data;
 
@@ -68,5 +70,15 @@ public class AppDbContext : DbContext
 
         modelBuilder.Entity<DocumentSchema>()
             .HasIndex(s => new { s.DocumentType, s.ClientId });
+
+        // ── Cifragem em repouso (DPAPI) das colunas com PII fiscal ──
+        // Transparente: cifra ao gravar, decifra ao ler. Dados legados em texto
+        // são lidos como estão e re-cifrados no próximo save (migração preguiçosa).
+        var encrypt = new ValueConverter<string?, string?>(
+            v => Crypto.Protect(v),
+            v => Crypto.Unprotect(v));
+        modelBuilder.Entity<Document>().Property(d => d.ExtractedJson).HasConversion(encrypt);
+        modelBuilder.Entity<Document>().Property(d => d.ExtractedJsonOriginal).HasConversion(encrypt);
+        modelBuilder.Entity<Document>().Property(d => d.OcrText).HasConversion(encrypt);
     }
 }

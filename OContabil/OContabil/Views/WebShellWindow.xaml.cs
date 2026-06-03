@@ -31,6 +31,29 @@ public partial class WebShellWindow : Window
         try
         {
             await web.EnsureCoreWebView2Async();
+
+            // ── Hardening do WebView2 (defesa em profundidade, menor superfície) ──
+            var s = web.CoreWebView2.Settings;
+            s.AreDevToolsEnabled = false;               // sem DevTools/inspeção em produção
+            s.AreDefaultContextMenusEnabled = false;    // sem menu "Inspecionar/Salvar como"
+            s.AreBrowserAcceleratorKeysEnabled = false; // sem F12/Ctrl+Shift+I/Ctrl+P etc.
+            s.IsZoomControlEnabled = false;
+            s.IsStatusBarEnabled = false;
+            s.IsGeneralAutofillEnabled = false;
+            s.IsPasswordAutosaveEnabled = false;
+
+            // Apenas a origem local é permitida — bloqueia navegação externa, popups e downloads.
+            web.CoreWebView2.NavigationStarting += (_, e) =>
+            {
+                if (!e.Uri.StartsWith("https://ocontabil.local/", StringComparison.OrdinalIgnoreCase))
+                {
+                    e.Cancel = true;
+                    SafeLog.Warn("webview.nav", "Navegacao externa bloqueada: " + e.Uri);
+                }
+            };
+            web.CoreWebView2.NewWindowRequested += (_, e) => { e.Handled = true; };
+            web.CoreWebView2.DownloadStarting += (_, e) => { e.Cancel = true; };
+
             web.CoreWebView2.WebMessageReceived += OnWebMessage;
 
             var webUi = Path.Combine(AppContext.BaseDirectory, "WebUI");
@@ -40,7 +63,8 @@ public partial class WebShellWindow : Window
         }
         catch (Exception ex)
         {
-            MessageBox.Show("Falha ao iniciar a UI web: " + ex.Message, "OContabil",
+            SafeLog.Error("webview.init", ex);
+            MessageBox.Show("Não foi possível iniciar a interface. Tente reabrir o aplicativo.", "OContabil",
                 MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
@@ -58,7 +82,8 @@ public partial class WebShellWindow : Window
         }
         catch (Exception ex)
         {
-            Respond(id, new { ok = false, error = ex.Message });
+            SafeLog.Error("webmsg", ex);
+            Respond(id, new { ok = false, error = "Não foi possível processar a solicitação." });
         }
     }
 

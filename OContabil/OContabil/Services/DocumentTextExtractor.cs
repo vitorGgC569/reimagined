@@ -23,6 +23,13 @@ public static class DocumentTextExtractor
     {
         if (!File.Exists(path)) return string.Empty;
 
+        // PDF não é lido como texto bruto (evita lixo binário): retorna vazio para
+        // o pipeline cair no OCR (Python/Tesseract). A extração da camada de texto
+        // de PDFs digitais exige uma lib PDF auditada — não adicionada aqui para não
+        // puxar pacote não-verificado (princípio anti-supply-chain).
+        if (Path.GetExtension(path).ToLowerInvariant() == ".pdf")
+            return string.Empty;
+
         // .NET 8 não traz a code page 1252 por padrão (GetEncoding(1252) lança sem
         // CodePagesEncodingProvider). UTF-8 + Latin1 cobrem documentos PT-BR; o 1252
         // entra só se disponível. Construção guardada — nunca quebra a leitura.

@@ -51,7 +51,10 @@ public static class SchemaManager
 
     private static void WriteCurrentVersion(AppDbContext db, int version)
     {
-        Exec(db, $"INSERT INTO SchemaVersion(Version, AppliedAt) VALUES ({version}, '{DateTime.UtcNow:O}')");
+        // Parametrizado (sem interpolação em SQL) — rigor anti-injection mesmo
+        // sendo valores internos/confiáveis.
+        try { db.Database.ExecuteSqlRaw("INSERT INTO SchemaVersion(Version, AppliedAt) VALUES ({0}, {1})", version, DateTime.UtcNow.ToString("O")); }
+        catch { }
     }
 
     // V1 — auditoria, revisões e schemas configuráveis.

@@ -5,6 +5,7 @@
 function UsersScreen({ toast }) {
   const DB = window.DB;
   const [tab, setTab] = useState('usuarios');
+  const [createOpen, setCreateOpen] = useState(false);
 
   const papelColor = { 'Administrador': 'var(--accent)', 'Contador': 'var(--st-info)', 'Aux. Contábil': 'var(--text-2)', 'Somente leitura': 'var(--text-3)' };
   const auditIcon = { aprovado: 'check', sistema: 'raio', export: 'download', seguranca: 'cadeado', edicao: 'lapis', config: 'config' };
@@ -13,7 +14,7 @@ function UsersScreen({ toast }) {
   return (
     <div style={{ animation: 'om-fade-in .25s ease' }}>
       <SectionHeader title="Usuários e segurança" subtitle="Gestão de acesso, permissões e trilha de auditoria" icon="usuarios"
-        action={<Button variant="primary" icon="mais" onClick={() => toast('Convite enviado por e-mail interno')}>Convidar usuário</Button>} />
+        action={<Button variant="primary" icon="mais" onClick={() => setCreateOpen(true)}>Convidar usuário</Button>} />
 
       {/* Indicadores de segurança */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14, marginBottom: 16 }}>
@@ -99,6 +100,7 @@ function UsersScreen({ toast }) {
           </div>
         </Panel>
       )}
+      <UserCreateModal open={createOpen} onClose={() => setCreateOpen(false)} toast={toast} />
     </div>
   );
 }
@@ -116,7 +118,14 @@ function SchemasScreen({ toast }) {
     };
   });
   const [sel, setSel] = useState(schemaList[0] || null);
-  if (!sel) return <div style={{ padding: 28, color: 'var(--text-2)', animation: 'om-fade-in .25s ease' }}>Nenhum schema de extração cadastrado.</div>;
+  const [schemaModal, setSchemaModal] = useState(null);
+  if (!sel) return (
+    <div style={{ padding: 28, color: 'var(--text-2)', animation: 'om-fade-in .25s ease' }}>
+      Nenhum schema de extração cadastrado.
+      <div style={{ marginTop: 14 }}><Button variant="primary" icon="mais" onClick={() => setSchemaModal({ mode: 'new' })}>Novo schema</Button></div>
+      <SchemaEditModal state={schemaModal} onClose={() => setSchemaModal(null)} toast={toast} />
+    </div>
+  );
   const campos = (sel.fields || []).map(function (f) {
     return { campo: f.nome, tipoVal: (f.tipo === 'str' || !f.tipo ? 'texto' : f.tipo), desc: f.desc || '' };
   });
@@ -124,7 +133,7 @@ function SchemasScreen({ toast }) {
   return (
     <div style={{ animation: 'om-fade-in .25s ease' }}>
       <SectionHeader title="Schemas de extração" subtitle="Defina quais campos extrair por tipo de documento e cliente" icon="schemas"
-        action={<Button variant="primary" icon="mais" onClick={() => toast('Novo schema criado')}>Novo schema</Button>} />
+        action={<Button variant="primary" icon="mais" onClick={() => setSchemaModal({ mode: 'new' })}>Novo schema</Button>} />
 
       <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: 16, alignItems: 'start' }}>
         <Panel style={{ padding: 8 }}>
@@ -150,7 +159,7 @@ function SchemasScreen({ toast }) {
               <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>{sel.nome}</h3>
               <p style={{ margin: '3px 0 0', fontSize: 12, color: 'var(--text-2)' }}>Tipo {sel.tipo} · atualizado em {sel.atualizado}</p>
             </div>
-            <Button variant="default" size="sm" icon="mais">Adicionar campo</Button>
+            <Button variant="default" size="sm" icon="mais" disabled={sel.sistema} onClick={() => setSchemaModal({ mode: 'edit', schema: sel })}>Adicionar campo</Button>
           </div>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead><tr style={{ background: 'var(--surface-2)' }}>
@@ -178,7 +187,102 @@ function SchemasScreen({ toast }) {
           </table>
         </Panel>
       </div>
+      <SchemaEditModal state={schemaModal} onClose={() => setSchemaModal(null)} toast={toast} />
     </div>
+  );
+}
+
+/* ---- estilos de campo (modais admin) ---- */
+const admFld = { width: '100%', height: 38, padding: '0 12px', fontSize: 13.5, background: 'var(--surface)', border: '1px solid var(--hairline)', borderRadius: 'var(--r-md)', color: 'var(--text)', outline: 'none', fontFamily: 'var(--font-sans)' };
+const admLbl = { display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-2)', margin: '0 0 6px' };
+
+/* ---- Criar usuário ---- */
+function UserCreateModal({ open, onClose, toast }) {
+  const [nome, setNome] = useState(''); const [usuario, setUsuario] = useState('');
+  const [email, setEmail] = useState(''); const [papel, setPapel] = useState('Operador');
+  const [senha, setSenha] = useState(''); const [busy, setBusy] = useState(false);
+  useEffect(() => { if (open) { setNome(''); setUsuario(''); setEmail(''); setPapel('Operador'); setSenha(''); setBusy(false); } }, [open]);
+  const salvar = () => {
+    if (!nome.trim() || !usuario.trim() || senha.length < 6) { toast('Preencha nome, login e senha (mín. 6).', 'error'); return; }
+    setBusy(true);
+    window.OContabilBridge.call('users.create', { nome, usuario, email, papel, senha }).then(r => {
+      setBusy(false);
+      if (r && r.ok) { toast('Usuário criado'); if (window.__refreshData) window.__refreshData(); onClose(); }
+      else toast((r && r.error) || 'Falha ao criar usuário', 'error');
+    });
+  };
+  return (
+    <Modal open={open} onClose={onClose} width={460}>
+      <div style={{ padding: '18px 22px', borderBottom: '1px solid var(--hairline)', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ color: 'var(--accent)' }}><Icon name="usuarios" size={19} /></span>
+        <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Novo usuário</h2>
+      </div>
+      <div style={{ padding: 22, display: 'flex', flexDirection: 'column', gap: 13 }}>
+        <div><label style={admLbl}>Nome completo</label><input style={admFld} value={nome} onChange={e => setNome(e.target.value)} /></div>
+        <div style={{ display: 'flex', gap: 12 }}>
+          <div style={{ flex: 1 }}><label style={admLbl}>Login</label><input style={admFld} value={usuario} onChange={e => setUsuario(e.target.value)} /></div>
+          <div style={{ flex: 1 }}><label style={admLbl}>Senha (mín. 6)</label><input type="password" style={admFld} value={senha} onChange={e => setSenha(e.target.value)} /></div>
+        </div>
+        <div><label style={admLbl}>E-mail</label><input style={admFld} value={email} onChange={e => setEmail(e.target.value)} /></div>
+        <div><label style={admLbl}>Papel</label><Select value={papel} onChange={setPapel} width="100%" options={[{ value: 'Operador', label: 'Operador' }, { value: 'Administrador', label: 'Administrador' }, { value: 'Visualizador', label: 'Visualizador' }]} /></div>
+        <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
+          <Button variant="ghost" onClick={onClose}>Cancelar</Button>
+          <div style={{ flex: 1 }} />
+          <Button variant="primary" icon="check" disabled={busy} onClick={salvar}>{busy ? 'Criando…' : 'Criar usuário'}</Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---- Criar / editar schema ---- */
+function SchemaEditModal({ state, onClose, toast }) {
+  const open = !!state;
+  const isNew = !!state && state.mode === 'new';
+  const [nome, setNome] = useState(''); const [tipo, setTipo] = useState('');
+  const [campos, setCampos] = useState(''); const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!state) return;
+    if (state.mode === 'new') { setNome(''); setTipo(''); setCampos(''); }
+    else { const s = state.schema; setNome(s.nome); setTipo(s.tipo); setCampos((s.fields || []).map(f => f.nome + '::' + (f.tipo || 'str') + '::' + (f.desc || '')).join('\n')); }
+    setBusy(false);
+  }, [state]);
+  if (!open) return null;
+  const salvar = () => {
+    const lista = campos.split('\n').map(l => l.trim()).filter(Boolean);
+    if (isNew && (!nome.trim() || !tipo.trim())) { toast('Informe nome e tipo.', 'error'); return; }
+    setBusy(true);
+    const call = isNew
+      ? window.OContabilBridge.call('schemas.create', { nome, tipo, campos: lista })
+      : window.OContabilBridge.call('schemas.update', { id: state.schema.id, campos: lista });
+    call.then(r => {
+      setBusy(false);
+      if (r && r.ok) { toast(isNew ? 'Schema criado' : 'Schema atualizado'); if (window.__refreshData) window.__refreshData(); onClose(); }
+      else toast((r && r.error) || 'Falha ao salvar schema', 'error');
+    });
+  };
+  return (
+    <Modal open={open} onClose={onClose} width={520}>
+      <div style={{ padding: '18px 22px', borderBottom: '1px solid var(--hairline)', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ color: 'var(--accent)' }}><Icon name="schemas" size={19} /></span>
+        <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>{isNew ? 'Novo schema' : 'Editar campos — ' + nome}</h2>
+      </div>
+      <div style={{ padding: 22, display: 'flex', flexDirection: 'column', gap: 13 }}>
+        {isNew && <div style={{ display: 'flex', gap: 12 }}>
+          <div style={{ flex: 1 }}><label style={admLbl}>Nome</label><input style={admFld} value={nome} onChange={e => setNome(e.target.value)} /></div>
+          <div style={{ flex: 1 }}><label style={admLbl}>Tipo (ex.: NF-e)</label><input style={admFld} value={tipo} onChange={e => setTipo(e.target.value)} /></div>
+        </div>}
+        <div>
+          <label style={admLbl}>Campos — um por linha (<span className="mono">nome::str::descrição</span>)</label>
+          <textarea value={campos} onChange={e => setCampos(e.target.value)} rows={8} style={{ ...admFld, height: 'auto', padding: 10, fontFamily: 'var(--font-mono)', fontSize: 12.5, resize: 'vertical' }} />
+        </div>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <Button variant="ghost" onClick={onClose}>Cancelar</Button>
+          <div style={{ flex: 1 }} />
+          <Button variant="primary" icon="check" disabled={busy} onClick={salvar}>{busy ? 'Salvando…' : 'Salvar'}</Button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

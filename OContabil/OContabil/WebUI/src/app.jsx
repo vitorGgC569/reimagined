@@ -332,7 +332,15 @@ function App() {
         </main>
       </div>
 
-      {doc && <ReviewDialog doc={doc} onClose={() => setDoc(null)} onNav={navDoc} onAction={() => {}} toast={showToast} />}
+      {doc && <ReviewDialog doc={doc} onClose={() => setDoc(null)} onNav={navDoc} toast={showToast}
+        onAction={(d, action, reason) => {
+          var b = window.OContabilBridge;
+          if (!b || !b.available || !d || !d.id) return;
+          var call = action === 'aprovado'
+            ? b.call('documents.validate', { id: d.id })
+            : b.call('documents.reject', { id: d.id, reason: reason || '' });
+          call.then(function () { if (window.__refreshData) window.__refreshData(); });
+        }} />}
       <CommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} nav={nav} openCopilot={openCopilot} setTheme={setTheme} theme={theme} />
       <CopilotPanel open={copilotOpen} onClose={() => setCopilotOpen(false)} nav={nav} openDoc={openDoc} autoFocus={copilotFocus} />
       <Toast toast={toast} />

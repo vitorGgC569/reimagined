@@ -170,7 +170,15 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
               { value: 'comfortable', icon: 'linhas', label: '', title: 'Densidade confortável' },
               { value: 'compact', icon: 'linhasComp', label: '', title: 'Densidade compacta' },
             ]} />
-            <Button variant="default" icon="download">Exportar</Button>
+            <Button variant="default" icon="download" onClick={() => {
+              const b = window.OContabilBridge;
+              if (!b || !b.available) { toast('Exportação indisponível'); return; }
+              b.call('exports.run', { format: 'csv', clienteId: fCliente === 'todos' ? 0 : fCliente, tipo: fTipo, status: fStatus === 'aprovado' ? 'aprovado' : 'todos' }).then(r => {
+                if (r && r.ok && r.data && r.data.canceled) return;
+                if (r && r.ok && r.data) toast((r.data.count || 0) + ' documento(s) exportado(s) para CSV');
+                else toast((r && r.error) || 'Falha na exportação');
+              });
+            }}>Exportar</Button>
             <Button variant="default" icon="pasta" onClick={() => setOrgOpen(true)}>Organizar</Button>
             <Button variant="primary" icon="upload" onClick={() => {
               window.OContabilBridge.call('documents.upload', { clienteId: fCliente === 'todos' ? 0 : fCliente }).then(function (r) {
@@ -205,9 +213,26 @@ function DocumentsScreen({ openDoc, density, setDensity, initialFilter, toast })
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', marginBottom: 12, background: 'var(--accent-weak)', border: '1px solid var(--accent-weak-2)', borderRadius: 'var(--r-md)', animation: 'om-pop-in .15s ease' }}>
           <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-ink)' }}>{sel.size} selecionados</span>
           <div style={{ width: 1, height: 18, background: 'var(--accent-weak-2)' }} />
-          <Button variant="ghost" size="sm" icon="check" onClick={() => { toast('✓ ' + sel.size + ' documentos aprovados'); setSel(new Set()); }}>Aprovar</Button>
-          <Button variant="ghost" size="sm" icon="download" onClick={() => toast('Exportação iniciada para ' + sel.size + ' documentos')}>Exportar</Button>
-          <Button variant="ghost" size="sm" icon="x">Rejeitar</Button>
+          <Button variant="ghost" size="sm" icon="check" onClick={() => {
+            const b = window.OContabilBridge; const ids = Array.from(sel);
+            if (b && b.available) Promise.all(ids.map(id => b.call('documents.validate', { id }))).then(() => { if (window.__refreshData) window.__refreshData(); });
+            toast('✓ ' + ids.length + ' documento(s) aprovado(s)'); setSel(new Set());
+          }}>Aprovar</Button>
+          <Button variant="ghost" size="sm" icon="x" onClick={() => {
+            const b = window.OContabilBridge; const ids = Array.from(sel);
+            if (b && b.available) Promise.all(ids.map(id => b.call('documents.reject', { id, reason: 'Rejeição em lote' }))).then(() => { if (window.__refreshData) window.__refreshData(); });
+            toast(ids.length + ' documento(s) rejeitado(s)'); setSel(new Set());
+          }}>Rejeitar</Button>
+          <Button variant="ghost" size="sm" icon="download" onClick={() => {
+            const b = window.OContabilBridge; const ids = Array.from(sel);
+            if (!b || !b.available) { toast('Exportação indisponível'); return; }
+            b.call('exports.run', { format: 'csv', ids }).then(r => {
+              if (r && r.ok && r.data && r.data.canceled) return;
+              if (r && r.ok && r.data) toast((r.data.count || 0) + ' documento(s) exportado(s) para CSV');
+              else toast((r && r.error) || 'Falha na exportação');
+            });
+            setSel(new Set());
+          }}>Exportar</Button>
           <div style={{ flex: 1 }} />
           <button onClick={() => setSel(new Set())} style={{ background: 'none', border: 'none', color: 'var(--accent-ink)', fontSize: 12.5, fontWeight: 500 }}>Limpar seleção</button>
         </div>

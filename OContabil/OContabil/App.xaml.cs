@@ -110,7 +110,7 @@ public partial class App : Application
             IOException => "Erro de leitura/escrita em disco. Pode haver falta de espaço ou bloqueio por antivírus.",
             System.Net.Http.HttpRequestException => "Falha de rede. Verifique sua conexão e tente novamente.",
             TimeoutException => "Tempo esgotado. A operação demorou mais do que o limite configurado.",
-            _ => $"Ocorreu um erro inesperado: {ex.Message}"
+            _ => "Ocorreu um erro inesperado. Um registro técnico (sem dados sensíveis) foi gravado nos logs."
         };
     }
 }
