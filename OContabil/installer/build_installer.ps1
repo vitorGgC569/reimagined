@@ -35,7 +35,10 @@ if (-not (Test-Path $wv2)) {
 # Localiza o compilador do Inno Setup
 $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
 if (-not $iscc) {
-  foreach ($c in @("C:\Program Files (x86)\Inno Setup 6\ISCC.exe", "C:\Program Files\Inno Setup 6\ISCC.exe")) {
+  foreach ($c in @(
+      "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+      "C:\Program Files\Inno Setup 6\ISCC.exe",
+      "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe")) {  # instalação user-scope (winget)
     if (Test-Path $c) { $iscc = $c; break }
   }
 }
