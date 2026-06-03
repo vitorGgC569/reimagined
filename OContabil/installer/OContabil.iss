@@ -42,10 +42,15 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; Binários principais (.NET 8 publicado em self-contained — gerado por build_installer.ps1 em .\publish)
 Source: "publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-; Modelo GLiNER (opcional — só copia se existir na pasta)
+; Modelo GLiNER ONNX (opcional — caminho C# nativo, hoje dormente)
 Source: "models\onnx\*"; DestDir: "{app}\models\onnx"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 
-; Embedded Python (opcional — só copia se existir)
+; Modelo GLiNER2 (gliner2-multi-v1) — cache HuggingFace embutido p/ uso 100% OFFLINE (opcional, ~ver README).
+; Quando presente, o app seta HF_HOME/HF_HUB_OFFLINE e NÃO baixa nada da internet.
+Source: "models\hf\*"; DestDir: "{app}\models\hf"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
+
+; Python embarcado + gliner2 (opcional — habilita o motor GLiNER sem Python instalado).
+; O app detecta {app}\python\python.exe automaticamente. NOTA: inclui PyTorch (pesado).
 Source: "python\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 
 ; Scripts Python

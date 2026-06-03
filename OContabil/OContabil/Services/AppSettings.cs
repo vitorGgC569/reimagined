@@ -134,7 +134,7 @@ public static class AppSettings
 
     private sealed class SettingsData
     {
-        public string GlinerModelName { get; set; } = "fastino/gliner2-base-v1";
+        public string GlinerModelName { get; set; } = "fastino/gliner2-multi-v1";
         public double GlinerThreshold { get; set; } = 0.80;
         public AiEnginePreference PreferredEngine { get; set; } = AiEnginePreference.Auto;
         public int AiTimeoutSeconds { get; set; } = 120;

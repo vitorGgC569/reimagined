@@ -140,6 +140,17 @@ public sealed class DocumentProcessingQueue
                     var result = await task;
                     if (result.Success)
                     {
+                        // HÍBRIDO: o motor ML (GLiNER/ONNX) é forte em nomes/entidades; enriquece
+                        // com o determinístico (valor/CNPJ/chave/datas validados) sem perder os nomes.
+                        if (engine == AiEnginePreference.Python || engine == AiEnginePreference.Onnx)
+                        {
+                            try
+                            {
+                                var det = await RunRegexAsync(item, threshold);
+                                if (det.Success) result = ExtractionMerge.Merge(result, det);
+                            }
+                            catch { /* mantém o resultado do motor ML */ }
+                        }
                         result.Note = $"engine={engine}; attempt={attempt + 1}";
                         return result;
                     }
@@ -406,7 +417,11 @@ public sealed class DocumentProcessingQueue
             ToastService.ShowError($"Erro no processamento: {errorMessage}"));
     }
 
-    public void Shutdown() => _cts.Cancel();
+    public void Shutdown()
+    {
+        _cts.Cancel();
+        try { _gliner.Dispose(); } catch { }   // encerra o sidecar GLiNER persistente
+    }
 
     private static string[] GetLabelsForType(string docType) => docType switch
     {

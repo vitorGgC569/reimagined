@@ -158,10 +158,72 @@ def _normalize_shape(result: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def build_schema() -> dict:
+    """Schema contábil para notas fiscais brasileiras (NER schema-driven do gliner2)."""
+    return {
+        "nota_fiscal": [
+            "cnpj_emitente::str::CNPJ da empresa emitente (formato XX.XXX.XXX/XXXX-XX)",
+            "nome_emitente::str::Razao social completa do emitente",
+            "cnpj_destinatario::str::CNPJ do destinatario",
+            "numero_nota::str::Numero da nota fiscal (serie e numero)",
+            "data_emissao::str::Data de emissao (DD/MM/AAAA)",
+            "valor_total::str::Valor total em reais (R$ X.XXX,XX)",
+            "valor_icms::str::Valor do ICMS destacado",
+            "valor_ipi::str::Valor do IPI",
+            "chave_acesso::str::Chave de acesso NF-e (44 digitos)",
+            "natureza_operacao::str::Natureza da operacao",
+            "descricao_produtos::str::Descricao dos produtos ou servicos"
+        ]
+    }
+
+
+def process_with_loaded(extractor, text: str, doc_type: str = "", threshold: float = 0.5, model_name: str = "") -> dict:
+    """Roda a extração com um modelo JÁ carregado (reuso no sidecar persistente)."""
+    raw_result = extractor.extract_json(text, build_schema(), include_confidence=True)
+    filtered_result = apply_threshold_filter(raw_result, threshold)
+    filtered_result = _normalize_shape(filtered_result)
+
+    confidences = []
+    entity_count = 0
+
+    def collect_stats(obj):
+        nonlocal entity_count
+        if isinstance(obj, dict):
+            if "confidence" in obj and "text" in obj:
+                confidences.append(float(obj["confidence"]))
+                if obj.get("text"):
+                    entity_count += 1
+            else:
+                for v in obj.values():
+                    collect_stats(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                collect_stats(item)
+
+    collect_stats(filtered_result)
+    avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    max_confidence = max(confidences) if confidences else 0.0
+    min_confidence = min(confidences) if confidences else 0.0
+
+    return {
+        "success": True,
+        "extraction": filtered_result,
+        "avg_confidence": round(float(avg_confidence), 4),
+        "max_confidence": round(float(max_confidence), 4),
+        "min_confidence": round(float(min_confidence), 4),
+        "entity_count": entity_count,
+        "threshold_applied": threshold,
+        "text_length": len(text),
+        "model": model_name or "gliner2",
+        "validation": validate_extraction(filtered_result),
+        "processing_method": "gliner2-json"
+    }
+
+
 def process_with_gliner(
-    text: str, 
-    doc_type: str = "", 
-    model_name: str = "fastino/gliner2-base-v1", 
+    text: str,
+    doc_type: str = "",
+    model_name: str = "fastino/gliner2-multi-v1",
     threshold: float = 0.5
 ) -> dict:
     """
@@ -173,81 +235,20 @@ def process_with_gliner(
     try:
         from gliner2 import GLiNER2
         
-        # Inicialização com cache de modelo (evita reload)
+        # Carga do modelo (cache do HF). No sidecar persistente isso ocorre UMA vez.
         extractor = GLiNER2.from_pretrained(model_name)
-        
-        # Schema contábil otimizado para notas fiscais brasileiras
-        schema = {
-            "nota_fiscal": [
-                "cnpj_emitente::str::CNPJ da empresa emitente (formato XX.XXX.XXX/XXXX-XX)",
-                "nome_emitente::str::Razao social completa do emitente",
-                "cnpj_destinatario::str::CNPJ do destinatario",
-                "numero_nota::str::Numero da nota fiscal (serie e numero)",
-                "data_emissao::str::Data de emissao (DD/MM/AAAA)",
-                "valor_total::str::Valor total em reais (R$ X.XXX,XX)",
-                "valor_icms::str::Valor do ICMS destacado",
-                "valor_ipi::str::Valor do IPI",
-                "chave_acesso::str::Chave de acesso NF-e (44 digitos)",
-                "natureza_operacao::str::Natureza da operacao",
-                "descricao_produtos::str::Descricao dos produtos ou servicos"
-            ]
-        }
-
-        # Extração com confidence scores
-        raw_result = extractor.extract_json(
-            text,
-            schema,
-            include_confidence=True
-        )
-        
-        # 🎯 CORREÇÃO CRÍTICA: Aplicar threshold configurável
-        filtered_result = apply_threshold_filter(raw_result, threshold)
-        # Normaliza p/ o formato dos extratores C# ({grupo:{campo:{text,confidence}}}).
-        filtered_result = _normalize_shape(filtered_result)
-        
-        # Coletar estatísticas de confiança APÓS filtragem
-        confidences = []
-        entity_count = 0
-        
-        def collect_stats(obj):
-            nonlocal entity_count
-            if isinstance(obj, dict):
-                if "confidence" in obj and "text" in obj:
-                    confidences.append(float(obj["confidence"]))
-                    if obj.get("text"):  # Só conta se tem valor
-                        entity_count += 1
-                else:
-                    for v in obj.values():
-                        collect_stats(v)
-            elif isinstance(obj, list):
-                for item in obj:
-                    collect_stats(item)
-        
-        collect_stats(filtered_result)
-        
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-        max_confidence = max(confidences) if confidences else 0.0
-        min_confidence = min(confidences) if confidences else 0.0
-        
-        # Validar CNPJs extraídos (formato brasileiro)
-        validation = validate_extraction(filtered_result)
-        
-        return {
-            "success": True,
-            "extraction": filtered_result,
-            "avg_confidence": round(float(avg_confidence), 4),
-            "max_confidence": round(float(max_confidence), 4),
-            "min_confidence": round(float(min_confidence), 4),
-            "entity_count": entity_count,
-            "threshold_applied": threshold,  # ✅ Transparência para debug
-            "text_length": len(text),
-            "model": model_name,
-            "validation": validation,
-            "processing_method": "gliner2-json"
-        }
+        return process_with_loaded(extractor, text, doc_type, threshold, model_name)
 
     except (ImportError, OSError) as e:
-        return extract_basic_fallback(text, str(e), threshold)
+        # GLiNER2 indisponivel (ex.: gliner2/torch ausentes). NAO usamos o regex interno
+        # do bridge — retornamos falha para o C# cair no motor DETERMINISTICO
+        # (RegexExtractionService + NfeXmlExtractor), que e mais completo e validado.
+        return {
+            "success": False,
+            "error": f"GLiNER2 indisponivel: {type(e).__name__}",
+            "text_length": len(text),
+            "avg_confidence": 0.0,
+        }
     except Exception as e:
         return {
             "success": False,
@@ -372,17 +373,78 @@ def extract_basic_fallback(
     }
 
 
+def serve(model_name: str, default_threshold: float):
+    """Sidecar PERSISTENTE: carrega o modelo UMA vez e atende requisições via stdin
+    (uma linha JSON por documento), respondendo uma linha JSON em stdout. Logs de carga/
+    inferência vão p/ stderr — o stdout fica limpo, só com o protocolo."""
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr  # qualquer print() do modelo vai p/ stderr
+
+    extractor = None
+    try:
+        from gliner2 import GLiNER2
+        extractor = GLiNER2.from_pretrained(model_name)
+    except Exception as e:
+        sys.stderr.write(f"[serve] falha ao carregar {model_name}: {e}\n")
+        sys.stderr.flush()
+
+    def emit(obj):
+        real_stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        real_stdout.flush()
+
+    emit({"ready": True, "model": model_name, "loaded": extractor is not None})
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            if req.get("cmd") == "quit":
+                break
+            fp = req.get("file", "")
+            try:
+                th = max(0.0, min(1.0, float(req.get("threshold", default_threshold))))
+            except (TypeError, ValueError):
+                th = default_threshold
+            if not fp or not os.path.exists(fp):
+                emit({"success": False, "error": f"Arquivo nao encontrado: {fp}"})
+                continue
+            if extractor is None:
+                emit({"success": False, "error": "GLiNER2 indisponivel (modelo nao carregado)."})
+                continue
+            text = extract_text_from_file(fp)
+            if text.startswith("[ERRO"):
+                emit({"success": False, "error": text})
+                continue
+            res = process_with_loaded(extractor, text, req.get("doc_type", ""), th, model_name)
+            res["ocr_sample"] = text[:1500] + "..." if len(text) > 1500 else text
+            emit(res)
+        except Exception as e:
+            emit({"success": False, "error": str(e), "error_type": type(e).__name__})
+
+
 def main():
+    # Sidecar persistente: python gliner_bridge.py --serve [modelo] [threshold]
+    if len(sys.argv) > 1 and sys.argv[1] == "--serve":
+        model = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "fastino/gliner2-multi-v1"
+        try:
+            th = max(0.0, min(1.0, float(sys.argv[3]))) if len(sys.argv) > 3 else 0.5
+        except ValueError:
+            th = 0.5
+        serve(model, th)
+        return
+
     if len(sys.argv) < 2:
         print(json.dumps({
-            "success": False, 
-            "error": "Uso: python gliner_bridge.py <arquivo> [tipo] [modelo] [threshold]"
+            "success": False,
+            "error": "Uso: gliner_bridge.py <arquivo> [tipo] [modelo] [threshold]  |  --serve [modelo] [threshold]"
         }))
         sys.exit(1)
 
     file_path = sys.argv[1]
     doc_type = sys.argv[2] if len(sys.argv) > 2 else "nota_fiscal"
-    model_name = sys.argv[3] if len(sys.argv) > 3 else "fastino/gliner2-base-v1"
+    model_name = sys.argv[3] if len(sys.argv) > 3 else "fastino/gliner2-multi-v1"
     
     # Validação robusta do threshold
     try:
