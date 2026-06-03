@@ -75,7 +75,7 @@ public sealed class GlinerService : IDisposable
         return "";
     }
 
-    public async Task<GlinerResult> ProcessFileAsync(string filePath, string docType = "", CancellationToken ct = default)
+    public async Task<GlinerResult> ProcessFileAsync(string filePath, string text, string docType = "", CancellationToken ct = default)
     {
         if (!IsPythonAvailable)
             return Fail("Python não encontrado. Instale Python 3.10+ e gliner2, ou use o motor determinístico.");
@@ -89,10 +89,12 @@ public sealed class GlinerService : IDisposable
             if (_stdin == null || _stdout == null || _proc == null || _proc.HasExited)
                 return Fail("Sidecar GLiNER indisponível.");
 
-            // Argumentos via JSON (sem shell): caminho do arquivo escapado pelo serializer.
+            // Requisição como JSON (sem shell). O TEXTO já foi extraído pelo C# (inclui OCR) e
+            // segue junto — o sidecar não precisa de OCR (pytesseract/PyMuPDF). 'file' é fallback.
             var req = JsonSerializer.Serialize(new
             {
                 file = filePath,
+                text = text ?? "",
                 doc_type = docType ?? "",
                 threshold = AppSettings.GlinerThreshold
             });

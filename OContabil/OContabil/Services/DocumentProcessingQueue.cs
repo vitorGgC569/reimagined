@@ -123,6 +123,16 @@ public sealed class DocumentProcessingQueue
 
         var order = BuildEngineOrder(preference, item.FilePath);
 
+        // Extrai o texto UMA vez (OCR via C#/Tesseract+PDFium p/ PDF/imagem) e reusa em TODOS
+        // os motores e no merge — sem OCR duplicado e sem exigir OCR no Python embarcado.
+        string text;
+        try
+        {
+            using var textCts = new CancellationTokenSource(timeout);
+            text = await DocumentTextExtractor.ReadAsync(item.FilePath, textCts.Token) ?? "";
+        }
+        catch { text = ""; }
+
         Exception? lastError = null;
         foreach (var engine in order)
         {
@@ -133,9 +143,9 @@ public sealed class DocumentProcessingQueue
                     using var cts = new CancellationTokenSource(timeout);
                     var task = engine switch
                     {
-                        AiEnginePreference.Onnx => RunOnnxAsync(item, threshold, cts.Token),
-                        AiEnginePreference.Python => RunPythonAsync(item, cts.Token),
-                        _ => RunRegexAsync(item, threshold)
+                        AiEnginePreference.Onnx => RunOnnxAsync(text, item.DocType, threshold),
+                        AiEnginePreference.Python => RunPythonAsync(item.FilePath, text, item.DocType, cts.Token),
+                        _ => RunRegexAsync(text, item.DocType, threshold)
                     };
                     var result = await task;
                     if (result.Success)
@@ -146,7 +156,7 @@ public sealed class DocumentProcessingQueue
                         {
                             try
                             {
-                                var det = await RunRegexAsync(item, threshold);
+                                var det = await RunRegexAsync(text, item.DocType, threshold);
                                 if (det.Success) result = ExtractionMerge.Merge(result, det);
                             }
                             catch { /* mantém o resultado do motor ML */ }
@@ -190,38 +200,28 @@ public sealed class DocumentProcessingQueue
         };
     }
 
-    private async Task<GlinerResult> RunOnnxAsync(QueueItem item, double threshold, CancellationToken ct)
+    private Task<GlinerResult> RunOnnxAsync(string text, string docType, double threshold)
     {
-        var text = await DocumentTextExtractor.ReadAsync(item.FilePath, ct);
         if (string.IsNullOrWhiteSpace(text))
-            return new GlinerResult { Success = false, Error = "Sem texto extraível para ONNX." };
-
-        var labels = GetLabelsForType(item.DocType);
-        return await _onnx.PredictAsync(text, labels, (float)threshold);
+            return Task.FromResult(new GlinerResult { Success = false, Error = "Sem texto extraível para ONNX." });
+        var labels = GetLabelsForType(docType);
+        return _onnx.PredictAsync(text, labels, (float)threshold);
     }
 
-    private async Task<GlinerResult> RunPythonAsync(QueueItem item, CancellationToken ct)
+    private async Task<GlinerResult> RunPythonAsync(string filePath, string text, string docType, CancellationToken ct)
     {
         if (!_gliner.IsPythonAvailable)
             return new GlinerResult { Success = false, Error = "Python não disponível." };
-        return await _gliner.ProcessFileAsync(item.FilePath, item.DocType, ct);
+        // O texto já foi extraído pelo C# (inclui OCR) e é enviado ao sidecar — o Python não
+        // precisa de OCR (pytesseract/PyMuPDF). 'filePath' segue como fallback.
+        return await _gliner.ProcessFileAsync(filePath, text, docType, ct);
     }
 
-    private async Task<GlinerResult> RunRegexAsync(QueueItem item, double threshold)
+    private static Task<GlinerResult> RunRegexAsync(string text, string docType, double threshold)
     {
-        var text = await DocumentTextExtractor.ReadAsync(item.FilePath);
         if (string.IsNullOrWhiteSpace(text))
-        {
-            // Tenta extrair texto pelo Python (PDF/OCR) e em seguida regex.
-            try
-            {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(AppSettings.AiTimeoutSeconds));
-                var pyResult = await _gliner.ProcessFileAsync(item.FilePath, item.DocType, cts.Token);
-                text = pyResult.OcrText ?? "";
-            }
-            catch { }
-        }
-        return RegexExtractionService.Extract(text ?? "", item.DocType, threshold);
+            return Task.FromResult(new GlinerResult { Success = false, Error = "Sem texto extraível." });
+        return Task.FromResult(RegexExtractionService.Extract(text, docType, threshold));
     }
 
     private void ApplyResult(QueueItem item, GlinerResult result)

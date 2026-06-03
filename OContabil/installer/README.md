@@ -75,6 +75,8 @@ offline, embuta o Python + o modelo:
    .\python\python.exe -m pip install gliner2   # puxa torch/transformers (pesado)
    ```
    O app detecta `{app}\python\python.exe` automaticamente (sem Python no sistema).
+   **OCR não é necessário no Python**: o C# já faz o OCR (Tesseract + PDFium) e envia o texto
+   pronto ao sidecar — dispensa `pytesseract`/`Pillow`/`PyMuPDF` no bundle.
 
 2. **Cache do modelo** em `installer/models/hf/` (baixa uma vez; depois fica offline):
    ```powershell

@@ -402,20 +402,23 @@ def serve(model_name: str, default_threshold: float):
             req = json.loads(line)
             if req.get("cmd") == "quit":
                 break
-            fp = req.get("file", "")
             try:
                 th = max(0.0, min(1.0, float(req.get("threshold", default_threshold))))
             except (TypeError, ValueError):
                 th = default_threshold
-            if not fp or not os.path.exists(fp):
-                emit({"success": False, "error": f"Arquivo nao encontrado: {fp}"})
-                continue
             if extractor is None:
                 emit({"success": False, "error": "GLiNER2 indisponivel (modelo nao carregado)."})
                 continue
-            text = extract_text_from_file(fp)
-            if text.startswith("[ERRO"):
-                emit({"success": False, "error": text})
+            # Texto extraido pelo C# (OCR/Tesseract/PDFium) tem PRIORIDADE; o arquivo e fallback.
+            text = req.get("text") or ""
+            if not text:
+                fp = req.get("file", "")
+                if not fp or not os.path.exists(fp):
+                    emit({"success": False, "error": "Sem texto e arquivo inexistente."})
+                    continue
+                text = extract_text_from_file(fp)
+            if not text or text.startswith("[ERRO"):
+                emit({"success": False, "error": text or "Texto vazio."})
                 continue
             res = process_with_loaded(extractor, text, req.get("doc_type", ""), th, model_name)
             res["ocr_sample"] = text[:1500] + "..." if len(text) > 1500 else text
