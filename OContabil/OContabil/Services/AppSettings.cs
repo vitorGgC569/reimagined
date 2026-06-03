@@ -114,11 +114,22 @@ public static class AppSettings
             if (File.Exists(_settingsPath))
             {
                 var json = File.ReadAllText(_settingsPath);
-                return JsonSerializer.Deserialize<SettingsData>(json) ?? new SettingsData();
+                var data = JsonSerializer.Deserialize<SettingsData>(json) ?? new SettingsData();
+                Migrate(data);
+                return data;
             }
         }
         catch { }
         return new SettingsData();
+    }
+
+    /// <summary>Migra settings legados (preserva escolhas explícitas do usuário).</summary>
+    private static void Migrate(SettingsData d)
+    {
+        // gliner2-base-v1 era apenas o DEFAULT antigo (não há escolha de modelo na UI) e é
+        // fraco p/ PT-BR; sobe para o multilíngue (novo default). Modelos custom são mantidos.
+        if (string.IsNullOrWhiteSpace(d.GlinerModelName) || d.GlinerModelName == "fastino/gliner2-base-v1")
+            d.GlinerModelName = "fastino/gliner2-multi-v1";
     }
 
     private static void Save()
