@@ -31,7 +31,18 @@ public class AppDbContext : DbContext
     protected override void OnConfiguring(DbContextOptionsBuilder options)
     {
         if (!options.IsConfigured)
-            options.UseSqlite($"Data Source={DatabasePath};Cache=Shared");
+        {
+            // SQLCipher: banco inteiro cifrado em repouso. A chave (PRAGMA key) é
+            // protegida por DPAPI (DbKey). Connstring montada via builder p/ escapar
+            // corretamente a chave base64.
+            var csb = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+            {
+                DataSource = DatabasePath,
+                Cache = Microsoft.Data.Sqlite.SqliteCacheMode.Shared,
+                Password = OContabil.Services.DbKey.Get(),
+            };
+            options.UseSqlite(csb.ConnectionString);
+        }
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)

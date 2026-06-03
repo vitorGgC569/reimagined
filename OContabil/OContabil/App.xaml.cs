@@ -20,6 +20,15 @@ public partial class App : Application
 
         ConfigureSerilog();
 
+        // SQLCipher: inicializa o provider nativo e migra DB legado (plaintext) p/ cifrado
+        // ANTES de qualquer acesso ao banco. Guardado — falha aqui não derruba o app.
+        try
+        {
+            SQLitePCL.Batteries_V2.Init();
+            OContabil.Services.DbCipherMigration.EnsureEncrypted();
+        }
+        catch (Exception ex) { Log.Error(ex, "Falha na inicializacao/migracao SQLCipher"); }
+
         Log.Information("OContabil iniciado — versão {Version}",
             System.Reflection.Assembly.GetExecutingAssembly().GetName().Version);
 

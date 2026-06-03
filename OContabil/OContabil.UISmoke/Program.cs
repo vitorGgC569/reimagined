@@ -71,7 +71,7 @@ class Program
 
     static void UploadExportFlow(Window win)
     {
-        string testDoc = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\boleto_atlantico.txt";
+        string testDoc = Environment.GetEnvironmentVariable("OCONTABIL_TESTDOC") ?? @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\boleto_atlantico.txt";
         string csvOut = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\export_teste.csv";
         try { if (File.Exists(csvOut)) File.Delete(csvOut); } catch { }
 
@@ -131,7 +131,7 @@ class Program
 
     static void OrganizeFlow(Window win)
     {
-        string testDoc = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\boleto_atlantico.txt";
+        string testDoc = Environment.GetEnvironmentVariable("OCONTABIL_TESTDOC") ?? @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_test\boleto_atlantico.txt";
         string root = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_org";
         try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { }
 

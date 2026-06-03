@@ -7,13 +7,14 @@ using Microsoft.ML.Tokenizers;
 namespace OContabil.Services;
 
 /// <summary>
-/// Motor de inferência nativo (ONNX Runtime) para GLiNER 2.
-/// Usa tokenizer WordPiece (BERT) via <see cref="Microsoft.ML.Tokenizers"/>
-/// e roda totalmente em-processo, eliminando a necessidade de Python para
-/// inferência.
+/// Infraestrutura de inferência ONNX Runtime (em-processo) para um futuro motor
+/// nativo de extração. Carrega a sessão ONNX e o tokenizer e monta os tensores de
+/// entrada. O DECODER de saída é específico do modelo: GLiNER2 (DeBERTa-v3 +
+/// SentencePiece + decode por schema/count) exige um decoder fiel que ainda não
+/// está implementado em C#. Enquanto isso, este motor reporta indisponível (nunca
+/// fabrica spans) e o pipeline usa os motores determinístico/Python.
 ///
-/// O modelo ONNX deve estar disponível em <c>Models/model.onnx</c>, com
-/// <c>tokenizer.json</c> ou <c>vocab.txt</c> ao lado.
+/// Modelo esperado em <c>Models/model.onnx</c> com <c>vocab.txt</c> ao lado.
 /// </summary>
 public class GlinerOnnxService : IDisposable
 {
@@ -115,40 +116,19 @@ public class GlinerOnnxService : IDisposable
             }
 
             var inputs = await Task.Run(() => BuildInputs(text, labels));
+            using var run = _session.Run(inputs); // valida que o modelo realmente roda
+            InspectOutput(run);
 
-            using var run = _session.Run(inputs);
-
-            var entities = DecodeEntities(run, text, labels, threshold);
-
-            var grouped = entities
-                .GroupBy(e => e.Label)
-                .ToDictionary(g => g.Key, g => g.OrderByDescending(e => e.Confidence).First());
-
-            var extractionDict = new Dictionary<string, object>();
-            foreach (var (label, ent) in grouped)
-            {
-                extractionDict[label] = new
-                {
-                    text = ent.Text,
-                    confidence = Math.Round(ent.Confidence, 4),
-                    start = ent.Start,
-                    end = ent.End
-                };
-            }
-
-            var extractionJson = JsonSerializer.Serialize(extractionDict);
-            using var extractionDoc = JsonDocument.Parse(extractionJson);
-            var avg = entities.Count > 0 ? entities.Average(e => (double)e.Confidence) : 0.0;
-
+            // Sem um decoder FIEL ao modelo (GLiNER2 = span/count por schema) não há
+            // como mapear a saída em campos sem fabricar. Regra do projeto: sem stubs/
+            // sem simulação → reportamos indisponível e o pipeline segue para o motor
+            // determinístico/Python.
             return new GlinerResult
             {
-                Success = true,
+                Success = false,
                 Model = "onnx-native",
-                Extraction = extractionDoc.RootElement.Clone(),
-                AvgConfidence = Math.Round(avg, 4),
-                EntityCount = grouped.Count,
+                Error = "Motor ONNX: decoder específico do modelo não implementado para este formato.",
                 ThresholdUsed = threshold,
-                OcrText = text.Length > 1500 ? text[..1500] + "..." : text,
                 TextLength = text.Length
             };
         }
@@ -206,59 +186,23 @@ public class GlinerOnnxService : IDisposable
         return list;
     }
 
-    private List<DecodedEntity> DecodeEntities(
-        IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs,
-        string text,
-        string[] labels,
-        float threshold)
+    /// <summary>
+    /// Apenas inspeciona/loga o formato da saída do modelo (diagnóstico). NÃO
+    /// decodifica entidades: o decode fiel do GLiNER2 (spans/count por schema) é
+    /// específico do modelo e ainda não está implementado em C#. Não fabricamos
+    /// posições — ver <see cref="PredictAsync"/>.
+    /// </summary>
+    private void InspectOutput(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs)
     {
-        var results = new List<DecodedEntity>();
-
-        // Convenção: o modelo retorna um tensor [batch, span, num_labels]
-        // ou um tensor de logits BIO. Tratamos a saída mais comum (scores por
-        // span) e ignoramos demais formatos com fallback vazio.
-        var first = outputs.FirstOrDefault();
-        if (first == null) return results;
-
-        var tensor = first.AsTensor<float>();
-        if (tensor == null) return results;
-
-        // Para modelos GLiNER reais, é necessário um decoder específico para
-        // mapear spans → tokens → caracteres. Como o modelo final pode variar,
-        // implementamos um decoder genérico que devolve as posições com maior
-        // score acima do threshold por label.
-        if (tensor.Dimensions.Length >= 2)
+        try
         {
-            int spans = tensor.Dimensions[^2];
-            int numLabels = tensor.Dimensions[^1];
-
-            for (int li = 0; li < Math.Min(numLabels, labels.Length); li++)
-            {
-                float best = float.MinValue;
-                int bestSpan = -1;
-                for (int s = 0; s < spans; s++)
-                {
-                    var score = tensor[0, s, li];
-                    if (score > best) { best = score; bestSpan = s; }
-                }
-                if (best >= threshold && bestSpan >= 0)
-                {
-                    // Mapear span -> trecho aproximado do texto (heurístico)
-                    int start = Math.Min(text.Length, bestSpan * 4);
-                    int end = Math.Min(text.Length, start + 32);
-                    results.Add(new DecodedEntity
-                    {
-                        Label = labels[li],
-                        Text = text.Substring(start, end - start).Trim(),
-                        Confidence = best,
-                        Start = start,
-                        End = end
-                    });
-                }
-            }
+            var first = outputs.FirstOrDefault();
+            var tensor = first?.AsTensor<float>();
+            var dims = tensor != null ? string.Join(",", tensor.Dimensions.ToArray()) : "n/d";
+            Log($"Saída ONNX recebida (dims=[{dims}]). Decoder específico do modelo " +
+                "não implementado — encaminhando para o motor determinístico/Python.");
         }
-
-        return results;
+        catch (Exception ex) { Log($"Inspeção de saída ONNX falhou: {ex.Message}"); }
     }
 
     public void Dispose()
@@ -266,14 +210,5 @@ public class GlinerOnnxService : IDisposable
         _session?.Dispose();
         _session = null;
         _loaded = false;
-    }
-
-    private struct DecodedEntity
-    {
-        public string Label;
-        public string Text;
-        public float Confidence;
-        public int Start;
-        public int End;
     }
 }
