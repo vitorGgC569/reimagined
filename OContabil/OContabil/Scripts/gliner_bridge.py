@@ -140,6 +140,24 @@ def apply_threshold_filter(
     return filtered
 
 
+def _normalize_shape(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Normaliza p/ {grupo: {campo: {text, confidence}}} — desembrulha listas de um
+    registro e descarta campos nulos — casando com o formato dos extratores C#
+    (NfeXmlExtractor / RegexExtractionService) e do downstream (FindField/ExtractValor)."""
+    if not isinstance(result, dict):
+        return result
+    out: Dict[str, Any] = {}
+    for group, val in result.items():
+        if isinstance(val, list):
+            val = val[0] if val else {}
+        if isinstance(val, dict):
+            out[group] = {k: v for k, v in val.items()
+                          if isinstance(v, dict) and v.get("text")}
+        else:
+            out[group] = val
+    return out
+
+
 def process_with_gliner(
     text: str, 
     doc_type: str = "", 
@@ -184,6 +202,8 @@ def process_with_gliner(
         
         # 🎯 CORREÇÃO CRÍTICA: Aplicar threshold configurável
         filtered_result = apply_threshold_filter(raw_result, threshold)
+        # Normaliza p/ o formato dos extratores C# ({grupo:{campo:{text,confidence}}}).
+        filtered_result = _normalize_shape(filtered_result)
         
         # Coletar estatísticas de confiança APÓS filtragem
         confidences = []

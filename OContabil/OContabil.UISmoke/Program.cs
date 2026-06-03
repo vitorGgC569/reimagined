@@ -89,7 +89,7 @@ class Program
             Console.WriteLine("arquivo informado: " + testDoc);
         }
         else Console.WriteLine("botao Importar NAO encontrado");
-        Thread.Sleep(14000);                    // enqueue + extracao (ONNX->Python->Regex) + refresh JS (0/2.5/6s)
+        Thread.Sleep(WaitMs(14000));            // enqueue + extracao (ONNX->Python->Regex) + refresh JS; override: OCONTABIL_SMOKE_WAITMS
         Shot("io1_documentos");
 
         // ---------- EXPORT -> CSV ----------
@@ -172,5 +172,7 @@ class Program
 
     static string Ascii(string s) => s.Replace("ç", "c").Replace("õ", "o").Replace("á", "a").Replace("ú", "u").Replace("ã", "a");
     static void Shot(string n) { try { Capture.Screen().ToFile(Path.Combine(ShotDir, n + ".png")); Console.WriteLine("shot " + n); } catch (Exception e) { Console.WriteLine("shot " + n + ": " + e.Message); } }
+    static int WaitMs(int def) => int.TryParse(Environment.GetEnvironmentVariable("OCONTABIL_SMOKE_WAITMS"), out var v) && v > 0 ? v : def;
+
     static T Retry<T>(Func<T> f, int sec) where T : class { var end = DateTime.UtcNow.AddSeconds(sec); while (DateTime.UtcNow < end) { try { var r = f(); if (r != null) return r; } catch { } Thread.Sleep(300); } return null; }
 }

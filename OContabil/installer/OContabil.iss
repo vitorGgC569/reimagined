@@ -39,8 +39,8 @@ Name: "brazilian"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; Binários principais (.NET 8 publicado em self-contained)
-Source: "..\OContabil\bin\Release\net8.0-windows\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Binários principais (.NET 8 publicado em self-contained — gerado por build_installer.ps1 em .\publish)
+Source: "publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Modelo GLiNER (opcional — só copia se existir na pasta)
 Source: "models\onnx\*"; DestDir: "{app}\models\onnx"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
@@ -51,33 +51,39 @@ Source: "python\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs
 ; Scripts Python
 Source: "..\OContabil\Scripts\*"; DestDir: "{app}\Scripts"; Flags: ignoreversion recursesubdirs
 
+; Bootstrapper do WebView2 Runtime (Evergreen) — baixado por build_installer.ps1; instalado só se ausente
+Source: "redist\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist; Check: not WebView2Installed
+
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+; Instala o WebView2 Runtime (Evergreen) silenciosamente, se ausente e o bootstrapper foi empacotado.
+Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Instalando o Microsoft Edge WebView2 Runtime..."; Flags: skipifdoesntexist; Check: not WebView2Installed
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-function InitializeSetup(): Boolean;
+{ App é self-contained (.NET 8 embarcado) — a única dependência de sistema é o WebView2 Runtime. }
+{ Detecta o WebView2 (Evergreen) pelo GUID estável de cliente do EdgeUpdate. }
+function WebView2Installed(): Boolean;
 var
-  NetCoreInstalled: Boolean;
-  ResultCode: Integer;
+  pv: String;
 begin
-  // Verifica .NET 8 Desktop Runtime via comando dotnet
-  NetCoreInstalled := Exec('dotnet', '--list-runtimes', '', SW_HIDE,
-                            ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
-  if not NetCoreInstalled then
-  begin
-    if MsgBox('O .NET 8 Desktop Runtime não foi detectado.' #13#13
-              'O instalador continuará, mas será necessário instalar manualmente:' #13
-              'https://dotnet.microsoft.com/download/dotnet/8.0' #13#13
-              'Deseja continuar mesmo assim?',
-              mbConfirmation, MB_YESNO) = IDNO then
-    begin
-      Result := False;
-      Exit;
-    end;
-  end;
+  Result :=
+    RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', pv) or
+    RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', pv) or
+    RegQueryStringValue(HKCU, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', pv);
+  if Result then
+    Result := (pv <> '') and (pv <> '0.0.0.0');
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  if (not WebView2Installed()) and (not FileExists(ExpandConstant('{src}\redist\MicrosoftEdgeWebview2Setup.exe'))) then
+    MsgBox('O Microsoft Edge WebView2 Runtime não foi detectado e o instalador offline dele não está incluído.' #13#13
+           'O OContabil precisa do WebView2 para a interface. Instale-o (gratuito):' #13
+           'https://developer.microsoft.com/microsoft-edge/webview2/',
+           mbInformation, MB_OK);
   Result := True;
 end;

@@ -45,6 +45,9 @@ public sealed class WebBridge
 
             case "exports.run": return ExportsRun(payload);
 
+            case "backup.export": return BackupExport(payload);
+            case "backup.restore": return BackupRestore(payload);
+
             case "organize.plan": return OrganizePlan(payload);
             case "organize.run": return OrganizeRun(payload);
 
@@ -340,6 +343,51 @@ public sealed class WebBridge
             count = docs.Count,
             note = official ? $"Layout oficial {fmt.ToUpperInvariant()} ainda não implementado — dados exportados em CSV." : (string?)null,
         });
+    }
+
+    // ── Backup / Recuperação (cifrado por SENHA, independente do db.key/DPAPI) ──
+    private object BackupExport(JsonElement p)
+    {
+        if (_auth.CurrentUser?.Role != Models.UserRole.Admin) return Err("Apenas administradores podem exportar backup.");
+        var senha = Str(p, "senha");
+        if (senha.Length < 6) return Err("Defina uma senha de backup com ao menos 6 caracteres.");
+
+        var sfd = new Microsoft.Win32.SaveFileDialog
+        {
+            FileName = $"ocontabil_backup_{DateTime.Now:yyyyMMdd_HHmm}.ocbak",
+            Filter = "Backup OContabil (*.ocbak)|*.ocbak|Todos os arquivos (*.*)|*.*",
+            Title = "Salvar backup cifrado",
+        };
+        if (sfd.ShowDialog() != true) return Ok(new { canceled = true });
+
+        try { DbBackupService.Export(sfd.FileName, senha); }
+        catch (Exception ex) { SafeLog.Error("backup.export", ex); return Err("Não foi possível gerar o backup."); }
+
+        using var db = new AppDbContext();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "backup.export", "Database", null, Path.GetFileName(sfd.FileName));
+        return Ok(new { path = sfd.FileName, note = "Guarde o arquivo e a senha em local seguro — sem a senha, o backup é irrecuperável." });
+    }
+
+    private object BackupRestore(JsonElement p)
+    {
+        if (_auth.CurrentUser?.Role != Models.UserRole.Admin) return Err("Apenas administradores podem restaurar backup.");
+        var senha = Str(p, "senha");
+        if (senha.Length < 6) return Err("Informe a senha do backup.");
+
+        var ofd = new Microsoft.Win32.OpenFileDialog
+        {
+            Filter = "Backup OContabil (*.ocbak)|*.ocbak|Todos os arquivos (*.*)|*.*",
+            Title = "Selecionar backup para restaurar",
+            CheckFileExists = true,
+        };
+        if (ofd.ShowDialog() != true) return Ok(new { canceled = true });
+
+        try { DbBackupService.StageRestore(ofd.FileName, senha); }
+        catch (Exception ex) { SafeLog.Error("backup.restore", ex); return Err("Senha incorreta ou arquivo de backup inválido."); }
+
+        using var db = new AppDbContext();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "backup.restore", "Database", null, Path.GetFileName(ofd.FileName));
+        return Ok(new { staged = true, note = "Backup validado. Feche e reabra o OContabil para concluir a restauração." });
     }
 
     // ── Organização (estrutura de pastas determinística, sem IA) ──

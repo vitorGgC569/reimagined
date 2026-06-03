@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <AssemblyTitle>OContabil</AssemblyTitle>
+    <ApplicationIcon>Assets\logo.ico</ApplicationIcon>
     <Description>Processamento Inteligente de Documentos Contabeis</Description>
     <Company>OContabil</Company>
     <Version>1.0.0</Version>

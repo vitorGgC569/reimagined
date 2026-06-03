@@ -12,17 +12,23 @@ public class GlinerResult
 {
     public bool Success { get; set; }
     public string Model { get; set; } = string.Empty;
+
+    [JsonPropertyName("ocr_sample")]
     public string? OcrText { get; set; }
+
+    [JsonPropertyName("text_length")]
     public int TextLength { get; set; }
-    
+
     [JsonPropertyName("avg_confidence")]
     public double AvgConfidence { get; set; }
-    
+
     [JsonPropertyName("entity_count")]
     public int EntityCount { get; set; }
     public string? Error { get; set; }
     public string? Note { get; set; }
     public JsonElement? Extraction { get; set; }
+
+    [JsonPropertyName("threshold_applied")]
     public double? ThresholdUsed { get; set; }
     public Dictionary<string, EntityPrediction>? RawEntities { get; set; }
 }

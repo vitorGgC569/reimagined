@@ -108,6 +108,19 @@ public sealed class DocumentProcessingQueue
         var timeout = TimeSpan.FromSeconds(AppSettings.AiTimeoutSeconds);
         var maxRetries = AppSettings.AiMaxRetries;
 
+        // NF-e XML: extração ESTRUTURADA (determinística, precisa, parser XXE-safe)
+        // tem prioridade sobre qualquer motor. Só para .xml (evita custo de OCR à toa).
+        if (System.IO.Path.GetExtension(item.FilePath).Equals(".xml", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var xmlText = await DocumentTextExtractor.ReadAsync(item.FilePath, CancellationToken.None);
+                var nfe = NfeXmlExtractor.TryExtract(xmlText, threshold);
+                if (nfe != null) { nfe.Note = "engine=NfeXml"; return nfe; }
+            }
+            catch { /* segue para os motores normais */ }
+        }
+
         var order = BuildEngineOrder(preference, item.FilePath);
 
         Exception? lastError = null;

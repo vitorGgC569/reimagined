@@ -25,6 +25,7 @@ public partial class App : Application
         try
         {
             SQLitePCL.Batteries_V2.Init();
+            OContabil.Services.DbCipherMigration.ApplyPendingRestore(); // restore por senha (se houver pendente)
             OContabil.Services.DbCipherMigration.EnsureEncrypted();
         }
         catch (Exception ex) { Log.Error(ex, "Falha na inicializacao/migracao SQLCipher"); }

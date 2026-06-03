@@ -6,6 +6,16 @@ function UsersScreen({ toast }) {
   const DB = window.DB;
   const [tab, setTab] = useState('usuarios');
   const [createOpen, setCreateOpen] = useState(false);
+  const [bkPwd, setBkPwd] = useState('');
+
+  const doBackup = (action, okMsg) => {
+    if (bkPwd.length < 6) { toast('Senha de backup: mínimo 6 caracteres.', 'error'); return; }
+    window.OContabilBridge.call(action, { senha: bkPwd }).then(r => {
+      if (r && r.ok && r.data && r.data.canceled) return;       // usuário cancelou o diálogo
+      if (r && r.ok) { setBkPwd(''); toast((r.data && r.data.note) || okMsg); }
+      else toast((r && r.error) || 'Falha na operação de backup', 'error');
+    });
+  };
 
   const papelColor = { 'Administrador': 'var(--accent)', 'Contador': 'var(--st-info)', 'Aux. Contábil': 'var(--text-2)', 'Somente leitura': 'var(--text-3)' };
   const auditIcon = { aprovado: 'check', sistema: 'raio', export: 'download', seguranca: 'cadeado', edicao: 'lapis', config: 'config' };
@@ -35,7 +45,7 @@ function UsersScreen({ toast }) {
       </div>
 
       <div style={{ display: 'flex', gap: 2, marginBottom: 14, borderBottom: '1px solid var(--hairline)' }}>
-        {[['usuarios', 'Usuários'], ['auditoria', 'Trilha de auditoria']].map(([k, l]) => (
+        {[['usuarios', 'Usuários'], ['auditoria', 'Trilha de auditoria'], ['backup', 'Backup e recuperação']].map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} style={{ padding: '9px 14px', fontSize: 13.5, fontWeight: 500, background: 'transparent', border: 'none', borderBottom: '2px solid ' + (tab === k ? 'var(--accent)' : 'transparent'), color: tab === k ? 'var(--text)' : 'var(--text-2)', marginBottom: -1 }}>{l}</button>
         ))}
       </div>
@@ -100,6 +110,31 @@ function UsersScreen({ toast }) {
           </div>
         </Panel>
       )}
+      {tab === 'backup' && (
+        <Panel style={{ padding: 22, maxWidth: 640 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <span style={{ color: 'var(--accent)' }}><Icon name="cadeado" size={18} /></span>
+            <span style={{ fontSize: 15, fontWeight: 600 }}>Backup cifrado por senha</span>
+          </div>
+          <p style={{ fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 16 }}>
+            O banco é cifrado em repouso com uma chave protegida pela sua conta do Windows. Se você
+            reinstalar o Windows, trocar de conta ou o perfil corromper, essa chave se perde e o banco
+            fica irrecuperável. Gere um backup cifrado por senha e guarde o arquivo
+            <span className="mono"> .ocbak</span> + a senha em local seguro — é o seu plano de recuperação.
+          </p>
+          <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 6 }}>Senha do backup (mín. 6 caracteres)</label>
+          <input type="password" value={bkPwd} onChange={e => setBkPwd(e.target.value)} placeholder="••••••••"
+            style={{ width: '100%', padding: '9px 12px', fontSize: 13, background: 'var(--surface-2)', border: '1px solid var(--hairline)', borderRadius: 8, color: 'var(--text)', marginBottom: 16, boxSizing: 'border-box' }} />
+          <div style={{ display: 'flex', gap: 10 }}>
+            <Button variant="primary" icon="download" onClick={() => doBackup('backup.export', 'Backup exportado.')}>Exportar backup</Button>
+            <Button variant="default" icon="upload" onClick={() => doBackup('backup.restore', 'Restauração preparada — reinicie o app.')}>Restaurar backup…</Button>
+          </div>
+          <p style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 14 }}>
+            A restauração é validada e aplicada ao reabrir o OContabil. Operação restrita a administradores.
+          </p>
+        </Panel>
+      )}
+
       <UserCreateModal open={createOpen} onClose={() => setCreateOpen(false)} toast={toast} />
     </div>
   );
