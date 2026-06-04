@@ -1499,6 +1499,16 @@ def evaluate_release_gate(metrics_by_phase: Dict[str, Dict[str, float]]) -> Dict
 
 
 def phase_repetition_scale(profile: Dict, phase_name: str) -> float:
+    # Diagnostic/override knob: NSOS_RUL_SCALE forces the repetition-unlikelihood
+    # scale for ALL phases (e.g. "0" to disable it).  RUL runs a per-step,
+    # per-sample host loop over the full softmax (probs.cpu() + O(seq*neg*vocab))
+    # — setting it to 0 isolates how much of the step time is that host path.
+    env = os.environ.get("NSOS_RUL_SCALE")
+    if env is not None and env != "":
+        try:
+            return float(env)
+        except ValueError:
+            pass
     phase_scales = profile.get("phase_repetition_unlikelihood_scale", {})
     return float(phase_scales.get(phase_name, profile.get("repetition_unlikelihood_scale", 0.0)))
 
