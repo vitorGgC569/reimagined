@@ -1,4 +1,5 @@
 #include "cuda/mamba_kernels.cuh"
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -553,12 +554,23 @@ __global__ void mamba_selective_scan_forward_parallel_kernel(
   y[idx] = tanhf(h_t) * C_in[idx];
 }
 
-static bool mamba_parallel_scan_enabled() {
-  static const bool en = [] {
+// Runtime toggle (default from NSOS_MAMBA_PARALLEL_SCAN).  Atomic so a parity
+// test or the Python A/B can switch paths within one process; external linkage
+// (declared in the .cuh) so those callers can reach it.
+static std::atomic<bool> &mamba_parallel_scan_flag() {
+  static std::atomic<bool> flag{[] {
     const char *e = std::getenv("NSOS_MAMBA_PARALLEL_SCAN");
     return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
-  }();
-  return en;
+  }()};
+  return flag;
+}
+
+void set_mamba_parallel_scan(bool enabled) {
+  mamba_parallel_scan_flag().store(enabled, std::memory_order_relaxed);
+}
+
+bool mamba_parallel_scan_enabled() {
+  return mamba_parallel_scan_flag().load(std::memory_order_relaxed);
 }
 
 void launch_mamba_selective_scan_forward(

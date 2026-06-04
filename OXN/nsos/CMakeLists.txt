@@ -485,6 +485,13 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gpu_parity PRIVATE nsos_core)
     add_test(NAME test_gpu_parity COMMAND test_gpu_parity)
 
+    # Fase 2 gate: opt-in Mamba2 parallel-prefix scan vs sequential (1e-4).
+    # Skips when CUDA is off / no GPU; on a real GPU `ctest -R parallel_scan`
+    # is the gate that promotes NSOS_MAMBA_PARALLEL_SCAN to default.
+    add_executable(test_mamba_parallel_scan_parity tests/test_mamba_parallel_scan_parity.cpp)
+    target_link_libraries(test_mamba_parallel_scan_parity PRIVATE nsos_core)
+    add_test(NAME test_mamba_parallel_scan_parity COMMAND test_mamba_parallel_scan_parity)
+
     # Decomposed GPU parity sub-tests.  Each binary covers one kernel /
     # surface so that a CUDA segfault in one (historically the streaming
     # mamba scan on CUDA 12.9) does not mask passing kernels in the rest

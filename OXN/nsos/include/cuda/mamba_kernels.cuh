@@ -60,6 +60,14 @@ void launch_mamba_selective_scan_forward(
     const float *C_in, float *y, float *state_history, int Batch, int Seq,
     int D);
 
+// Runtime toggle for the OPT-IN parallel-prefix (associative) selective scan
+// (default from NSOS_MAMBA_PARALLEL_SCAN env).  OFF -> the validated channel-
+// parallel sequential kernel.  Exposed so the parity test / Python A/B can
+// switch paths in a single process.  Must clear the 1e-4 parity gate before
+// being promoted to default.
+void set_mamba_parallel_scan(bool enabled);
+bool mamba_parallel_scan_enabled();
+
 // =====================================================================
 // Selective scan backward, paired with the forward kernel above.
 //
