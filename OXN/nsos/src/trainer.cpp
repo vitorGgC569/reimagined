@@ -573,14 +573,63 @@ void scale_gradients(const std::vector<Parameter*>& params, float scale) {
     }
 }
 
+#ifdef USE_CUDA
+// One reusable device scalar (4 bytes, process lifetime) for the fused global
+// gradient-norm reduction.  Allocated once so clip_gradients does not cudaMalloc
+// per step.
+float* clip_norm_accumulator() {
+    static float* d_accum = [] {
+        float* p = nullptr;
+        if (cudaMalloc(&p, sizeof(float)) != cudaSuccess) {
+            p = nullptr;
+        }
+        (void)cudaGetLastError();
+        return p;
+    }();
+    return d_accum;
+}
+#endif
+
 float clip_gradients(const std::vector<Parameter*>& params, float max_norm) {
-    float total_norm_sq = 0.0f;
-    for (auto* p : params) {
-        if (!p || p->grad.size == 0) continue;
-        const float norm = p->grad.norm();
-        total_norm_sq += norm * norm;
+    float total_norm = 0.0f;
+    bool fused_done = false;
+#ifdef USE_CUDA
+    float* d_accum = gpu_custom_kernels_supported() ? clip_norm_accumulator() : nullptr;
+    if (d_accum) {
+        // FUSED global grad-norm: accumulate every GPU gradient's sum-of-squares
+        // into ONE device scalar (norm_kernel uses atomicAdd) and read it back
+        // with a SINGLE D2H per step.  Previously this called Tensor::norm()
+        // once per parameter, each issuing its own blocking D2H -> N pipeline
+        // drains per step (a dominant cause of low GPU utilization in the
+        // optimizer phase).  norm_kernel already used atomicAdd, so the global
+        // sum's low-bit ordering is no less deterministic than before.
+        cudaMemsetAsync(d_accum, 0, sizeof(float), 0);
+        double host_sq = 0.0;
+        for (auto* p : params) {
+            if (!p || p->grad.size == 0) continue;
+            if (p->grad.get_device() == Device::GPU) {
+                launch_norm_kernel(d_accum, p->grad.raw_data(), p->grad.size);
+            } else {
+                const float n = p->grad.norm();  // CPU path: no device sync
+                host_sq += static_cast<double>(n) * static_cast<double>(n);
+            }
+        }
+        trainer_check_cuda("launch_norm_kernel(clip)");
+        float gpu_sq = 0.0f;
+        cudaMemcpy(&gpu_sq, d_accum, sizeof(float), cudaMemcpyDeviceToHost);  // single sync
+        total_norm = std::sqrt(static_cast<float>(host_sq) + gpu_sq);
+        fused_done = true;
     }
-    const float total_norm = std::sqrt(total_norm_sq);
+#endif
+    if (!fused_done) {
+        float total_norm_sq = 0.0f;
+        for (auto* p : params) {
+            if (!p || p->grad.size == 0) continue;
+            const float norm = p->grad.norm();
+            total_norm_sq += norm * norm;
+        }
+        total_norm = std::sqrt(total_norm_sq);
+    }
 
     if (total_norm > max_norm) {
         const float coeff = max_norm / (total_norm + 1e-6f);

@@ -10,11 +10,13 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _OPENMP
@@ -305,17 +307,60 @@ T copy_scalar_from_device(const T*) {
 #endif
 
 #ifdef USE_CUDA
+// Process-wide dedicated stream for host<->device / device<->device tensor
+// copies, created once on first use.  Keeping copies off the default (compute)
+// stream lets a copy synchronize only ITSELF instead of draining the whole
+// device (cudaMemcpy's implicit full sync).
+//
+// It is created as a *blocking* stream (cudaStreamCreate, NOT cudaStreamNonBlocking)
+// on purpose: a blocking stream implicitly orders after prior work on the legacy
+// default stream (0).  That reproduces exactly the ordering guarantee of the
+// cudaMemcpy this replaces — a kernel that just wrote `src` on stream 0 is
+// guaranteed to finish before the copy reads it — without an explicit event.
+// On creation failure we fall back to the original blocking cudaMemcpy, so the
+// path is always correct even on a driver that refuses the stream.
+static cudaStream_t tensor_copy_stream() {
+    static cudaStream_t stream = [] {
+        cudaStream_t s = nullptr;
+        if (cudaStreamCreate(&s) != cudaSuccess) {
+            s = nullptr;
+        }
+        (void)cudaGetLastError();
+        return s;
+    }();
+    return stream;
+}
+
 void copy_tensor_bytes(float* dst, Device dst_device, const float* src, Device src_device,
                        size_t bytes) {
     if (bytes == 0) {
         return;
     }
     if (dst_device == Device::GPU || src_device == Device::GPU) {
-        cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
-        const cudaError_t status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            throw std::runtime_error(std::string("CUDA memcpy failed: ") +
-                                     cudaGetErrorString(status));
+        cudaStream_t stream = tensor_copy_stream();
+        if (stream) {
+            // Async copy on the dedicated stream, then wait on JUST this stream.
+            // Equivalent ordering to the legacy blocking cudaMemcpy (blocking
+            // stream serializes with stream 0), but does not stall unrelated
+            // device work the way cudaDeviceSynchronize would.
+            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, stream);
+            const cudaError_t launch = cudaGetLastError();
+            if (launch != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA async memcpy failed: ") +
+                                         cudaGetErrorString(launch));
+            }
+            const cudaError_t sync = cudaStreamSynchronize(stream);
+            if (sync != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA copy-stream sync failed: ") +
+                                         cudaGetErrorString(sync));
+            }
+        } else {
+            cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
+            const cudaError_t status = cudaGetLastError();
+            if (status != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA memcpy failed: ") +
+                                         cudaGetErrorString(status));
+            }
         }
         return;
     }
@@ -331,11 +376,154 @@ void copy_tensor_bytes(float* dst, Device, const float* src, Device, size_t byte
 
 } // namespace
 
+#ifdef USE_CUDA
+namespace {
+
+// ── GPU caching allocator (PyTorch-style caching allocator) ───────────────
+// Per-step training allocates/frees many managed tensors with RECURRING exact
+// sizes (same shapes every iteration).  cudaMallocManaged/cudaFree are
+// heavyweight, partially-synchronizing driver calls; doing dozens per step adds
+// avoidable overhead AND makes CUDA Graph capture impossible (allocation is
+// illegal during capture).  This pool keeps freed blocks on per-exact-size free
+// lists and hands them back on the next request -> with static shapes, reuse is
+// perfect (zero fragmentation) and addresses are stable across steps (the
+// precondition for graph replay; warm the pool with one step, then capture
+// hits only the free list -> no driver alloc inside the captured region).
+// Disable with NSOS_GPU_POOL=0 (falls back to raw cudaMallocManaged/cudaFree).
+class ManagedPool {
+public:
+    static ManagedPool& instance() {
+        static ManagedPool pool;
+        return pool;
+    }
+
+    void* allocate(size_t bytes) {
+        if (bytes == 0) return nullptr;
+        if (!enabled_) return raw_alloc(bytes);
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto& bin = free_[bytes];
+        if (!bin.empty()) {
+            void* p = bin.back();
+            bin.pop_back();
+            cached_bytes_ -= bytes;
+            return p;
+        }
+        void* p = raw_alloc(bytes);
+        if (!p) {
+            // Out of memory: return every cached free block to the driver and
+            // retry once (mirrors a caching allocator's empty-cache-on-OOM).
+            trim_locked();
+            p = raw_alloc(bytes);
+        }
+        if (p) live_[p] = bytes;
+        return p;
+    }
+
+    void deallocate(void* p) {
+        if (!p) return;
+        if (!enabled_) {
+            cudaFree(p);
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = live_.find(p);
+        if (it == live_.end()) {
+            cudaFree(p);  // not pool-owned (shouldn't happen) — be safe
+            return;
+        }
+        const size_t sz = it->second;
+        if (cap_bytes_ != 0 && cached_bytes_ + sz > cap_bytes_) {
+            // Cache is full: return this block to the driver instead of caching
+            // it, so total managed footprint stays bounded.
+            cudaFree(p);
+            live_.erase(it);
+            return;
+        }
+        free_[sz].push_back(p);
+        cached_bytes_ += sz;
+    }
+
+private:
+    ManagedPool() {
+        const char* env = std::getenv("NSOS_GPU_POOL");
+        enabled_ = !(env && std::string(env) == "0");
+        // Cap on CACHED (free-list) bytes.  Unified Memory oversubscribes
+        // SILENTLY (no OOM — it just thrashes via page eviction), so an
+        // unbounded cache (e.g. interleaving an inference and a training working
+        // set in one process) could push a small card into thrash.  Default =
+        // 60% of device memory; NSOS_GPU_POOL_MAX_MB overrides; "0" = unlimited.
+        const char* cap_env = std::getenv("NSOS_GPU_POOL_MAX_MB");
+        if (cap_env) {
+            cap_bytes_ = static_cast<size_t>(std::strtoull(cap_env, nullptr, 10))
+                         * 1024ull * 1024ull;
+        } else {
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b > 0) {
+                cap_bytes_ = static_cast<size_t>(static_cast<double>(total_b) * 0.6);
+            }
+            (void)cudaGetLastError();
+        }
+    }
+
+    // Return all currently-cached (free) blocks to the driver.  Live blocks
+    // still owned by a Tensor are untouched.
+    void trim_locked() {
+        for (auto& kv : free_) {
+            for (void* p : kv.second) {
+                cudaFree(p);
+                live_.erase(p);
+            }
+            kv.second.clear();
+        }
+        cached_bytes_ = 0;
+    }
+
+    static void* raw_alloc(size_t bytes) {
+        void* raw = nullptr;
+        if (cudaMallocManaged(&raw, bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return nullptr;
+        }
+        // Pascal+Windows hardening, applied ONCE per physical block (it then
+        // persists across every pooled reuse): hint the driver that this UM
+        // block is accessed by host and device so pages stay migratable rather
+        // than faulting on host access (sm_61 + Windows lacks demand paging).
+        int device_id = 0;
+        if (cudaGetDevice(&device_id) == cudaSuccess) {
+#if CUDART_VERSION >= 13000
+            cudaMemLocation loc_dev;
+            loc_dev.type = cudaMemLocationTypeDevice;
+            loc_dev.id = device_id;
+            cudaMemLocation loc_host;
+            loc_host.type = cudaMemLocationTypeHost;
+            loc_host.id = 0;
+            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, loc_dev);
+            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, loc_host);
+#else
+            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, device_id);
+            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId);
+#endif
+        }
+        (void)cudaGetLastError();
+        return raw;
+    }
+
+    bool enabled_ = true;
+    size_t cached_bytes_ = 0;  // current sum of free-list block sizes
+    size_t cap_bytes_ = 0;     // max cached bytes (0 = unlimited)
+    std::mutex mtx_;
+    std::unordered_map<size_t, std::vector<void*>> free_;  // exact bytes -> free blocks
+    std::unordered_map<void*, size_t> live_;               // ptr -> its byte size
+};
+
+}  // namespace
+#endif  // USE_CUDA
+
 void TensorDeleter::operator()(float* ptr) {
     if (!ptr) return;
     if (device == Device::GPU) {
 #ifdef USE_CUDA
-        cudaFree(ptr);
+        ManagedPool::instance().deallocate(ptr);
 #endif
     } else {
 #ifdef _WIN32
@@ -362,41 +550,13 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
     float* raw_ptr = nullptr;
     if (device == Device::GPU) {
 #ifdef USE_CUDA
-        cudaMallocManaged(&raw_ptr, size * sizeof(float));
-        // Pascal+Windows hardening: tell the driver this UM allocation
-        // will be accessed concurrently by both host and device.  This
-        // hints the runtime to keep pages migratable rather than locking
-        // them on the GPU (which would page-fault on host access since
-        // sm_61 + Windows lacks demand paging).  Errors here are
-        // non-fatal — older driver/arch combinations may not honor the
-        // advice, in which case sync_host_access remains the safety net.
-        if (raw_ptr) {
-            int device_id = 0;
-            if (cudaGetDevice(&device_id) == cudaSuccess) {
-                // CUDA 13 changed the cudaMemAdvise signature: the trailing
-                // int device id became a struct cudaMemLocation.  Bridge
-                // both APIs with a single CUDART_VERSION guard so the same
-                // source compiles cleanly under 12.x and 13.x toolkits.
-#if CUDART_VERSION >= 13000
-                cudaMemLocation loc_dev;
-                loc_dev.type = cudaMemLocationTypeDevice;
-                loc_dev.id   = device_id;
-                cudaMemLocation loc_host;
-                loc_host.type = cudaMemLocationTypeHost;
-                loc_host.id   = 0;
-                cudaMemAdvise(raw_ptr, size * sizeof(float),
-                              cudaMemAdviseSetAccessedBy, loc_dev);
-                cudaMemAdvise(raw_ptr, size * sizeof(float),
-                              cudaMemAdviseSetAccessedBy, loc_host);
-#else
-                cudaMemAdvise(raw_ptr, size * sizeof(float),
-                              cudaMemAdviseSetAccessedBy, device_id);
-                cudaMemAdvise(raw_ptr, size * sizeof(float),
-                              cudaMemAdviseSetAccessedBy, cudaCpuDeviceId);
-#endif
-            }
-            (void)cudaGetLastError();
-        }
+        // Allocate from the managed caching pool.  cudaMallocManaged +
+        // cudaMemAdvise (Pascal+Windows UM hardening) happen once per physical
+        // block inside the pool; a pooled reuse returns a ready, advise-tagged
+        // block with no driver call.  sync_host_access remains the safety net
+        // for host access regardless.
+        raw_ptr = static_cast<float*>(
+            ManagedPool::instance().allocate(static_cast<size_t>(size) * sizeof(float)));
 #endif
     } else {
 #ifdef _WIN32
@@ -415,8 +575,15 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
     if (fill_value == 0.0f) {
         if (device == Device::GPU) {
 #ifdef USE_CUDA
-            cudaMemset(raw_ptr, 0, size * sizeof(float));
-            cudaDeviceSynchronize();
+            // Zero on the default stream and return WITHOUT a full-device drain.
+            // Kernels that consume this tensor run on the same (default) stream
+            // and are ordered after the memset automatically; host access is
+            // gated by sync_host_access()/data().  The previous
+            // cudaDeviceSynchronize() drained the WHOLE device on every
+            // zero-filled GPU allocation -> dozens of pipeline stalls per train
+            // step, a dominant cause of low GPU utilization.
+            cudaMemsetAsync(raw_ptr, 0, size * sizeof(float), 0);
+            (void)cudaGetLastError();
 #endif
         } else {
             std::memset(raw_ptr, 0, size * sizeof(float));
@@ -424,12 +591,15 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
     } else {
         if (device == Device::GPU) {
 #ifdef USE_CUDA
+            // Synchronous cudaMemcpy from pageable host memory blocks the host
+            // until the copy completes, so host_values is safe to free on return
+            // and no separate cudaDeviceSynchronize is required.
             std::vector<float> host_values(static_cast<size_t>(size), fill_value);
             cudaMemcpy(raw_ptr,
                        host_values.data(),
                        static_cast<size_t>(size) * sizeof(float),
                        cudaMemcpyHostToDevice);
-            cudaDeviceSynchronize();
+            (void)cudaGetLastError();
 #endif
         } else {
             std::fill_n(raw_ptr, size, fill_value);

@@ -380,32 +380,60 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def(py::init<const ModelConfig&, Device>(),
              py::arg("config"),
              py::arg("device") = Device::CPU)
+        // GIL released around the pure-C++ compute body (pybind marshals
+        // args/return with the GIL held).  Safe because the only Python callback
+        // path is Trainer::train_loop's callback (left GIL-holding below); the
+        // audit collector (LayerAuditCollector) is a concrete C++ type, so
+        // forward/backward never re-enter Python mid-call.
         .def("forward", py::overload_cast<const Tensor&, Context*>(&JambaModel::forward),
-             py::arg("x"), py::arg("ctx") = nullptr)
-        .def("forward_ids", &JambaModel::forward_ids, py::arg("ids"), py::arg("ctx") = nullptr)
-        .def("forward_ids_batch", &JambaModel::forward_ids_batch, py::arg("batch_ids"), py::arg("ctx") = nullptr)
-        .def("forward_trunk", &JambaModel::forward_trunk, py::arg("ids"), py::arg("ctx") = nullptr)
-        .def("forward_embedding", &JambaModel::forward_embedding, py::arg("x"), py::arg("ctx") = nullptr)
-        .def("reason", &JambaModel::reason, py::arg("x"), py::arg("num_simulations") = 100)
-        .def("forward_thought", &JambaModel::forward_thought)
-        .def("run_reasoning_loop", py::overload_cast<const Tensor&, int>(&JambaModel::run_reasoning_loop))
-        .def("backward_external", &JambaModel::backward_external)
-        .def("backward_embedding", &JambaModel::backward_embedding)
-        .def("backward", &JambaModel::backward)
+             py::arg("x"), py::arg("ctx") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
+        .def("forward_ids", &JambaModel::forward_ids, py::arg("ids"), py::arg("ctx") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
+        .def("forward_ids_batch", &JambaModel::forward_ids_batch, py::arg("batch_ids"), py::arg("ctx") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
+        .def("forward_trunk", &JambaModel::forward_trunk, py::arg("ids"), py::arg("ctx") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
+        .def("forward_embedding", &JambaModel::forward_embedding, py::arg("x"), py::arg("ctx") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
+        .def("reason", &JambaModel::reason, py::arg("x"), py::arg("num_simulations") = 100,
+             py::call_guard<py::gil_scoped_release>())
+        .def("forward_thought", &JambaModel::forward_thought,
+             py::call_guard<py::gil_scoped_release>())
+        .def("run_reasoning_loop", py::overload_cast<const Tensor&, int>(&JambaModel::run_reasoning_loop),
+             py::call_guard<py::gil_scoped_release>())
+        .def("backward_external", &JambaModel::backward_external,
+             py::call_guard<py::gil_scoped_release>())
+        .def("backward_embedding", &JambaModel::backward_embedding,
+             py::call_guard<py::gil_scoped_release>())
+        .def("backward", &JambaModel::backward,
+             py::call_guard<py::gil_scoped_release>())
         .def("reset_session", &JambaModel::reset_session)
         .def("set_hamiltonian_mode", &JambaModel::set_hamiltonian_mode)
-        .def("session_adapt", &JambaModel::session_adapt)
-        .def("run_simd_inference", &JambaModel::run_simd_inference)
-        .def("save", &JambaModel::save)
-        .def("load", &JambaModel::load, py::arg("path"), py::arg("strict") = true)
+        .def("session_adapt", &JambaModel::session_adapt,
+             py::call_guard<py::gil_scoped_release>())
+        .def("run_simd_inference", &JambaModel::run_simd_inference,
+             py::call_guard<py::gil_scoped_release>())
+        // Disk I/O (no Python callback) -> release the GIL so a multi-MB/GB
+        // pack save/load doesn't block other Python threads.
+        .def("save", &JambaModel::save, py::call_guard<py::gil_scoped_release>())
+        .def("load", &JambaModel::load, py::arg("path"), py::arg("strict") = true,
+             py::call_guard<py::gil_scoped_release>())
         .def("set_reference_path", &JambaModel::set_reference_path, py::arg("enabled"))
+        // Enable SSA on every attention layer (mirror of InferenceEngine's
+        // binding so a bare JambaModel can be configured symmetrically).
+        .def("set_sparse_attention", &JambaModel::set_sparse_attention,
+             py::arg("enabled"), py::arg("block_size") = 64, py::arg("top_k_blocks") = 8,
+             py::arg("local_blocks") = 1, py::arg("sink_blocks") = 1)
         .def("release_full_precision_linear_weights",
              &JambaModel::release_full_precision_linear_weights)
-        .def("save_edge_linear_pack", &JambaModel::save_edge_linear_pack, py::arg("path"))
+        .def("save_edge_linear_pack", &JambaModel::save_edge_linear_pack, py::arg("path"),
+             py::call_guard<py::gil_scoped_release>())
         .def("load_edge_linear_pack",
              &JambaModel::load_edge_linear_pack,
              py::arg("path"),
-             py::arg("release_full_precision") = true)
+             py::arg("release_full_precision") = true,
+             py::call_guard<py::gil_scoped_release>())
         .def("supports_streaming_inference", &JambaModel::supports_streaming_inference)
         .def("set_streaming_inference", &JambaModel::set_streaming_inference, py::arg("enabled"))
         .def("set_training_mode", &JambaModel::set_training_mode, py::arg("enabled"))
@@ -487,15 +515,21 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("last_auxiliary_stats", &Trainer::last_auxiliary_stats)
         .def("configure_progressive_qat", &Trainer::configure_progressive_qat, py::arg("scheduler"))
         .def("progressive_qat_active", &Trainer::progressive_qat_active)
-        .def("train_step", &Trainer::train_step)
+        // GIL released around the C++ training step (forward+backward+optimizer
+        // are pure C++).  train_loop below keeps the GIL: it invokes a Python
+        // callback per step.
+        .def("train_step", &Trainer::train_step,
+             py::call_guard<py::gil_scoped_release>())
         .def("train_supervised",
              &Trainer::train_supervised,
              py::arg("prompt_tokens"),
-             py::arg("answer_tokens"))
+             py::arg("answer_tokens"),
+             py::call_guard<py::gil_scoped_release>())
         .def("train_supervised_batch",
              &Trainer::train_supervised_batch,
              py::arg("prompt_batch"),
-             py::arg("answer_batch"))
+             py::arg("answer_batch"),
+             py::call_guard<py::gil_scoped_release>())
         .def("train_loop",
              &Trainer::train_loop,
              py::arg("tokens"),
@@ -510,26 +544,34 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def("load_model",
              py::overload_cast<const std::string&, const ModelConfig&>(&InferenceEngine::load_model),
              py::arg("path"),
-             py::arg("config") = ModelConfig{})
+             py::arg("config") = ModelConfig{},
+             py::call_guard<py::gil_scoped_release>())
+        // Decode/training loops are pure C++ -> release the GIL so other Python
+        // threads (and async I/O) run concurrently.
         .def("generate",
              py::overload_cast<const std::string&, int, float>(&InferenceEngine::generate),
              py::arg("prompt"),
              py::arg("max_tokens") = 50,
-             py::arg("temperature") = 0.7f)
+             py::arg("temperature") = 0.7f,
+             py::call_guard<py::gil_scoped_release>())
         .def("generate_ex",
              py::overload_cast<const std::string&, const GenerationOptions&>(&InferenceEngine::generate),
              py::arg("prompt"),
-             py::arg("options"))
+             py::arg("options"),
+             py::call_guard<py::gil_scoped_release>())
         .def("generate_batch", &InferenceEngine::generate_batch,
              py::arg("prompts"),
-             py::arg("options") = GenerationOptions{})
+             py::arg("options") = GenerationOptions{},
+             py::call_guard<py::gil_scoped_release>())
         .def("train_step",
              py::overload_cast<const std::vector<int>&, const std::vector<int>&>(&InferenceEngine::train_step),
              py::arg("input"),
-             py::arg("target") = std::vector<int>{})
+             py::arg("target") = std::vector<int>{},
+             py::call_guard<py::gil_scoped_release>())
         .def("train_text",
              py::overload_cast<const std::string&>(&InferenceEngine::train_step),
-             py::arg("text"))
+             py::arg("text"),
+             py::call_guard<py::gil_scoped_release>())
         .def("configure_progressive_qat",
              [](InferenceEngine& e, const TrainPhaseScheduler& s) {
                  if (!e.trainer)
@@ -558,7 +600,8 @@ PYBIND11_MODULE(nsos_ext, m) {
              py::overload_cast<const std::string&, const std::string&>(&InferenceEngine::self_heal),
              py::arg("prompt"),
              py::arg("response"))
-        .def("save_checkpoint", &InferenceEngine::save_checkpoint, py::arg("path"))
+        .def("save_checkpoint", &InferenceEngine::save_checkpoint, py::arg("path"),
+             py::call_guard<py::gil_scoped_release>())
         .def("save_model_pack", &InferenceEngine::save_model_pack, py::arg("directory"))
         .def("get_memory_usage", &InferenceEngine::get_memory_usage)
         .def("last_generation_metrics",
