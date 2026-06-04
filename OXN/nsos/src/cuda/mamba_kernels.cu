@@ -1,5 +1,6 @@
 #include "cuda/mamba_kernels.cuh"
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -489,12 +490,94 @@ __global__ void mamba_selective_scan_backward_kernel(
   }
 }
 
+// ── Parallel-prefix (associative) selective scan ─────────────────────────────
+// The forward recurrence h_t = decay_t * h_{t-1} + (B_t * x_t) is a first-order
+// AFFINE recurrence, i.e. an associative scan with operator
+//   (a_l,b_l) o (a_r,b_r) = (a_l*a_r,  a_r*b_l + b_r),  identity (1,0),
+// applied to h_{-1}=0 so that h_t is the b-component of the inclusive scan.
+// This kernel does ONE block per (batch,dim) channel and a Hillis-Steele
+// inclusive scan over time in shared memory -> O(log Seq) depth instead of the
+// O(Seq) per-thread loop of mamba_selective_scan_forward_kernel.
+//
+// Why a separate, OPT-IN path: the sequential kernel is already parallel over
+// Batch*D channels, so for TRAINING batches it saturates the GPU and this adds
+// nothing.  The win is the FEW-CHANNEL / LONG-SEQUENCE regime (inference,
+// batch=1) where most SMs would sit idle.  Default OFF (NSOS_MAMBA_PARALLEL_SCAN)
+// keeps the validated sequential kernel as the bit-reference; the reassociated
+// FP summation here differs only in low bits and must clear the 1e-4 parity gate
+// (validate on a real GPU per docs/COLAB_GPU_VALIDATION.md) before promotion.
+// Requires Seq to fit one block (<= 1024 threads) + 2*Seq floats of shared mem;
+// the launcher falls back to the sequential kernel otherwise.
+__global__ void mamba_selective_scan_forward_parallel_kernel(
+    const float *__restrict__ x, const float *__restrict__ dt,
+    const float *__restrict__ A, const float *__restrict__ B_in,
+    const float *__restrict__ C_in, float *__restrict__ y,
+    float *__restrict__ state_history, int Batch, int Seq, int D) {
+  extern __shared__ float smem[];   // [0,Seq) = a (decay prod), [Seq,2Seq) = b
+  float *sa = smem;
+  float *sb = smem + Seq;
+
+  const int channel = blockIdx.x;   // one block per (batch,dim) channel
+  if (channel >= Batch * D) return; // whole block returns together — no divergence
+  const int b = channel / D;
+  const int d = channel % D;
+  const int t = threadIdx.x;        // blockDim.x == Seq, so t in [0,Seq)
+
+  const float a_value = fmaxf(A[d], 1e-3f);
+  const int idx = (b * Seq + t) * D + d;
+  sa[t] = expf(-softplus_device(dt[idx]) * a_value);  // decay_t
+  sb[t] = B_in[idx] * x[idx];                         // input term
+  __syncthreads();
+
+  // Hillis-Steele inclusive scan with the affine operator.  Double-buffer via
+  // two barriers so every thread reads the previous step's values.
+  for (int off = 1; off < Seq; off <<= 1) {
+    float a_new = sa[t];
+    float b_new = sb[t];
+    if (t >= off) {
+      const float a_prev = sa[t - off];
+      const float b_prev = sb[t - off];
+      a_new = a_prev * sa[t];           // a_left * a_right
+      b_new = sa[t] * b_prev + sb[t];   // a_right * b_left + b_right
+    }
+    __syncthreads();
+    sa[t] = a_new;
+    sb[t] = b_new;
+    __syncthreads();
+  }
+
+  const float h_t = sb[t];  // inclusive-scan b-component == h_t (h_{-1}=0)
+  if (state_history != nullptr) {
+    state_history[idx] = h_t;
+  }
+  y[idx] = tanhf(h_t) * C_in[idx];
+}
+
+static bool mamba_parallel_scan_enabled() {
+  static const bool en = [] {
+    const char *e = std::getenv("NSOS_MAMBA_PARALLEL_SCAN");
+    return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+  }();
+  return en;
+}
+
 void launch_mamba_selective_scan_forward(
     const float *x, const float *dt, const float *A, const float *B_in,
     const float *C_in, float *y, float *state_history, int Batch, int Seq,
     int D) {
   const int total_channels = Batch * D;
   if (total_channels <= 0 || Seq <= 0) {
+    return;
+  }
+  // Opt-in O(log Seq) parallel-prefix scan (default OFF -> sequential kernel).
+  // Needs Seq to fit in one block; shared mem = 2*Seq floats.
+  if (mamba_parallel_scan_enabled() && Seq <= 1024) {
+    const int threads = Seq;            // one thread per timestep
+    const int blocks = total_channels;  // one block per channel
+    const size_t shmem = static_cast<size_t>(2) * static_cast<size_t>(Seq) *
+                         sizeof(float);
+    mamba_selective_scan_forward_parallel_kernel<<<blocks, threads, shmem>>>(
+        x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D);
     return;
   }
   const int threads = 256;
