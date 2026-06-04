@@ -52,9 +52,11 @@ public:
   BitLinear(int in, int out, bool b, uint64_t seed);
 
   void set_precision_mode(int bits);
+  // Enable BF16 Tensor-Core compute for matmuls (master weights stay FP32).
+  // Mixed precision is a global GEMM mode; this toggles it (BF16 when enabled).
   void set_mixed_precision(bool enabled) {
-    (void)enabled;
-  } // Ultra-SOTA compatibility
+    set_matmul_precision_mode(enabled ? 1 : 0);
+  }
   void set_use_hadamard(bool use) { use_hadamard = use; }
   void set_use_tequila(bool use) { use_tequila = use; }
   void set_use_loqa(bool use) { loqa.active = use; }

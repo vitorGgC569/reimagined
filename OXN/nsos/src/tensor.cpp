@@ -6,6 +6,7 @@
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -788,6 +789,36 @@ Tensor Tensor::mul(float scalar) const {
     return result;
 }
 
+// ── Mixed-precision (BF16/FP16 Tensor-Core) GEMM control ─────────────────────
+// 0 = FP32 (default, bit-parity with CPU); 1 = BF16; 2 = FP16.  Master weights
+// and optimizer state stay FP32; inputs are cast to the low precision only at
+// the GEMM call site (standard AMP recipe).  Runtime-settable so a model/config
+// or the Python plane can flip it on a modern (sm_75+) GPU for 2-4x training
+// throughput, while default-OFF preserves FP32 parity for existing checkpoints.
+// Initialized from NSOS_MIXED_PRECISION for back-compat.  Atomic: the control
+// thread writes, matmul reads per call (relaxed — exactness of the switch step
+// is irrelevant, only that it is observed).
+static std::atomic<int>& matmul_precision_mode_storage() {
+    static std::atomic<int> mode{[] {
+        const char* env = std::getenv("NSOS_MIXED_PRECISION");
+        if (!env || *env == '\0') return 0;
+        const std::string v(env);
+        if (v == "bf16" || v == "BF16") return 1;
+        if (v == "fp16" || v == "FP16") return 2;
+        return 0;
+    }()};
+    return mode;
+}
+
+void set_matmul_precision_mode(int mode) {
+    if (mode < 0 || mode > 2) mode = 0;
+    matmul_precision_mode_storage().store(mode, std::memory_order_relaxed);
+}
+
+int matmul_precision_mode() {
+    return matmul_precision_mode_storage().load(std::memory_order_relaxed);
+}
+
 Tensor Tensor::matmul(const Tensor& other) const {
     if (shape.size() < 2 || other.shape.size() < 2) {
         throw std::runtime_error("matmul requires rank >= 2 tensors");
@@ -854,14 +885,9 @@ Tensor Tensor::matmul(const Tensor& other) const {
         // Adam state stays FP32 always.  Weights stay FP32 in storage;
         // they're cast to BF16 only at the GEMM call site.  This is
         // the standard "mixed precision" recipe (TF / PyTorch AMP).
-        static const int mixed_mode = [] {
-            const char* env = std::getenv("NSOS_MIXED_PRECISION");
-            if (!env || *env == '\0') return 0;  // 0 = FP32
-            const std::string v(env);
-            if (v == "bf16" || v == "BF16") return 1;
-            if (v == "fp16" || v == "FP16") return 2;
-            return 0;
-        }();
+        // Runtime-controllable (set_matmul_precision_mode / ModelConfig /
+        // Python binding); initialized from NSOS_MIXED_PRECISION for back-compat.
+        const int mixed_mode = matmul_precision_mode();
 
         if (mixed_mode != 0) {
             // cublasGemmEx with mixed precision: A and B in lower

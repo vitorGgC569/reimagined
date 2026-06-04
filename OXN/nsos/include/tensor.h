@@ -13,6 +13,13 @@
 
 namespace nsos {
 
+// Mixed-precision GEMM control (BF16/FP16 Tensor Cores on sm_75+).
+// 0 = FP32 (default, bit-parity with CPU), 1 = BF16, 2 = FP16.  Master weights
+// and optimizer state remain FP32; only GEMM inputs are cast.  Default-OFF;
+// initialized from NSOS_MIXED_PRECISION env for back-compat.  See tensor.cpp.
+void set_matmul_precision_mode(int mode);
+int matmul_precision_mode();
+
 struct TensorShape {
     std::vector<int> dims;
     std::vector<size_t> strides;

@@ -98,6 +98,22 @@ PYBIND11_MODULE(nsos_ext, m) {
         return determinism::DeterminismManager::instance().get_determinism_report();
     });
 
+    // Mixed-precision GEMM control (BF16/FP16 Tensor Cores on sm_75+).
+    // 0=FP32 (default), 1=BF16, 2=FP16.  Master weights/optimizer stay FP32;
+    // only GEMM inputs are cast.  Lets the training plane flip BF16 on a modern
+    // GPU for 2-4x throughput.  Accepts ints or the strings "fp32"/"bf16"/"fp16".
+    m.def("set_matmul_precision_mode", [](int mode) {
+        set_matmul_precision_mode(mode);
+    }, py::arg("mode"));
+    m.def("set_matmul_precision", [](const std::string& s) {
+        int mode = 0;
+        if (s == "bf16" || s == "BF16") mode = 1;
+        else if (s == "fp16" || s == "FP16") mode = 2;
+        else mode = 0;  // "fp32"/anything else
+        set_matmul_precision_mode(mode);
+    }, py::arg("precision"));
+    m.def("matmul_precision_mode", []() { return matmul_precision_mode(); });
+
     py::enum_<Device>(m, "Device")
         .value("CPU", Device::CPU)
         .value("GPU", Device::GPU)
