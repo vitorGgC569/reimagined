@@ -202,7 +202,6 @@ if (NSOS_ENABLE_CUDA)
         endif()
         target_sources(nsos_core PRIVATE
             src/cuda/kernels.cu
-            src/cuda/persistent_kernel.cu
             src/cuda/mamba_kernels.cu
             src/cuda/moe_kernels.cu
             src/cuda/bitnet_kernels.cu
