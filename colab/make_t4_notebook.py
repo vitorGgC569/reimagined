@@ -11,7 +11,10 @@ Run once: `python colab/make_t4_notebook.py` (pure JSON authoring, no GPU).
 import json
 from pathlib import Path
 
-BRANCH = "feature/nsos-gpu-phases12"
+# Slash-free branch name: Colab's /github/<owner>/<repo>/blob/<branch>/<path>
+# URL resolver mis-parses branch names that contain "/", so we publish + open
+# from a slash-free alias of feature/nsos-gpu-phases12.
+BRANCH = "nsos-gpu-phases12"
 
 def md(text):
     return {"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)}
