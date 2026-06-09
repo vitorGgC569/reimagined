@@ -106,7 +106,12 @@ cells.append(md("""## 3 — Build do `nsos_ext` (CUDA, arch da T4 = sm_75)
 
 Força rebuild (as mudanças C++ desta branch precisam recompilar) e usa o
 `colab_bootstrap` para detectar a GPU, escolher o perfil e cachear o `.so` no Drive."""))
-cells.append(code("""# Força recompilar com os commits C++ desta branch (pool, BF16, scan).
+cells.append(code("""# Força recompilar com os commits C++ desta branch (pool, BF16, scan, loss-path).
+# CRÍTICO: limpa o cache no Drive E o build-colab local. Sem o rm do build-colab,
+# um .so de um pull anterior na MESMA sessão fica STALE e o setup_environment o
+# reusa -> os fixes novos não entram no binário (o step-time não muda apesar dos
+# commits). rm -rf garante recompilação a partir do código que a célula 2 puxou.
+!rm -rf /content/reimagined/OXN/nsos/build-colab
 !rm -f /content/drive/MyDrive/nsos_v11/_bootstrap/*.so.* 2>/dev/null || true
 
 import sys, os
