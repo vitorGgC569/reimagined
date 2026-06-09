@@ -25,8 +25,13 @@ public:
         if (grad.size == 0) return;
 #ifdef USE_CUDA
         if (grad.get_device() == Device::GPU) {
-            cudaMemset(grad.data(), 0, static_cast<size_t>(grad.size) * sizeof(float));
-            cudaDeviceSynchronize();
+            // Async zero on the default stream: no host sync (raw_data), no
+            // full-device drain.  The grad is consumed by backward/optimizer
+            // kernels on the same stream (ordered after this); host access goes
+            // through data().  The old cudaMemset + cudaDeviceSynchronize ran
+            // PER PARAMETER every step -> hundreds of full-device drains/step.
+            cudaMemsetAsync(grad.raw_data(), 0,
+                            static_cast<size_t>(grad.size) * sizeof(float), 0);
             return;
         }
 #endif
@@ -62,8 +67,13 @@ public:
             const int n = grad.size;
             for (int i = 0; i < n; ++i) gp[i] += ip[i];
         } else {
-            Tensor new_grad = grad.add(incoming);
-            grad.copy_from(new_grad);
+            // Reassign instead of copy_from: grad.add() already produced the
+            // summed tensor on-device, so pointing grad at it avoids an extra
+            // GPU->GPU copy + stream sync per parameter on every backward.  The
+            // old buffer returns to the caching pool; the optimizer keys its
+            // m/v state on the Parameter*, not the grad buffer address, so the
+            // reassignment is safe.
+            grad = grad.add(incoming);
         }
     }
 
