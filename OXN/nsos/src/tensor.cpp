@@ -1686,6 +1686,41 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const 
     return dx;
 }
 
+#ifdef USE_CUDA
+// Persistent device scratch for the cross_entropy GPU fast path.  The trainer
+// calls cross_entropy ~batch_size times per training step; the previous per-call
+// CudaBuffer<float>(1) + CudaBuffer<int>(rows) did 2 cudaMalloc + 2 cudaFree EACH
+// (all synchronizing) -> ~4*batch alloc syncs/step.  Reused buffers remove that.
+// Single-threaded training use (the only caller).
+static float* ce_loss_scratch() {
+    static float* p = [] {
+        float* q = nullptr;
+        if (cudaMalloc(&q, sizeof(float)) != cudaSuccess) {
+            q = nullptr;
+            (void)cudaGetLastError();
+        }
+        return q;
+    }();
+    return p;
+}
+static int* ce_target_scratch(int rows) {
+    static int* p = nullptr;
+    static int cap = 0;
+    if (rows <= 0) return nullptr;
+    if (rows > cap) {
+        if (p) cudaFree(p);
+        p = nullptr;
+        if (cudaMalloc(&p, static_cast<size_t>(rows) * sizeof(int)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cap = 0;
+            return nullptr;
+        }
+        cap = rows;
+    }
+    return p;
+}
+#endif
+
 std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) const {
     int rank = static_cast<int>(shape.size());
     if (rank < 2) {
@@ -1708,20 +1743,24 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
 
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        CudaBuffer<float> d_loss(1);
-        CudaBuffer<int> d_target(static_cast<size_t>(rows));
-        cudaMemset(d_loss.get(), 0, sizeof(float));
-        cudaMemcpy(d_target.get(), target.data(),
-                   static_cast<size_t>(rows) * sizeof(int),
-                   cudaMemcpyHostToDevice);
-        launch_fused_cross_entropy(d_loss.get(), grad.raw_data(), raw_data(),
-                                    d_target.get(), rows, classes);
-        sync_cuda();
-        const float inv_rows = 1.0f / std::max(rows, 1);
-        launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
-        sync_cuda();
-        loss = copy_scalar_from_device(d_loss.get()) * inv_rows;
-        return {loss, grad};
+        // Reused device scratch instead of per-call cudaMalloc/cudaFree.
+        float* d_loss = ce_loss_scratch();
+        int* d_target = ce_target_scratch(rows);
+        if (d_loss != nullptr && d_target != nullptr) {
+            cudaMemset(d_loss, 0, sizeof(float));
+            cudaMemcpy(d_target, target.data(),
+                       static_cast<size_t>(rows) * sizeof(int),
+                       cudaMemcpyHostToDevice);
+            launch_fused_cross_entropy(d_loss, grad.raw_data(), raw_data(),
+                                        d_target, rows, classes);
+            sync_cuda();
+            const float inv_rows = 1.0f / std::max(rows, 1);
+            launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
+            sync_cuda();
+            loss = copy_scalar_from_device(d_loss) * inv_rows;
+            return {loss, grad};
+        }
+        // scratch alloc failed (rare) — fall through to the host CE path.
     }
 #endif
 

@@ -1415,7 +1415,7 @@ float train_supervised_batch_impl(Trainer& trainer,
             zero_tensor_inplace(full_grad_buffer);
         }
         Tensor full_grad = full_grad_buffer;
-        float* full_ptr = full_grad.data();
+        float* full_ptr = full_grad.raw_data();  // GPU→GPU copies below; no host sync needed
         const Device grad_device = full_grad.get_device();
         for (int batch = 0; batch < batch_size; ++batch) {
             const int answer_start = static_cast<int>(grouped_prompt_lengths[static_cast<size_t>(batch)]) - 1;
@@ -1440,7 +1440,7 @@ float train_supervised_batch_impl(Trainer& trainer,
                 answer_logits,
                 answer_grad);
 
-            const float* answer_ptr = answer_grad.data();
+            const float* answer_ptr = answer_grad.raw_data();  // src ready on default stream; copy stream orders after
             const Device answer_device = answer_grad.get_device();
             for (int row = 0; row < answer_rows; ++row) {
                 const size_t dst_offset =
