@@ -1440,20 +1440,22 @@ float train_supervised_batch_impl(Trainer& trainer,
                 answer_logits,
                 answer_grad);
 
-            const float* answer_ptr = answer_grad.raw_data();  // src ready on default stream; copy stream orders after
-            const Device answer_device = answer_grad.get_device();
-            for (int row = 0; row < answer_rows; ++row) {
-                const size_t dst_offset =
-                    ((static_cast<size_t>(batch) * rows) + (answer_start + row)) *
-                    static_cast<size_t>(vocab);
-                const size_t src_offset =
-                    static_cast<size_t>(row) * static_cast<size_t>(vocab);
-                copy_tensor_bytes(full_ptr + dst_offset,
-                                  grad_device,
-                                  answer_ptr + src_offset,
-                                  answer_device,
+            // Single contiguous copy of this sample's answer-grad block into
+            // full_grad.  In [batch, rows, vocab] layout the answer rows
+            // [answer_start, answer_end) are contiguous, and answer_grad is
+            // [answer_rows, vocab] contiguous — so the whole block moves in ONE
+            // copy.  The old per-row loop issued answer_rows copy_tensor_bytes
+            // calls, each with its own cudaStreamSynchronize, i.e.
+            // ~answer_rows*batch stream syncs/step (the real cost that scaled
+            // with answer_len and dominated the T4 step time).
+            const size_t dst_offset =
+                (static_cast<size_t>(batch) * rows +
+                 static_cast<size_t>(answer_start)) *
+                static_cast<size_t>(vocab);
+            copy_tensor_bytes(full_ptr + dst_offset, grad_device,
+                              answer_grad.raw_data(), answer_grad.get_device(),
+                              static_cast<size_t>(answer_rows) *
                                   static_cast<size_t>(vocab) * sizeof(float));
-            }
             total_loss += loss;
             ++sample_count;
         }
