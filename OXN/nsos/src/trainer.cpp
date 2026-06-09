@@ -986,6 +986,37 @@ void record_training_audit_step(Trainer& trainer,
     }
 }
 
+#ifdef USE_CUDA
+// NSOS_RUL_HOST=1 forces the host repetition-unlikelihood path (for A/B parity
+// against the GPU kernel).  Default: GPU when tensors are device-resident.
+bool rul_force_host() {
+    static const bool force = [] {
+        const char* e = std::getenv("NSOS_RUL_HOST");
+        return e != nullptr && e[0] == '1';
+    }();
+    return force;
+}
+
+// Persistent device buffer for per-sample answer-token uploads (grows on demand)
+// so the GPU loss-adjustment path never cudaMalloc's per call.
+int* loss_token_device_buffer(int count) {
+    static int* buf = nullptr;
+    static int cap = 0;
+    if (count <= 0) return nullptr;
+    if (count > cap) {
+        if (buf) cudaFree(buf);
+        buf = nullptr;
+        if (cudaMalloc(&buf, static_cast<size_t>(count) * sizeof(int)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cap = 0;
+            return nullptr;
+        }
+        cap = count;
+    }
+    return buf;
+}
+#endif
+
 void apply_supervised_gradient_weights(const Trainer& trainer,
                                        const std::vector<int>& answer_tokens,
                                        int vocab,
@@ -1010,6 +1041,24 @@ void apply_supervised_gradient_weights(const Trainer& trainer,
     if (!needs_first_token && !needs_eos) {
         return;
     }
+
+#ifdef USE_CUDA
+    // GPU path: scale the affected row(s) in place on the device — no host
+    // round-trip (the previous sync_host_access + host write drained the
+    // pipeline and forced a per-sample GPU->CPU sync every step).
+    if (answer_grad.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+        if (needs_first_token) {
+            launch_scale_inplace_kernel(answer_grad.raw_data(), ft_scale, vocab);
+        }
+        if (needs_eos) {
+            launch_scale_inplace_kernel(
+                answer_grad.raw_data() + static_cast<size_t>(last_row) * vocab,
+                eos_scale, vocab);
+        }
+        trainer_check_cuda("launch_scale_inplace_kernel(grad_weights)");
+        return;
+    }
+#endif
 
     // Drain pending GPU work before host write — Pascal+Windows UM has
     // no demand paging.  No-op when answer_grad is host-resident.
@@ -1044,10 +1093,31 @@ void apply_repetition_unlikelihood(const Trainer& trainer,
     }
 
     Tensor probs = answer_logits.softmax(-1);
+    const int vocab = answer_logits.shape.back();
+
+#ifdef USE_CUDA
+    // GPU path: do the whole repetition-unlikelihood adjustment on the device
+    // using the on-GPU softmax — eliminates the per-sample probs.cpu()/grad.cpu()
+    // D2H + host loop that dominated the training step (it scales with
+    // answer_len * batch).  NSOS_RUL_HOST=1 forces the host path for A/B parity.
+    if (!rul_force_host() && answer_grad.get_device() == Device::GPU &&
+        probs.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+        const int rows = static_cast<int>(answer_tokens.size());
+        int* d_tokens = loss_token_device_buffer(rows);
+        if (d_tokens) {
+            cudaMemcpy(d_tokens, answer_tokens.data(),
+                       static_cast<size_t>(rows) * sizeof(int), cudaMemcpyHostToDevice);
+            launch_repetition_unlikelihood_kernel(
+                answer_grad.raw_data(), probs.raw_data(), d_tokens, rows, vocab,
+                scale, trainer.eos_token_id);
+            trainer_check_cuda("launch_repetition_unlikelihood_kernel");
+            return;
+        }
+    }
+#endif
+
     Tensor probs_host = probs.get_device() == Device::GPU ? probs.cpu() : probs;
     Tensor grad_host = answer_grad.get_device() == Device::GPU ? answer_grad.cpu() : answer_grad.clone();
-
-    const int vocab = answer_logits.shape.back();
     const float* prob_ptr = probs_host.data();
     float* grad_ptr = grad_host.data();
 

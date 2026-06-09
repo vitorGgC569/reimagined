@@ -100,6 +100,13 @@ void launch_squared_relu_backward_kernel(float *in_grad, const float *grad_out,
 void launch_clamp_kernel(float *out, const float *in, float min_val,
                          float max_val, int n);
 void launch_norm_kernel(float *d_sum_sq, const float *in, int n);
+// Repetition-unlikelihood gradient adjustment fully on GPU (mirrors the host
+// loop in trainer.cpp::apply_repetition_unlikelihood).  grad/probs are
+// [rows, vocab] device pointers; answer_tokens is a [rows] device int buffer.
+void launch_repetition_unlikelihood_kernel(float *grad, const float *probs,
+                                           const int *answer_tokens, int rows,
+                                           int vocab, float scale,
+                                           int eos_token_id);
 void launch_kaiming_uniform_kernel(float *out, int n, float limit,
                                    unsigned long long seed);
 void launch_check_stability_kernel(int *d_found_issue, const float *in,

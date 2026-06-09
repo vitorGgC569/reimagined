@@ -1031,6 +1031,89 @@ extern "C" void launch_norm_kernel(float *d_sum_sq, const float *in, int n) {
   norm_kernel<<<blocks, threads>>>(d_sum_sq, in, n);
 }
 
+// Repetition-unlikelihood (Welleck et al. 2020) gradient adjustment, on GPU.
+// Mirrors the host loop in trainer.cpp::apply_repetition_unlikelihood EXACTLY,
+// eliminating the per-sample probs.cpu()/grad.cpu() D2H + host loop that was the
+// dominant training-step cost (it scales with answer_len*batch).
+//
+// One block per answer row (rows 1..rows-1; row 0 has no history window).
+// Thread 0 reconstructs the up-to-4 unique "negative" tokens from the answer
+// token window [row-4, row-1] (excluding the row's target and EOS), computes
+// each factor = scale * p_neg/(1-p_neg) from the on-GPU softmax, sums them, then
+// all threads apply grad[row,:] -= total_factor*probs[row,:] and thread 0 adds
+// each factor back at its negative-token column.  Net result is identical to the
+// host's per-negative subtract+scatter (the subtracts are linear and sum).
+__global__ void repetition_unlikelihood_kernel(
+    float *__restrict__ grad, const float *__restrict__ probs,
+    const int *__restrict__ answer_tokens, int rows, int vocab, float scale,
+    int eos_token_id) {
+  const int row = blockIdx.x + 1;  // rows 1..rows-1
+  if (row >= rows) return;
+
+  __shared__ int s_neg[4];
+  __shared__ float s_factor[4];
+  __shared__ int s_count;
+  __shared__ float s_total_factor;
+
+  if (threadIdx.x == 0) {
+    const int target_token = answer_tokens[row];
+    int neg_ids[4];
+    int neg_count = 0;
+    const int window_start = max(0, row - 4);
+    for (int prev = row - 1; prev >= window_start; --prev) {
+      const int cand = answer_tokens[prev];
+      if (cand == target_token || cand == eos_token_id) continue;
+      bool seen = false;
+      for (int i = 0; i < neg_count; ++i) {
+        if (neg_ids[i] == cand) { seen = true; break; }
+      }
+      if (!seen && neg_count < 4) neg_ids[neg_count++] = cand;
+    }
+    int kept = 0;
+    float total = 0.0f;
+    for (int i = 0; i < neg_count; ++i) {
+      const int neg = neg_ids[i];
+      if (neg < 0 || neg >= vocab) continue;
+      const float p_neg = probs[row * vocab + neg];
+      if (p_neg <= 1e-6f || p_neg >= 1.0f - 1e-6f) continue;
+      const float denom = fmaxf(1.0f - p_neg, 1e-6f);
+      const float factor = scale * p_neg / denom;
+      s_neg[kept] = neg;
+      s_factor[kept] = factor;
+      total += factor;
+      ++kept;
+    }
+    s_count = kept;
+    s_total_factor = total;
+  }
+  __syncthreads();
+
+  const int count = s_count;
+  if (count == 0) return;
+  const float total_factor = s_total_factor;
+  float *row_grad = grad + row * vocab;
+  const float *row_probs = probs + row * vocab;
+  for (int col = threadIdx.x; col < vocab; col += blockDim.x) {
+    row_grad[col] -= total_factor * row_probs[col];
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < count; ++i) {
+      row_grad[s_neg[i]] += s_factor[i];
+    }
+  }
+}
+
+extern "C" void launch_repetition_unlikelihood_kernel(
+    float *grad, const float *probs, const int *answer_tokens, int rows,
+    int vocab, float scale, int eos_token_id) {
+  if (rows <= 1 || vocab <= 0) return;
+  const int threads = 256;
+  const int blocks = rows - 1;  // one block per row 1..rows-1
+  repetition_unlikelihood_kernel<<<blocks, threads>>>(
+      grad, probs, answer_tokens, rows, vocab, scale, eos_token_id);
+}
+
 __global__ void check_stability_kernel(int *d_found, const float *in,
                                        float max_val, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
