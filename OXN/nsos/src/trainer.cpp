@@ -3,6 +3,7 @@
 #include "../include/cuda/kernels.cuh"
 #include "../include/layer_audit.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -1327,6 +1328,24 @@ float train_supervised_batch_impl(Trainer& trainer,
     });
     std::unordered_map<uint64_t, Tensor> full_grad_buffers;
 
+    // Diagnostic step-timing (NSOS_TRAIN_TIMING=1): localizes where the step
+    // time goes (forward / per-sample loss loop / backward / optimizer), with a
+    // device sync around each section so the wall-times are accurate.  Off by
+    // default (zero overhead); prints one line per step to stderr.
+    const bool nsos_step_timing = [] {
+        const char* e = std::getenv("NSOS_TRAIN_TIMING");
+        return e != nullptr && e[0] == '1';
+    }();
+    double tm_fwd = 0.0, tm_loss = 0.0, tm_bwd = 0.0, tm_opt = 0.0;
+    int tm_buckets = 0;
+    auto tm_now = [&]() {
+#ifdef USE_CUDA
+        if (nsos_step_timing) cudaDeviceSynchronize();
+#endif
+        return std::chrono::steady_clock::now();
+    };
+    using tm_ms = std::chrono::duration<double, std::milli>;
+
     for (size_t order_index = 0; order_index < sample_order.size();) {
         const size_t first_index = sample_order[order_index];
         const size_t first_prompt_len = prompt_batch[first_index].size();
@@ -1389,7 +1408,11 @@ float train_supervised_batch_impl(Trainer& trainer,
             apply_auxiliary_stack_before_forward(trainer, grouped_prompts, grouped_answers);
         accumulate_auxiliary_stats(auxiliary_total, bucket_aux);
         Context ctx;
+        const auto _tm_fwd0 = tm_now();
         Tensor logits = trainer.model->forward_ids_batch(grouped_inputs, &ctx);
+        const auto _tm_fwd1 = tm_now();
+        tm_fwd += tm_ms(_tm_fwd1 - _tm_fwd0).count();
+        ++tm_buckets;
         if (logits.shape.size() != 3) {
             throw std::runtime_error("train_supervised_batch expects rank-3 logits from batched forward");
         }
@@ -1460,13 +1483,25 @@ float train_supervised_batch_impl(Trainer& trainer,
             ++sample_count;
         }
 
+        const auto _tm_loss1 = tm_now();
+        tm_loss += tm_ms(_tm_loss1 - _tm_fwd1).count();
         trainer.model->backward_external(full_grad, ctx);
+        const auto _tm_bwd1 = tm_now();
+        tm_bwd += tm_ms(_tm_bwd1 - _tm_loss1).count();
     }
 
     apply_qat_regularization(trainer);
     apply_moe_aux_regularization(trainer);
     float grad_norm = 0.0f;
+    const auto _tm_opt0 = tm_now();
     apply_optimizer_step(trainer, params, std::max(sample_count, 1), &grad_norm);
+    if (nsos_step_timing) {
+        const auto _tm_opt1 = tm_now();
+        tm_opt = tm_ms(_tm_opt1 - _tm_opt0).count();
+        std::cerr << "[timing] buckets=" << tm_buckets
+                  << " fwd=" << tm_fwd << "ms loss=" << tm_loss
+                  << "ms bwd=" << tm_bwd << "ms opt=" << tm_opt << "ms" << std::endl;
+    }
     finalize_auxiliary_stats(auxiliary_total);
     trainer.last_auxiliary_stats = auxiliary_total;
     const float mean_loss = total_loss / static_cast<float>(std::max(sample_count, 1));
