@@ -184,6 +184,72 @@ manifest = json.loads((V11_BUNDLE / 'curriculum_manifest.json').read_text('utf-8
 print('[data] train total:', sum(p['train_samples'] for p in manifest['phases']))
 """))
 
+cells.append(md("""## 4.5 — TESTE do checkpoint: perguntas da phase1 com RESPOSTA do modelo
+
+Carrega o checkpoint mais recente do Drive e gera respostas (greedy, mesmos
+guards do eval do curriculum) para amostras reais de `phase1_algorithms` —
+pergunta / esperado / resposta do modelo, lado a lado. **Não treina nada.**
+Requer células 1-4 executadas (Drive + clone + build + bundle)."""))
+cells.append(code("""# [4.5] Teste qualitativo do checkpoint (phase1) — nada de treino aqui
+import os, sys, random
+from pathlib import Path
+sys.path.insert(0, str(REPO_ROOT / 'OXN/nsos/scripts'))
+os.environ.setdefault('NSOS_GPU_POOL', '1')
+os.environ.setdefault('NSOS_MAMBA_A_LOGSPACED', '1')  # irrelevante p/ pesos carregados; mantem coerencia
+from train_curriculum import (build_model_config, load_nsos, resolve_profile,
+                              set_model_training_mode, greedy_generate, SPECIAL_TOKENS)
+from nsos_curriculum_lib import curriculum_texts_for_phase
+
+BUNDLE = REPO_ROOT / 'OXN/nsos/scripts/distillation_bundle_v11'
+assert BUNDLE.exists(), 'rode a celula 4 antes (bundle ausente)'
+
+# checkpoint mais recente entre TODOS os runs no Drive
+runs_root = DRIVE_ROOT / 'runs'
+cands = [f for f in runs_root.glob('*/*.bin') if f.name != 'audit_reload_probe.bin']
+assert cands, f'nenhum checkpoint .bin em {runs_root}'
+ckpt = max(cands, key=lambda f: f.stat().st_mtime)
+print(f'[test] checkpoint: {ckpt}  ({ckpt.stat().st_size/1e6:.1f} MB)')
+
+nsos = load_nsos(Path(info['build_dir']))
+_, profile = resolve_profile(info['profile'])
+tok = nsos.Tokenizer()
+tok.load(str(BUNDLE / 'tokenizer_8192.ox3'))
+tok.add_special_tokens(SPECIAL_TOKENS)
+eos_id = tok.encode('<|endoftext|>')[0]
+
+dev = nsos.Device.GPU
+cfg = build_model_config(nsos, profile, tok.vocab_size, dev)
+model = nsos.JambaModel(cfg, dev)
+model.to(dev)
+try:
+    model.load(str(ckpt), True)
+    print('[test] load estrito OK')
+except Exception as exc:
+    print(f'[test] load estrito falhou ({exc}); tentando parcial...')
+    model.load(str(ckpt), False)
+set_model_training_mode(model, False)
+
+phase = 'phase1_algorithms'
+rows = curriculum_texts_for_phase(BUNDLE, phase, 'eval')
+if not rows:
+    phase = 'phase3_curated_text'
+    rows = curriculum_texts_for_phase(BUNDLE, phase, 'eval')
+print(f'[test] {phase}: {len(rows)} amostras de eval; gerando 5...\\n')
+
+rng = random.Random(42)
+for i, row in enumerate(rng.sample(rows, min(5, len(rows)))):
+    prompt = f"<|task:{row['kind']}|>\\nPrompt:\\n{row['prompt']}\\nAnswer:\\n"
+    out = greedy_generate(nsos, model, tok, prompt, max_new_tokens=48,
+                          eos_token_id=eos_id)
+    print('=' * 72)
+    print(f'[{i+1}] tarefa: {row[\"kind\"]}')
+    print(f'PERGUNTA : {row[\"prompt\"][:300]}')
+    print(f'ESPERADO : {str(row[\"answer\"])[:200]}')
+    print(f'MODELO   : {out[:200]}')
+print('=' * 72)
+del model
+"""))
+
 cells.append(md("""## 5 — TREINO (BF16 + pool, checkpoint no Drive a cada 100 steps)
 
 Liga **BF16** (Tensor Cores T4) e o **pool** (default ON). O parallel-scan fica
