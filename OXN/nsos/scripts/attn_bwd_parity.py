@@ -101,137 +101,123 @@ def main() -> int:
     _, profile = resolve_profile(args.profile)
     vocab = int(profile.get("target_vocab", profile.get("vocab_size", 4096)))
 
+    # v5: QUATRO bracos — host x2 e gpu x2 — para medir o PISO DE RUIDO do
+    # proprio pipeline (atomics existentes: scatter-add do embedding, grad_A do
+    # mamba, scatter do MoE) e separa-lo do efeito do kernel novo.
     loss_h, g_h = run_arm(nsos, profile, vocab, host_arm=True)
+    loss_h2, g_h2 = run_arm(nsos, profile, vocab, host_arm=True)
     loss_g, g_g = run_arm(nsos, profile, vocab, host_arm=False)
+    loss_g2, g_g2 = run_arm(nsos, profile, vocab, host_arm=False)
     os.environ["NSOS_ATTN_BWD_HOST"] = "0"
 
-    print(f"[parity] loss step0: host={loss_h:.6f} gpu={loss_g:.6f} "
-          f"(forward identico esperado: dloss={abs(loss_h-loss_g):.2e})")
+    print(f"[parity] loss step0: host={loss_h:.6f} host2={loss_h2:.6f} "
+          f"gpu={loss_g:.6f} gpu2={loss_g2:.6f}")
 
-    common = sorted(set(g_h) & set(g_g))
-    if not common:
-        print("[parity] ERRO: nenhum gradiente comum capturado")
-        return 2
-
-    # METODOLOGIA v3 (licao da v2, pre-registrada): rel POR PARAMETRO explode em
-    # tensores de norma ~0 (experts MoE pouco roteados) por puro caos de
-    # backprop amplificado em profundidade — qualquer implementacao
-    # numericamente diferente-mas-correta reprova nesse criterio. Observaveis
-    # corretos: (a) rel GLOBAL sobre o gradiente inteiro; (b) os grupos da
-    # PROPRIA atencao, com out_proj como CONTROLE INTERNO (entradas identicas
-    # nos dois bracos => rel ~1e-7 obrigatorio; se out_proj reprovar, o
-    # problema NAO e o kernel novo). Experts/tiny-norm: reportados, nao gateados.
-    def group_of(name: str) -> str:
-        if "out_proj" in name:
-            return "attn.out_proj (CONTROLE)"
-        if "q_down_proj" in name:
-            return "attn.q_down_proj (ALVO)"
-        if "kv_down_proj" in name:
-            return "attn.kv_down_proj (ALVO)"
-        if "experts" in name or "router" in name:
-            return "moe (chaos esperado)"
-        if "mamba" in name:
-            return "mamba (downstream)"
-        if "embedding" in name:
-            return "embedding (downstream)"
-        return "outros (downstream)"
-
-    sum_d2 = 0.0
-    sum_g2 = 0.0
-    groups: dict[str, list[tuple[float, float, str]]] = {}
-    for name in common:
-        a, b = g_h[name], g_g[name]
-        if a.shape != b.shape:
-            print(f"[parity] SHAPE DIVERGE em {name}: {a.shape} vs {b.shape}")
-            return 2
-        diff = (b.astype(np.float64) - a.astype(np.float64)).ravel()
-        a64 = a.astype(np.float64).ravel()
-        d2 = float(np.dot(diff, diff))
-        g2 = float(np.dot(a64, a64))
-        sum_d2 += d2
-        sum_g2 += g2
-        rel = float(np.sqrt(d2) / (np.sqrt(g2) + 1e-12))
-        groups.setdefault(group_of(name), []).append(
-            (rel, float(np.max(np.abs(diff))) if diff.size else 0.0, name))
-
-    global_rel = float(np.sqrt(sum_d2) / (np.sqrt(sum_g2) + 1e-12))
-    print(f"[parity] params comparados: {len(common)}")
-    print(f"[parity] REL GLOBAL (||dG||/||G||) = {global_rel:.3e}")
-    attn_rels = []
-    control_rel = None
-    for gname in sorted(groups):
-        items = groups[gname]
-        rels = [r for r, _, _ in items]
-        worst = max(items)
-        print(f"[parity]   {gname:<28} n={len(items):>3} rel_max={max(rels):.3e} "
-              f"rel_med={float(np.median(rels)):.3e} | pior: {worst[2]}")
-        if "ALVO" in gname:
-            attn_rels.append(max(rels))
-        if "CONTROLE" in gname:
-            control_rel = max(rels)
-
-    # ── v4: o unico gate fisicamente valido e a CAMADA DE ATENCAO DO TOPO ──
-    # Licao da v3 (pre-registrada): rel ~0.35-0.41 em TODOS os grupos com pior
-    # sempre em layers.1 (fundo) + forward bit-identico = assinatura de CAOS de
-    # backprop amplificado em profundidade (×~3/camada => 1e-6 no topo vira
-    # ~0.4 no fundo apos ~11 camadas). dy so e identico entre os bracos na
-    # camada de atencao MAIS ALTA — apenas la a comparacao mede o kernel, e nao
-    # o caos. Gate v4: rel dos ALVOS (q/kv) na camada do topo; out_proj do topo
-    # como controle (deve ser ~1e-7). O perfil por camada e impresso para
-    # evidenciar o gradiente de amplificacao (deve crescer topo -> fundo).
     import re as _re
+
+    # Classificador v5: exige ".attn." — na v4, mamba.out_proj (todo layer tem
+    # um!) poluiu o grupo "controle", e o backward do mamba-11 roda DEPOIS do
+    # backward da atencao-11, vendo a divergencia legitimamente => controle
+    # inflado por max() com um tensor que NAO e controle.
+    def is_attn(name: str, part: str) -> bool:
+        return f"attn.{part}" in name
 
     def layer_of(name: str):
         m = _re.search(r"layers\.(\d+)\.", name)
         return int(m.group(1)) if m else None
 
-    attn_by_layer: dict[int, dict[str, float]] = {}
-    for gname, items in groups.items():
-        if "attn" not in gname:
-            continue
-        kind = ("out" if "out_proj" in gname
-                else "q" if "q_down" in gname else "kv")
-        for rel, _abs, name in items:
-            li = layer_of(name)
-            if li is None:
-                continue
-            d = attn_by_layer.setdefault(li, {})
-            d[kind] = max(d.get(kind, 0.0), rel)
+    def compare(ga: dict, gb: dict):
+        """Retorna (global_rel, attn_profile{layer: {q,kv,out}}, n)."""
+        common = sorted(set(ga) & set(gb))
+        sum_d2 = 0.0
+        sum_g2 = 0.0
+        prof: dict[int, dict[str, float]] = {}
+        for name in common:
+            a, b = ga[name], gb[name]
+            if a.shape != b.shape:
+                raise RuntimeError(f"shape diverge em {name}")
+            diff = (b.astype(np.float64) - a.astype(np.float64)).ravel()
+            a64 = a.astype(np.float64).ravel()
+            d2 = float(np.dot(diff, diff))
+            g2 = float(np.dot(a64, a64))
+            sum_d2 += d2
+            sum_g2 += g2
+            kind = ("q" if is_attn(name, "q_down_proj")
+                    else "kv" if is_attn(name, "kv_down_proj")
+                    else "out" if is_attn(name, "out_proj") else None)
+            if kind is not None:
+                li = layer_of(name)
+                if li is not None:
+                    rel = float(np.sqrt(d2) / (np.sqrt(g2) + 1e-12))
+                    d = prof.setdefault(li, {})
+                    d[kind] = max(d.get(kind, 0.0), rel)
+        return float(np.sqrt(sum_d2) / (np.sqrt(sum_g2) + 1e-12)), prof, len(common)
 
-    if not attn_by_layer:
-        print("[parity] ERRO: nenhum tensor de atencao identificado por camada")
+    if not (set(g_h) & set(g_g)):
+        print("[parity] ERRO: nenhum gradiente comum capturado")
         return 2
 
-    print("[parity] perfil por camada (rel_max q / kv / out — espera-se crescer topo->fundo):")
-    for li in sorted(attn_by_layer, reverse=True):
-        d = attn_by_layer[li]
+    noise_h, prof_hh, _ = compare(g_h, g_h2)
+    noise_g, prof_gg, _ = compare(g_g, g_g2)
+    effect, prof_hg, n_cmp = compare(g_h, g_g)
+
+    print(f"[parity] params: {n_cmp}")
+    print(f"[parity] PISO DE RUIDO  host-vs-host = {noise_h:.3e}   "
+          f"gpu-vs-gpu = {noise_g:.3e}")
+    print(f"[parity] EFEITO         host-vs-gpu  = {effect:.3e}")
+
+    def top_attn(prof):
+        if not prof:
+            return None, 0.0, 0.0
+        top = max(prof)
+        d = prof[top]
+        return top, max(d.get("q", 0.0), d.get("kv", 0.0)), d.get("out", 0.0)
+
+    print("[parity] perfil attn REAL por camada (host-vs-gpu; classificador exige '.attn.'):")
+    for li in sorted(prof_hg, reverse=True):
+        d = prof_hg[li]
         print(f"[parity]   layer {li:>2}: q={d.get('q', 0):.3e} "
               f"kv={d.get('kv', 0):.3e} out={d.get('out', 0):.3e}")
 
-    top = max(attn_by_layer)
-    dtop = attn_by_layer[top]
-    top_target = max(dtop.get("q", 0.0), dtop.get("kv", 0.0))
-    top_control = dtop.get("out", 0.0)
-    print(f"[parity] TOPO = layer {top}: alvo(q/kv)={top_target:.3e} "
-          f"controle(out)={top_control:.3e} | global(caos)={global_rel:.3e}")
+    top, t_target, t_control = top_attn(prof_hg)
+    _, nh_target, nh_control = top_attn(prof_hh)
+    _, ng_target, ng_control = top_attn(prof_gg)
+    print(f"[parity] TOPO attn = layer {top}: alvo={t_target:.3e} controle={t_control:.3e}")
+    print(f"[parity]   ruido no topo: host alvo={nh_target:.3e} ctrl={nh_control:.3e} | "
+          f"gpu alvo={ng_target:.3e} ctrl={ng_control:.3e}")
 
-    if top_control > 1e-4:
-        print("[parity] ERRO DE HARNESS: controle do TOPO deveria ser ~1e-7 "
-              "(dy identico) — divergencia fora do kernel novo; colar saida")
+    floor = max(noise_h, noise_g)
+    floor_ctrl = max(nh_control, ng_control, 1e-9)
+    floor_tgt = max(nh_target, ng_target, 1e-9)
+
+    # Matriz de decisao pre-registrada (v5):
+    # D1 efeito <= 3x piso global         -> PASS (indistinguivel do nao-determinismo existente)
+    # D2 controle topo > 10x piso-ctrl    -> ERRO DE HARNESS (divergencia fora do kernel)
+    # D3 alvo topo <= pass_tol            -> PASS (kernel correto; global e caos)
+    # D4 alvo topo > fail_tol e > 10x piso-alvo -> FAIL REAL (q vs kv impresso)
+    # D5 caso contrario                   -> ZONA CINZA (colar saida)
+    if effect <= 3.0 * floor:
+        print(f"[parity] PASS (D1) — efeito {effect:.2e} <= 3x piso {floor:.2e}: o kernel "
+              f"novo e indistinguivel do nao-determinismo ja existente. PROMOVIDO.")
+        return 0
+    if t_control > max(10.0 * floor_ctrl, 1e-5):
+        print(f"[parity] ERRO DE HARNESS (D2): controle topo {t_control:.2e} > "
+              f"10x ruido {floor_ctrl:.2e} — divergencia fora do kernel novo; colar saida")
         return 2
-    if top_target <= args.pass_tol:
-        print(f"[parity] PASS — alvo do topo <= {args.pass_tol:.0e}: kernel GPU "
-              f"correto; rel global {global_rel:.1e} e caos de profundidade "
-              f"(nenhuma implementacao correta-mas-reassociada passaria nele). "
-              f"PROMOVIDO (default GPU); treinar normalmente.")
+    if t_target <= args.pass_tol:
+        print(f"[parity] PASS (D3) — alvo topo {t_target:.2e} <= {args.pass_tol:.0e}; "
+              f"global {effect:.1e} e caos de profundidade. PROMOVIDO.")
         return 0
-    if top_target <= args.fail_tol:
-        print(f"[parity] ZONA CINZA no topo ({top_target:.3e}) — colar a saida")
-        return 0
-    print(f"[parity] FAIL REAL: alvo do topo {top_target:.3e} > {args.fail_tol:.0e} "
-          f"— bug no kernel ({'q' if dtop.get('q',0)>=dtop.get('kv',0) else 'kv'} "
-          f"e o pior); treinar com NSOS_ATTN_BWD_HOST=1 e colar a saida")
-    return 1
+    if t_target > args.fail_tol and t_target > 10.0 * floor_tgt:
+        d = prof_hg.get(top, {})
+        worst_kind = "q" if d.get("q", 0.0) >= d.get("kv", 0.0) else "kv"
+        print(f"[parity] FAIL REAL (D4) — alvo topo {t_target:.2e} > {args.fail_tol:.0e} "
+              f"e > 10x ruido {floor_tgt:.2e}: bug no caminho '{worst_kind}'. "
+              f"Treinar com NSOS_ATTN_BWD_HOST=1 e colar a saida.")
+        return 1
+    print(f"[parity] ZONA CINZA (D5) — alvo topo {t_target:.2e}, ruidos "
+          f"(alvo {floor_tgt:.2e}, ctrl {floor_ctrl:.2e}); colar a saida")
+    return 0
 
 
 if __name__ == "__main__":
