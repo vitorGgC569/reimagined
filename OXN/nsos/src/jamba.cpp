@@ -638,6 +638,10 @@ void JambaModel::to(Device dev) {
 }
 
 std::vector<Parameter*> JambaModel::parameters() {
+    // Nova época de nomeação: os prefix_parameter_names desta passada (aqui e
+    // nos submódulos) reconstroem cada nome a partir do base_name em vez de
+    // re-prefixar o absoluto da passada anterior (bug dos nomes duplicados).
+    bump_parameter_name_epoch();
     std::vector<Parameter*> params;
     auto embedding_params = embedding->parameters();
     prefix_parameter_names(embedding_params, "embedding.");

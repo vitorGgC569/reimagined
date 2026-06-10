@@ -16,6 +16,11 @@ public:
     Tensor grad;
     std::string name;
     std::string base_name;
+    // Época da última nomeação (ver prefix_parameter_names): nomes são
+    // reconstruídos a partir do base_name uma vez por passada de
+    // JambaModel::parameters().  Sem isso, cada passada re-prefixava o nome
+    // ABSOLUTO da anterior ("layers.2.up.layers.2.up.weight" — observado).
+    long long name_epoch = -1;
     uint64_t version = 1;
 
     Parameter() = default;

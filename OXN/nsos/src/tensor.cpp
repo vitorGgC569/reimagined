@@ -333,11 +333,30 @@ static cudaStream_t tensor_copy_stream() {
 }
 
 void copy_tensor_bytes(float* dst, Device dst_device, const float* src, Device src_device,
-                       size_t bytes) {
+                       size_t bytes, bool async_d2d = false) {
     if (bytes == 0) {
         return;
     }
     if (dst_device == Device::GPU || src_device == Device::GPU) {
+        if (async_d2d && dst_device == Device::GPU && src_device == Device::GPU) {
+            // D2D entre buffers do pool: enfileira no stream legacy (0) e NÃO
+            // bloqueia o host.  A ordenação é total — produtores de `src` e
+            // consumidores de `dst` rodam no stream 0, e o reuso de buffers
+            // do pool também é stream-ordered; leituras host posteriores
+            // passam por sync_host_access (que drena se houver pendência).
+            // O sync de host aqui era um dreno de pipeline COMPLETO por
+            // clone/save (dezenas por step no forward de treino) — medido
+            // como o overhead uniforme por camada na T4.  Opt-in por call
+            // site: cópias de/para ponteiros EXTERNOS (__cuda_array_interface__)
+            // e H2D/D2H mantêm o sync (lifetime do buffer de origem).
+            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, nullptr);
+            const cudaError_t launch = cudaGetLastError();
+            if (launch != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA async D2D memcpy failed: ") +
+                                         cudaGetErrorString(launch));
+            }
+            return;
+        }
         cudaStream_t stream = tensor_copy_stream();
         if (stream) {
             // Async copy on the dedicated stream, then wait on JUST this stream.
@@ -368,7 +387,9 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src, Device s
     std::memcpy(dst, src, bytes);
 }
 #else
-void copy_tensor_bytes(float* dst, Device, const float* src, Device, size_t bytes) {
+void copy_tensor_bytes(float* dst, Device, const float* src, Device, size_t bytes,
+                       bool async_d2d = false) {
+    (void)async_d2d;
     if (bytes > 0) {
         std::memcpy(dst, src, bytes);
     }
@@ -1432,6 +1453,17 @@ float Tensor::norm() const {
 Tensor Tensor::clone() const {
     Tensor result(shape.dims, device);
     if (size > 0) {
+#ifdef USE_CUDA
+        if (device == Device::GPU) {
+            // raw_data() + cópia async no stream 0: o caminho antigo chamava
+            // data() nos DOIS lados (cada um podendo drenar o device via
+            // sync_host_access) e ainda sincronizava o copy-stream — três
+            // barreiras por clone, pagas em cada save de treino por camada.
+            copy_tensor_bytes(result.raw_data(), result.device, raw_data(), device,
+                              size * sizeof(float), /*async_d2d=*/true);
+            return result;
+        }
+#endif
         copy_tensor_bytes(result.data(), result.device, data(), device, size * sizeof(float));
     }
     return result;
@@ -1513,6 +1545,13 @@ void Tensor::copy_from(const Tensor& other) {
         throw std::runtime_error("Tensor shape mismatch in copy_from");
     }
     if (size > 0) {
+#ifdef USE_CUDA
+        if (device == Device::GPU && other.device == Device::GPU) {
+            copy_tensor_bytes(raw_data(), device, other.raw_data(), other.device,
+                              size * sizeof(float), /*async_d2d=*/true);
+            return;
+        }
+#endif
         copy_tensor_bytes(data(), device, other.data(), other.device, size * sizeof(float));
     }
 }
@@ -1609,9 +1648,17 @@ Tensor Tensor::slice(int dim, int start, int end) const {
 
     if (dim == 0 && rank >= 1) {
         const int inner = size / shape[0];
-        const float* src_ptr = data() + static_cast<size_t>(start * inner);
         const size_t bytes =
             static_cast<size_t>((end - start) * inner) * sizeof(float);
+#ifdef USE_CUDA
+        if (device == Device::GPU) {
+            copy_tensor_bytes(result.raw_data(), result.device,
+                              raw_data() + static_cast<size_t>(start * inner), device,
+                              bytes, /*async_d2d=*/true);
+            return result;
+        }
+#endif
+        const float* src_ptr = data() + static_cast<size_t>(start * inner);
         copy_tensor_bytes(result.data(), result.device, src_ptr, device, bytes);
         return result;
     }

@@ -1,5 +1,6 @@
 #include "../include/mamba2.h"
 #include "../include/cuda/mamba_kernels.cuh"
+#include "../include/jamba_utils.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -10,19 +11,6 @@
 namespace nsos {
 
 namespace {
-
-void prefix_parameter_names(std::vector<Parameter*>& params, const std::string& prefix) {
-    for (auto* param : params) {
-        if (!param) {
-            continue;
-        }
-        const std::string current = param->name.empty() ? param->base_name : param->name;
-        const std::string leaf = param->base_name.empty() ? current : param->base_name;
-        param->base_name = leaf;
-        param->name =
-            (current.find('.') == std::string::npos) ? (prefix + leaf) : (prefix + current);
-    }
-}
 
 bool can_use_gpu_mamba_scan(const Tensor& x, const Tensor& delta,
                             const Tensor& a_data) {
