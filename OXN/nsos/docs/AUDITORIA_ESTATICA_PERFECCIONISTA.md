@@ -63,6 +63,19 @@ Prioridade: P0 = próximo lever de perf/correção · P1 = estrutural · P2 = ro
 32. **Re-treinar BPE** com corpus ampliado (item 12) + pesos por fase já documentados em `nsos_curriculum_lib.py:1274`.
 33. **Lab: braço HOST opcional** (hoje sempre roda 1 step lento de referência — flag para pular).
 
+### §5b — Adendo da varredura final (cheiros residuais)
+
+34. `http_api_server.cpp:1403` — poll de 10ms em loop (provável shutdown/wait): trocar por
+    condition_variable com timeout (S; cosmético até haver carga de serving).
+35. `nsos_sdk.cpp` tem **1** único site de mutex vs 21 no http_api e 11 no memory_system —
+    revisar thread-safety do SDK sob serving concorrente quando ele virar superfície quente (M).
+36. `chat.cpp:54,112` usa `std::rand` — irrelevante (stub documentado, item 21), mas reforça
+    a guarda de build proposta para não-produto.
+
+**Estado notável:** ZERO `TODO/FIXME/HACK` em todo `src/`+`include/` do produto — a dívida
+está em estrutura e padrões, não em pendências esquecidas; `smart_loader` não tem mais o
+sleep de polling apontado no plano antigo (já corrigido).
+
 ## §6 — Varrido e LIMPO (não mexer sem motivo novo)
 
 - Ops elementwise/matmul batched+BF16/softmax-lastdim/rmsnorm±bwd/squared_relu±bwd/CE/clip/adamw: **cobertura GPU confirmada** (`use_gpu_fast_path` em 21 sites de `tensor.cpp`).
