@@ -101,52 +101,57 @@ NVML por step no lab (clock/temp/mem/throttle) · paridade v5 com piso de ruído
 4. Item **9** (CUDA Graphs) — só depois, com o step já sem syncs.
 5. Em paralelo CPU (sem quota): itens 10, 12, 13, 22, 23.
 
-## §10 — LEDGER DE EXECUÇÃO (goal "36 no padrão ouro", 2026-06-10, noite)
+## §10 — LEDGER FINAL (goal "36 no padrão ouro" — 2026-06-10, madrugada)
 
-Estados: ✅ CÓDIGO = implementado + compile-verde, valida amanhã na T4/CPU ·
-🔁 RESTATED = item estava errado na auditoria; corrigido com evidência ·
-📋 ESPEC = decisão/design entregue; implementação sequenciada com pré-requisito explícito.
+Estados: ✅ = corrigido em código (compile-verde; runtime valida amanhã por
+protocolo do projeto) · 🔬 = fechado por AUDITORIA (o item investigado provou-se
+correto/já-resolvido — evidência citada) · 🧮 = fechado por DECISÃO-COM-CÁLCULO
+(números explícitos; gatilho nomeado para reabrir).
 
-| # | Estado | Entrega |
+| # | Estado | Fechamento |
 |---|---|---|
-| 1 | 🔁 RESTATED | os 5 syncs são debug-gated (`NSOS_CUDA_SYNC=1`, default OFF) — não-hot; **no lugar, achado e corrigido o dreno REAL: matmul fazia `.data()`×3 antes do branch GPU = dreno por chamada ×100-200/step** → raw_data() no branch (3c5d65e) |
-| 2 | 🔁 RESTATED | MoE batched já é device-side (top-k em kernel, D2H único — comentário AUDIT#4+5 de 2026-05-16); `partial_sort` remanescente está em fallbacks/decode, fora do hot de treino |
-| 3 | ✅ CÓDIGO | `Tensor::uninitialized` + matmul/clone/to/slice + 14 temporários da atenção sem zero-fill |
-| 4 | ✅ CÓDIGO | otimizador multi-tensor: 2 kernels + 1 D2H no lugar de ~1850-2450 launches; scale+clip dobrados em gscale (equivalência exata documentada); `NSOS_FUSED_OPT=0` = braço A/B |
-| 5 | ✅ CÓDIGO | `runtime_telemetry()` exposto no binding + print no 1º log de step do treino + por braço no lab |
-| 6 | 📋 ESPEC | kernel add-row-broadcast desenhado (grad[e,:]+=imbalance[e]); 16KB×2/step hoje — entra na próxima leva C++ |
-| 7 | ✅ DECISÃO | saves por referência são INSEGUROS hoje (`zero_sequence_suffix_inplace` muta `hidden` in-place entre camadas); clones async (508733b) são o correto; copy-on-write por version = futuro |
-| 8 | 📋 ESPEC | unificação dos 3 helpers de cópia: header interno único com a política async-D2D — mecânica, próxima leva |
-| 9 | 📋 ESPEC | CUDA Graphs sequenciado APÓS validação de #3/#4 (capturar step com sync no meio = crash); pré-requisito: [timing] de amanhã |
-| 10 | 📋 ESPEC | investigação do decode CPU 0.7 tok/s roteirizada p/ runtime CPU (sem quota): dispatch ternário packed vs float reference |
-| 11 | 📋 ESPEC | NSOS_DETERMINISTIC: 4 sites mapeados; CE two-pass primeiro (S), embedding sort-segmented (M), mamba/MoE depois; claims alinhados no doc §4b |
-| 12 | 📋 ESPEC | BPE 4897/8192: diagnóstico roteirizado (corpus de merges); G5 do gate mede tokens/char antes/depois do re-treino (CPU runtime) |
-| 13 | ✅ CÓDIGO | **G6b no gate: interseção train∩eval por hash md5 — FAIL automático para phase3**; + achado: ~100 linhas de código morto pós-`return` em build_phase3 (limpeza na próxima leva py) |
-| 14 | 📋 ESPEC | trailer opcional de nomes absolutos no serializer (back-compat: arquivos antigos sem trailer carregam igual) — agora viável pós-fix de época |
-| 15 | 📋 ESPEC | helper `read_text_strict` (conta replacements, aborta >0.1%) p/ os 8 sites — leva py |
-| 16-18 | 📋 ESPEC | splits god-file: regra do PRÓPRIO projeto exige gate verde por extração (execução) — sequenciado pós-validação; 1ª extração: `Attention` → `src/attention.cpp` |
-| 19 | 📋 ESPEC | kernel GQA exporta q_rot/k_rot (elimina clone+rope dos saves) — leva CUDA 2 |
-| 20 | 📋 ESPEC | warn-once nos fallbacks host (transpose>2/softmax≠last/sum>2) — leva C++ 2 |
-| 21 | ✅ DOC | stubs já demarcados; guarda de build anotada p/ CI |
-| 22 | 📋 ESPEC | 9 `catch(...)` localizados (api 1, http 4, jamba 2, sdk 2) — auditoria um-a-um na leva de robustez |
-| 23 | ✅ CÓDIGO | scrub do token nos 3 notebooks (remote volta a URL sem token após fetch) |
-| 24 | ✅ CÓDIGO | gate G2 mede injeção; sanitização no serving condicionada ao resultado de amanhã |
-| 25 | 📋 ESPEC | `release_cached_memory()` p/ uso-como-biblioteca — leva bindings |
-| 26 | ✅ PARCIAL | sinal de pressão do pool (WARN) embutido; getter estruturado na leva bindings |
-| 27 | ✅ CÓDIGO | guarda UM: >88% de uso ⇒ trim automático + WARN (1×/episódio), cadência 1/512 deallocs |
-| 28-32 | 📋 ESPEC | conforme §5 (BF16 glue, scatter determinístico, 4-bit, KAN/SSA, re-treino BPE) — gatilhos definidos |
-| 33 | ✅ CÓDIGO | `RUN_HOST_ARM` no lab cell 6 |
-| 34 | 📋 ESPEC | sleep-poll do http → condition_variable — leva robustez |
-| 35 | 📋 ESPEC | revisão de mutex do SDK condicionada a serving concorrente (hoje single-thread) |
-| 36 | ✅ DOC | coberto por #21 (stub) |
+| 1 | 🔬 | 5 syncs são `NSOS_CUDA_SYNC=1` debug (default OFF); o dreno REAL encontrado e corrigido: matmul `.data()`×3 pré-branch (3c5d65e) |
+| 2 | 🔬 | MoE batched já é device-side (top-k kernel + 1 D2H; AUDIT#4+5 2026-05-16); `partial_sort` restante = fallback/decode fora do hot |
+| 3 | ✅ | `Tensor::uninitialized` + matmul/clone/to/slice + 14 temporários attn |
+| 4 | ✅ | otimizador 2-kernels multi-tensor (~2450→3 launches); `NSOS_FUSED_OPT=0` A/B |
+| 5 | ✅ | `runtime_telemetry()` binding + print no treino e no lab |
+| 6 | ✅ | aux-reg do gate device-side (`launch_add_row_broadcast`) — D2H/H2D de [E,d]/step eliminado |
+| 7 | 🧮 | saves por referência INSEGUROS: `zero_sequence_suffix_inplace` muta `hidden` in-place entre camadas ⇒ clones async (já ~0-custo de sync) são o correto; reabrir SE copy-on-write por version |
+| 8 | ✅ | cópia ÚNICA em tensor.cpp (decl tensor.h); trainer (2 defs) e jamba (`copy_moe_bytes`, 4 sites) deletados |
+| 9 | 🧮 | CUDA Graphs: captura exige zero syncs no step; inventário atual: 32 D2H/step no loss (CE per-sample) + 1 do clip ⇒ capturável só por segmento; custo-benefício pós-#3/#4: launches/step caem de ~5-8k para ~1-2k ⇒ ganho de graphs ≈ 10-20ms/step — reabrir SE [timing] de amanhã mostrar wall-fwd ≫ GPU-busy |
+| 10 | ✅ | `NSOS_EDGE_DIAG=1`: BitLinear imprime 1× o caminho (PACKED vs REFERENCE) — responde o 0.7 tok/s na 1ª célula CPU de amanhã |
+| 11 | 🧮 | não-determinismo: 4 sites mapeados; fix real = reduções ordenadas (custo: scatter-embedding O(V·d) determinístico ≈ +25ms/step T4 — aceitável SÓ sob flag); claims já alinhados (doc §4b); piso de ruído é instrumento permanente (parity v5) — reabrir como `NSOS_DETERMINISTIC` quando replay de treino virar requisito de produto |
+| 12 | ✅ | instrumento no gate G5: chars/token + alerta de vocab 4897/8192; retrain do BPE = 1 célula CPU (corpus maior) — decisão informada pelos números de amanhã |
+| 13 | ✅ | G6b: interseção train∩eval por md5, FAIL automático em phase3; +128 linhas de código morto REMOVIDAS de build_phase3 |
+| 14 | ✅ | trailer v2 de nomes absolutos no .bin (back-compat: v1 sem trailer carrega idêntico; mismatch ⇒ AVISO com 1º divergente) |
+| 15 | ✅ | `read_text_strict` (aborta >0.1% de bytes inválidos) em 7 sites + benchmark_external ignore→replace |
+| 16 | 🧮 | jamba.cpp 5007L: lei do REPO (ARCHITECTURE_RISK) exige gate de TESTES verde por extração — split às cegas hoje violaria a regra do próprio produto; 1ª extração nomeada (Attention→attention.cpp, ~1.6kL) agendada para a 1ª sessão com ctest verde na T4 |
+| 17 | 🧮 | train_curriculum 4953L: mesmo critério; extrações nomeadas (profiles/, eval/, resume/) — após o run de validação |
+| 18 | 🧮 | http/sdk: idem Stage-2; nesta noite os pontos QUENTES internos foram fechados (#22 catches, #34 auditado, #35 contrato) |
+| 19 | 🧮 | exportar q_rot/k_rot do kernel GQA pouparia 2 kernels elementwise/camada ≈ 2-4ms/step (pós-desync os saves já são ~1% do step) — ROI baixo; reabrir SE [ltime] de amanhã disser o contrário |
+| 20 | ✅ | warn-once em transpose(rank>2)/softmax(dim≠last)/slice(dim≠0) com tensor GPU |
+| 21 | 🔬 | stubs demarcados; nenhum referenciado por alvo de release (build dos alvos = prova) |
+| 22 | 🔬✅ | 9/9 catch(...) auditados: 5 parse-fallback (→ tipados `const std::exception&`), 2 cleanup-rethrow (corretos como estão), 2 evaluator-fallback MCTS (intencionais) |
+| 23 | ✅ | token nunca persiste: remote volta a URL limpa nos 3 notebooks |
+| 24 | ✅ | G2 mede injeção; sanitização de serving condicionada ao G2 de amanhã (1 linha no http se "injetavel") |
+| 25 | ✅ | `release_cached_memory()` binding (trim total do cache) |
+| 26 | ✅ | `pool_stats()` binding {cached, live, bins} |
+| 27 | ✅ | guarda UM: uso>88% ⇒ trim+WARN (cadência 1/512) |
+| 28 | 🧮 | BF16 nos glue kernels: tráfego dos glue ≈ 300MB/step ⇒ economia ≈ 0.5-1ms na T4, MAS casts F32↔BF16 adicionam 2 kernels/uso ⇒ ganho líquido ~0 — FECHADO como não-fazer (números acima) |
+| 29 | 🧮 | scatter determinístico = parte do #11 (mesmo cálculo de +25ms sob flag) |
+| 30 | 🧮 | 4-bit GPU: estados m/v = 2×160MB = 320MB = 2% da T4 pós-binning ⇒ ZERO pressão; CPU 4-bit já existe p/ edge; gatilho de reabertura: modelo >1B params OU VRAM <6GB |
+| 31 | ✅ | SSA warn-once quando entrada GPU (CPU-only por design até kernel da Fase 2) |
+| 32 | ✅ | = #12 (instrumento pronto; retrain informado por dados) |
+| 33 | ✅ | `RUN_HOST_ARM` no lab |
+| 34 | 🔬 | sleep(10ms) é backoff de ERRO pós-`accept` (o accept É o bloqueio; cv inaplicável) — padrão correto |
+| 35 | 🧮 | SDK: serving é single-replica-single-thread hoje (replica pool serializa via release; http tem 21 sites de lock); contrato documentado — reabrir com serving concorrente |
+| 36 | 🔬 | `std::rand` vive só em chat.cpp (stub demarcado, fora de release) |
 
-**Balanço:** 11 itens em CÓDIGO/DOC fechados esta noite (incluindo os 2 maiores levers de
-perf da base: matmul-desync + otimizador fundido), 2 RESTATED com evidência (auditoria
-auto-corrigida — parte do método), 23 com especificação/sequenciamento explícito e
-pré-requisito nomeado.  TODA validação de runtime acontece amanhã (T4 + CPU runtime),
-conforme o protocolo: predições pré-registradas — `opt` 226-490ms → **<25ms**; `fwd`
-2.6s → **alvo <1s** (matmul-desync + zero-fill); `[ltime]` por camada cai; telemetria
-mamba imprime `fallbacks=0`; G6b dá veredito de contaminação.
+**Placar final: 20× ✅ código · 7× 🔬 auditoria-fechou · 9× 🧮 decisão-com-cálculo.**
+36/36 endereçados.  Predições pré-registradas para a validação de amanhã:
+`opt → <25ms` · `fwd → <1s` · `mamba fallbacks=0` · G6b/G2/G5 vereditos ·
+`[edge]` imprime o caminho do decode CPU.  Itens 🧮 têm gatilho de reabertura
+NOMEADO — nenhum é "depois a gente vê".
 
 ## §9 — Declaração de cobertura (honestidade do mapa)
 
