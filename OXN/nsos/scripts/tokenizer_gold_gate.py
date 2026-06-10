@@ -138,6 +138,12 @@ def main() -> int:
     print(f"[gate] G3 determinismo encode: {det_fail} divergencias")
     print(f"[gate] G4 prefix-stability prompt|answer: {prefix_fail}/{rt_total} quebram "
           f"({'WARN: eval gera de prompt sozinho' if prefix_fail else 'estavel'})")
+    total_chars = sum(l * c for l, c in token_lens.items())
+    total_toks = sum(token_lens.values())
+    comp = total_chars / max(total_toks, 1)
+    print(f"[gate] G5 compressao: {comp:.2f} chars/token sobre {total_toks} tokens "
+          f"(vocab efetivo {tok.vocab_size} — alvo do artefato era 8192; "
+          f"re-treinar o BPE com corpus maior deve subir esta razao)")
     print(f"[gate] G5 max id visto={max_id_seen} (vocab={tok.vocab_size}); "
           f"len de token: " +
           ", ".join(f"{l}ch:{c}" for l, c in sorted(token_lens.items())[:8]))

@@ -1,0 +1,35 @@
+=====================================================================
+ RESCUE: can DEPTH compose forward-only? (LR-matched, bottleneck fixes)
+=====================================================================
+ task XOR-of-groups, chance 0.250, single-layer ref ~0.387 ncc / ~0.478 lin
+
+PER-DEPTH CURVES (ncc + lin at sampled depths):
+  A) code-only (LR-matched baseline)
+   depth: ncc  d0  0.307  d1  0.384  d2  0.344  d3  0.344  d5  0.330  d8  0.330  d12 0.330  d18 0.330  d25 0.330  
+          lin  d0  0.355  d1  0.473  d2  0.366  d3  0.357  d5  0.337  d8  0.337  d12 0.337  d18 0.337  d25 0.337  
+          dead@25 0.77  entropy@25 0.65
+  B) SKIP-CONCAT (each layer sees raw + prev code = Oxta-mem of input)
+   depth: ncc  d0  0.307  d1  0.385  d2  0.334  d3  0.305  d5  0.293  d8  0.293  d12 0.293  d18 0.293  d25 0.293  
+          lin  d0  0.355  d1  0.475  d2  0.394  d3  0.335  d5  0.305  d8  0.305  d12 0.305  d18 0.305  d25 0.305  
+          dead@25 0.81  entropy@25 0.59
+  C) SOFT-TEMP dense code (tau=0.4)
+   depth: ncc  d0  0.307  d1  0.323  d2  0.366  d3  0.350  d5  0.327  d8  0.331  d12 0.335  d18 0.335  d25 0.335  
+          lin  d0  0.355  d1  0.453  d2  0.532  d3  0.417  d5  0.375  d8  0.339  d12 0.318  d18 0.318  d25 0.318  
+          dead@25 0.84  entropy@25 0.54
+
+WIDTH-SCALED single layer m=1600 (LR sweep, ncc/lin):
+  lr=0.050: 0.459 / 0.595    lr=0.074: 0.438 / 0.599    lr=0.100: 0.450 / 0.585
+
+SUMMARY (NCC best-over-depth / LIN best-over-depth):
+  A code-only ... best ncc 0.384  lin 0.473  | single(d1) ncc 0.384 lin 0.473
+  B skip-concat . best ncc 0.385  lin 0.475  | d1 ncc 0.385 lin 0.475 | MEM-concat lin 0.527
+  C soft-temp ... best ncc 0.366  lin 0.532  | d1 ncc 0.323 lin 0.453
+  wide(matched lr=0.074) ncc 0.438 lin 0.599
+
+DOES DEPTH HELP (best-depth beats its own layer-1 by >=0.05 ncc)?
+  A code-only ... no  (+0.000)
+  B skip-concat . no  (+0.000)   [the decisive test]
+  C soft-temp ... no  (+0.043)
+
+  width confound check: wide lr=0.074 lin 0.599 vs lr=0.10 lin 0.585 (deep best lin 0.532)
+=====================================================================

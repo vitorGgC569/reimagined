@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "sparse_attention.h"
 
 #include <algorithm>
@@ -11,6 +12,20 @@
 #endif
 
 namespace nsos {
+
+namespace {
+void ssa_warn_gpu_once(const Tensor& t) {
+    if (t.get_device() != Device::GPU) return;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::fprintf(stderr,
+                     "[ssa] WARN: sparse attention executa em CPU (sem kernel "
+                     "CUDA ainda) — entrada GPU sera copiada; use só em "
+                     "fine-tune/inferencia CPU\n");
+    }
+}
+}  // namespace
 
 Tensor dense_causal_attention(const Tensor& Q, const Tensor& K, const Tensor& V,
                               float scale) {
@@ -58,6 +73,7 @@ Tensor sparse_selective_attention(const Tensor& Q, const Tensor& K,
                                   const SparseAttentionConfig& cfg,
                                   SparseAttentionStats* stats,
                                   const Tensor* Wsel) {
+  ssa_warn_gpu_once(Q);
   const int n = Q.shape[0];
   const int d = Q.shape[1];
   const int B = std::max(cfg.block_size, 1);

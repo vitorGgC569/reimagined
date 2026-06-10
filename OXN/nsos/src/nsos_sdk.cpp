@@ -47,7 +47,7 @@ std::optional<long long> parse_integer(const std::string& text) {
             return std::nullopt;
         }
         return value;
-    } catch (...) {
+    } catch (const std::exception&) {
         return std::nullopt;
     }
 }
@@ -415,7 +415,7 @@ ModelConfig read_model_config(const std::filesystem::path& path) {
         if (it == values.end()) return fallback;
         try {
             return std::stof(it->second);
-        } catch (...) {
+        } catch (const std::exception&) {
             return fallback;
         }
     };

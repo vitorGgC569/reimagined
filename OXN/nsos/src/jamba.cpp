@@ -207,32 +207,7 @@ uint64_t hash_token_sequence(const std::vector<int>& tokens) {
     return hash;
 }
 
-void copy_moe_bytes(float* dst,
-                    Device dst_device,
-                    const float* src,
-                    Device src_device,
-                    size_t bytes) {
-    if (bytes == 0) {
-        return;
-    }
-#ifdef USE_CUDA
-    if (dst_device == Device::GPU || src_device == Device::GPU) {
-        cudaMemcpyKind kind = cudaMemcpyDefault;
-        if (dst_device == Device::GPU && src_device == Device::GPU) {
-            kind = cudaMemcpyDeviceToDevice;
-        } else if (dst_device == Device::GPU && src_device == Device::CPU) {
-            kind = cudaMemcpyHostToDevice;
-        } else if (dst_device == Device::CPU && src_device == Device::GPU) {
-            kind = cudaMemcpyDeviceToHost;
-        } else {
-            kind = cudaMemcpyHostToHost;
-        }
-        cudaMemcpy(dst, src, bytes, kind);
-        return;
-    }
-#endif
-    std::memcpy(dst, src, bytes);
-}
+// (auditoria #8) copy_moe_bytes removida — copy_tensor_bytes unificada (tensor.h).
 
 void zero_sequence_suffix_inplace(Tensor& tensor, const std::vector<int>& lengths) {
     if (tensor.shape.size() != 3 || lengths.empty()) {
@@ -1926,7 +1901,7 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
         float* expert_input_ptr = expert_input.data();
         for (size_t local_row = 0; local_row < selected_rows.size(); ++local_row) {
             const int source_row = selected_rows[local_row];
-            copy_moe_bytes(expert_input_ptr + static_cast<int>(local_row) * dim,
+            copy_tensor_bytes(expert_input_ptr + static_cast<int>(local_row) * dim,
                            target_device,
                            x.data() + source_row * dim,
                            x.get_device(),
@@ -1957,7 +1932,7 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
 
         for (size_t local_row = 0; local_row < selected_rows.size(); ++local_row) {
             const int target_row = selected_rows[local_row];
-            copy_moe_bytes(scatter_ptr + target_row * dim,
+            copy_tensor_bytes(scatter_ptr + target_row * dim,
                            target_device,
                            scaled_ptr + static_cast<int>(local_row) * dim,
                            target_device,
@@ -2187,7 +2162,7 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
 
         for (size_t local_row = 0; local_row < selected_rows.size(); ++local_row) {
             const int source_row = selected_rows[local_row];
-            copy_moe_bytes(expert_dy_ptr + static_cast<int>(local_row) * dim,
+            copy_tensor_bytes(expert_dy_ptr + static_cast<int>(local_row) * dim,
                            target_device,
                            dy.data() + source_row * dim,
                            dy.get_device(),
@@ -2221,7 +2196,7 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
 
         for (size_t local_row = 0; local_row < selected_rows.size(); ++local_row) {
             const int target_row = selected_rows[local_row];
-            copy_moe_bytes(scatter_ptr + target_row * dim,
+            copy_tensor_bytes(scatter_ptr + target_row * dim,
                            target_device,
                            expert_grad_ptr + static_cast<int>(local_row) * dim,
                            expert_grad.get_device(),

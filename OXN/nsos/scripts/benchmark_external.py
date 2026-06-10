@@ -268,7 +268,7 @@ def evaluate_suite(nsos, model, tokenizer, rows: List[Dict], eos_token_id: int) 
 
 def fetch_wikitext(cache_path: Path) -> str:
     if cache_path.exists():
-        return cache_path.read_text(encoding="utf-8", errors="ignore")
+        return cache_path.read_text(encoding="utf-8", errors="replace")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     response = requests.get(WIKITEXT2_VALID_URL, timeout=60)
     response.raise_for_status()

@@ -706,7 +706,7 @@ bool decode_chunked_body(SOCKET socket,
         size_t chunk_size = 0;
         try {
             chunk_size = static_cast<size_t>(std::stoull(size_text, nullptr, 16));
-        } catch (...) {
+        } catch (const std::exception&) {
             error_message = "chunked request contained invalid chunk size";
             return false;
         }
@@ -1063,7 +1063,7 @@ RequestReadResult read_http_request(SOCKET socket, const HttpApiServerConfig& co
             try {
                 const unsigned long long parsed = std::stoull(content_length_it->second);
                 content_length = static_cast<size_t>(parsed);
-            } catch (...) {
+            } catch (const std::exception&) {
                 result.error = make_error_response(400, "Bad Request", request_id,
                                                    "invalid_content_length",
                                                    "content-length header is invalid");

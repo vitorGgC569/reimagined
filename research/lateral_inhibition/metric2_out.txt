@@ -1,0 +1,30 @@
+width_metric.cpp
+=====================================================================
+ WIDTH METRIC — how much width does forward-only cost vs backprop?
+=====================================================================
+
+[B] PARITY-8 (depth 3, MEDIAN of 3 seeds, leaky-ReLU backprop). chance 0.500
+  width | backprop acc (params) | fwd-fwd acc (params)
+     8  |   0.814  (  234)      |  0.517  (  232)
+    16  |   0.876  (  722)      |  0.701  (  720)
+    24  |   0.900  ( 1466)      |  0.797  ( 1464)
+    32  |   0.889  ( 2466)      |  0.836  ( 2464)
+    48  |   0.915  ( 5234)      |  0.930  ( 5232)
+    64  |   0.926  ( 9026)      |  0.959  ( 9024)
+
+  ISO-ACCURACY (FF width needed to match backprop@width):
+    backprop@16 (0.876): FF needs width ~38.7  => 2.42x width, ~4.92x params
+    backprop@24 (0.900): FF needs width ~42.9  => 1.79x width, ~2.90x params
+    backprop@32 (0.889): FF needs width ~41.1  => 1.28x width, ~1.58x params
+    backprop@48 (0.915): FF needs width ~45.4  => 0.95x width, ~0.89x params
+    backprop@64 (0.926): FF needs width ~47.3  => 0.74x width, ~0.56x params
+
+[A] CONTINUAL A->B (depth 3, dim 16, 4 classes). retain A AFTER B; chance 0.250
+  width | backprop retain | FF retain | FF+mem retain
+    16  |     0.477       |   0.489   |    0.610
+    32  |     0.454       |   0.486   |    0.595
+    64  |     0.381       |   0.525   |    0.673
+   128  |     0.420       |   0.632   |    0.705
+
+ read [B]: FF's width tax to match backprop. read [A]: does width fix backprop's forgetting?
+=====================================================================

@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "../include/bitlinear.h"
 #include "../include/bitnet_adapter.h"
 #include "../include/bitnet_gpu_dispatch.h"
@@ -278,6 +280,14 @@ Tensor BitLinear::gemm_158bit_ultra(const Tensor &x_q,
 }
 
 Tensor BitLinear::forward(const Tensor &input) {
+  // (auditoria #10) NSOS_EDGE_DIAG=1: imprime UMA vez qual caminho o forward
+  // de inferência CPU tomou (packed ternário vs float reference) — responde
+  // em 1 linha o "por que 0.7 tok/s" sem profiler.
+  static const bool edge_diag = [] {
+    const char* e = std::getenv("NSOS_EDGE_DIAG");
+    return e != nullptr && e[0] == '1';
+  }();
+
   // Clone so the activation saved for backward (rmsnorm_backward, STE) can
   // never be corrupted by an in-place mutation of the caller's input buffer.
   saved_input = input.clone();
@@ -292,6 +302,13 @@ Tensor BitLinear::forward(const Tensor &input) {
   }
 
   if (use_reference_path) {
+    if (edge_diag) {
+      static bool printed_ref = false;
+      if (!printed_ref) {
+        printed_ref = true;
+        std::fprintf(stderr, "[edge] BitLinear::forward caminho = REFERENCE (float matmul)\n");
+      }
+    }
     if (weight.data.size == 0) {
       throw std::runtime_error("BitLinear reference path requires full precision weights");
     }
@@ -420,6 +437,13 @@ Tensor BitLinear::forward(const Tensor &input) {
     return output;
   }
 
+  if (edge_diag) {
+    static bool printed_packed = false;
+    if (!printed_packed) {
+      printed_packed = true;
+      std::fprintf(stderr, "[edge] BitLinear::forward caminho = PACKED ternario (1.58-bit)\n");
+    }
+  }
   if (!packed_weight_valid ||
       (weight.data.size > 0 && packed_weight_version != weight.version)) {
     repack_weights();

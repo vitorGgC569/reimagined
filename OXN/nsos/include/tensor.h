@@ -20,6 +20,22 @@ namespace nsos {
 void set_matmul_precision_mode(int mode);
 int matmul_precision_mode();
 
+// (auditoria #8) Cópia de bytes UNIFICADA entre TUs — implementação única em
+// tensor.cpp: D2D opt-in async no stream 0; H2D/D2H síncronos (lifetime do
+// buffer host).  trainer.cpp e jamba.cpp tinham cópias locais com semânticas
+// divergentes (uma 100% síncrona).
+void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
+                       Device src_device, size_t bytes, bool async_d2d = false);
+
+// (auditoria #25/#26) Observabilidade e controle do pool GPU.
+struct PoolStats {
+    size_t cached_bytes = 0;   // soma das free-lists
+    size_t live_bytes = 0;     // blocos atualmente possuídos por Tensors
+    size_t bins = 0;           // nº de size-classes em cache
+};
+PoolStats pool_stats();
+void release_cached_memory();  // devolve TODO o cache ao driver (trim)
+
 struct TensorShape {
     std::vector<int> dims;
     std::vector<size_t> strides;
@@ -175,6 +191,7 @@ public:
     // escrevem todo elemento).  O zero-fill incondicional custava um kernel de
     // memset por alocação (~centenas por step de treino).
     static Tensor uninitialized(const std::vector<int>& s, Device dev = Device::CPU);
+
     static Tensor ones(const std::vector<int>& s, Device dev = Device::CPU) { return Tensor(s, dev, 1.0f); }
     static Tensor ones(const TensorShape& s, Device dev = Device::CPU) { return Tensor(s.dims, dev, 1.0f); }
     static Tensor random(const std::vector<int>& s, Device dev = Device::CPU);

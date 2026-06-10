@@ -88,6 +88,15 @@ PYBIND11_MODULE(nsos_ext, m) {
         return false;
 #endif
     });
+    m.def("pool_stats", []() {
+        const auto st = pool_stats();
+        py::dict d;
+        d["cached_bytes"] = st.cached_bytes;
+        d["live_bytes"] = st.live_bytes;
+        d["bins"] = st.bins;
+        return d;
+    });
+    m.def("release_cached_memory", []() { release_cached_memory(); });
     m.def("set_seed", [](uint64_t seed) {
         determinism::DeterminismManager::instance().set_global_seed(seed);
     });

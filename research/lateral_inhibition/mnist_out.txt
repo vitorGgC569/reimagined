@@ -1,0 +1,17 @@
+mnist_showdown.cpp
+=====================================================================
+ MNIST SHOWDOWN — backprop vs Forward-Forward (real task)
+=====================================================================
+ 15000 train / 10000 test, 784-dim, 10 classes, chance 0.100
+ arch: width 256, depth 3 (matched). backprop=Adam, FF=local goodness.
+
+[1] CLASSIFICATION + TRAINING TIME
+  backprop  : test acc 0.9603 | 1430.2s total, 95.35s/epoch (15 ep)
+  fwd-fwd   : test acc 0.8823 | 312.7s total, 12.51s/epoch (25 ep)
+  (note: time/epoch is the honest speed metric; backprop=1fwd+bwd, FF=2 fwd passes)
+
+[2] CONTINUAL (permuted-MNIST): learn MNIST -> learn permuted -> retain original
+  backprop      : MNIST(after A) 0.970  permuted(after B) 0.955  MNIST-RETAINED 0.549
+  FF (no mem)   : MNIST(after A) 0.870  permuted(after B) 0.863  MNIST-RETAINED 0.684
+  FF + OXTA-MEM : MNIST(after A) 0.766  permuted(after B) 0.728  MNIST-RETAINED 0.427
+=====================================================================

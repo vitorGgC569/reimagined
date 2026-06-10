@@ -1078,133 +1078,6 @@ def _phase3_reference_documents(split: str) -> List[Tuple[str, str, str]]:
 def build_phase3_curated_text(repo_root: Path, count: int, seed: int, split: str) -> List[Dict]:
     return build_phase3_curated_text_v2(repo_root, count, seed, split)
 
-    rng = random.Random(seed)
-    docs: List[Dict] = []
-
-    for title, body, source in _phase3_reference_documents(split):
-        for index, chunk in enumerate(chunk_text(body, chunk_chars=360, overlap_chars=48)):
-            docs.append(_make_doc_record("phase3_curated_text", f"{title} #{index + 1}", chunk, source))
-
-    prose_chunks: List[Tuple[str, str, str]] = []
-    for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        for index, chunk in enumerate(chunk_text(raw, chunk_chars=560, overlap_chars=64)):
-            prose_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    code_chunks: List[Tuple[str, str, str]] = []
-    for title, path in _repo_code_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        tagged = f"File: {path.name}\n\n{raw}"
-        for index, chunk in enumerate(chunk_text(tagged, chunk_chars=420, overlap_chars=56)):
-            code_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    selected_prose = _pick_split_subset(prose_chunks, split, random.Random(seed + 17))
-    selected_code = _pick_split_subset(code_chunks, split, random.Random(seed + 31))
-
-    for title, chunk, source in selected_prose:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    code_limit = max(1, count // 4)
-    for title, chunk, source in selected_code[:code_limit]:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    return _expand_records(docs, count, rng)
-
-    for title, body, source in _phase3_reference_documents(split):
-        for index, chunk in enumerate(chunk_text(body, chunk_chars=320, overlap_chars=48)):
-            docs.append(
-                _make_doc_record(
-                    "phase3_curated_text",
-                    f"{title} #{index + 1}",
-                    chunk,
-                    source,
-                )
-            )
-
-    prose_paths = [
-        ("NSOS README prose", repo_root / "OXN" / "nsos" / "README.md"),
-        ("NSOS plan prose", repo_root / "OXN" / "nsos" / "docs" / "NSOS_LLM_SMALL_PLAN.md"),
-        ("NSOS validation prose", repo_root / "OXN" / "nsos" / "docs" / "NSOS_VALIDATION_STATUS.md"),
-        ("OxtaMem notes prose", repo_root / "modules" / "oxtamem" / "README_NSOS.md"),
-    ]
-    prose_chunks: List[Tuple[str, str, str]] = []
-    for title, path in prose_paths:
-        if not path.exists():
-            continue
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        for index, chunk in enumerate(chunk_text(raw, chunk_chars=420, overlap_chars=56)):
-            prose_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    harvested: List[Tuple[str, str, str]] = []
-    for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        tagged = f"File: {path.name}\n\n{raw}"
-        for index, chunk in enumerate(chunk_text(tagged, chunk_chars=480, overlap_chars=72)):
-            harvested.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    for title, chunk, source in prose_chunks:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    rng.shuffle(harvested)
-    split_index = max(len(harvested) * 3 // 4, 1)
-    selected = harvested[:split_index] if split == "train" else harvested[split_index:]
-    if not selected:
-        selected = harvested
-    for title, chunk, source in selected:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    rng.shuffle(docs)
-    if len(docs) >= count:
-        return docs[:count]
-
-    expanded = list(docs)
-    while docs and len(expanded) < count:
-        template = docs[len(expanded) % len(docs)]
-        expanded.append({**template, "id": stable_hash(f"{template['id']}:{len(expanded)}")})
-    return expanded[:count]
-
-    bilingual_notes = [
-        (
-            "NSOS identity",
-            "NSOS is a compact neural runtime that combines BitLinear, memory, reasoning, and edge-oriented deployment. "
-            "O NSOS busca unir treino verificável, inferência eficiente e memória persistente.",
-            "handwritten",
-        ),
-        (
-            "Edge model focus",
-            "A small specialized model should prefer structured tasks, technical text, code, and exact answers over noisy generic web text. "
-            "Um modelo pequeno forte precisa ter identidade e métricas honestas.",
-            "handwritten",
-        ),
-        (
-            "Ternary inference",
-            "Packed ternary inference only becomes real when export, runtime layout, and decode path all agree. "
-            "Quantizar embeddings com mais cuidado costuma preservar mais qualidade.",
-            "handwritten",
-        ),
-    ]
-
-    selected_notes = bilingual_notes[:2] if split == "train" else bilingual_notes[2:]
-    for title, body, source in selected_notes:
-        docs.append(_make_doc_record("phase3_curated_text", title, body, source))
-
-    harvested: List[Tuple[str, str, str]] = []
-    for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        tagged = f"File: {path.name}\n\n{raw}"
-        for index, chunk in enumerate(chunk_text(tagged)):
-            harvested.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    rng.shuffle(harvested)
-    split_index = max(len(harvested) * 3 // 4, 1)
-    selected = harvested[:split_index] if split == "train" else harvested[split_index:]
-    if not selected:
-        selected = harvested
-    for title, chunk, source in selected[: max(count, 1)]:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    return docs[:count]
-
 
 def build_phase4_instructions(count: int, seed: int, split: str) -> List[Dict]:
     rng = random.Random(seed)
@@ -1810,13 +1683,13 @@ def build_phase3_curated_text_v2(repo_root: Path, count: int, seed: int, split: 
 
     prose_chunks: List[Tuple[str, str, str]] = []
     for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
+        raw = read_text_strict(path)
         for index, chunk in enumerate(chunk_text(raw, chunk_chars=560, overlap_chars=64)):
             prose_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
 
     code_chunks: List[Tuple[str, str, str]] = []
     for title, path in _repo_code_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
+        raw = read_text_strict(path)
         tagged = f"File: {path.name}\n\n{raw}"
         for index, chunk in enumerate(chunk_text(tagged, chunk_chars=420, overlap_chars=56)):
             code_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
@@ -2179,6 +2052,19 @@ def build_tokenizer_bundle(curriculum_root: Path, target_vocab: int) -> Path:
         encoding="utf-8",
     )
     return tokenizer_path
+
+
+
+def read_text_strict(path) -> str:
+    """(auditoria #15) Leitura com contabilidade de perda: errors="ignore"
+    descartava bytes em silencio.  Decodifica com errors="replace", conta os
+    U+FFFD e ABORTA acima de 0.1% (corpus corrompido nao entra calado)."""
+    raw = Path(path).read_bytes()
+    text = raw.decode("utf-8", errors="replace")
+    bad = text.count(chr(0xFFFD))
+    if bad and bad > max(1, len(text) // 1000):
+        raise ValueError(f"{path}: {bad} bytes invalidos (> 0.1%) — corpus corrompido")
+    return text
 
 
 def curriculum_texts_for_phase(curriculum_root: Path, phase_name: str, split: str) -> List[Dict]:

@@ -35,7 +35,7 @@ int int_after_flag(int argc, char* argv[], const std::string& flag, int fallback
     }
     try {
         return std::stoi(value);
-    } catch (...) {
+    } catch (const std::exception&) {
         return fallback;
     }
 }

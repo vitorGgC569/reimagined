@@ -1,0 +1,38 @@
+[core] training...
+    epoch 1/6 done
+    epoch 2/6 done
+    epoch 3/6 done
+    epoch 4/6 done
+    epoch 5/6 done
+    epoch 6/6 done
+[core] evaluating...
+[inhib-off] training...
+    epoch 1/6 done
+    epoch 2/6 done
+    epoch 3/6 done
+    epoch 4/6 done
+    epoch 5/6 done
+    epoch 6/6 done
+[anti-collapse-off] training...
+    epoch 1/6 done
+    epoch 2/6 done
+    epoch 3/6 done
+    epoch 4/6 done
+    epoch 5/6 done
+    epoch 6/6 done
+[const-k=3] training...
+    epoch 1/6 done
+    epoch 2/6 done
+    epoch 3/6 done
+    epoch 4/6 done
+    epoch 5/6 done
+    epoch 6/6 done
+[random-frozen] (no training)...
+[shuffled-depth] (reuse core)...
+[width-scaled single layer m=1600] training...
+    wide epoch 1/6
+    wide epoch 2/6
+    wide epoch 3/6
+    wide epoch 4/6
+    wide epoch 5/6
+    wide epoch 6/6

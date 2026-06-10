@@ -74,31 +74,7 @@ void zero_tensor_inplace(Tensor& tensor) {
     std::fill_n(tensor.data(), tensor.size, 0.0f);
 }
 
-void copy_tensor_bytes(float* dst,
-                       Device dst_device,
-                       const float* src,
-                       Device src_device,
-                       size_t bytes) {
-    if (bytes == 0) {
-        return;
-    }
-    if (dst_device == Device::GPU || src_device == Device::GPU) {
-        cudaMemcpyKind kind = cudaMemcpyDefault;
-        if (dst_device == Device::GPU && src_device == Device::GPU) {
-            kind = cudaMemcpyDeviceToDevice;
-        } else if (dst_device == Device::GPU && src_device == Device::CPU) {
-            kind = cudaMemcpyHostToDevice;
-        } else if (dst_device == Device::CPU && src_device == Device::GPU) {
-            kind = cudaMemcpyDeviceToHost;
-        } else {
-            kind = cudaMemcpyHostToHost;
-        }
-        cudaMemcpy(dst, src, bytes, kind);
-        trainer_check_cuda("cudaMemcpy");
-        return;
-    }
-    std::memcpy(dst, src, bytes);
-}
+// (auditoria #8) cópia local removida — usa copy_tensor_bytes unificada (tensor.h).
 
 bool can_use_gpu_optimizer(const Parameter& parameter, const Tensor& m, const Tensor& v) {
     return parameter.data.get_device() == Device::GPU &&
@@ -125,18 +101,7 @@ void zero_tensor_inplace(Tensor& tensor) {
     std::fill_n(tensor.data(), tensor.size, 0.0f);
 }
 
-void copy_tensor_bytes(float* dst,
-                       Device dst_device,
-                       const float* src,
-                       Device src_device,
-                       size_t bytes) {
-    (void)dst_device;
-    (void)src_device;
-    if (bytes == 0) {
-        return;
-    }
-    std::memcpy(dst, src, bytes);
-}
+// (auditoria #8) cópia local removida — usa copy_tensor_bytes unificada (tensor.h).
 #endif
 
 void restore_staged_tensor(Tensor& dst, const Tensor& staged) {
@@ -764,6 +729,39 @@ void apply_moe_aux_regularization(Trainer& trainer) {
             continue;
         }
 
+#ifdef USE_CUDA
+        if (gate_weight.grad.get_device() == Device::GPU &&
+            gpu_custom_kernels_supported()) {
+            // (auditoria #6) device-side: sobe E floats e soma por linha no
+            // kernel — elimina o cpu()/copy_from de [E,d] por camada por step.
+            std::vector<float> imbalance(loads.size());
+            for (size_t expert = 0; expert < loads.size(); ++expert) {
+                imbalance[expert] = (loads[expert] - mean_load) *
+                                    layer->router->aux_loss_coef *
+                                    trainer.moe_aux_loss_scale;
+            }
+            static float* d_imb = nullptr;
+            static size_t d_imb_cap = 0;
+            if (loads.size() > d_imb_cap) {
+                if (d_imb) cudaFree(d_imb);
+                d_imb = nullptr;
+                if (cudaMalloc(&d_imb, loads.size() * sizeof(float)) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    d_imb_cap = 0;
+                }
+                else { d_imb_cap = loads.size(); }
+            }
+            if (d_imb) {
+                cudaMemcpy(d_imb, imbalance.data(), loads.size() * sizeof(float),
+                           cudaMemcpyHostToDevice);
+                launch_add_row_broadcast(gate_weight.grad.raw_data(), d_imb,
+                                         static_cast<int>(loads.size()),
+                                         gate_weight.grad.shape[1]);
+                trainer_check_cuda("launch_add_row_broadcast");
+                continue;
+            }
+        }
+#endif
         Tensor grad_host =
             gate_weight.grad.get_device() == Device::GPU ? gate_weight.grad.cpu() : gate_weight.grad;
         float* grad_ptr = grad_host.data();

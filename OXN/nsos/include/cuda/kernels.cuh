@@ -144,6 +144,8 @@ void launch_multi_tensor_sqsum(float *accum, float *const *w, float *const *g,
                                const unsigned long long *offsets,
                                const unsigned char *wd_flags, int n_tensors,
                                unsigned long long total);
+void launch_add_row_broadcast(float *grad, const float *row_add, int rows,
+                              int cols);
 void launch_multi_tensor_adamw(float *const *w, float *const *g,
                                float *const *m, float *const *v,
                                const unsigned long long *offsets,

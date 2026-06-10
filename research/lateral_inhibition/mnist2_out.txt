@@ -1,0 +1,15 @@
+mnist_showdown.cpp
+=====================================================================
+ MNIST SHOWDOWN — backprop vs Forward-Forward (real task)
+=====================================================================
+ 8000 train / 10000 test, 784-dim, 10 classes, chance 0.100
+ arch: width 256, depth 3 (matched). backprop=Adam, FF=local goodness.
+
+[2] CONTINUAL (permuted-MNIST): retain original MNIST after learning permuted.
+    Oxta-mem anchor sweep (toy lambda=0.20 over-regularized on MNIST).
+  backprop              : A 0.956  B 0.948  RETAIN 0.780
+  FF (no mem)           : A 0.818  B 0.801  RETAIN 0.706
+  FF+mem (g=0.03,l=0.04)  : A 0.816  B 0.780  RETAIN 0.633
+  FF+mem (g=0.05,l=0.08)  : A 0.815  B 0.776  RETAIN 0.605
+  FF+mem (g=0.02,l=0.15)  : A 0.404  B 0.598  RETAIN 0.303
+=====================================================================

@@ -56,6 +56,22 @@ public:
             fs.write((char*)&bytes, 4);
             fs.write((char*)cpu_t.data(), bytes);
         }
+
+        // (auditoria #14) Trailer OPCIONAL v2: nomes absolutos por parâmetro.
+        // A identidade primária continua base_name#ocorrência (ordem de
+        // parameters()) — inserir/remover um módulo desloca ocorrências e o
+        // load fica silenciosamente errado; o trailer dá ao loader uma
+        // verificação secundária.  Arquivos antigos (sem trailer) carregam
+        // exatamente como antes: o loader trata EOF aqui como formato v1.
+        const uint32_t trailer_magic = 0x4E534E32u;  // 'NSN2'
+        fs.write((char*)&trailer_magic, 4);
+        fs.write((char*)&count, 4);
+        for (auto* p : params) {
+            const std::string& abs_name = p->name;
+            uint32_t len = (uint32_t)abs_name.size();
+            fs.write((char*)&len, 4);
+            fs.write(abs_name.c_str(), len);
+        }
     }
 
     static void load(JambaModel* model, const std::string& filename, bool strict = true) {
@@ -179,6 +195,41 @@ public:
             if (canonical_it != canonical_name_for_param.end()) {
                 loaded_runtime_names[canonical_it->second] = true;
             }
+        }
+
+        // (auditoria #14) Trailer v2 (opcional): nomes absolutos gravados
+        // pelo save.  Arquivo v1 termina aqui (EOF) — comportamento idêntico
+        // ao antigo.  Com trailer presente, compara nome absoluto por posição
+        // e AVISA em divergência (reordenação de módulos desloca as
+        // ocorrências da identidade primária silenciosamente).
+        {
+            uint32_t trailer_magic = 0;
+            if (fs.read((char*)&trailer_magic, 4) && trailer_magic == 0x4E534E32u) {
+                uint32_t tcount = 0;
+                fs.read((char*)&tcount, 4);
+                size_t mismatches = 0;
+                std::string first_mismatch;
+                for (uint32_t i = 0; i < tcount && fs; ++i) {
+                    uint32_t len = 0;
+                    fs.read((char*)&len, 4);
+                    if (len > 4096) break;
+                    std::string abs_name(len, ' ');
+                    fs.read(&abs_name[0], len);
+                    if (i < params.size() && params[i] && params[i]->name != abs_name) {
+                        ++mismatches;
+                        if (first_mismatch.empty()) {
+                            first_mismatch = abs_name + " != " + params[i]->name;
+                        }
+                    }
+                }
+                if (mismatches > 0) {
+                    std::cerr << "[ModelSerializer] AVISO: " << mismatches
+                              << " nomes absolutos divergem do runtime (1o: "
+                              << first_mismatch
+                              << ") — possivel reordenacao de modulos.\n";
+                }
+            }
+            fs.clear();
         }
 
         if (strict) {

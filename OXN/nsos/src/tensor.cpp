@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <set>
+#include <mutex>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -332,68 +334,11 @@ static cudaStream_t tensor_copy_stream() {
     return stream;
 }
 
-void copy_tensor_bytes(float* dst, Device dst_device, const float* src, Device src_device,
-                       size_t bytes, bool async_d2d = false) {
-    if (bytes == 0) {
-        return;
-    }
-    if (dst_device == Device::GPU || src_device == Device::GPU) {
-        if (async_d2d && dst_device == Device::GPU && src_device == Device::GPU) {
-            // D2D entre buffers do pool: enfileira no stream legacy (0) e NÃO
-            // bloqueia o host.  A ordenação é total — produtores de `src` e
-            // consumidores de `dst` rodam no stream 0, e o reuso de buffers
-            // do pool também é stream-ordered; leituras host posteriores
-            // passam por sync_host_access (que drena se houver pendência).
-            // O sync de host aqui era um dreno de pipeline COMPLETO por
-            // clone/save (dezenas por step no forward de treino) — medido
-            // como o overhead uniforme por camada na T4.  Opt-in por call
-            // site: cópias de/para ponteiros EXTERNOS (__cuda_array_interface__)
-            // e H2D/D2H mantêm o sync (lifetime do buffer de origem).
-            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, nullptr);
-            const cudaError_t launch = cudaGetLastError();
-            if (launch != cudaSuccess) {
-                throw std::runtime_error(std::string("CUDA async D2D memcpy failed: ") +
-                                         cudaGetErrorString(launch));
-            }
-            return;
-        }
-        cudaStream_t stream = tensor_copy_stream();
-        if (stream) {
-            // Async copy on the dedicated stream, then wait on JUST this stream.
-            // Equivalent ordering to the legacy blocking cudaMemcpy (blocking
-            // stream serializes with stream 0), but does not stall unrelated
-            // device work the way cudaDeviceSynchronize would.
-            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, stream);
-            const cudaError_t launch = cudaGetLastError();
-            if (launch != cudaSuccess) {
-                throw std::runtime_error(std::string("CUDA async memcpy failed: ") +
-                                         cudaGetErrorString(launch));
-            }
-            const cudaError_t sync = cudaStreamSynchronize(stream);
-            if (sync != cudaSuccess) {
-                throw std::runtime_error(std::string("CUDA copy-stream sync failed: ") +
-                                         cudaGetErrorString(sync));
-            }
-        } else {
-            cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
-            const cudaError_t status = cudaGetLastError();
-            if (status != cudaSuccess) {
-                throw std::runtime_error(std::string("CUDA memcpy failed: ") +
-                                         cudaGetErrorString(status));
-            }
-        }
-        return;
-    }
-    std::memcpy(dst, src, bytes);
-}
+// (movida p/ escopo de namespace — ver apos Tensor::uninitialized)
+
 #else
-void copy_tensor_bytes(float* dst, Device, const float* src, Device, size_t bytes,
-                       bool async_d2d = false) {
-    (void)async_d2d;
-    if (bytes > 0) {
-        std::memcpy(dst, src, bytes);
-    }
-}
+// (variante CPU fundida na definicao unica)
+
 #endif
 
 } // namespace
@@ -441,6 +386,7 @@ public:
         if (!enabled_) return raw_alloc(bytes);
         bytes = bin_bytes(bytes);
         std::lock_guard<std::mutex> lk(mtx_);
+        live_bytes_ += bytes;
         auto& bin = free_[bytes];
         if (!bin.empty()) {
             void* p = bin.back();
@@ -477,10 +423,12 @@ public:
             // it, so total managed footprint stays bounded.
             cudaFree(p);
             live_.erase(it);
+            live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
             return;
         }
         free_[sz].push_back(p);
         cached_bytes_ += sz;
+        live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
         // Guarda de oversubscription UM (auditoria #27): checagem barata por
         // cadência — UM não dá OOM, degrada paginando (T4 a 96% custou steps
         // 6->8s antes do binning).  Acima de 88% de uso do device: poda o
@@ -505,6 +453,20 @@ public:
             }
             (void)cudaGetLastError();
         }
+    }
+
+public:
+    PoolStats stats() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        PoolStats s;
+        s.cached_bytes = cached_bytes_;
+        s.live_bytes = live_bytes_;
+        s.bins = free_.size();
+        return s;
+    }
+    void trim() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        trim_locked();
     }
 
 private:
@@ -574,6 +536,7 @@ private:
 
     bool enabled_ = true;
     size_t cached_bytes_ = 0;  // current sum of free-list block sizes
+    size_t live_bytes_ = 0;    // soma dos blocos atualmente entregues a Tensors
     unsigned dealloc_probe_ = 0;        // cadência da guarda de pressão UM
     bool um_pressure_warned_ = false;   // 1 aviso por episódio de pressão
     size_t cap_bytes_ = 0;     // max cached bytes (0 = unlimited)
@@ -602,6 +565,26 @@ void TensorDeleter::operator()(float* ptr) {
 
 // Definida adiante (junto de Tensor::uninitialized); lida pelo construtor.
 bool tensor_skip_fill_flag();
+
+// (auditoria #20) Aviso único por op quando um tensor GPU cai num caminho
+// host-only — regressões de dispatch nunca mais passam em silêncio.
+static void warn_host_fallback_once(const char* op, Device dev) {
+#ifdef USE_CUDA
+    if (dev != Device::GPU) return;
+    static std::mutex m;
+    static std::set<std::string> warned;
+    std::lock_guard<std::mutex> lk(m);
+    if (warned.insert(op).second) {
+        std::fprintf(stderr,
+                     "[tensor] WARN: op '%s' executando no HOST com tensor GPU "
+                     "(fallback sem kernel) - perf degradada\n",
+                     op);
+    }
+#else
+    (void)op; (void)dev;
+#endif
+}
+
 
 Tensor::Tensor() : size(0), device(Device::CPU) {
     shape = TensorShape(std::vector<int>{});
@@ -701,6 +684,87 @@ bool tensor_skip_fill_flag() { return g_tensor_skip_fill; }
 Tensor Tensor::uninitialized(const std::vector<int>& s, Device dev) {
     SkipFillGuard guard;
     return Tensor(s, dev);
+}
+
+
+// (auditoria #8) Definição ÚNICA em escopo de namespace — casa com a decl do
+// tensor.h e elimina as cópias divergentes de trainer.cpp/jamba.cpp.
+void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
+                       Device src_device, size_t bytes, bool async_d2d) {
+#ifdef USE_CUDA
+
+    if (bytes == 0) {
+        return;
+    }
+    if (dst_device == Device::GPU || src_device == Device::GPU) {
+        if (async_d2d && dst_device == Device::GPU && src_device == Device::GPU) {
+            // D2D entre buffers do pool: enfileira no stream legacy (0) e NÃO
+            // bloqueia o host.  A ordenação é total — produtores de `src` e
+            // consumidores de `dst` rodam no stream 0, e o reuso de buffers
+            // do pool também é stream-ordered; leituras host posteriores
+            // passam por sync_host_access (que drena se houver pendência).
+            // O sync de host aqui era um dreno de pipeline COMPLETO por
+            // clone/save (dezenas por step no forward de treino) — medido
+            // como o overhead uniforme por camada na T4.  Opt-in por call
+            // site: cópias de/para ponteiros EXTERNOS (__cuda_array_interface__)
+            // e H2D/D2H mantêm o sync (lifetime do buffer de origem).
+            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, nullptr);
+            const cudaError_t launch = cudaGetLastError();
+            if (launch != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA async D2D memcpy failed: ") +
+                                         cudaGetErrorString(launch));
+            }
+            return;
+        }
+        cudaStream_t stream = tensor_copy_stream();
+        if (stream) {
+            // Async copy on the dedicated stream, then wait on JUST this stream.
+            // Equivalent ordering to the legacy blocking cudaMemcpy (blocking
+            // stream serializes with stream 0), but does not stall unrelated
+            // device work the way cudaDeviceSynchronize would.
+            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, stream);
+            const cudaError_t launch = cudaGetLastError();
+            if (launch != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA async memcpy failed: ") +
+                                         cudaGetErrorString(launch));
+            }
+            const cudaError_t sync = cudaStreamSynchronize(stream);
+            if (sync != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA copy-stream sync failed: ") +
+                                         cudaGetErrorString(sync));
+            }
+        } else {
+            cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
+            const cudaError_t status = cudaGetLastError();
+            if (status != cudaSuccess) {
+                throw std::runtime_error(std::string("CUDA memcpy failed: ") +
+                                         cudaGetErrorString(status));
+            }
+        }
+        return;
+    }
+    std::memcpy(dst, src, bytes);
+
+#else
+    (void)dst_device; (void)src_device; (void)async_d2d;
+    if (bytes > 0) {
+        std::memcpy(dst, src, bytes);
+    }
+#endif
+}
+
+PoolStats pool_stats() {
+#ifdef USE_CUDA
+    return ManagedPool::instance().stats();
+#else
+    return PoolStats{};
+#endif
+}
+
+void release_cached_memory() {
+#ifdef USE_CUDA
+    ManagedPool::instance().trim();
+#endif
 }
 
 Tensor Tensor::random(const std::vector<int>& s, Device dev) {
@@ -1203,6 +1267,7 @@ Tensor Tensor::transpose(int dim0, int dim1) const {
     // via its precomputed strides.  The previous version allocated a
     // std::vector (src_idx) AND called get() (which recomputes a flat index)
     // for every element.
+    warn_host_fallback_once("transpose(rank>2)", device);
     std::vector<int> idx(rank);
     const float* src = data();
     float* dst = result.data();
@@ -1344,6 +1409,7 @@ Tensor Tensor::softmax(int dim) const {
     }
 #endif
 
+    warn_host_fallback_once("softmax(dim!=last)", device);
     const float* src = data();
     float* dst = result.data();
 #pragma omp parallel for
@@ -1739,6 +1805,7 @@ Tensor Tensor::slice(int dim, int start, int end) const {
         return result;
     }
 
+    warn_host_fallback_once("slice(dim!=0)", device);
     std::vector<int> idx = make_indices(rank);
     for (int flat = 0; flat < result.size; ++flat) {
         int remaining = flat;

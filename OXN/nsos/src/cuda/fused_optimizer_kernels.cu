@@ -157,3 +157,27 @@ extern "C" void launch_multi_tensor_adamw(float* const* w,
     multi_tensor_adamw_kernel<<<blocks_for_total(total), kThreads>>>(
         meta, gscale, beta1, beta2, bc1, bc2, lr, eps, weight_decay);
 }
+
+namespace {
+__global__ void add_row_broadcast_kernel(float* __restrict__ grad,
+                                         const float* __restrict__ row_add,
+                                         int rows, int cols) {
+    const long long total = static_cast<long long>(rows) * cols;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+         i < total;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        grad[i] += row_add[i / cols];
+    }
+}
+}  // namespace
+
+// (auditoria #6) MoE aux-reg device-side: grad do gate [E, d] += imbalance[E]
+// sem o round-trip D2H/H2D por step que existia no caminho host.
+extern "C" void launch_add_row_broadcast(float* grad, const float* row_add,
+                                         int rows, int cols) {
+    const long long total = static_cast<long long>(rows) * cols;
+    if (total <= 0) return;
+    const long long b = (total + kThreads - 1) / kThreads;
+    add_row_broadcast_kernel<<<static_cast<int>(b < kMaxBlocks ? b : kMaxBlocks),
+                               kThreads>>>(grad, row_add, rows, cols);
+}
