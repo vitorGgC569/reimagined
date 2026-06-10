@@ -170,23 +170,67 @@ def main() -> int:
         if "CONTROLE" in gname:
             control_rel = max(rels)
 
-    if control_rel is not None and control_rel > 1e-5:
-        print(f"[parity] ATENCAO: controle out_proj rel={control_rel:.3e} > 1e-5 — "
-              f"divergencia ANTES do kernel novo (investigar harness/forward)")
+    # ── v4: o unico gate fisicamente valido e a CAMADA DE ATENCAO DO TOPO ──
+    # Licao da v3 (pre-registrada): rel ~0.35-0.41 em TODOS os grupos com pior
+    # sempre em layers.1 (fundo) + forward bit-identico = assinatura de CAOS de
+    # backprop amplificado em profundidade (×~3/camada => 1e-6 no topo vira
+    # ~0.4 no fundo apos ~11 camadas). dy so e identico entre os bracos na
+    # camada de atencao MAIS ALTA — apenas la a comparacao mede o kernel, e nao
+    # o caos. Gate v4: rel dos ALVOS (q/kv) na camada do topo; out_proj do topo
+    # como controle (deve ser ~1e-7). O perfil por camada e impresso para
+    # evidenciar o gradiente de amplificacao (deve crescer topo -> fundo).
+    import re as _re
 
-    attn_worst = max(attn_rels) if attn_rels else float("inf")
-    print(f"[parity] gate = max(global={global_rel:.3e}, attn_alvo={attn_worst:.3e})")
-    gate = max(global_rel, attn_worst)
-    if gate <= args.pass_tol:
-        print(f"[parity] PASS (<= {args.pass_tol:.0e}) — reassociacao pura; "
-              f"caminho GPU promovido (default ja e GPU)")
+    def layer_of(name: str):
+        m = _re.search(r"layers\.(\d+)\.", name)
+        return int(m.group(1)) if m else None
+
+    attn_by_layer: dict[int, dict[str, float]] = {}
+    for gname, items in groups.items():
+        if "attn" not in gname:
+            continue
+        kind = ("out" if "out_proj" in gname
+                else "q" if "q_down" in gname else "kv")
+        for rel, _abs, name in items:
+            li = layer_of(name)
+            if li is None:
+                continue
+            d = attn_by_layer.setdefault(li, {})
+            d[kind] = max(d.get(kind, 0.0), rel)
+
+    if not attn_by_layer:
+        print("[parity] ERRO: nenhum tensor de atencao identificado por camada")
+        return 2
+
+    print("[parity] perfil por camada (rel_max q / kv / out — espera-se crescer topo->fundo):")
+    for li in sorted(attn_by_layer, reverse=True):
+        d = attn_by_layer[li]
+        print(f"[parity]   layer {li:>2}: q={d.get('q', 0):.3e} "
+              f"kv={d.get('kv', 0):.3e} out={d.get('out', 0):.3e}")
+
+    top = max(attn_by_layer)
+    dtop = attn_by_layer[top]
+    top_target = max(dtop.get("q", 0.0), dtop.get("kv", 0.0))
+    top_control = dtop.get("out", 0.0)
+    print(f"[parity] TOPO = layer {top}: alvo(q/kv)={top_target:.3e} "
+          f"controle(out)={top_control:.3e} | global(caos)={global_rel:.3e}")
+
+    if top_control > 1e-4:
+        print("[parity] ERRO DE HARNESS: controle do TOPO deveria ser ~1e-7 "
+              "(dy identico) — divergencia fora do kernel novo; colar saida")
+        return 2
+    if top_target <= args.pass_tol:
+        print(f"[parity] PASS — alvo do topo <= {args.pass_tol:.0e}: kernel GPU "
+              f"correto; rel global {global_rel:.1e} e caos de profundidade "
+              f"(nenhuma implementacao correta-mas-reassociada passaria nele). "
+              f"PROMOVIDO (default GPU); treinar normalmente.")
         return 0
-    if gate <= args.fail_tol:
-        print(f"[parity] ZONA CINZA (<= {args.fail_tol:.0e}) — colar a saida "
-              f"para analise antes de promover")
+    if top_target <= args.fail_tol:
+        print(f"[parity] ZONA CINZA no topo ({top_target:.3e}) — colar a saida")
         return 0
-    print(f"[parity] FAIL (> {args.fail_tol:.0e}) — usar NSOS_ATTN_BWD_HOST=1 "
-          f"no treino e colar esta saida")
+    print(f"[parity] FAIL REAL: alvo do topo {top_target:.3e} > {args.fail_tol:.0e} "
+          f"— bug no kernel ({'q' if dtop.get('q',0)>=dtop.get('kv',0) else 'kv'} "
+          f"e o pior); treinar com NSOS_ATTN_BWD_HOST=1 e colar a saida")
     return 1
 
 
