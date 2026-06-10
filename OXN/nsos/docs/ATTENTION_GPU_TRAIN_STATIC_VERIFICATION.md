@@ -60,6 +60,29 @@ bloco host original intacto.
 - Ganho de tempo real (predição: step T4 do v11 cai de ~16 s para ~1-2 s, pois
   o backward host O(B·H·S²·hd) single-thread + migrações UM saem do caminho).
 
+## 4b. VEREDITO DO GATE (Colab T4, 2026-06-10) — PASS (D1) + descoberta
+
+Histórico do instrumento (cada falha pré-registrada e corrigida): v1 media
+trajetória através do Adam (caos de sign-flip); v2 capturava grads com atributo
+inexistente; v3 gateava rel por-parâmetro (explode em normas ~0); v4 tinha o
+controle poluído por `mamba.out_proj` (todo layer tem um). **v5** = 4 braços
+(host×2, gpu×2) com piso de ruído + classificador `.attn.` estrito.
+
+Resultado: **efeito host-vs-gpu 3.53e-1 ≈ pisos host-vs-host 3.24e-1 /
+gpu-vs-gpu 3.43e-1 (D1-PASS)**; no topo (layer 11), ruído do próprio host
+(alvo 1.15e-1) > diferença host-vs-gpu (8.0e-2). O kernel é indistinguível do
+não-determinismo pré-existente. **Promovido (default GPU).**
+
+**Descoberta colateral (pré-registrada como desfecho possível): o treino NUNCA
+foi determinístico** — mesma seed/dados/código divergem ~32% nos gradientes em
+1 step. Fontes: atomicAdd no scatter-add do embedding, grad_A do Mamba, scatter
+do MoE e na redução do escalar de loss da CE (o próprio loss oscila 1 ulp:
+9.803181 vs 9.803182), amplificadas ×~3/camada pelo backprop. O gate
+verify_determinism cobre apenas seeding de Tensor.random — não gradientes.
+Implicação: claims de "replay determinístico" valem para inferência/seed, não
+para treino. Backlog (não bloqueante): modo NSOS_DETERMINISTIC com reduções
+segmentadas ordenadas nos 4 pontos de atomic.
+
 ## 5. Limitações conhecidas (honestas)
 
 - O forward batched-exato ainda recomputa RoPE para os SAVES (clone+rotação) em
