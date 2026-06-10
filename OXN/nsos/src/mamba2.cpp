@@ -2,6 +2,7 @@
 #include "../include/cuda/mamba_kernels.cuh"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -116,6 +117,34 @@ Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
   // during QAT (mixed precision: ternary robust + out_proj, higher-precision
   // SSM scan parameters).  See trainer.cpp apply_progressive_qat_phase.
   in_proj_sensitive.set_quantization_sensitive(true);
+
+  // OXTA-CRIT Lei 2 (docs/OXTA_CRIT_THEORY.md): A = ones gives a fully
+  // DEGENERATE memory spectrum — every channel forgets at the same rate
+  // (tau ~ 1/A identical everywhere; measured by scripts/criticality_probe.py:
+  // tau_log_spread = 0.0).  S4D-style log-spaced A spans a hierarchy of
+  // timescales (tau from 1 to 1/A_min tokens at nominal dt) so slow channels
+  // exist from step 0 instead of having to be discovered by gradient.
+  // Opt-in (default OFF preserves behavior): NSOS_MAMBA_A_LOGSPACED=1,
+  // optional NSOS_MAMBA_A_MIN (default 0.01 -> tau up to ~100 tokens).
+  // Read per-construction (not static) so an A/B harness can flip the env
+  // between model constructions in one process.  Deterministic (no RNG).
+  if (const char* env = std::getenv("NSOS_MAMBA_A_LOGSPACED");
+      env != nullptr && env[0] == '1') {
+    float a_min = 0.01f;
+    if (const char* mn = std::getenv("NSOS_MAMBA_A_MIN"); mn != nullptr) {
+      const float parsed = std::strtof(mn, nullptr);
+      if (parsed > 1e-3f && parsed < 1.0f) {
+        a_min = parsed;
+      }
+    }
+    float* a_ptr = A.data.data();
+    const int n = A.data.size;
+    const float log_min = std::log(a_min);
+    for (int d = 0; d < n; ++d) {
+      const float frac = (n > 1) ? static_cast<float>(d) / static_cast<float>(n - 1) : 0.0f;
+      a_ptr[d] = std::exp(log_min * frac);  // d=0 -> 1.0 ... d=n-1 -> a_min
+    }
+  }
 }
 
 float Mamba2SSD::softplus_stable(float x) {

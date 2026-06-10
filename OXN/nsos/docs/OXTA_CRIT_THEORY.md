@@ -128,7 +128,44 @@ trabalho que faça qualquer um dos quatro.
 - **Espectro κ (Lei 2):** inicialização/regularização de A e dt-proj para
   distribuir 1/A em escala log (hierarquia); depois κ real com o tap v2.
 
-## 5. O diferencial Oxta, em uma frase
+## 5. RESULTADOS — validação experimental (GTX 1050 Ti, 2026-06-09)
+
+Experimentos pequenos (`scripts/crit_experiments.py`), todos reproduzíveis:
+
+**E1 — matemática da Lei 2 (CPU, sim numérica).** κ previsto 2.50 → Hill mede
+2.35 ✓ (no regime κ<1 o Hill superestima — viés de T finito conhecido, anotado).
+Retenção com mediana casada: decaimento constante = spread ZERO; flutuante =
+**7.8 décadas** de spread (p99.9/p50) — o mecanismo de memória livre de escala
+existe numericamente.
+
+**E2 — fix do espectro degenerado.** `NSOS_MAMBA_A_LOGSPACED=1` (mamba2.cpp,
+opt-in, default intacto): spread de τ passa de 0.00 → 2.00 décadas na init.
+
+**E3 — consequência funcional (o headline).** Tarefa de recall (payload através
+de 16 distratores, 10 classes, mesmos dados/seeds/hiperparâmetros, 480 steps,
+mamba_small):
+| braço | ACC | loss final |
+|---|---|---|
+| A=ones (atual) | **0.125** (≈chance) | ~1.27 (plateau = só EOS) |
+| A=log-espaçado | **1.000** | **0.0000** (resolve no step ~160) |
+Uma linha de inicialização: chance → perfeito. Candidato direto à causa do
+held-out fraco de longo alcance (gap #1 do NSOS_VALIDATION_STATUS).
+Bônus-descoberta: quando canais lentos EXISTEM, o treino os AMPLIFICA
+(τ_max 100→1000 em 240-480 steps); quando não existem, o gradiente não os cria
+(spread 0.00→0.06). Init importa porque a descoberta por gradiente é lenta.
+
+**E4 + controle — P2 (descritificação) confirmada com atribuição causal.**
+240 steps, mesmos dados: com QAT progressivo, p0 +0.049 e fração de camadas na
+banda crítica g∈[0.5,2] **colapsa 0.976 → 0.214** (g_med 1.12→2.36); SEM QAT,
+drift nulo (0.976 → 0.976, Δp0=0.0005). A saída do manifold crítico é efeito
+do QAT, não do treino comum. Remédio previsto (P4): regularizador de
+covariação α²(1−p₀)≈const — próximo experimento.
+
+Medição de base (criticality_probe v1, perfil v11 @ init): 122 lineares,
+g mediano 1.125, 99.2% na banda [0.5,2] — a init está sobre o manifold; e
+TODAS as camadas Mamba com A≡1 (τ≡1, spread 0.0) — o defeito que E3 quantifica.
+
+## 6. O diferencial Oxta, em uma frase
 
 > Não vendemos um modelo maior. **Vendemos um modelo na fase certa** — pesos na
 > borda da ordem, memória na borda do esquecimento, pensamento na borda do
