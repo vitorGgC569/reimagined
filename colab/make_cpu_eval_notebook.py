@@ -164,6 +164,22 @@ else:
 print('[data] bundle pronto')
 """))
 
+cells.append(code("""# [4.5] PADRAO OURO do tokenizer + raio-x do corpus (segundos, CPU)
+# G1 roundtrip byte-exato em todos os eval rows | G2 specials atomicos +
+# teste de injecao | G3 determinismo | G4 prefix-stability prompt|answer |
+# G5 cobertura | G6 composicao do corpus por fonte (o raio-x que explica
+# "por que o modelo responde C++": phase3 inclui o fonte do NSOS por design).
+import subprocess, sys
+r = subprocess.run([sys.executable,
+                    '/content/reimagined/OXN/nsos/scripts/tokenizer_gold_gate.py',
+                    '--bundle-dir', '/content/reimagined/OXN/nsos/scripts/distillation_bundle_v11',
+                    '--build-dir', BUILD_DIR], capture_output=True, text=True)
+print(r.stdout)
+if r.returncode != 0:
+    print(r.stderr[-1500:])
+print('TOKENIZER GATE:', 'PASS' if r.returncode == 0 else 'FAIL')
+"""))
+
 cells.append(code("""# [5] Perguntas e RESPOSTAS do checkpoint — tudo em CPU/RAM
 import os, sys, time, random
 from pathlib import Path
