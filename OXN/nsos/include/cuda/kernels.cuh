@@ -107,6 +107,33 @@ void launch_repetition_unlikelihood_kernel(float *grad, const float *probs,
                                            const int *answer_tokens, int rows,
                                            int vocab, float scale,
                                            int eos_token_id);
+
+// ── GQA attention TRAINING path (src/cuda/attention_train_kernels.cu) ──────
+// Glue kernels keeping Attention forward-saves and the exact-cache backward
+// fully device-resident (the GEMMs run through Tensor::matmul's batched
+// cuBLAS path).  Layouts identical to jamba.cpp:
+//   q/dO heads [B,S,H,hd] · k/v heads [B,S,KV,hd] · permuted [B,H,S,hd]
+//   transposed [B,H,hd,S] · scores/P/dS [B*H,S,S]
+void launch_attn_gather_heads(float *out, const float *src, int B, int S,
+                              int H_out, int hd, int src_heads, int group,
+                              int transposed);
+void launch_attn_unpermute_heads(float *out, const float *src, int B, int H,
+                                 int S, int hd);
+void launch_attn_reduce_group(float *out, const float *src, int B, int S,
+                              int KV, int hd, int H, int group);
+void launch_attn_masked_softmax(float *p, const int *valid, int B, int H,
+                                int S, float scale);
+void launch_attn_softmax_backward(float *ds, const float *p, const float *dp,
+                                  int B, int H, int S, float scale);
+void launch_batched_transpose_last2(float *out, const float *src, int N,
+                                    int R, int C);
+void launch_rope_apply(float *x, const float *cos_buf, const float *sin_buf,
+                       int B, int S, int H, int hd, int start_pos, int max_seq,
+                       int dir);
+void launch_kv_split(float *k, float *v, const float *kv, long long rows,
+                     int kvd);
+void launch_kv_concat(float *out, const float *k, const float *v,
+                      long long rows, int kvd);
 void launch_kaiming_uniform_kernel(float *out, int n, float limit,
                                    unsigned long long seed);
 void launch_check_stability_kernel(int *d_found_issue, const float *in,

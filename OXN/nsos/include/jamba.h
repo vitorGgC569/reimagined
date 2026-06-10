@@ -130,6 +130,15 @@ private:
   Tensor saved_v_heads_;
   Tensor saved_attn_probs_;
   int saved_input_rank_ = 0;
+  // GPU training path (src/cuda/attention_train_kernels.cu): device copies of
+  // the rotary tables, lazily (re)uploaded when cos_cached/sin_cached grow, and
+  // the device-resident exact-cache backward.  Behavior-neutral on CPU builds.
+  Tensor rope_cos_gpu_;
+  Tensor rope_sin_gpu_;
+  size_t rope_gpu_uploaded_ = 0;
+  void ensure_rope_gpu_cache();
+  Tensor backward_exact_gpu(const Tensor& dy, int batch_size, int seq_len,
+                            int kv_dim, float scale);
   bool exact_training_path_ = true;
   // SSA opt-in state (default OFF preserves exact existing behavior).
   bool sparse_enabled_ = false;

@@ -2617,6 +2617,65 @@ void Attention::precompute_freqs_cis() {
     }
 }
 
+#ifdef USE_CUDA
+namespace {
+
+// Persistent device buffer for per-batch valid lengths (grows on demand) so the
+// attention GPU backward never cudaMalloc's per call.  Single training thread.
+int* attn_valid_device_buffer(int count) {
+    static int* buf = nullptr;
+    static int cap = 0;
+    if (count <= 0) return nullptr;
+    if (count > cap) {
+        if (buf) cudaFree(buf);
+        buf = nullptr;
+        if (cudaMalloc(&buf, static_cast<size_t>(count) * sizeof(int)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cap = 0;
+            return nullptr;
+        }
+        cap = count;
+    }
+    return buf;
+}
+
+// NSOS_ATTN_BWD_HOST=1 forces the host exact-cache backward (the A/B parity arm
+// against the GPU path).  Read per call so one process can flip arms.
+bool attn_bwd_force_host() {
+    const char* e = std::getenv("NSOS_ATTN_BWD_HOST");
+    return e != nullptr && e[0] == '1';
+}
+
+void attn_train_check_cuda(const char* op) {
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(op) + " failed: " +
+                                 cudaGetErrorString(status));
+    }
+}
+
+}  // namespace
+#endif  // USE_CUDA
+
+// Uploads cos_cached/sin_cached to device buffers (lazily; re-uploads only when
+// the host tables grew, e.g. after reserve_kv_cache).  No-op on CPU builds.
+void Attention::ensure_rope_gpu_cache() {
+#ifdef USE_CUDA
+    const size_t n = cos_cached.size();
+    if (n == 0 || (rope_gpu_uploaded_ == n &&
+                   rope_cos_gpu_.size == static_cast<int>(n))) {
+        return;
+    }
+    rope_cos_gpu_ = Tensor({static_cast<int>(n)}, Device::GPU);
+    rope_sin_gpu_ = Tensor({static_cast<int>(n)}, Device::GPU);
+    cudaMemcpy(rope_cos_gpu_.raw_data(), cos_cached.data(), n * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(rope_sin_gpu_.raw_data(), sin_cached.data(), n * sizeof(float),
+               cudaMemcpyHostToDevice);
+    rope_gpu_uploaded_ = n;
+#endif
+}
+
 std::pair<Tensor, Tensor> Attention::apply_rope(const Tensor& q, const Tensor& k, int start_pos) {
     if (q.shape.size() != k.shape.size() || (q.shape.size() != 3 && q.shape.size() != 4)) {
         throw std::runtime_error("Attention::apply_rope expects rank-3 or rank-4 q/k tensors");
@@ -2987,6 +3046,48 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         // observed ~24 s/step on Colab T4.  Fix: keep the cheap setup
         // (D2H, KV split, RoPE) so backward can run, and gate the
         // expensive attention loops behind `if (!used_gpu_exact_forward)`.
+        Tensor output_heads;  // filled by the host fallback below; empty on the GPU-save path
+#ifdef USE_CUDA
+        bool gpu_saved_done = false;
+        if (used_gpu_exact_forward && q_flat.get_device() == Device::GPU &&
+            kv_flat.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+            // Device-resident backward saves.  This block previously ALWAYS did
+            // a full D2H of q_flat/kv_flat + a host KV split + host RoPE per
+            // attention layer per forward step — megabytes of Unified-Memory
+            // page migration whose only purpose was stashing backward inputs,
+            // even though the forward output came from the fused GPU kernel.
+            // Now: split KV with a kernel, clone on device, rotate with the
+            // RoPE kernel (math identical to apply_rope), and save GPU tensors
+            // (Attention::backward has a matching GPU exact-cache branch).
+            Tensor k_flat_gpu({batch_size, seq_len, kv_dim}, Device::GPU);
+            Tensor v_flat_gpu({batch_size, seq_len, kv_dim}, Device::GPU);
+            launch_kv_split(k_flat_gpu.raw_data(), v_flat_gpu.raw_data(),
+                            kv_flat.raw_data(),
+                            static_cast<long long>(batch_size) * seq_len, kv_dim);
+            attn_train_check_cuda("launch_kv_split");
+
+            Tensor q_rot_gpu = q_flat.clone();  // [B,S,d_model] ≡ [B,S,H,hd] layout
+            Tensor k_rot_gpu = k_flat_gpu.clone();
+            ensure_rope_gpu_cache();
+            launch_rope_apply(q_rot_gpu.raw_data(), rope_cos_gpu_.raw_data(),
+                              rope_sin_gpu_.raw_data(), batch_size, seq_len,
+                              n_heads, head_dim, 0, max_seq_len, +1);
+            launch_rope_apply(k_rot_gpu.raw_data(), rope_cos_gpu_.raw_data(),
+                              rope_sin_gpu_.raw_data(), batch_size, seq_len,
+                              n_kv_heads, head_dim, 0, max_seq_len, +1);
+            attn_train_check_cuda("launch_rope_apply(fwd)");
+
+            saved_q_rot_ =
+                q_rot_gpu.reshape({batch_size, seq_len, n_heads, head_dim});
+            saved_k_rot_ =
+                k_rot_gpu.reshape({batch_size, seq_len, n_kv_heads, head_dim});
+            saved_v_heads_ =
+                v_flat_gpu.reshape({batch_size, seq_len, n_kv_heads, head_dim});
+            saved_attn_probs_ = Tensor();
+            gpu_saved_done = true;
+        }
+        if (!gpu_saved_done) {
+#endif
         Tensor q_host = (q_flat.get_device() == Device::GPU) ? q_flat.cpu() : q_flat;
         Tensor kv_host = (kv_flat.get_device() == Device::GPU) ? kv_flat.cpu() : kv_flat;
         Tensor k_flat({batch_size, seq_len, kv_dim}, Device::CPU);
@@ -3024,7 +3125,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         // when the GPU path did NOT run.  When GPU ran, output_heads
         // stays unwritten and is discarded; `exact_forward_gpu` is
         // what gets returned from out_proj below.
-        Tensor output_heads({batch_size, seq_len, n_heads, head_dim}, q_rot.get_device());
+        output_heads = Tensor({batch_size, seq_len, n_heads, head_dim}, q_rot.get_device());
         if (!used_gpu_exact_forward) {
             float* out_ptr = output_heads.data();
             const float* q_ptr = q_rot.data();
@@ -3101,6 +3202,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         saved_k_rot_ = k_rot;
         saved_v_heads_ = v_heads;
         saved_attn_probs_ = Tensor();
+#ifdef USE_CUDA
+        }  // !gpu_saved_done — host fallback save path
+#endif
 
         // When the GPU kernel produced `exact_forward_gpu`, hand it
         // straight to out_proj — no reshape of CPU output_heads needed
@@ -3772,6 +3876,116 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
     return input.shape.size() == 1 ? projected.reshape({d_model}) : projected;
 }
 
+#ifdef USE_CUDA
+// Device-resident exact-cache backward.  Mirrors the host loop in
+// Attention::backward EXACTLY (same masks: j<=i, j<valid_b, i<valid_b; same
+// softmax 1e-9 guard; scale folded into dS; RoPE-transpose at start_pos=0;
+// rows beyond valid_b produce zero grads), but as 5 batched-cuBLAS GEMM
+// families + glue kernels from attention_train_kernels.cu.  The GEMMs run
+// through Tensor::matmul, so the BF16 Tensor-Core mode applies here too.
+// Derivation per (b,h,i):  P = softmax(mask(scale·Q·Kᵀ))
+//   dP = dO·Vᵀ ; dS = scale·P⊙(dP − Σⱼ P·dP) ; dQ = dS·K ; dK = dSᵀ·Q ;
+//   dV = Pᵀ·dO ; GQA: dK/dV reduzidos por grupo de query-heads.
+Tensor Attention::backward_exact_gpu(const Tensor& dy, int batch_size,
+                                     int seq_len, int kv_dim, float scale) {
+    const int B = batch_size;
+    const int S = seq_len;
+    const int H = n_heads;
+    const int KV = n_kv_heads;
+    const int hd = head_dim;
+    const int group = kv_group_size;
+    const int BH = B * H;
+
+    Tensor grad_out = out_proj->backward(dy);  // [B,S,d_model] on GPU
+    Tensor grad_heads = grad_out.reshape({B, S, H, hd});
+
+    // Per-batch valid lengths (clamped exactly like the host) -> device.
+    int* dvalid = attn_valid_device_buffer(B);
+    if (dvalid == nullptr) {
+        throw std::runtime_error("attention backward: valid-length buffer alloc failed");
+    }
+    std::vector<int> valid_host(static_cast<size_t>(B), S);
+    for (int b = 0; b < B; ++b) {
+        valid_host[static_cast<size_t>(b)] =
+            std::clamp(saved_valid_lengths_[static_cast<size_t>(b)], 0, S);
+    }
+    cudaMemcpy(dvalid, valid_host.data(), static_cast<size_t>(B) * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    // Head gather/expand: Q,dO permute [B,S,H,hd]->[B,H,S,hd]; K,V expanded to
+    // per-query-head (GQA kv_head = min(h/group, KV-1)), K/V also produced
+    // pre-transposed [B,H,hd,S] for the scores/dP GEMMs.
+    Tensor Qp({B, H, S, hd}, Device::GPU);
+    Tensor Op({B, H, S, hd}, Device::GPU);
+    Tensor Kp({B, H, S, hd}, Device::GPU);
+    Tensor KpT({B, H, hd, S}, Device::GPU);
+    Tensor VpT({B, H, hd, S}, Device::GPU);
+    launch_attn_gather_heads(Qp.raw_data(), saved_q_rot_.raw_data(), B, S, H, hd, H, 1, 0);
+    launch_attn_gather_heads(Op.raw_data(), grad_heads.raw_data(), B, S, H, hd, H, 1, 0);
+    launch_attn_gather_heads(Kp.raw_data(), saved_k_rot_.raw_data(), B, S, H, hd, KV, group, 0);
+    launch_attn_gather_heads(KpT.raw_data(), saved_k_rot_.raw_data(), B, S, H, hd, KV, group, 1);
+    launch_attn_gather_heads(VpT.raw_data(), saved_v_heads_.raw_data(), B, S, H, hd, KV, group, 1);
+    attn_train_check_cuda("launch_attn_gather_heads");
+
+    // P = masked_softmax(scale * Q Kᵀ)   (in place over the scores buffer)
+    Tensor scores = Qp.reshape({BH, S, hd}).matmul(KpT.reshape({BH, hd, S}));
+    launch_attn_masked_softmax(scores.raw_data(), dvalid, B, H, S, scale);
+    // dP = dO Vᵀ ; dS = scale * P ⊙ (dP − rowdot)
+    Tensor dP = Op.reshape({BH, S, hd}).matmul(VpT.reshape({BH, hd, S}));
+    Tensor dS({BH, S, S}, Device::GPU);
+    launch_attn_softmax_backward(dS.raw_data(), scores.raw_data(), dP.raw_data(),
+                                 B, H, S, scale);
+    attn_train_check_cuda("attn softmax fwd/bwd");
+
+    // dQ = dS K ; dK(per-q-head) = dSᵀ Q ; dV(per-q-head) = Pᵀ dO
+    Tensor dQp = dS.matmul(Kp.reshape({BH, S, hd}));
+    Tensor dS_T({BH, S, S}, Device::GPU);
+    Tensor P_T({BH, S, S}, Device::GPU);
+    launch_batched_transpose_last2(dS_T.raw_data(), dS.raw_data(), BH, S, S);
+    launch_batched_transpose_last2(P_T.raw_data(), scores.raw_data(), BH, S, S);
+    attn_train_check_cuda("attn transposes");
+    Tensor dKp = dS_T.matmul(Qp.reshape({BH, S, hd}));
+    Tensor dVp = P_T.matmul(Op.reshape({BH, S, hd}));
+
+    // Back to model layouts (+ GQA group reduction for K/V).
+    Tensor grad_q_rot({B, S, H, hd}, Device::GPU);
+    Tensor grad_k_rot({B, S, KV, hd}, Device::GPU);
+    Tensor grad_v({B, S, KV, hd}, Device::GPU);
+    launch_attn_unpermute_heads(grad_q_rot.raw_data(), dQp.raw_data(), B, H, S, hd);
+    launch_attn_reduce_group(grad_k_rot.raw_data(), dKp.raw_data(), B, S, KV, hd, H, group);
+    launch_attn_reduce_group(grad_v.raw_data(), dVp.raw_data(), B, S, KV, hd, H, group);
+    attn_train_check_cuda("attn unpermute/reduce");
+
+    // RoPE transpose-rotation (identical math to apply_rope_backward, pos
+    // clamp included); V carries no rotation, matching the host.
+    ensure_rope_gpu_cache();
+    launch_rope_apply(grad_q_rot.raw_data(), rope_cos_gpu_.raw_data(),
+                      rope_sin_gpu_.raw_data(), B, S, H, hd, 0, max_seq_len, -1);
+    launch_rope_apply(grad_k_rot.raw_data(), rope_cos_gpu_.raw_data(),
+                      rope_sin_gpu_.raw_data(), B, S, KV, hd, 0, max_seq_len, -1);
+    attn_train_check_cuda("launch_rope_apply(bwd)");
+
+    // Assemble projection grads: [B,S,H,hd] is layout-identical to
+    // [B,S,d_model]; KV halves interleave into [B,S,2*kv_dim].
+    Tensor grad_q_input = grad_q_rot.reshape({B, S, d_model});
+    Tensor grad_kv_input({B, S, 2 * kv_dim}, Device::GPU);
+    launch_kv_concat(grad_kv_input.raw_data(), grad_k_rot.raw_data(),
+                     grad_v.raw_data(), static_cast<long long>(B) * S, kv_dim);
+    attn_train_check_cuda("launch_kv_concat");
+
+    Tensor grad_q = q_down_proj->backward(grad_q_input);
+    Tensor grad_kv = kv_down_proj->backward(grad_kv_input);
+    Tensor grad_total = grad_q.add(grad_kv);
+    if (saved_input_rank_ == 1) {
+        return grad_total.reshape({d_model});
+    }
+    if (saved_input_rank_ == 2) {
+        return grad_total.reshape({S, d_model});
+    }
+    return grad_total;
+}
+#endif  // USE_CUDA
+
 Tensor Attention::backward(const Tensor& dy, Context* ctx) {
     (void)ctx;
     const bool has_exact_cache = saved_q_rot_.size > 0 &&
@@ -3783,6 +3997,19 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
         const int batch_size = saved_q_rot_.shape[0];
         const int seq_len = saved_q_rot_.shape[1];
         const int kv_dim = n_kv_heads * head_dim;
+
+#ifdef USE_CUDA
+        // GPU exact-cache backward: keeps the whole attention backward
+        // device-resident.  The host loop below remains as the reference
+        // implementation and the NSOS_ATTN_BWD_HOST=1 parity arm.
+        if (!attn_bwd_force_host() && gpu_custom_kernels_supported() &&
+            saved_q_rot_.get_device() == Device::GPU &&
+            saved_k_rot_.get_device() == Device::GPU &&
+            saved_v_heads_.get_device() == Device::GPU &&
+            head_dim % 2 == 0) {
+            return backward_exact_gpu(dy, batch_size, seq_len, kv_dim, scale);
+        }
+#endif
 
         Tensor grad_out = out_proj->backward(dy);
         Tensor grad_out_host = (grad_out.get_device() == Device::GPU) ? grad_out.cpu() : grad_out;
