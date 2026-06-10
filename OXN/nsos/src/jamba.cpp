@@ -3100,8 +3100,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             // Now: split KV with a kernel, clone on device, rotate with the
             // RoPE kernel (math identical to apply_rope), and save GPU tensors
             // (Attention::backward has a matching GPU exact-cache branch).
-            Tensor k_flat_gpu({batch_size, seq_len, kv_dim}, Device::GPU);
-            Tensor v_flat_gpu({batch_size, seq_len, kv_dim}, Device::GPU);
+            Tensor k_flat_gpu = Tensor::uninitialized({batch_size, seq_len, kv_dim}, Device::GPU);
+            Tensor v_flat_gpu = Tensor::uninitialized({batch_size, seq_len, kv_dim}, Device::GPU);
             launch_kv_split(k_flat_gpu.raw_data(), v_flat_gpu.raw_data(),
                             kv_flat.raw_data(),
                             static_cast<long long>(batch_size) * seq_len, kv_dim);
@@ -3956,11 +3956,11 @@ Tensor Attention::backward_exact_gpu(const Tensor& dy, int batch_size,
     // Head gather/expand: Q,dO permute [B,S,H,hd]->[B,H,S,hd]; K,V expanded to
     // per-query-head (GQA kv_head = min(h/group, KV-1)), K/V also produced
     // pre-transposed [B,H,hd,S] for the scores/dP GEMMs.
-    Tensor Qp({B, H, S, hd}, Device::GPU);
-    Tensor Op({B, H, S, hd}, Device::GPU);
-    Tensor Kp({B, H, S, hd}, Device::GPU);
-    Tensor KpT({B, H, hd, S}, Device::GPU);
-    Tensor VpT({B, H, hd, S}, Device::GPU);
+    Tensor Qp = Tensor::uninitialized({B, H, S, hd}, Device::GPU);
+    Tensor Op = Tensor::uninitialized({B, H, S, hd}, Device::GPU);
+    Tensor Kp = Tensor::uninitialized({B, H, S, hd}, Device::GPU);
+    Tensor KpT = Tensor::uninitialized({B, H, hd, S}, Device::GPU);
+    Tensor VpT = Tensor::uninitialized({B, H, hd, S}, Device::GPU);
     launch_attn_gather_heads(Qp.raw_data(), saved_q_rot_.raw_data(), B, S, H, hd, H, 1, 0);
     launch_attn_gather_heads(Op.raw_data(), grad_heads.raw_data(), B, S, H, hd, H, 1, 0);
     launch_attn_gather_heads(Kp.raw_data(), saved_k_rot_.raw_data(), B, S, H, hd, KV, group, 0);
@@ -3973,15 +3973,15 @@ Tensor Attention::backward_exact_gpu(const Tensor& dy, int batch_size,
     launch_attn_masked_softmax(scores.raw_data(), dvalid, B, H, S, scale);
     // dP = dO Vᵀ ; dS = scale * P ⊙ (dP − rowdot)
     Tensor dP = Op.reshape({BH, S, hd}).matmul(VpT.reshape({BH, hd, S}));
-    Tensor dS({BH, S, S}, Device::GPU);
+    Tensor dS = Tensor::uninitialized({BH, S, S}, Device::GPU);
     launch_attn_softmax_backward(dS.raw_data(), scores.raw_data(), dP.raw_data(),
                                  B, H, S, scale);
     attn_train_check_cuda("attn softmax fwd/bwd");
 
     // dQ = dS K ; dK(per-q-head) = dSᵀ Q ; dV(per-q-head) = Pᵀ dO
     Tensor dQp = dS.matmul(Kp.reshape({BH, S, hd}));
-    Tensor dS_T({BH, S, S}, Device::GPU);
-    Tensor P_T({BH, S, S}, Device::GPU);
+    Tensor dS_T = Tensor::uninitialized({BH, S, S}, Device::GPU);
+    Tensor P_T = Tensor::uninitialized({BH, S, S}, Device::GPU);
     launch_batched_transpose_last2(dS_T.raw_data(), dS.raw_data(), BH, S, S);
     launch_batched_transpose_last2(P_T.raw_data(), scores.raw_data(), BH, S, S);
     attn_train_check_cuda("attn transposes");
@@ -3989,9 +3989,9 @@ Tensor Attention::backward_exact_gpu(const Tensor& dy, int batch_size,
     Tensor dVp = P_T.matmul(Op.reshape({BH, S, hd}));
 
     // Back to model layouts (+ GQA group reduction for K/V).
-    Tensor grad_q_rot({B, S, H, hd}, Device::GPU);
-    Tensor grad_k_rot({B, S, KV, hd}, Device::GPU);
-    Tensor grad_v({B, S, KV, hd}, Device::GPU);
+    Tensor grad_q_rot = Tensor::uninitialized({B, S, H, hd}, Device::GPU);
+    Tensor grad_k_rot = Tensor::uninitialized({B, S, KV, hd}, Device::GPU);
+    Tensor grad_v = Tensor::uninitialized({B, S, KV, hd}, Device::GPU);
     launch_attn_unpermute_heads(grad_q_rot.raw_data(), dQp.raw_data(), B, H, S, hd);
     launch_attn_reduce_group(grad_k_rot.raw_data(), dKp.raw_data(), B, S, KV, hd, H, group);
     launch_attn_reduce_group(grad_v.raw_data(), dVp.raw_data(), B, S, KV, hd, H, group);
@@ -4009,7 +4009,7 @@ Tensor Attention::backward_exact_gpu(const Tensor& dy, int batch_size,
     // Assemble projection grads: [B,S,H,hd] is layout-identical to
     // [B,S,d_model]; KV halves interleave into [B,S,2*kv_dim].
     Tensor grad_q_input = grad_q_rot.reshape({B, S, d_model});
-    Tensor grad_kv_input({B, S, 2 * kv_dim}, Device::GPU);
+    Tensor grad_kv_input = Tensor::uninitialized({B, S, 2 * kv_dim}, Device::GPU);
     launch_kv_concat(grad_kv_input.raw_data(), grad_k_rot.raw_data(),
                      grad_v.raw_data(), static_cast<long long>(B) * S, kv_dim);
     attn_train_check_cuda("launch_kv_concat");

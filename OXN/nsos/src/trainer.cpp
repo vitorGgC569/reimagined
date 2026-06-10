@@ -941,10 +941,181 @@ void apply_criticality_regularization(Trainer& trainer,
     }
 }
 
+#ifdef USE_CUDA
+namespace {
+
+// NSOS_FUSED_OPT=0 desliga o passo fundido (braço A/B; default ON).
+bool fused_optimizer_enabled() {
+    const char* e = std::getenv("NSOS_FUSED_OPT");
+    return e == nullptr || e[0] != '0';
+}
+
+// Buffer device persistente para os metadados do passo fundido
+// (ponteiros w/g/m/v + offsets + flags de weight-decay).  Cresce sob demanda;
+// re-upload por step é obrigatório porque add_grad recria o tensor de grad
+// (ponteiro muda a cada backward) — ~30 KB H2D, custo ~µs.
+unsigned char* fused_opt_meta_buffer(size_t bytes) {
+    static unsigned char* buf = nullptr;
+    static size_t cap = 0;
+    if (bytes == 0) return nullptr;
+    if (bytes > cap) {
+        if (buf) cudaFree(buf);
+        buf = nullptr;
+        if (cudaMalloc(&buf, bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cap = 0;
+            return nullptr;
+        }
+        cap = bytes;
+    }
+    return buf;
+}
+
+}  // namespace
+
+// Item #4 da auditoria: o passo do otimizador inteiro (scale de acumulação +
+// clip global + AdamW) em 2 kernels multi-tensor + 1 D2H de 4 bytes, no lugar
+// de ~3-4 launches POR PARÂMETRO (~1850-2450/step no v11; opt medido em
+// 226-490 ms).  Equivalência exata com o caminho antigo:
+//   norm(g·s) = s·norm(g)  e  adamw(g·s·coeff) == adamw(g, gscale=s·coeff)
+// — mesma ordem de operações (norm antes do step++, lr depois), mesmo guard
+// do clip (só quando total>max, com o mesmo +1e-6).  Diferença observável
+// única: os tensores .grad ficam CRUS após o passo (antes ficavam
+// escalados+clipados) — estado interno entre steps, zerado no passo seguinte.
+// Retorna false SEM efeitos colaterais se qualquer parâmetro não for elegível
+// (qualquer coisa fora da GPU) — o caminho antigo roda por inteiro.
+static bool apply_optimizer_step_fused(Trainer& trainer,
+                                       const std::vector<Parameter*>& params,
+                                       int accumulation_steps,
+                                       float* grad_norm_out) {
+    if (!fused_optimizer_enabled() || !gpu_custom_kernels_supported()) {
+        return false;
+    }
+    float* d_accum = clip_norm_accumulator();
+    if (!d_accum) {
+        return false;
+    }
+
+    std::vector<Parameter*> active;
+    active.reserve(params.size());
+    for (auto* p : params) {
+        if (!p || p->grad.size == 0) continue;
+        if (p->data.get_device() != Device::GPU ||
+            p->grad.get_device() != Device::GPU) {
+            return false;
+        }
+        active.push_back(p);
+    }
+    if (active.empty()) {
+        return false;
+    }
+
+    for (auto* p : active) {
+        auto m_it = trainer.m_state.find(p);
+        if (m_it == trainer.m_state.end()) {
+            trainer.m_state.emplace(p, Tensor::zeros(p->data.shape.dims,
+                                                     p->data.get_device()));
+            trainer.v_state.emplace(p, Tensor::zeros(p->data.shape.dims,
+                                                     p->data.get_device()));
+        } else if (m_it->second.shape != p->data.shape ||
+                   m_it->second.get_device() != p->data.get_device()) {
+            m_it->second = Tensor::zeros(p->data.shape.dims, p->data.get_device());
+            trainer.v_state[p] =
+                Tensor::zeros(p->data.shape.dims, p->data.get_device());
+        }
+        if (!can_use_gpu_optimizer(*p, trainer.m_state[p], trainer.v_state[p])) {
+            return false;
+        }
+    }
+
+    const int n = static_cast<int>(active.size());
+    static std::vector<unsigned char> staging;
+    const size_t ptr_bytes = sizeof(float*) * static_cast<size_t>(n) * 4;
+    const size_t off_bytes =
+        sizeof(unsigned long long) * static_cast<size_t>(n + 1);
+    const size_t wd_bytes = static_cast<size_t>(n);
+    staging.resize(ptr_bytes + off_bytes + wd_bytes);
+    float** h_w = reinterpret_cast<float**>(staging.data());
+    float** h_g = h_w + n;
+    float** h_m = h_w + 2 * n;
+    float** h_v = h_w + 3 * n;
+    auto* h_off =
+        reinterpret_cast<unsigned long long*>(staging.data() + ptr_bytes);
+    unsigned char* h_wd = staging.data() + ptr_bytes + off_bytes;
+    unsigned long long total = 0;
+    for (int i = 0; i < n; ++i) {
+        Parameter* p = active[static_cast<size_t>(i)];
+        h_w[i] = p->data.raw_data();
+        h_g[i] = p->grad.raw_data();
+        h_m[i] = trainer.m_state[p].raw_data();
+        h_v[i] = trainer.v_state[p].raw_data();
+        h_off[i] = total;
+        total += static_cast<unsigned long long>(p->data.size);
+        h_wd[i] = should_apply_weight_decay(*p) ? 1 : 0;
+    }
+    h_off[n] = total;
+    if (total == 0) {
+        return false;
+    }
+
+    unsigned char* d_meta = fused_opt_meta_buffer(staging.size());
+    if (!d_meta) {
+        return false;
+    }
+    cudaMemcpy(d_meta, staging.data(), staging.size(), cudaMemcpyHostToDevice);
+    auto* d_w = reinterpret_cast<float* const*>(d_meta);
+    auto* d_g = d_w + n;
+    auto* d_m = d_w + 2 * n;
+    auto* d_v = d_w + 3 * n;
+    const auto* d_off =
+        reinterpret_cast<const unsigned long long*>(d_meta + ptr_bytes);
+    const unsigned char* d_wd = d_meta + ptr_bytes + off_bytes;
+
+    cudaMemsetAsync(d_accum, 0, sizeof(float), 0);
+    launch_multi_tensor_sqsum(d_accum, d_w, d_g, d_m, d_v, d_off, d_wd, n, total);
+    trainer_check_cuda("launch_multi_tensor_sqsum");
+    float sq = 0.0f;
+    cudaMemcpy(&sq, d_accum, sizeof(float), cudaMemcpyDeviceToHost);
+
+    const float acc_scale =
+        1.0f / static_cast<float>(std::max(accumulation_steps, 1));
+    const float total_norm = acc_scale * std::sqrt(std::max(sq, 0.0f));
+    if (grad_norm_out) {
+        *grad_norm_out = total_norm;
+    }
+    float coeff = 1.0f;
+    if (total_norm > trainer.max_grad_norm) {
+        coeff = trainer.max_grad_norm / (total_norm + 1e-6f);
+    }
+    const float gscale = acc_scale * coeff;
+
+    trainer.global_step_count++;
+    const float cur_lr = compute_current_lr(trainer);
+    const float bc1 = 1.0f - std::pow(trainer.beta1, trainer.global_step_count);
+    const float bc2 = 1.0f - std::pow(trainer.beta2, trainer.global_step_count);
+
+    launch_multi_tensor_adamw(d_w, d_g, d_m, d_v, d_off, d_wd, n, total, gscale,
+                              trainer.beta1, trainer.beta2, bc1, bc2, cur_lr,
+                              trainer.eps, trainer.weight_decay);
+    trainer_check_cuda("launch_multi_tensor_adamw");
+    for (auto* p : active) {
+        p->mark_updated();
+    }
+    return true;
+}
+#endif  // USE_CUDA
+
 void apply_optimizer_step(Trainer& trainer,
                           const std::vector<Parameter*>& params,
                           int accumulation_steps,
                           float* grad_norm_out = nullptr) {
+#ifdef USE_CUDA
+    if (apply_optimizer_step_fused(trainer, params, accumulation_steps,
+                                   grad_norm_out)) {
+        apply_criticality_regularization(trainer, params);
+        return;
+    }
+#endif
     scale_gradients(params, 1.0f / std::max(accumulation_steps, 1));
     const float grad_norm = clip_gradients(params, trainer.max_grad_norm);
     if (grad_norm_out) {

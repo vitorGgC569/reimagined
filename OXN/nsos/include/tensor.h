@@ -170,6 +170,11 @@ public:
     static Tensor from_blob(void* ptr, std::vector<int> s, Device dev, bool take_ownership=false);
     static Tensor zeros(const std::vector<int>& s, Device dev = Device::CPU) { return Tensor(s, dev, 0.0f); }
     static Tensor zeros(const TensorShape& s, Device dev = Device::CPU) { return Tensor(s.dims, dev, 0.0f); }
+    // Aloca SEM zero-fill — exclusivamente para produtores que comprovadamente
+    // sobrescrevem 100% do buffer (GEMM beta=0, cópias completas, kernels que
+    // escrevem todo elemento).  O zero-fill incondicional custava um kernel de
+    // memset por alocação (~centenas por step de treino).
+    static Tensor uninitialized(const std::vector<int>& s, Device dev = Device::CPU);
     static Tensor ones(const std::vector<int>& s, Device dev = Device::CPU) { return Tensor(s, dev, 1.0f); }
     static Tensor ones(const TensorShape& s, Device dev = Device::CPU) { return Tensor(s.dims, dev, 1.0f); }
     static Tensor random(const std::vector<int>& s, Device dev = Device::CPU);

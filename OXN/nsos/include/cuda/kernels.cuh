@@ -134,6 +134,24 @@ void launch_kv_split(float *k, float *v, const float *kv, long long rows,
                      int kvd);
 void launch_kv_concat(float *out, const float *k, const float *v,
                       long long rows, int kvd);
+
+// ── Otimizador multi-tensor (src/cuda/fused_optimizer_kernels.cu) ──────────
+// O passo AdamW inteiro (scale de acumulação + clip + update) em 2 kernels
+// para TODOS os parâmetros, com o scale e o coeficiente de clip dobrados em
+// gscale.  Arrays de ponteiros/offsets/flags residem em buffer device único.
+void launch_multi_tensor_sqsum(float *accum, float *const *w, float *const *g,
+                               float *const *m, float *const *v,
+                               const unsigned long long *offsets,
+                               const unsigned char *wd_flags, int n_tensors,
+                               unsigned long long total);
+void launch_multi_tensor_adamw(float *const *w, float *const *g,
+                               float *const *m, float *const *v,
+                               const unsigned long long *offsets,
+                               const unsigned char *wd_flags, int n_tensors,
+                               unsigned long long total, float gscale,
+                               float beta1, float beta2, float bc1, float bc2,
+                               float lr, float eps, float weight_decay);
+
 void launch_kaiming_uniform_kernel(float *out, int n, float limit,
                                    unsigned long long seed);
 void launch_check_stability_kernel(int *d_found_issue, const float *in,

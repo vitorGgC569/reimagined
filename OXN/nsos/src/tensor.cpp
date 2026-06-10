@@ -574,6 +574,9 @@ void TensorDeleter::operator()(float* ptr) {
     }
 }
 
+// Definida adiante (junto de Tensor::uninitialized); lida pelo construtor.
+bool tensor_skip_fill_flag();
+
 Tensor::Tensor() : size(0), device(Device::CPU) {
     shape = TensorShape(std::vector<int>{});
     data_ptr = nullptr;
@@ -612,6 +615,13 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
         throw std::runtime_error("Tensor allocation failed");
     }
 
+    if (tensor_skip_fill_flag()) {
+        // Tensor::uninitialized: produtor garante sobrescrita total; pular o
+        // memset economiza um kernel por alocação no hot path de treino.
+        data_ptr = std::shared_ptr<float>(raw_ptr, TensorDeleter(device));
+        return;
+    }
+
     if (fill_value == 0.0f) {
         if (device == Device::GPU) {
 #ifdef USE_CUDA
@@ -647,6 +657,24 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
     }
 
     data_ptr = std::shared_ptr<float>(raw_ptr, TensorDeleter(device));
+}
+
+// Flag thread-local lida pelo construtor: quando armada (via
+// Tensor::uninitialized), o fill inicial é pulado.  Guard RAII garante reset
+// mesmo se o construtor lançar (falha de alocação).
+namespace {
+thread_local bool g_tensor_skip_fill = false;
+struct SkipFillGuard {
+    SkipFillGuard() { g_tensor_skip_fill = true; }
+    ~SkipFillGuard() { g_tensor_skip_fill = false; }
+};
+}  // namespace
+
+bool tensor_skip_fill_flag() { return g_tensor_skip_fill; }
+
+Tensor Tensor::uninitialized(const std::vector<int>& s, Device dev) {
+    SkipFillGuard guard;
+    return Tensor(s, dev);
 }
 
 Tensor Tensor::random(const std::vector<int>& s, Device dev) {
@@ -881,19 +909,32 @@ Tensor Tensor::matmul(const Tensor& other) const {
         out_dims[rank_b - 2] = m;
     }
 
-    Tensor result(out_dims, device);
+#ifdef USE_CUDA
+    const bool matmul_gpu_path =
+        use_gpu_fast_path(*this, other) && gpu_blas_supported();
+#else
+    const bool matmul_gpu_path = false;
+#endif
+    // GPU: GEMM beta=0 sobrescreve 100% de C -> alocação sem zero-fill.
+    Tensor result = matmul_gpu_path ? Tensor::uninitialized(out_dims, device)
+                                    : Tensor(out_dims, device);
     int batch = size / (m * k);
     int other_batch = other.size / (k * n);
     if (other_batch != 1 && other_batch != batch) {
         throw std::runtime_error("Unsupported batched matmul shape mismatch");
     }
 
-    const float* a_ptr = data();
-    const float* b_ptr = other.data();
-    float* out_ptr = result.data();
-
 #ifdef USE_CUDA
-    if (use_gpu_fast_path(*this, other) && gpu_blas_supported()) {
+    if (matmul_gpu_path) {
+        // raw_data(): SEM sync_host_access.  O fetch antigo via data() nos 3
+        // tensores ANTES deste branch drenava o device a cada matmul (a op
+        // mais chamada do treino, ~100-200x/step) — o passo inteiro rodava
+        // efetivamente síncrono op-a-op.  cuBLAS roda no stream legacy,
+        // ordenado com produtores/consumidores; leitura host posterior passa
+        // por sync_host_access.
+        const float* a_ptr = raw_data();
+        const float* b_ptr = other.raw_data();
+        float* out_ptr = result.raw_data();
         cublasHandle_t handle = cublas_handle();
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -1062,6 +1103,12 @@ Tensor Tensor::matmul(const Tensor& other) const {
         return result;
     }
 #endif
+
+    // Fallback host: o fetch via data() (com sync_host_access) vive SÓ aqui —
+    // o branch GPU acima usa raw_data() sem drenos.
+    const float* a_ptr = data();
+    const float* b_ptr = other.data();
+    float* out_ptr = result.data();
 
     // CPU: BLIS-style blocked GEMM (MathOps::gemm) per batch -- same contiguous
     // row-major layout the naive loop below assumes, but an order of magnitude
@@ -1451,7 +1498,8 @@ float Tensor::norm() const {
 }
 
 Tensor Tensor::clone() const {
-    Tensor result(shape.dims, device);
+    // Cópia integral sobrescreve tudo — sem zero-fill.
+    Tensor result = Tensor::uninitialized(shape.dims, device);
     if (size > 0) {
 #ifdef USE_CUDA
         if (device == Device::GPU) {
@@ -1474,7 +1522,8 @@ Tensor Tensor::to(Device dev) const {
         return *this;
     }
 
-    Tensor result(shape.dims, dev);
+    // Cópia integral sobrescreve tudo — sem zero-fill.
+    Tensor result = Tensor::uninitialized(shape.dims, dev);
     if (size > 0) {
         copy_tensor_bytes(result.data(), result.device, data(), device, size * sizeof(float));
     }
@@ -1644,7 +1693,8 @@ Tensor Tensor::slice(int dim, int start, int end) const {
 
     std::vector<int> out_dims = shape.dims;
     out_dims[dim] = end - start;
-    Tensor result(out_dims, device);
+    // Ambos os caminhos (memcpy dim-0 e loop genérico) escrevem todo elemento.
+    Tensor result = Tensor::uninitialized(out_dims, device);
 
     if (dim == 0 && rank >= 1) {
         const int inner = size / shape[0];

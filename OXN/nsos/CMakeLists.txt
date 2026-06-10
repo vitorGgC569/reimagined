@@ -209,6 +209,7 @@ if (NSOS_ENABLE_CUDA)
             src/cuda/kan_kernels.cu
             src/cuda/sparse_attention_kernels.cu
             src/cuda/attention_train_kernels.cu
+            src/cuda/fused_optimizer_kernels.cu
         )
         # PUBLIC because tensor.h includes <cuda_runtime.h> when USE_CUDA
         # is defined; tests/CLI/API targets that link nsos_core need to
