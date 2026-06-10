@@ -481,6 +481,30 @@ public:
         }
         free_[sz].push_back(p);
         cached_bytes_ += sz;
+        // Guarda de oversubscription UM (auditoria #27): checagem barata por
+        // cadência — UM não dá OOM, degrada paginando (T4 a 96% custou steps
+        // 6->8s antes do binning).  Acima de 88% de uso do device: poda o
+        // cache e avisa uma vez por episódio.
+        if (((++dealloc_probe_) & 511u) == 0) {
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b > 0) {
+                const double used = 1.0 - static_cast<double>(free_b) /
+                                              static_cast<double>(total_b);
+                if (used > 0.88) {
+                    trim_locked();
+                    if (!um_pressure_warned_) {
+                        std::fprintf(stderr,
+                                     "[pool] WARN: device %.0f%% cheio — cache "
+                                     "podado (evitando thrash UM)\n",
+                                     used * 100.0);
+                        um_pressure_warned_ = true;
+                    }
+                } else if (used < 0.80) {
+                    um_pressure_warned_ = false;
+                }
+            }
+            (void)cudaGetLastError();
+        }
     }
 
 private:
@@ -550,6 +574,8 @@ private:
 
     bool enabled_ = true;
     size_t cached_bytes_ = 0;  // current sum of free-list block sizes
+    unsigned dealloc_probe_ = 0;        // cadência da guarda de pressão UM
+    bool um_pressure_warned_ = false;   // 1 aviso por episódio de pressão
     size_t cap_bytes_ = 0;     // max cached bytes (0 = unlimited)
     std::mutex mtx_;
     std::unordered_map<size_t, std::vector<void*>> free_;  // exact bytes -> free blocks

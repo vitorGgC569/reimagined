@@ -72,6 +72,8 @@ if REPO_ROOT.exists():
 else:
     subprocess.run(['git', 'clone', '--depth', '1', '--branch', BRANCH, url, str(REPO_ROOT)], check=True)
 
+subprocess.run(['git', '-C', str(REPO_ROOT), 'remote', 'set-url', 'origin', REPO_URL], check=False)  # nao persistir token no .git/config
+
 sha = subprocess.run(['git', '-C', str(REPO_ROOT), 'rev-parse', '--short', 'HEAD'],
                      capture_output=True, text=True).stdout.strip()
 print('=' * 60)

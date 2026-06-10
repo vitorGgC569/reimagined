@@ -64,6 +64,8 @@ else:
     subprocess.run(['git', 'clone', '--depth', '1', '--branch', BRANCH, url, str(REPO_ROOT)], check=True)
 os.environ['REPO_ROOT'] = str(REPO_ROOT)
 
+subprocess.run(['git', '-C', str(REPO_ROOT), 'remote', 'set-url', 'origin', REPO_URL], check=False)  # nao persistir token no .git/config
+
 sha = subprocess.run(['git', '-C', str(REPO_ROOT), 'rev-parse', '--short', 'HEAD'],
                      capture_output=True, text=True).stdout.strip()
 msg = subprocess.run(['git', '-C', str(REPO_ROOT), 'log', '-1', '--format=%s'],
@@ -174,11 +176,19 @@ def arm(name, host, steps):
         dt = time.perf_counter() - t0
         print(f'[{name}] step {s} loss={float(loss):.4f} wall={dt:.2f}s '
               f'({B*(P+A)/dt:.0f} tok/s) | {gpustat()}', flush=True)
+    try:
+        t = m.runtime_telemetry()
+        print(f'[{name}] mamba fastpath: hits={t["mamba_fast_path_hits"]} '
+              f'fallbacks={t["mamba_fast_path_fallbacks"]} reason={t["mamba_last_fallback_reason"]!r}')
+    except Exception as exc:
+        print(f'[{name}] telemetria indisponivel: {exc}')
     del tr, m
 
+RUN_HOST_ARM = True   # False pula o braco host (lento; so referencia)
 with sys_pipes():   # forca o [timing] nativo a aparecer AQUI, intercalado
     arm('GPU-attn', host=False, steps=4)
-    arm('HOST-attn (referencia lenta)', host=True, steps=1)
+    if RUN_HOST_ARM:
+        arm('HOST-attn (referencia lenta)', host=True, steps=1)
 os.environ['NSOS_ATTN_BWD_HOST'] = '0'
 """))
 

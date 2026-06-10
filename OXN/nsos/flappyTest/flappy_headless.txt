@@ -1,0 +1,26 @@
+=====================================================================
+ NSOS learns Flappy Bird (behavior cloning, real JambaModel)
+=====================================================================
+ baselines: heuristic avg=10.00   random avg=0.00
+
+ training tokens: 480000  (vocab=98)
+ training a 2-layer d=64 NSOS model...
+   step 1  loss 6.0228
+   step 25  loss 1.0064
+   step 50  loss 0.8462
+   step 75  loss 0.5105
+   step 100  loss 0.4763
+   step 125  loss 0.4342
+   step 150  loss 0.4044
+   step 175  loss 0.4249
+   step 200  loss 0.2925
+   step 225  loss 0.5011
+   step 250  loss 0.4231
+ trained in 23.7s
+
+ action-prediction accuracy vs heuristic (teacher-forced): 95.3%
+ NSOS self-play avg score=4.25  best=10   (heuristic 10.00, random ~0)
+
+=====================================================================
+ done. NSOS self-play avg 4.25 vs heuristic 10.00
+=====================================================================

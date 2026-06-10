@@ -101,6 +101,53 @@ NVML por step no lab (clock/temp/mem/throttle) · paridade v5 com piso de ruído
 4. Item **9** (CUDA Graphs) — só depois, com o step já sem syncs.
 5. Em paralelo CPU (sem quota): itens 10, 12, 13, 22, 23.
 
+## §10 — LEDGER DE EXECUÇÃO (goal "36 no padrão ouro", 2026-06-10, noite)
+
+Estados: ✅ CÓDIGO = implementado + compile-verde, valida amanhã na T4/CPU ·
+🔁 RESTATED = item estava errado na auditoria; corrigido com evidência ·
+📋 ESPEC = decisão/design entregue; implementação sequenciada com pré-requisito explícito.
+
+| # | Estado | Entrega |
+|---|---|---|
+| 1 | 🔁 RESTATED | os 5 syncs são debug-gated (`NSOS_CUDA_SYNC=1`, default OFF) — não-hot; **no lugar, achado e corrigido o dreno REAL: matmul fazia `.data()`×3 antes do branch GPU = dreno por chamada ×100-200/step** → raw_data() no branch (3c5d65e) |
+| 2 | 🔁 RESTATED | MoE batched já é device-side (top-k em kernel, D2H único — comentário AUDIT#4+5 de 2026-05-16); `partial_sort` remanescente está em fallbacks/decode, fora do hot de treino |
+| 3 | ✅ CÓDIGO | `Tensor::uninitialized` + matmul/clone/to/slice + 14 temporários da atenção sem zero-fill |
+| 4 | ✅ CÓDIGO | otimizador multi-tensor: 2 kernels + 1 D2H no lugar de ~1850-2450 launches; scale+clip dobrados em gscale (equivalência exata documentada); `NSOS_FUSED_OPT=0` = braço A/B |
+| 5 | ✅ CÓDIGO | `runtime_telemetry()` exposto no binding + print no 1º log de step do treino + por braço no lab |
+| 6 | 📋 ESPEC | kernel add-row-broadcast desenhado (grad[e,:]+=imbalance[e]); 16KB×2/step hoje — entra na próxima leva C++ |
+| 7 | ✅ DECISÃO | saves por referência são INSEGUROS hoje (`zero_sequence_suffix_inplace` muta `hidden` in-place entre camadas); clones async (508733b) são o correto; copy-on-write por version = futuro |
+| 8 | 📋 ESPEC | unificação dos 3 helpers de cópia: header interno único com a política async-D2D — mecânica, próxima leva |
+| 9 | 📋 ESPEC | CUDA Graphs sequenciado APÓS validação de #3/#4 (capturar step com sync no meio = crash); pré-requisito: [timing] de amanhã |
+| 10 | 📋 ESPEC | investigação do decode CPU 0.7 tok/s roteirizada p/ runtime CPU (sem quota): dispatch ternário packed vs float reference |
+| 11 | 📋 ESPEC | NSOS_DETERMINISTIC: 4 sites mapeados; CE two-pass primeiro (S), embedding sort-segmented (M), mamba/MoE depois; claims alinhados no doc §4b |
+| 12 | 📋 ESPEC | BPE 4897/8192: diagnóstico roteirizado (corpus de merges); G5 do gate mede tokens/char antes/depois do re-treino (CPU runtime) |
+| 13 | ✅ CÓDIGO | **G6b no gate: interseção train∩eval por hash md5 — FAIL automático para phase3**; + achado: ~100 linhas de código morto pós-`return` em build_phase3 (limpeza na próxima leva py) |
+| 14 | 📋 ESPEC | trailer opcional de nomes absolutos no serializer (back-compat: arquivos antigos sem trailer carregam igual) — agora viável pós-fix de época |
+| 15 | 📋 ESPEC | helper `read_text_strict` (conta replacements, aborta >0.1%) p/ os 8 sites — leva py |
+| 16-18 | 📋 ESPEC | splits god-file: regra do PRÓPRIO projeto exige gate verde por extração (execução) — sequenciado pós-validação; 1ª extração: `Attention` → `src/attention.cpp` |
+| 19 | 📋 ESPEC | kernel GQA exporta q_rot/k_rot (elimina clone+rope dos saves) — leva CUDA 2 |
+| 20 | 📋 ESPEC | warn-once nos fallbacks host (transpose>2/softmax≠last/sum>2) — leva C++ 2 |
+| 21 | ✅ DOC | stubs já demarcados; guarda de build anotada p/ CI |
+| 22 | 📋 ESPEC | 9 `catch(...)` localizados (api 1, http 4, jamba 2, sdk 2) — auditoria um-a-um na leva de robustez |
+| 23 | ✅ CÓDIGO | scrub do token nos 3 notebooks (remote volta a URL sem token após fetch) |
+| 24 | ✅ CÓDIGO | gate G2 mede injeção; sanitização no serving condicionada ao resultado de amanhã |
+| 25 | 📋 ESPEC | `release_cached_memory()` p/ uso-como-biblioteca — leva bindings |
+| 26 | ✅ PARCIAL | sinal de pressão do pool (WARN) embutido; getter estruturado na leva bindings |
+| 27 | ✅ CÓDIGO | guarda UM: >88% de uso ⇒ trim automático + WARN (1×/episódio), cadência 1/512 deallocs |
+| 28-32 | 📋 ESPEC | conforme §5 (BF16 glue, scatter determinístico, 4-bit, KAN/SSA, re-treino BPE) — gatilhos definidos |
+| 33 | ✅ CÓDIGO | `RUN_HOST_ARM` no lab cell 6 |
+| 34 | 📋 ESPEC | sleep-poll do http → condition_variable — leva robustez |
+| 35 | 📋 ESPEC | revisão de mutex do SDK condicionada a serving concorrente (hoje single-thread) |
+| 36 | ✅ DOC | coberto por #21 (stub) |
+
+**Balanço:** 11 itens em CÓDIGO/DOC fechados esta noite (incluindo os 2 maiores levers de
+perf da base: matmul-desync + otimizador fundido), 2 RESTATED com evidência (auditoria
+auto-corrigida — parte do método), 23 com especificação/sequenciamento explícito e
+pré-requisito nomeado.  TODA validação de runtime acontece amanhã (T4 + CPU runtime),
+conforme o protocolo: predições pré-registradas — `opt` 226-490ms → **<25ms**; `fwd`
+2.6s → **alvo <1s** (matmul-desync + zero-fill); `[ltime]` por camada cai; telemetria
+mamba imprime `fallbacks=0`; G6b dá veredito de contaminação.
+
 ## §9 — Declaração de cobertura (honestidade do mapa)
 
 - **Leitura integral nesta era:** tensor.cpp, trainer.cpp (caminho de treino), jamba.cpp (atenção/forward/parameters), mamba2.cpp (scan/backward/init), autograd.h, kernels novos, pool, serializer (identidade), notebooks/geradores, attn_bwd_parity, curriculum (phase3).

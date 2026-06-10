@@ -4108,6 +4108,15 @@ def main() -> int:
                         )
                     elif step == 1 or step % max(args.log_every_steps, 1) == 0 or step == max_steps:
                         logger.log(f"  step={step} loss={loss:.4f} ema={ema_loss:.4f} lr={cur_lr:.2e}")
+                        if step <= log_every_steps:
+                            try:
+                                _t = model.runtime_telemetry()
+                                logger.log(
+                                    f"[boot] mamba GPU fastpath: hits={_t['mamba_fast_path_hits']} "
+                                    f"fallbacks={_t['mamba_fast_path_fallbacks']} "
+                                    f"reason={_t['mamba_last_fallback_reason']!r}")
+                            except Exception as _exc:  # binding antigo: reporta, nunca silencia
+                                logger.log(f"[boot] runtime_telemetry indisponivel: {_exc}")
 
                     if args.checkpoint_every_steps > 0 and step % args.checkpoint_every_steps == 0:
                         save_checkpoint_artifact(f"{phase_name}_step{step}")

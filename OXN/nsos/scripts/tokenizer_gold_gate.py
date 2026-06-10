@@ -173,6 +173,23 @@ def main() -> int:
                         for s, n in by_source.most_common(6))
         print(f"[gate]    {phase}: {len(rows)} rows | {top}")
 
+    # G6b: contaminacao train/eval por hash exato do texto (chunks repetidos
+    # entre splits — overlap de chunking p.ex.).  Fases de DOCUMENTOS gateiam
+    # (phase3); fases sinteticas so reportam (payloads curtos podem colidir).
+    import hashlib
+    for phase in phases:
+        tr = curriculum_texts_for_phase(args.bundle_dir, phase, "train")
+        ev = curriculum_texts_for_phase(args.bundle_dir, phase, "eval")
+        h = lambda r: hashlib.md5((str(r.get("prompt", "")) + "\x00" +
+                                   str(r.get("answer", ""))).encode()).hexdigest()
+        inter = len({h(r) for r in tr} & {h(r) for r in ev})
+        flag = "FAIL" if (inter and "phase3" in phase) else ("WARN" if inter else "ok")
+        print(f"[gate] G6b {phase}: train∩eval = {inter} rows ({flag})")
+        if inter and "phase3" in phase:
+            failures.append(f"G6b contaminacao train/eval em {phase}: {inter} rows")
+        elif inter:
+            warns.append(f"G6b {phase}: {inter} rows identicas entre splits")
+
     for w in warns:
         print(f"[gate] WARN: {w}")
     if failures:

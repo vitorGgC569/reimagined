@@ -105,6 +105,8 @@ os.environ['REPO_ROOT'] = str(REPO_ROOT)
 os.environ['DRIVE_ROOT'] = str(DRIVE_ROOT)
 
 # ── PROVA DE VERSÃO (anti binario/fonte stale) ─────────────────────────────
+subprocess.run(['git', '-C', str(REPO_ROOT), 'remote', 'set-url', 'origin', REPO_URL], check=False)  # nao persistir token no .git/config
+
 sha = subprocess.run(['git', '-C', str(REPO_ROOT), 'rev-parse', '--short', 'HEAD'],
                      capture_output=True, text=True).stdout.strip()
 msg = subprocess.run(['git', '-C', str(REPO_ROOT), 'log', '-1', '--format=%s'],

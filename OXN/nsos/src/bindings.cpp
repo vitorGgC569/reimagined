@@ -425,6 +425,14 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def("backward", &JambaModel::backward,
              py::call_guard<py::gil_scoped_release>())
         .def("reset_session", &JambaModel::reset_session)
+        .def("runtime_telemetry", [](const JambaModel& model) {
+            const auto t = model.runtime_telemetry();
+            py::dict d;
+            d["mamba_fast_path_hits"] = t.mamba_fast_path_hits;
+            d["mamba_fast_path_fallbacks"] = t.mamba_fast_path_fallbacks;
+            d["mamba_last_fallback_reason"] = t.mamba_last_fallback_reason;
+            return d;
+        })
         .def("set_hamiltonian_mode", &JambaModel::set_hamiltonian_mode)
         .def("session_adapt", &JambaModel::session_adapt,
              py::call_guard<py::gil_scoped_release>())
