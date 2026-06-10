@@ -398,9 +398,27 @@ public:
         return pool;
     }
 
+    // Size-class binning (estilo PyTorch caching allocator).  Cachear por
+    // tamanho EXATO fragmenta patologicamente sob shapes dependentes de dados
+    // (contagem de tokens por expert no MoE, buckets de comprimento variável):
+    // cada tamanho inédito vira uma free-list própria que nunca recicla, o
+    // cache incha até o cap e o footprint UM chega a ~96% da GPU -> thrash
+    // (medido na T4: mem 11.4->15.4GB em 3 steps, step-time crescendo junto,
+    // sem throttle térmico).  Arredondar para classes faz tamanhos vizinhos
+    // reutilizarem o mesmo bloco: <1MB -> múltiplo de 64KB; >=1MB -> de 2MB.
+    static size_t bin_bytes(size_t bytes) {
+        constexpr size_t k64 = 64ull << 10;
+        constexpr size_t k2m = 2ull << 20;
+        if (bytes < (1ull << 20)) {
+            return ((bytes + k64 - 1) / k64) * k64;
+        }
+        return ((bytes + k2m - 1) / k2m) * k2m;
+    }
+
     void* allocate(size_t bytes) {
         if (bytes == 0) return nullptr;
         if (!enabled_) return raw_alloc(bytes);
+        bytes = bin_bytes(bytes);
         std::lock_guard<std::mutex> lk(mtx_);
         auto& bin = free_[bytes];
         if (!bin.empty()) {
