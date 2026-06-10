@@ -1,6 +1,9 @@
 # LHR — Latent Hamiltonian Reasoning ("Pêndulo Cognitivo")
 
 **Status:** pesquisa / incubação (não é claim de produto). Default OFF atrás de flag.
+**SUPERSEDED:** evoluído (com autocrítica — a "física" da v1 não era conservativa;
+o conserto é o core Hopfield-energia) e absorvido pela arquitetura memória-nativa
+em `ENGRAMA_ARCHITECTURE.md`. Este doc permanece como registro da v1.
 **Origem:** síntese dos componentes já existentes no NSOS — H-TTT (dinâmica
 simplética), recurrent-depth latent reasoning (Geiping et al., arXiv 2502.05171)
 e o corpo ternário 1.58-bit — numa mecânica que nenhum dos três campos usa.
