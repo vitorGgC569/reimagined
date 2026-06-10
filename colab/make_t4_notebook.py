@@ -57,7 +57,11 @@ cells.append(md("""## 2 — Token + clone da branch
 
 Usa o secret **`GITHUB_TOKEN`** (ícone de chave na barra lateral → "Notebook access" ON).
 Cai para `GH_TOKEN` se existir. Clona exatamente a branch `%s`.""" % BRANCH))
-cells.append(code(f"""REPO_URL = 'https://github.com/vitorGgC569/reimagined.git'
+cells.append(code(f"""# Auto-suficiente: roda mesmo se a celula 1 nao tiver rodado neste runtime.
+import os, subprocess
+from pathlib import Path
+
+REPO_URL = 'https://github.com/vitorGgC569/reimagined.git'
 REPO_ROOT = Path('/content/reimagined')
 BRANCH = '{BRANCH}'
 
