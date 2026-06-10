@@ -175,7 +175,9 @@ do último checkpoint."""))
 cells.append(code("""import time, os, sys, subprocess, shutil as _sh
 from pathlib import Path
 
-RUN_NAME = os.environ.get('NSOS_RUN_NAME', f"t4_gpuphases_{time.strftime('%Y%m%d')}")
+# "alog" = A log-espaçado (OXTA-CRIT Lei 2). Nome de run NOVO de propósito:
+# retomar checkpoint de um run antigo carregaria o A=ones salvo e desfaria o fix.
+RUN_NAME = os.environ.get('NSOS_RUN_NAME', f"t4_alog_{time.strftime('%Y%m%d')}")
 RUN_DIR = DRIVE_ROOT / 'runs' / RUN_NAME
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -197,6 +199,12 @@ env['PYTHONUNBUFFERED'] = '1'
 env['NSOS_MIXED_PRECISION'] = 'bf16'   # T4 Tensor Cores (NÃO ligar ao retomar de checkpoint FP32)
 env['NSOS_GPU_POOL'] = '1'             # caching allocator ~3.9x (default já é ON)
 env['NSOS_MAMBA_PARALLEL_SCAN'] = '0'  # OFF até passar a paridade 1e-4 (Célula 7)
+# OXTA-CRIT Lei 2 (validado na 1050 Ti: recall chance->100%, E3 do
+# docs/OXTA_CRIT_THEORY.md): espectro de timescales log-espacado na init do
+# Mamba em vez do A=ones degenerado. Predicao: melhora held-out de longo alcance.
+env['NSOS_MAMBA_A_LOGSPACED'] = '1'
+# NSOS_CRIT_REG (P4) fica OFF neste run de proposito: 1 variavel por vez
+# (este run A/B-a apenas o espectro de A contra o run anterior).
 
 cmd = [sys.executable, '-u', str(REPO_ROOT / 'OXN/nsos/scripts/train_curriculum.py'),
        '--profile', info['profile'], '--bundle-dir', str(V11_BUNDLE),

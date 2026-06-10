@@ -165,6 +165,18 @@ Medição de base (criticality_probe v1, perfil v11 @ init): 122 lineares,
 g mediano 1.125, 99.2% na banda [0.5,2] — a init está sobre o manifold; e
 TODAS as camadas Mamba com A≡1 (τ≡1, spread 0.0) — o defeito que E3 quantifica.
 
+**E5 — P4 (controlador de criticalidade) CONFIRMADA.** Mesmo setup do E4 com
+NSOS_CRIT_REG=1 (controlador em trainer.cpp: a cada 10 steps, rescale
+multiplicativo w·exp(−(η/2)·log(g/g0)), clamp ±5%, padrão ternário invariante):
+| condição | Δp0 | g_med | frac g∈[0.5,2] | loss |
+|---|---|---|---|---|
+| QAT sem controlador | +0.049 | 1.12→2.36 | 0.976→0.214 | 1.105 |
+| QAT + controlador | **+0.050** | 1.12→1.25 | **0.976→0.976** | 1.154 |
+| sem QAT (controle) | +0.0005 | 1.13 | 0.976→0.976 | 1.106 |
+O QAT continuou esparsificando (Δp0 idêntico) — o controlador não bloqueia a
+quantização; apenas restaura a escala: a lei de covariação α²(1−p₀)≈const
+operando. Pendente da P4: claim de lr maior estável (long-run, T4).
+
 ## 6. O diferencial Oxta, em uma frase
 
 > Não vendemos um modelo maior. **Vendemos um modelo na fase certa** — pesos na

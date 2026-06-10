@@ -871,6 +871,76 @@ static void apply_adam_step_4bit(Trainer& trainer,
     p->mark_updated();
 }
 
+// OXTA-CRIT Lei 1 (docs/OXTA_CRIT_THEORY.md) — controlador de criticalidade.
+// E4+controle mediu que o QAT progressivo — e só ele — tira as camadas
+// lineares da banda crítica (frac g em [0.5,2]: 0.976 -> 0.214 em 240 steps),
+// onde g = gamma^2*(1-p0)*fan_in é o ganho de ramo ternário (regra absmean).
+// Este controlador aplica, a cada K steps, uma correção multiplicativa pequena
+// puxando cada peso rank-2 de volta ao seu ganho INICIAL g0 (capturado na 1a
+// visita): w *= exp(-(eta/2)*log(g/g0)), clampado a ±5% por aplicação.
+// Rescale puro: o PADRÃO ternário (sinais de round(w/gamma)) é invariante de
+// escala — só o balanço escala/esparsidade é restaurado (lei de covariação).
+// mark_updated() invalida os caches packed (repack-once permanece correto).
+// Opt-in experimental: NSOS_CRIT_REG=1 [NSOS_CRIT_REG_ETA=0.2]
+// [NSOS_CRIT_REG_EVERY=10]. Estado g0 é process-wide por Parameter*.
+void apply_criticality_regularization(Trainer& trainer,
+                                      const std::vector<Parameter*>& params) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("NSOS_CRIT_REG");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static const float eta = [] {
+        const char* e = std::getenv("NSOS_CRIT_REG_ETA");
+        const float v = e ? std::strtof(e, nullptr) : 0.2f;
+        return (v > 0.0f && v <= 1.0f) ? v : 0.2f;
+    }();
+    static const int every = [] {
+        const char* e = std::getenv("NSOS_CRIT_REG_EVERY");
+        const int v = e ? std::atoi(e) : 10;
+        return v > 0 ? v : 10;
+    }();
+    if (trainer.global_step_count % every != 0) {
+        return;
+    }
+    static std::unordered_map<Parameter*, float> g0_map;
+
+    for (auto* p : params) {
+        if (!p || p->data.size == 0 || p->data.shape.size() != 2) continue;
+        const int rows = p->data.shape[0];
+        const int cols = p->data.shape[1];
+        if (rows <= 1 || cols <= 1) continue;
+
+        Tensor host = p->data.get_device() == Device::GPU ? p->data.cpu() : p->data;
+        const float* w = host.data();
+        const int n = host.size;
+        double abs_sum = 0.0;
+        for (int i = 0; i < n; ++i) abs_sum += std::fabs(w[i]);
+        const float gamma = static_cast<float>(abs_sum / std::max(n, 1));
+        if (gamma <= 0.0f) continue;
+        int zeros = 0;
+        const float half_gamma = 0.5f * gamma;
+        for (int i = 0; i < n; ++i) zeros += (std::fabs(w[i]) < half_gamma) ? 1 : 0;
+        const float p0 = static_cast<float>(zeros) / static_cast<float>(n);
+        const float g = gamma * gamma * (1.0f - p0) * static_cast<float>(cols);
+        if (g <= 0.0f) continue;
+
+        auto it = g0_map.find(p);
+        if (it == g0_map.end()) {
+            g0_map.emplace(p, g);  // baseline = ganho na 1a visita (init saudável)
+            continue;
+        }
+        const float log_ratio = std::log(g / it->second);
+        float log_c = -0.5f * eta * log_ratio;
+        log_c = std::clamp(log_c, -0.05f, 0.05f);
+        if (std::fabs(log_c) < 1e-5f) continue;
+        scale_tensor_inplace(p->data, std::exp(log_c));
+        p->mark_updated();
+    }
+}
+
 void apply_optimizer_step(Trainer& trainer,
                           const std::vector<Parameter*>& params,
                           int accumulation_steps,
@@ -969,6 +1039,8 @@ void apply_optimizer_step(Trainer& trainer,
         }
         p->mark_updated();
     }
+
+    apply_criticality_regularization(trainer, params);
 }
 
 void record_training_audit_step(Trainer& trainer,
