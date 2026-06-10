@@ -138,7 +138,7 @@ def arm(name, host, steps):
     set_model_training_mode(m, True)
     tr = nsos.Trainer(m, 3e-4)
     rng = random.Random(0)
-    B, P, A = 8, 32, 128
+    B, P, A = 32, 32, 128   # forma real de treino (bs32); host-arm roda 1 step so p/ contraste
     pb = [[rng.randint(1, vocab-1) for _ in range(P)] for _ in range(B)]
     ab = [[rng.randint(1, vocab-1) for _ in range(A)] + [0] for _ in range(B)]
     for s in range(steps):

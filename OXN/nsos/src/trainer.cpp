@@ -1377,6 +1377,9 @@ float train_supervised_batch_impl(Trainer& trainer,
     if (prompt_batch.empty() || prompt_batch.size() != answer_batch.size()) {
         throw std::runtime_error("train_supervised_batch requires aligned prompt/answer batches");
     }
+    // Âncora do wall C++ (NSOS_TRAIN_TIMING): a diferença entre o wall do
+    // chamador Python e este wall expõe o custo de binding/conversão de listas.
+    const auto tm_call0 = std::chrono::steady_clock::now();
 
     auto params = trainer.model->parameters();
     apply_progressive_qat_phase(trainer);
@@ -1408,7 +1411,7 @@ float train_supervised_batch_impl(Trainer& trainer,
         const char* e = std::getenv("NSOS_TRAIN_TIMING");
         return e != nullptr && e[0] == '1';
     }();
-    double tm_fwd = 0.0, tm_loss = 0.0, tm_bwd = 0.0, tm_opt = 0.0;
+    double tm_fwd = 0.0, tm_loss = 0.0, tm_bwd = 0.0, tm_opt = 0.0, tm_gap = 0.0;
     int tm_buckets = 0;
     auto tm_now = [&]() {
 #ifdef USE_CUDA
@@ -1417,6 +1420,12 @@ float train_supervised_batch_impl(Trainer& trainer,
         return std::chrono::steady_clock::now();
     };
     using tm_ms = std::chrono::duration<double, std::milli>;
+    // prep = parameters() + QAT phase + zero-grads + sort (sincronizado quando
+    // timing on, p/ drenar os memsets enfileirados).  gap = custo entre buckets
+    // (agrupamento, aux stack, zeragem do full_grad) — v1 do instrumento não o
+    // media e deixava ~60-80% do wall sem dono.
+    const auto tm_prep_end = tm_now();
+    auto tm_last = tm_prep_end;
 
     for (size_t order_index = 0; order_index < sample_order.size();) {
         const size_t first_index = sample_order[order_index];
@@ -1481,6 +1490,7 @@ float train_supervised_batch_impl(Trainer& trainer,
         accumulate_auxiliary_stats(auxiliary_total, bucket_aux);
         Context ctx;
         const auto _tm_fwd0 = tm_now();
+        tm_gap += tm_ms(_tm_fwd0 - tm_last).count();
         Tensor logits = trainer.model->forward_ids_batch(grouped_inputs, &ctx);
         const auto _tm_fwd1 = tm_now();
         tm_fwd += tm_ms(_tm_fwd1 - _tm_fwd0).count();
@@ -1560,6 +1570,7 @@ float train_supervised_batch_impl(Trainer& trainer,
         trainer.model->backward_external(full_grad, ctx);
         const auto _tm_bwd1 = tm_now();
         tm_bwd += tm_ms(_tm_bwd1 - _tm_loss1).count();
+        tm_last = _tm_bwd1;
     }
 
     apply_qat_regularization(trainer);
@@ -1570,9 +1581,16 @@ float train_supervised_batch_impl(Trainer& trainer,
     if (nsos_step_timing) {
         const auto _tm_opt1 = tm_now();
         tm_opt = tm_ms(_tm_opt1 - _tm_opt0).count();
-        std::cerr << "[timing] buckets=" << tm_buckets
-                  << " fwd=" << tm_fwd << "ms loss=" << tm_loss
-                  << "ms bwd=" << tm_bwd << "ms opt=" << tm_opt << "ms" << std::endl;
+        const double wall = tm_ms(_tm_opt1 - tm_call0).count();
+        const double prep = tm_ms(tm_prep_end - tm_call0).count();
+        const double gap_tail = tm_ms(_tm_opt0 - tm_last).count();
+        const double unacc =
+            wall - (prep + tm_gap + tm_fwd + tm_loss + tm_bwd + gap_tail + tm_opt);
+        std::cerr << "[timing] buckets=" << tm_buckets << " wall=" << wall
+                  << "ms prep=" << prep << " gap=" << tm_gap << " fwd=" << tm_fwd
+                  << " loss=" << tm_loss << " bwd=" << tm_bwd
+                  << " tail=" << gap_tail << " opt=" << tm_opt
+                  << " unacc=" << unacc << std::endl;
     }
     finalize_auxiliary_stats(auxiliary_total);
     trainer.last_auxiliary_stats = auxiliary_total;
