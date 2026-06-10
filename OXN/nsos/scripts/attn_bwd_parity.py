@@ -64,12 +64,27 @@ def run_arm(nsos, profile, vocab, host_arm: bool):
     p, a = make_batch(rng, 2, 24, 8, vocab)
     loss = float(trainer.train_supervised_batch(p, a))
     grads = {}
+    skipped = 0
+    first_err = None
     for prm in model.parameters():
+        name = getattr(prm, "name", "?")
         try:
-            if prm.grad.size > 0:
-                grads[prm.name] = np.array(prm.grad.numpy(), dtype=np.float32, copy=True)
-        except Exception:
+            # Tensor nao expoe .size em Python — capture via numpy e cheque la.
+            g = np.array(prm.grad.numpy(), dtype=np.float32, copy=True)
+        except Exception as exc:  # ex.: grad vazio (param sem gradiente neste passo)
+            skipped += 1
+            if first_err is None:
+                first_err = f"{name}: {type(exc).__name__}: {exc}"
             continue
+        if g.size > 0:
+            grads[name] = g
+        else:
+            skipped += 1
+    if not grads:
+        print(f"[parity] captura de grads falhou em TODOS os params; primeiro erro: {first_err}")
+    elif skipped:
+        print(f"[parity] aviso: {skipped} params sem grad capturavel "
+              f"(primeiro: {first_err})")
     del trainer, model
     return loss, grads
 
