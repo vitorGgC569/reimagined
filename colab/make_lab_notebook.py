@@ -119,8 +119,14 @@ print('PASS' if r.returncode == 0 else 'FAIL -> manter NSOS_ATTN_BWD_HOST=1 no t
 
 cells.append(code("""# [6] TIMING real do step (v11, answer-len realista) — fwd/loss/bwd/opt
 # Braco GPU (novo backward) 4 steps; braco HOST 1 step so para o contraste.
-import os, sys, time, random
+# wurlitzer garante que o stderr NATIVO (as linhas [timing] do C++) apareca
+# nesta celula — sem ele o Colab as solta em bloco separado ou as engole.
+import os, sys, time, random, subprocess
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'wurlitzer'], check=False)
+from wurlitzer import sys_pipes
 sys.path.insert(0, '/content/reimagined/OXN/nsos/scripts')
+print('[ver] binario em uso (sha do build da celula 3):', info.get('sha', '?'),
+      '| ext:', info['ext_so'])
 os.environ['NSOS_TRAIN_TIMING'] = '1'
 os.environ['NSOS_GPU_POOL'] = '1'
 os.environ['NSOS_MIXED_PRECISION'] = 'bf16'
@@ -149,8 +155,9 @@ def arm(name, host, steps):
               f'({B*(P+A)/dt:.0f} tok/s)', flush=True)
     del tr, m
 
-arm('GPU-attn', host=False, steps=4)
-arm('HOST-attn (referencia lenta)', host=True, steps=1)
+with sys_pipes():   # forca o [timing] nativo a aparecer AQUI, intercalado
+    arm('GPU-attn', host=False, steps=4)
+    arm('HOST-attn (referencia lenta)', host=True, steps=1)
 os.environ['NSOS_ATTN_BWD_HOST'] = '0'
 """))
 
