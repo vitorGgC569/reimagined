@@ -99,7 +99,20 @@ else:
 
 os.environ['REPO_ROOT'] = str(REPO_ROOT)
 os.environ['DRIVE_ROOT'] = str(DRIVE_ROOT)
-subprocess.run(['git', '-C', str(REPO_ROOT), 'log', '-1', '--oneline'], check=True)
+
+# ── PROVA DE VERSÃO (anti binario/fonte stale) ─────────────────────────────
+sha = subprocess.run(['git', '-C', str(REPO_ROOT), 'rev-parse', '--short', 'HEAD'],
+                     capture_output=True, text=True).stdout.strip()
+msg = subprocess.run(['git', '-C', str(REPO_ROOT), 'log', '-1', '--format=%s'],
+                     capture_output=True, text=True).stdout.strip()
+print('=' * 70)
+print(f'[git] >>> HEAD em uso: {{sha}}  ({{msg[:60]}})')
+marker = (REPO_ROOT / 'OXN/nsos/src/mamba2.cpp').read_text(encoding='utf-8').count('NSOS_MAMBA_A_LOGSPACED')
+print(f'[git] >>> fix A-logspaced no fonte clonado: {{"SIM" if marker > 0 else "*** NAO — FONTE ANTIGO ***"}} ({{marker}} refs)')
+print('[git] >>> a celula 3 deve mostrar "cache MISS/HIT for sha=' + sha + '..." — se o sha')
+print('[git] >>> divergir, o .so e de outro commit. E o boot do treino imprime')
+print('[git] >>> "[boot] mamba A spectrum ... fix ATIVO/INATIVO" como prova final de runtime.')
+print('=' * 70)
 """))
 
 cells.append(md("""## 3 — Build do `nsos_ext` (CUDA, arch da T4 = sm_75)
@@ -181,14 +194,14 @@ RUN_NAME = os.environ.get('NSOS_RUN_NAME', f"t4_alog_{time.strftime('%Y%m%d')}")
 RUN_DIR = DRIVE_ROOT / 'runs' / RUN_NAME
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
+# Resume por MTIME sobre TODOS os .bin do run (inclui os checkpoints
+# intra-fase {fase}_stepN.bin salvos a cada 100 steps — a versao anterior so
+# achava fases COMPLETAS, entao um disconnect no meio da fase resetava do zero).
+# Semantica honesta: --resume-model e WARM-START (carrega pesos; o curriculo
+# re-roda as fases com pesos quentes — granularidade de fase, nao de step).
 def latest_ckpt(rd):
-    order = ['phase1_algorithms','phase2_structured','phase3_curated_text',
-             'phase4_instructions','phase5_verifier','phase6_memory','instruction_polish','final_model']
-    found = None
-    for p in order:
-        c = rd / f'{p}.bin'
-        if c.exists(): found = c
-    return found
+    cands = [f for f in rd.glob('*.bin') if f.name != 'audit_reload_probe.bin']
+    return max(cands, key=lambda f: f.stat().st_mtime) if cands else None
 resume = latest_ckpt(RUN_DIR)
 
 env = os.environ.copy()

@@ -3642,6 +3642,26 @@ def main() -> int:
         print("[boot] JambaModel constructed; moving to device...", flush=True)
         model.to(device)
         print(f"[boot] model on {device_label}", flush=True)
+        # OXTA-CRIT Lei 2: prova de runtime do espectro de timescales do Mamba.
+        # Linha definitiva para saber se NSOS_MAMBA_A_LOGSPACED chegou ao .so em
+        # uso — spread ~0 = A=ones degenerado (fix INATIVO); spread >= ~2 décadas
+        # = log-espaçado (fix ATIVO).  Lê os parâmetros do modelo vivo, então não
+        # há como um binário stale mentir aqui.
+        try:
+            import numpy as _np
+            _taus = []
+            for _p in model.parameters():
+                if _p.name.endswith("mamba.A"):
+                    _a = _np.abs(_np.asarray(_p.data.numpy(), dtype=_np.float64))
+                    _taus.append(1.0 / _np.maximum(_a, 1e-3))
+            if _taus:
+                _t = _np.concatenate(_taus)
+                _spread = float(_np.log10(_t.max() / max(float(_t.min()), 1e-9)))
+                _verdict = "LOGSPACED (fix ATIVO)" if _spread > 0.5 else "DEGENERADO A=ones (fix INATIVO)"
+                print(f"[boot] mamba A spectrum: tau[min={_t.min():.1f} med={float(_np.median(_t)):.1f} "
+                      f"max={_t.max():.1f}] spread_log10={_spread:.2f} -> {_verdict}", flush=True)
+        except Exception as _exc:  # nunca derruba o boot por causa do probe
+            print(f"[boot] mamba A spectrum probe indisponivel: {_exc}", flush=True)
         audit_min_layer_coverage = (
             int(args.audit_min_layer_coverage)
             if int(args.audit_min_layer_coverage) > 0
