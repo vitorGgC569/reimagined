@@ -547,6 +547,17 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
     // after first iteration).  Effectively free.
     const auto profiler_begin_layer = profiler_begin_layer_;
     const auto profiler_end_layer   = profiler_end_layer_;
+    // Diagnóstico NSOS_LAYER_TIMING=1: tempo por camada (sync em volta de cada
+    // layer->forward) impresso uma linha por forward — localiza ONDE o forward
+    // gasta (mamba vs attn vs moe por índice).  OFF por default (custo zero).
+    static const bool nsos_layer_timing = [] {
+        const char* e = std::getenv("NSOS_LAYER_TIMING");
+        return e != nullptr && e[0] == '1';
+    }();
+    std::vector<double> layer_ms;
+    if (nsos_layer_timing) {
+        layer_ms.assign(layers.size(), 0.0);
+    }
     int layer_index = 0;
     for (auto& layer : layers) {
         if (ctx && ctx->abort_signal && ctx->abort_signal->load(std::memory_order_relaxed)) {
@@ -556,7 +567,23 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
         if (profiler_begin_layer) {
             profiler_begin_layer(profiler_, layer_index);
         }
+        std::chrono::steady_clock::time_point lt0;
+        if (nsos_layer_timing) {
+#ifdef USE_CUDA
+            cudaDeviceSynchronize();
+#endif
+            lt0 = std::chrono::steady_clock::now();
+        }
         hidden = layer->forward(hidden, ctx);
+        if (nsos_layer_timing) {
+#ifdef USE_CUDA
+            cudaDeviceSynchronize();
+#endif
+            layer_ms[static_cast<size_t>(layer_index)] +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - lt0)
+                    .count();
+        }
         if (profiler_end_layer) {
             profiler_end_layer(profiler_);
         }
@@ -569,6 +596,16 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
     saved_final_norm_ = hidden.rmsnorm();
     if (saved_final_norm_.shape.size() == 3 && !last_input_batch_lengths_.empty()) {
         zero_sequence_suffix_inplace(saved_final_norm_, last_input_batch_lengths_);
+    }
+    if (nsos_layer_timing) {
+#ifdef USE_CUDA
+        cudaDeviceSynchronize();
+#endif
+        std::cerr << "[ltime]";
+        for (size_t i = 0; i < layer_ms.size(); ++i) {
+            std::cerr << " L" << i << "=" << static_cast<int>(layer_ms[i]);
+        }
+        std::cerr << "ms" << std::endl;
     }
     const auto head_started = std::chrono::steady_clock::now();
     Tensor logits = value_head->forward(saved_final_norm_);

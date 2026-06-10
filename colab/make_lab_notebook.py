@@ -80,6 +80,9 @@ print('=' * 70)
 cells.append(code("""# [3] Build LIMPO (cache por sha; rm garante recompilar o codigo da celula 2)
 import sys, os
 from pathlib import Path
+if 'nsos_ext' in sys.modules:
+    raise RuntimeError('nsos_ext JA carregado neste runtime — extensao nativa nao '
+                       'recarrega. Runtime > Restart runtime e rode 1-2-3-6 de novo.')
 REPO_ROOT = Path('/content/reimagined')
 os.system('rm -rf /content/reimagined/OXN/nsos/build-colab')
 os.system('rm -f /content/drive/MyDrive/nsos_v11/_bootstrap/*.so.* 2>/dev/null')
@@ -122,12 +125,30 @@ cells.append(code("""# [6] TIMING real do step (v11, answer-len realista) — fw
 # wurlitzer garante que o stderr NATIVO (as linhas [timing] do C++) apareca
 # nesta celula — sem ele o Colab as solta em bloco separado ou as engole.
 import os, sys, time, random, subprocess
-subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'wurlitzer'], check=False)
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'wurlitzer', 'nvidia-ml-py'],
+               check=False)
 from wurlitzer import sys_pipes
+import pynvml
+pynvml.nvmlInit()
+_h = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+def gpustat():
+    # clock SM + temperatura + throttle reasons + memoria: separa
+    # "fica lento por TERMICO" de "fica lento por PRESSAO DE MEMORIA".
+    sm = pynvml.nvmlDeviceGetClockInfo(_h, pynvml.NVML_CLOCK_SM)
+    t = pynvml.nvmlDeviceGetTemperature(_h, pynvml.NVML_TEMPERATURE_GPU)
+    mem = pynvml.nvmlDeviceGetMemoryInfo(_h).used / 2**20
+    try:
+        thr = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(_h)
+    except Exception:
+        thr = -1
+    return f'sm={sm}MHz temp={t}C mem={mem:.0f}MB throttle=0x{thr:x}'
+
 sys.path.insert(0, '/content/reimagined/OXN/nsos/scripts')
 print('[ver] binario em uso (sha do build da celula 3):', info.get('sha', '?'),
       '| ext:', info['ext_so'])
 os.environ['NSOS_TRAIN_TIMING'] = '1'
+os.environ['NSOS_LAYER_TIMING'] = '1'   # imprime [ltime] L0..L11 por forward
 os.environ['NSOS_GPU_POOL'] = '1'
 os.environ['NSOS_MIXED_PRECISION'] = 'bf16'
 from train_curriculum import build_model_config, load_nsos, resolve_profile, set_model_training_mode
@@ -152,7 +173,7 @@ def arm(name, host, steps):
         loss = tr.train_supervised_batch(pb, ab)
         dt = time.perf_counter() - t0
         print(f'[{name}] step {s} loss={float(loss):.4f} wall={dt:.2f}s '
-              f'({B*(P+A)/dt:.0f} tok/s)', flush=True)
+              f'({B*(P+A)/dt:.0f} tok/s) | {gpustat()}', flush=True)
     del tr, m
 
 with sys_pipes():   # forca o [timing] nativo a aparecer AQUI, intercalado
