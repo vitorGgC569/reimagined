@@ -698,10 +698,17 @@ struct SkipFillGuard {
 bool tensor_skip_fill_flag() { return g_tensor_skip_fill; }
 
 Tensor Tensor::uninitialized(const std::vector<int>& s, Device dev) {
-    // NSOS_UNINIT=0: desliga a elisão (braço de triagem A/B — volta a zerar tudo).
+    // TRIAGEM 2026-06-11 (T4): a bissecção por kill-switch isolou ESTA elisão
+    // como causa de grads zero/NaN/explosão no harness de paridade (pisos
+    // voltaram a ~0,2 com uninit=0; fused=0 e async=0 continuaram doentes).
+    // Algum produtor da lista "provadamente 100% sobrescrito" não cobre tudo
+    // em alguma condição.  Default invertido para SEGURO: a elisão agora é
+    // OPT-IN (NSOS_UNINIT=1) até a prova de cobertura ser fechada site a site
+    // com o instrumento de paridade.  Custo de manter zero-fill: ~1 memset
+    // assíncrono por alocação — nunca foi medido como gargalo isolado.
     static const bool uninit_enabled = [] {
         const char* e = std::getenv("NSOS_UNINIT");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     if (!uninit_enabled) {
         return Tensor(s, dev);
