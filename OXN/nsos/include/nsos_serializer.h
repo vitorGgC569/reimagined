@@ -131,41 +131,58 @@ public:
             return out.str();
         };
 
+        // Endurecimento contra ARQUIVO NÃO CONFIÁVEL (model pack pode vir de
+        // terceiros): cada leitura estrutural é conferida em fs ANTES de usar o
+        // valor, e total_elements é acumulado com guarda de overflow + teto, em
+        // vez de multiplicar size_t cru (rank 8 × dim 1e9 = 1e72 estoura size_t
+        // por wraparound silencioso, podendo casar com um `bytes` forjado e
+        // alocar/ler um buffer inconsistente).  Teto idêntico ao limite int do
+        // tensor (checked_tensor_size).
+        constexpr size_t kMaxElements =
+            static_cast<size_t>(std::numeric_limits<int>::max());
+        auto read_field = [&](void* dst, std::streamsize n, const char* what) {
+            fs.read(reinterpret_cast<char*>(dst), n);
+            if (!fs) {
+                throw std::runtime_error(std::string("Checkpoint truncado lendo ") + what);
+            }
+        };
+
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t name_len;
-            fs.read((char*)&name_len, 4);
+            read_field(&name_len, 4, "name_len");
             if (name_len > 1024) throw std::runtime_error("Security: Name too long");
 
             std::string name(name_len, ' ');
-            fs.read(&name[0], name_len);
+            if (name_len > 0) read_field(&name[0], name_len, "name");
 
             uint32_t rank;
-            fs.read((char*)&rank, 4);
+            read_field(&rank, 4, "rank");
             if (rank > 8) throw std::runtime_error("Security: Rank too high");
 
             std::vector<int> shape(rank);
             size_t total_elements = 1;
             for (uint32_t j = 0; j < rank; ++j) {
                 int32_t val;
-                fs.read((char*)&val, 4);
+                read_field(&val, 4, "dim");
                 if (val < 0 || val > 1000000000) throw std::runtime_error("Security: Dimension invalid");
                 shape[j] = val;
-                total_elements *= val;
+                total_elements *= static_cast<size_t>(val);
+                if (total_elements > kMaxElements) {
+                    throw std::runtime_error("Security: Tensor element count exceeds limit");
+                }
             }
 
             uint32_t bytes;
-            fs.read((char*)&bytes, 4);
-            
-            // Validate byte size against shape
-            if (bytes != total_elements * sizeof(float)) 
+            read_field(&bytes, 4, "byte_count");
+
+            // Valida byte count contra o shape (agora sem overflow possível no
+            // produto: total_elements <= kMaxElements < 2^31).
+            if (static_cast<size_t>(bytes) != total_elements * sizeof(float))
                 throw std::runtime_error("Security: Payload size mismatch");
 
-            // Safe Allocation
+            // Alocação segura: total_elements já limitado a < 2^31 elementos.
             std::vector<float> buffer(total_elements);
-            fs.read((char*)buffer.data(), bytes);
-            if (!fs) {
-                throw std::runtime_error("Checkpoint payload truncated while reading " + name);
-            }
+            if (bytes > 0) read_field(buffer.data(), bytes, "payload");
 
             const auto it = params_by_name.find(name);
             if (it == params_by_name.end()) {
@@ -207,11 +224,13 @@ public:
             if (fs.read((char*)&trailer_magic, 4) && trailer_magic == 0x4E534E32u) {
                 uint32_t tcount = 0;
                 fs.read((char*)&tcount, 4);
+                // Não confiar no campo: limita ao count já validado do corpo.
+                if (tcount > count) tcount = count;
                 size_t mismatches = 0;
                 std::string first_mismatch;
                 for (uint32_t i = 0; i < tcount && fs; ++i) {
                     uint32_t len = 0;
-                    fs.read((char*)&len, 4);
+                    if (!fs.read((char*)&len, 4)) break;
                     if (len > 4096) break;
                     std::string abs_name(len, ' ');
                     fs.read(&abs_name[0], len);

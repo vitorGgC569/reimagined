@@ -36,9 +36,25 @@ namespace nsos {
 namespace {
 
 int checked_tensor_size(const TensorShape& shape) {
-    const size_t numel = shape.numel();
-    if (numel > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        throw std::overflow_error("Tensor element count exceeds NSOS v1 int storage limit");
+    // Ponto ÚNICO de validação de shape (chamado por TODO construtor de Tensor
+    // e por from_blob).  Acumula com guarda de overflow em vez de confiar no
+    // wraparound de numel(): uma dimensão negativa convertida para size_t vira
+    // um valor gigante e só estouraria o limite int DEPOIS — aqui rejeitamos a
+    // CAUSA (dim < 0) com mensagem clara e paramos a multiplicação assim que
+    // cruza INT_MAX, sem nunca produzir um produto sem sentido.
+    constexpr size_t kMaxElements =
+        static_cast<size_t>(std::numeric_limits<int>::max());
+    size_t numel = 1;
+    for (int d : shape.dims) {
+        if (d < 0) {
+            throw std::invalid_argument(
+                "Tensor dimension is negative (shape invalido na construcao)");
+        }
+        numel *= static_cast<size_t>(d);
+        if (numel > kMaxElements) {
+            throw std::overflow_error(
+                "Tensor element count exceeds NSOS v1 int storage limit");
+        }
     }
     return static_cast<int>(numel);
 }
