@@ -38,3 +38,27 @@ Ideias grandiosas → fogo adversarial → sobra pequeno, afiado e mensurável.
 Saldo das 3 rodadas: S1-S5 (Tessitura) + EXP-FLIP-0 + telemetria condicional —
 um programa experimental inteiro construído por debate entre instâncias, cada
 experimento com controles desenhados por quem tentou matá-lo.
+
+## RESULTADOS EXP-FLIP-0 (2026-06-11, local CPU — runs históricos)
+
+**live_distill v1 (~425M), p1→p2→p3:** flips 1,99%/fase; reversões 24,1%;
+delta-flips 0,70MB vs delta-FP 8,5MB (FP domina — árbitro confirmado).
+
+**live_distill_v8 (~94M), trajetória completa (7 transições):**
+| transição | flips % | rev % | delta FP |
+|---|---|---|---|
+| p1→p2 | 0,000 | — | 0,03MB (**idênticos**) |
+| p2→p3 | 2,804 | 9,9 | 14,6MB |
+| p3→p4 | 1,283 | 0* | 13,4MB |
+| p4→p5 | 0,000 | — | 0,03MB (**idênticos**) |
+| p5→p6 | 0,000 | — | 0,03MB (**idênticos**) |
+| p6→champion | 0,090 | — | 9,0MB |
+| champion→polish | 0,000 | — | 0,03MB (**idênticos**) |
+(*trivial: o C da tripla não treinou.)
+
+**Achados:** (1) FORENSE: 4 das 7 transições do v8 são checkpoints ~idênticos —
+fases 2, 5, 6 e polish efetivamente NÃO treinaram naquele run (no-op silencioso;
+candidato a explicação retroativa da generalização fraca do v8; flip_census
+vira gate forense de runs). (2) Interferência medida: 9,9% (v8) e 24,1% (v1)
+dos flips revertidos pela fase seguinte — varia por posição no curriculum.
+(3) Claim-1 reconfirmado em 2º modelo: FP delta (13-15MB) >> flips (2-5MB).
