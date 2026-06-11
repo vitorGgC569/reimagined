@@ -114,12 +114,11 @@ cells.append(code("""# [5] PARIDADE do backward GPU da atencao (gate 1e-3, FP32,
 import subprocess, os
 env = dict(os.environ)
 env['PYTHONPATH'] = os.path.dirname(info['ext_so'])
-r = subprocess.run(['python', '/content/reimagined/OXN/nsos/scripts/attn_bwd_parity.py',
+r = subprocess.run(['python', '/content/reimagined/OXN/nsos/scripts/parity_triage.py',
                     '--build-dir', BUILD], env=env,
                    capture_output=True, text=True)
 print(r.stdout)
 print(r.stderr[-1500:] if r.returncode != 0 else '')
-print('PASS' if r.returncode == 0 else 'FAIL -> manter NSOS_ATTN_BWD_HOST=1 no treino')
 """))
 
 cells.append(code("""# [6] TIMING real do step (v11, answer-len realista) — fwd/loss/bwd/opt

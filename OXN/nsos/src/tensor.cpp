@@ -698,6 +698,14 @@ struct SkipFillGuard {
 bool tensor_skip_fill_flag() { return g_tensor_skip_fill; }
 
 Tensor Tensor::uninitialized(const std::vector<int>& s, Device dev) {
+    // NSOS_UNINIT=0: desliga a elisão (braço de triagem A/B — volta a zerar tudo).
+    static const bool uninit_enabled = [] {
+        const char* e = std::getenv("NSOS_UNINIT");
+        return !(e && e[0] == '0');
+    }();
+    if (!uninit_enabled) {
+        return Tensor(s, dev);
+    }
     SkipFillGuard guard;
     return Tensor(s, dev);
 }
@@ -713,7 +721,12 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
         return;
     }
     if (dst_device == Device::GPU || src_device == Device::GPU) {
-        if (async_d2d && dst_device == Device::GPU && src_device == Device::GPU) {
+        static const bool async_d2d_enabled = [] {
+            const char* e = std::getenv("NSOS_ASYNC_D2D");
+            return !(e && e[0] == '0');
+        }();
+        if (async_d2d_enabled && async_d2d && dst_device == Device::GPU &&
+            src_device == Device::GPU) {
             // D2D entre buffers do pool: enfileira no stream legacy (0) e NÃO
             // bloqueia o host.  A ordenação é total — produtores de `src` e
             // consumidores de `dst` rodam no stream 0, e o reuso de buffers

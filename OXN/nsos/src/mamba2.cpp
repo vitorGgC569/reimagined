@@ -223,6 +223,7 @@ Tensor Mamba2SSD::ssd_forward(const Tensor& x, const Tensor& delta,
             x_canon.raw_data(), dt_canon.raw_data(), A_data.raw_data(),
             B_canon.raw_data(), C_canon.raw_data(), y_canon.raw_data(),
             history_ptr, batch, seq, dim);
+        ++gpu_fast_path_hits_;  // telemetria do caminho BATCHED (treino)
 
         // saved_state_history_ matches the original layout so callers
         // (notably ssd_backward) can compare shapes safely.
@@ -237,6 +238,10 @@ Tensor Mamba2SSD::ssd_forward(const Tensor& x, const Tensor& delta,
     }
 #endif
 
+    if (x.get_device() == Device::GPU) {
+        ++gpu_fast_path_fallbacks_;  // scan batched caiu no host com tensores GPU
+        last_fallback_reason_ = "ssd_forward_host_fallback";
+    }
     Tensor x_host = x.get_device() == Device::GPU ? x.cpu() : x;
     Tensor delta_host = delta.get_device() == Device::GPU ? delta.cpu() : delta;
     Tensor a_host = A_data.get_device() == Device::GPU ? A_data.cpu() : A_data;
