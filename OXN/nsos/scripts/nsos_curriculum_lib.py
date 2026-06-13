@@ -109,6 +109,7 @@ DEFAULT_PHASE_SIZES_V11 = {
 }
 
 COUNT_LABELS = ["ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN"]
+COUNT_LABELS_PT = ["ZERO", "UM", "DOIS", "TRES", "QUATRO", "CINCO", "SEIS", "SETE"]
 TOKENIZER_PHASE_TEXT_CAPS = {
     "phase1_algorithms": 160,
     "phase2_structured": 160,
@@ -371,30 +372,44 @@ def build_phase1_algorithms(count: int, seed: int, split: str) -> List[Dict]:
         + ["count_label"] * 1
     )
 
+    pt = os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt"
     for _ in range(count):
         mode = rng.choice(weighted_modes)
         if mode == "copy_short":
             value = _random_token_string(rng, 4, 8)
-            prompt = f"Copy exactly this token stream: {value}"
+            prompt = (f"Copie exatamente esta sequencia: {value}" if pt
+                      else f"Copy exactly this token stream: {value}")
             answer = value
         elif mode == "reverse_short":
             value = _random_token_string(rng, 4, 8)
-            prompt = f"Reverse this token stream: {value}"
+            prompt = (f"Inverta esta sequencia: {value}" if pt
+                      else f"Reverse this token stream: {value}")
             answer = value[::-1]
         elif mode == "parity_label":
             bits = "".join(rng.choice("01") for _ in range(rng.randint(5, 9)))
-            prompt = f"Parity for {bits}. Answer with EVEN or ODD."
-            answer = "EVEN" if sum(bit == "1" for bit in bits) % 2 == 0 else "ODD"
+            even = sum(bit == "1" for bit in bits) % 2 == 0
+            if pt:
+                prompt = f"Paridade de {bits}. Responda PAR ou IMPAR."
+                answer = "PAR" if even else "IMPAR"
+            else:
+                prompt = f"Parity for {bits}. Answer with EVEN or ODD."
+                answer = "EVEN" if even else "ODD"
         elif mode == "binary_add":
             a = rng.randint(0, 15)
             b = rng.randint(0, 15)
-            prompt = f"Add the binary values {a:b} + {b:b}. Answer in binary only."
+            prompt = (f"Some os valores binarios {a:b} + {b:b}. Responda somente em binario."
+                      if pt else
+                      f"Add the binary values {a:b} + {b:b}. Answer in binary only.")
             answer = format(a + b, "b")
         elif mode == "compare_label":
             a = rng.randint(-20, 20)
             b = rng.randint(-20, 20)
-            prompt = f"Compare {a} and {b}. Answer with one label from LT, GT, EQ."
-            answer = "LT" if a < b else "GT" if a > b else "EQ"
+            if pt:
+                prompt = f"Compare {a} e {b}. Responda com um rotulo: MENOR, MAIOR ou IGUAL."
+                answer = "MENOR" if a < b else "MAIOR" if a > b else "IGUAL"
+            else:
+                prompt = f"Compare {a} and {b}. Answer with one label from LT, GT, EQ."
+                answer = "LT" if a < b else "GT" if a > b else "EQ"
         else:
             target = rng.choice("abcxyz012")
             base = _random_token_string(rng, 6, 10)
@@ -403,11 +418,16 @@ def build_phase1_algorithms(count: int, seed: int, split: str) -> List[Dict]:
             rng.shuffle(chars)
             shuffled = "".join(chars)
             count_value = min(shuffled.count(target), len(COUNT_LABELS) - 1)
-            prompt = (
-                f"Count how many times '{target}' appears in: {shuffled}. "
-                "Answer with one label from ZERO to SEVEN."
-            )
-            answer = COUNT_LABELS[count_value]
+            if pt:
+                prompt = (f"Conte quantas vezes '{target}' aparece em: {shuffled}. "
+                          "Responda com um rotulo de ZERO a SETE.")
+                answer = COUNT_LABELS_PT[count_value]
+            else:
+                prompt = (
+                    f"Count how many times '{target}' appears in: {shuffled}. "
+                    "Answer with one label from ZERO to SEVEN."
+                )
+                answer = COUNT_LABELS[count_value]
 
         rows.append(_make_record("phase1_algorithms", mode, prompt, answer, f"{split}_synthetic"))
     return rows
@@ -539,7 +559,8 @@ def _phase1_real_rows(repo_root: Path, split: str, seed: int) -> List[Dict]:
 
 def build_phase1_algorithms_v2(repo_root: Path, count: int, seed: int, split: str) -> List[Dict]:
     rng = random.Random(seed)
-    rows = list(_phase1_real_rows(repo_root, split, seed))
+    rows = ([] if os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt"
+            else list(_phase1_real_rows(repo_root, split, seed)))
     rng.shuffle(rows)
     real_target = min(len(rows), max(count // 2, int(count * 0.7)))
     mixed = rows[:real_target]
