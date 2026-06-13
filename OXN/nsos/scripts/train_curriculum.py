@@ -4108,7 +4108,7 @@ def main() -> int:
                         )
                     elif step == 1 or step % max(args.log_every_steps, 1) == 0 or step == max_steps:
                         logger.log(f"  step={step} loss={loss:.4f} ema={ema_loss:.4f} lr={cur_lr:.2e}")
-                        if step <= log_every_steps:
+                        if step == 1:
                             try:
                                 _t = model.runtime_telemetry()
                                 logger.log(

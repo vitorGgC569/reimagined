@@ -219,7 +219,10 @@ tok.load(str(BUNDLE / 'tokenizer_8192.ox3'))
 tok.add_special_tokens(SPECIAL_TOKENS)
 eos_id = tok.encode('<|endoftext|>')[0]
 
-dev = nsos.Device.GPU
+# CPU: o decode streaming em GPU apresentou illegal-memory-access (caminho
+# nunca exercitado nesta era; investigacao nomeada). Em CPU o teste e' identico
+# ao notebook nsos_cpu_eval, que roda perfeito. ~1-2 min para 5 amostras.
+dev = nsos.Device.CPU
 cfg = build_model_config(nsos, profile, tok.vocab_size, dev)
 model = nsos.JambaModel(cfg, dev)
 model.to(dev)
@@ -272,7 +275,11 @@ RUN_DIR.mkdir(parents=True, exist_ok=True)
 # Semantica honesta: --resume-model e WARM-START (carrega pesos; o curriculo
 # re-roda as fases com pesos quentes — granularidade de fase, nao de step).
 def latest_ckpt(rd):
-    cands = [f for f in rd.glob('*.bin') if f.name != 'audit_reload_probe.bin']
+    # busca em TODOS os runs (RUN_NAME e' datado: dir novo do dia comeca vazio
+    # e o warm checkpoint vive no run de ontem)
+    cands = [f for f in (DRIVE_ROOT / 'runs').glob('*/*.bin')
+             if f.name != 'audit_reload_probe.bin']
+    cands += [f for f in rd.glob('*.bin') if f.name != 'audit_reload_probe.bin']
     return max(cands, key=lambda f: f.stat().st_mtime) if cands else None
 resume = latest_ckpt(RUN_DIR)
 
