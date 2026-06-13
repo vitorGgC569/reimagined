@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import re
 import struct
@@ -740,6 +741,32 @@ def _phase3_real_documents(repo_root: Path, split: str, seed: int) -> List[Tuple
     more aggressively from the larger sources.  The split parameter
     'train' vs 'eval' is honored by _pick_split_rows; each source uses
     a different RNG offset to avoid correlation."""
+    # NSOS_CURRICULUM_LANG=pt: modo PT-first — o produto fala portugues; corta
+    # ingles e codigo da fase de texto (o raio-x G6 + o teste qualitativo
+    # mostraram a "moda codigo": pool unico ~6:1 codigo:texto real).
+    if os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt":
+        dataset_specs = [
+            ("wikipedia_pt", 620, 72, 24000, 1200),
+        ]
+        docs: List[Tuple[str, str, str]] = []
+        for offset, (dataset_name, chunk_chars, overlap_chars,
+                     max_rows_train, max_rows_eval) in enumerate(dataset_specs):
+            max_rows = max_rows_train if split == "train" else max_rows_eval
+            rows = _pick_split_rows(
+                _load_real_dataset_rows(repo_root, dataset_name),
+                split,
+                random.Random(seed + 101 + offset * 17),
+                max_rows=max_rows,
+            )
+            for row_index, row in enumerate(rows):
+                text = str(row.get("text", "") or "")
+                for ci, chunk in enumerate(
+                        chunk_text(text, chunk_chars=chunk_chars,
+                                   overlap_chars=overlap_chars)):
+                    docs.append((f"{dataset_name} r{row_index} #{ci + 1}",
+                                 chunk, dataset_name))
+        return docs
+
     dataset_specs = [
         # (dataset_name, chunk_chars, overlap_chars, max_rows_train, max_rows_eval)
         # ── v10 baseline (always pulled) ─────────────────────────────────
@@ -1672,6 +1699,13 @@ def build_phase3_curated_text_v2(repo_root: Path, count: int, seed: int, split: 
     docs: List[Dict] = []
     real_docs = _phase3_real_documents(repo_root, split, seed)
     random.Random(seed + 13).shuffle(real_docs)
+
+    if os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt":
+        # PT-first: so corpus real PT (sem handwritten EN, sem repo, sem codigo);
+        # limite = count (era 560 — o gargalo que fazia o codigo dominar o pool).
+        for title, chunk, source in real_docs[:count]:
+            docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
+        return _expand_records(docs, count, rng)
 
     for title, body, source in _phase3_reference_documents(split):
         for index, chunk in enumerate(chunk_text(body, chunk_chars=360, overlap_chars=48)):

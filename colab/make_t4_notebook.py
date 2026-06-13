@@ -150,13 +150,15 @@ extraem do cache em <30s."""))
 cells.append(code("""import os, sys, shutil, subprocess, json
 from pathlib import Path
 
+LANG_MODE = 'pt'   # 'pt' = PT-first (sem ingles/codigo na fase de texto); 'en' = curriculum antigo
+os.environ['NSOS_CURRICULUM_LANG'] = LANG_MODE
 V11_BUNDLE = REPO_ROOT / 'OXN/nsos/scripts/distillation_bundle_v11'
 RAW_DRIVE = DRIVE_ROOT / '_datasets_raw'
 PROCESSED_DRIVE = DRIVE_ROOT / '_datasets_processed'
 RAW_REPO_LINK = REPO_ROOT / 'OXN/nsos/artifacts/real_datasets'
 PROCESSED_DRIVE.mkdir(parents=True, exist_ok=True); RAW_DRIVE.mkdir(parents=True, exist_ok=True)
 
-cached = PROCESSED_DRIVE / 'distillation_bundle_v11.zip'
+cached = PROCESSED_DRIVE / f'distillation_bundle_v11_{LANG_MODE}.zip'
 if cached.exists():
     print(f'[data] cache HIT: {cached}')
     if V11_BUNDLE.exists(): shutil.rmtree(V11_BUNDLE)
@@ -265,7 +267,7 @@ from pathlib import Path
 
 # "alog" = A log-espaçado (OXTA-CRIT Lei 2). Nome de run NOVO de propósito:
 # retomar checkpoint de um run antigo carregaria o A=ones salvo e desfaria o fix.
-RUN_NAME = os.environ.get('NSOS_RUN_NAME', f"t4_alog_{time.strftime('%Y%m%d')}")
+RUN_NAME = os.environ.get('NSOS_RUN_NAME', f"t4_{LANG_MODE}_{time.strftime('%Y%m%d')}")
 RUN_DIR = DRIVE_ROOT / 'runs' / RUN_NAME
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -275,9 +277,10 @@ RUN_DIR.mkdir(parents=True, exist_ok=True)
 # Semantica honesta: --resume-model e WARM-START (carrega pesos; o curriculo
 # re-roda as fases com pesos quentes — granularidade de fase, nao de step).
 def latest_ckpt(rd):
-    # busca em TODOS os runs (RUN_NAME e' datado: dir novo do dia comeca vazio
-    # e o warm checkpoint vive no run de ontem)
-    cands = [f for f in (DRIVE_ROOT / 'runs').glob('*/*.bin')
+    # warm resume SOMENTE dentro da mesma familia de runs (prefixo sem a data):
+    # um run PT nunca herda pesos do run EN/codigo e vice-versa.
+    family = RUN_NAME.rsplit('_', 1)[0]
+    cands = [f for f in (DRIVE_ROOT / 'runs').glob(f'{family}_*/*.bin')
              if f.name != 'audit_reload_probe.bin']
     cands += [f for f in rd.glob('*.bin') if f.name != 'audit_reload_probe.bin']
     return max(cands, key=lambda f: f.stat().st_mtime) if cands else None
