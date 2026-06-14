@@ -151,8 +151,15 @@ r = subprocess.run(['cmake', '-S', str(REPO_ROOT / 'OXN/nsos'), '-B', BUILD,
 print(r.stdout[-1500:])
 if r.returncode != 0:
     print('STDERR:', r.stderr[-3000:]); raise RuntimeError('cmake configure falhou')
-print('[build] compilando (nsos_ext + testes) — paciencia na 1a vez')
-r = subprocess.run(['cmake', '--build', BUILD, '-j', '2'], capture_output=True, text=True)
+print('[build] compilando alvos necessarios (nsos_ext + gates do Mamba) — paciencia na 1a vez')
+# Build SO os alvos que importam para treino+validacao desta corrida: o modulo
+# Python e os gates de gradiente/paridade do Mamba.  Evita compilar os ~60 testes
+# legados (alguns tem includes faltantes que so o GCC pega) que bloqueariam o
+# build inteiro sem relacao com o treino.
+r = subprocess.run(['cmake', '--build', BUILD, '-j', '2', '--target',
+                    'nsos_ext', 'test_gradcheck',
+                    'test_gpu_parity_mamba_proper', 'test_gpu_parity_mamba_nstate'],
+                   capture_output=True, text=True)
 print(r.stdout[-1500:])
 if r.returncode != 0:
     print('STDERR:', r.stderr[-3000:]); raise RuntimeError('build falhou')
