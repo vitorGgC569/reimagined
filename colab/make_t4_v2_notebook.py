@@ -192,17 +192,20 @@ def run_test(name):
     print(f'[skip] {name} nao encontrado em {BUILD}')
     return False
 
+# Só os alvos que o build alvo-restrito compila (gradcheck + paridades Mamba GPU).
 results = {n: run_test(n) for n in
-          ('test_gradcheck', 'test_mamba2', 'test_bitlinear', 'test_moe_training',
-           'test_gpu_parity_mamba_proper', 'test_gpu_parity_mamba_scan')}
+          ('test_gradcheck', 'test_gpu_parity_mamba_proper',
+           'test_gpu_parity_mamba_nstate')}
 print('\\n' + '=' * 50)
 for n, ok in results.items():
-    print(f'  {n:<32} {"PASS" if ok else "FAIL"}')
+    print(f'  {n:<34} {"PASS" if ok else "FAIL"}')
 assert results.get('test_gradcheck'), 'GRADCHECK FALHOU — gradientes incorretos'
-# Paridade GPU dos kernels proper (conv1d + scan readout-linear) na T4.
+# Paridade GPU dos kernels Mamba-2 (conv1d + scan linear + N-state) na T4.
 assert results.get('test_gpu_parity_mamba_proper'), \\
     'PARIDADE GPU proper-Mamba FALHOU — kernels CUDA divergem do host'
-print('GRADCHECK + PARIDADE GPU: PASS')
+assert results.get('test_gpu_parity_mamba_nstate'), \\
+    'PARIDADE GPU Mamba-2 N-state FALHOU — kernels CUDA divergem do host'
+print('GRADCHECK + PARIDADE GPU (proper + N-state): PASS')
 """))
 
 cells.append(md("""## 5 — Dataset controlado: adição em português (holdout composicional)

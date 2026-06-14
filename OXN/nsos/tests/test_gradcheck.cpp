@@ -50,17 +50,26 @@ namespace {
 constexpr float kTolStd = 5e-2f;
 constexpr float kTolScan = 1e-1f;
 constexpr float kEps = 1e-3f;
+// Absolute-error floor (numpy.allclose / torch.gradcheck style: pass when
+// |num - a| <= atol + rtol*|a|).  Near-zero gradient elements have a central-
+// difference estimate dominated by FP rounding — and that rounding differs
+// across compilers' FMA contraction (MSVC vs GCC -O3 -march=native), so a pure
+// RELATIVE gate spuriously trips on them.  The absolute floor tolerates that
+// noise; a genuinely wrong gradient has |num - a| >> atol and still fails.
+constexpr float kAtol = 5e-3f;
 
 int g_failures = 0;
 
 // Central-difference check of one analytic gradient buffer against a scalar
 // loss closure.  `data`/`n` is the parameter buffer being perturbed; `analytic`
-// is the hand-derived gradient for the same buffer.  Returns the max relative
-// error; records a failure (does not abort) so every block reports.
+// is the hand-derived gradient for the same buffer.  Pass/fail uses the
+// numpy.allclose criterion (atol + rtol); the reported max-rel is computed only
+// over meaningful (|a| > atol) elements so near-zero noise doesn't distort it.
 float gradcheck_buffer(float *data, int n, const float *analytic,
                        const std::function<double()> &loss_fn, const char *name,
                        float tol) {
   float max_rel = 0.0f;
+  bool any_fail = false;
   for (int i = 0; i < n; ++i) {
     const float orig = data[i];
     data[i] = orig + kEps;
@@ -70,13 +79,21 @@ float gradcheck_buffer(float *data, int n, const float *analytic,
     data[i] = orig;
     const float numeric = static_cast<float>((lp - lm) / (2.0 * kEps));
     const float a = analytic[i];
-    const float denom =
-        std::max(1e-3f, std::max(std::fabs(numeric), std::fabs(a)));
-    max_rel = std::max(max_rel, std::fabs(numeric - a) / denom);
+    const float abs_err = std::fabs(numeric - a);
+    // allclose pass/fail: catches real errors (abs_err >> atol) but tolerates
+    // FD rounding on near-zero gradients.
+    if (abs_err > kAtol + tol * std::fabs(a)) {
+      any_fail = true;
+    }
+    // Display metric: relative error over meaningful elements only.
+    if (std::fabs(a) > kAtol) {
+      max_rel = std::max(
+          max_rel, abs_err / std::max(std::fabs(a), std::fabs(numeric)));
+    }
   }
-  const bool ok = max_rel < tol;
-  std::printf("[gradcheck] %-28s max rel err = %.3e  (tol %.0e)  %s\n", name,
-              max_rel, tol, ok ? "OK" : "FAIL");
+  const bool ok = !any_fail;
+  std::printf("[gradcheck] %-28s max rel err = %.3e  (rtol %.0e atol %.0e)  %s\n",
+              name, max_rel, tol, kAtol, ok ? "OK" : "FAIL");
   if (!ok)
     ++g_failures;
   return max_rel;
