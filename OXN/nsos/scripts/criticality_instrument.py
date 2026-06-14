@@ -85,7 +85,8 @@ def _layer_key(name: str) -> str:
 def measure_branch_gains(model) -> dict:
     layers = []
     for p in model.parameters():
-        w = np.asarray(p.data.numpy())
+        # .cpu() first so this works for GPU-resident models too (no-op on CPU).
+        w = np.asarray(p.data.cpu().numpy())
         if w.ndim == 2 and min(w.shape) > 1:
             bg = branch_gain(w)
             bg["name"] = p.name
@@ -110,7 +111,7 @@ def _snapshot_grads(model) -> dict:
     grads = {}
     for p in model.parameters():
         try:
-            arr = np.asarray(p.grad.numpy()).ravel()
+            arr = np.asarray(p.grad.cpu().numpy()).ravel()  # .cpu() -> GPU-safe
         except Exception:
             arr = np.zeros(0, dtype=np.float64)
         grads[p.name] = arr

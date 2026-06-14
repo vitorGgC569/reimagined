@@ -186,12 +186,16 @@ def run_test(name):
     return False
 
 results = {n: run_test(n) for n in
-          ('test_gradcheck', 'test_mamba2', 'test_bitlinear', 'test_moe_training')}
+          ('test_gradcheck', 'test_mamba2', 'test_bitlinear', 'test_moe_training',
+           'test_gpu_parity_mamba_proper', 'test_gpu_parity_mamba_scan')}
 print('\\n' + '=' * 50)
 for n, ok in results.items():
-    print(f'  {n:<22} {"PASS" if ok else "FAIL"}')
+    print(f'  {n:<32} {"PASS" if ok else "FAIL"}')
 assert results.get('test_gradcheck'), 'GRADCHECK FALHOU — gradientes incorretos'
-print('GRADCHECK GATE: PASS')
+# Paridade GPU dos kernels proper (conv1d + scan readout-linear) na T4.
+assert results.get('test_gpu_parity_mamba_proper'), \\
+    'PARIDADE GPU proper-Mamba FALHOU — kernels CUDA divergem do host'
+print('GRADCHECK + PARIDADE GPU: PASS')
 """))
 
 cells.append(md("""## 5 — Dataset controlado: adição em português (holdout composicional)
@@ -243,12 +247,15 @@ os.environ['NSOS_MAMBA_CONV_K']     = '3'
 os.environ['NSOS_MOE_FP_ROUTER']    = '1'
 os.environ['NSOS_MOE_SWITCH_AUX']   = '1'
 os.environ['NSOS_MAMBA_A_LOGSPACED'] = '1'
+os.environ['NSOS_GPU_POOL'] = '1'        # caching allocator (GPU-first)
 
 sys.path.insert(0, str(__import__('pathlib').Path('/content/nsos_ext_v2')))
 import nsos_ext as nsos
 print('[nsos] modulo carregado')
 
-dev = nsos.Device.CPU   # proper-Mamba host-computed -> roda nativo em CPU
+# GPU-first: a via proper-Mamba agora e GPU-residente (kernels conv1d + scan
+# readout-linear), validada pela paridade na celula 4.  Treino roda na T4.
+dev = nsos.Device.GPU
 cfg = nsos.ModelConfig()
 cfg.num_layers = 4; cfg.d_model = 128; cfg.vocab_size = V
 cfg.n_heads = 4; cfg.n_kv_heads = 2
@@ -295,7 +302,7 @@ def eval_pairs(pairs):
     nll = 0.0; ntok = 0; correct = 0
     for (a, b) in pairs:
         p = prompt_ids(a, b); ans = answer_ids(a, b); seq = p + ans
-        logits = np.asarray(model.forward_ids(seq).numpy()).reshape(len(seq), V)
+        logits = np.asarray(model.forward_ids(seq).cpu().numpy()).reshape(len(seq), V)
         # exact-match: token previsto na 1a posicao da resposta
         pred = int(np.argmax(logits[len(p) - 1]))
         correct += int(pred == ans[0])
@@ -318,7 +325,7 @@ print(f'VEREDITO generalizacao: {verdict}  (held-out {em_he:.2f} vs baseline {ba
 print('Exemplos held-out:')
 for (a, b) in held[:8]:
     p = prompt_ids(a, b)
-    logits = np.asarray(model.forward_ids(p).numpy()).reshape(len(p), V)
+    logits = np.asarray(model.forward_ids(p).cpu().numpy()).reshape(len(p), V)
     pred = VOCAB[int(np.argmax(logits[-1]))]
     print(f'  {NUM_WORDS[a]} + {NUM_WORDS[b]} = {NUM_WORDS[a+b]:>10}  | modelo: {pred}')
 """))
