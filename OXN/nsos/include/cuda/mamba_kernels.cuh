@@ -111,6 +111,40 @@ void launch_mamba_simple_scan_backward(const float *grad_y, const float *y,
 void launch_mamba_single_token_update(const float *x, const float *dt,
                                       const float *A, float *state, float *y,
                                       int Batch, int D);
+
+// =====================================================================
+// Proper diagonal SSM (linear readout y = h*C, no tanh) — GPU-resident
+// path for Mamba2SSD::forward_proper/backward_proper.  Same affine
+// recurrence + state_history contract as the legacy selective scan.
+// Tensors: x, dt, B_in, C_in, y : [Batch, Seq, D]; A : [D];
+// state_history : [Batch, Seq, D] (h_t after each update; nullptr to skip).
+// No internal cudaDeviceSynchronize.
+// =====================================================================
+void launch_mamba_proper_scan_forward(
+    const float *x, const float *dt, const float *A, const float *B_in,
+    const float *C_in, float *y, float *state_history, int Batch, int Seq,
+    int D);
+
+void launch_mamba_proper_scan_backward(
+    const float *grad_y, const float *x, const float *dt, const float *A,
+    const float *B_in, const float *C_in, const float *state_history,
+    float *grad_x, float *grad_dt, float *grad_A, float *grad_B,
+    float *grad_C, int Batch, int Seq, int D);
+
+// =====================================================================
+// Causal depthwise conv1d (proper-path local mixing).
+//   in/out : [Batch, Seq, D]   weight : [D, K]
+//   out[b,t,c] = sum_{j} weight[c,j] * in[b, t-(K-1)+j, c]   (in[<0]=0)
+// backward: grad_in and grad_weight accumulate via atomicAdd; the
+// launcher zeroes both before the kernel.  No internal sync.
+// =====================================================================
+void launch_conv1d_causal_forward(const float *in, const float *weight,
+                                  float *out, int batch, int seq, int dim,
+                                  int K);
+void launch_conv1d_causal_backward(const float *grad_out, const float *in,
+                                   const float *weight, float *grad_in,
+                                   float *grad_weight, int batch, int seq,
+                                   int dim, int K);
 #endif
 
 }  // namespace cuda

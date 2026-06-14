@@ -526,6 +526,13 @@ if (NSOS_BUILD_TESTS)
     target_include_directories(test_gpu_parity_mamba_scan PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_mamba_scan COMMAND test_gpu_parity_mamba_scan)
 
+    # PROPER selective SSM (NSOS_MAMBA_PROPER_SSM): conv1d_causal + linear-readout
+    # scan CUDA kernels vs the host reference (forward output + input gradient).
+    add_executable(test_gpu_parity_mamba_proper tests/gpu/test_gpu_parity_mamba_proper.cpp)
+    target_link_libraries(test_gpu_parity_mamba_proper PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_mamba_proper PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_mamba_proper COMMAND test_gpu_parity_mamba_proper)
+
     add_executable(test_gpu_parity_jamba tests/gpu/test_gpu_parity_jamba.cpp)
     target_link_libraries(test_gpu_parity_jamba PRIVATE nsos_core)
     target_include_directories(test_gpu_parity_jamba PRIVATE tests/gpu)

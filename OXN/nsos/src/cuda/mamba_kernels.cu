@@ -382,7 +382,8 @@ __global__ void mamba_selective_scan_forward_kernel(
     const float *__restrict__ C_in,
     float *__restrict__ y,
     float *__restrict__ state_history,  // may be nullptr
-    int Batch, int Seq, int D) {
+    int Batch, int Seq, int D,
+    bool linear_readout) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   const int total_channels = Batch * D;
   if (channel >= total_channels) return;
@@ -400,7 +401,10 @@ __global__ void mamba_selective_scan_forward_kernel(
     if (state_history != nullptr) {
       state_history[idx] = state;
     }
-    y[idx] = tanhf(state) * C_in[idx];
+    // linear_readout=true -> proper diagonal SSM (y = h*C); false -> legacy
+    // tanh readout (y = tanh(h)*C).  The recurrence (state) is identical and
+    // linear, so the parallel-prefix path stays valid for both.
+    y[idx] = (linear_readout ? state : tanhf(state)) * C_in[idx];
   }
 }
 
@@ -432,7 +436,8 @@ __global__ void mamba_selective_scan_backward_kernel(
     float *__restrict__ grad_A,   // accumulated via atomicAdd
     float *__restrict__ grad_B,
     float *__restrict__ grad_C,
-    int Batch, int Seq, int D) {
+    int Batch, int Seq, int D,
+    bool linear_readout) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   const int total_channels = Batch * D;
   if (channel >= total_channels) return;
@@ -455,15 +460,17 @@ __global__ void mamba_selective_scan_backward_kernel(
     const float dt_val = dt[idx];
     const float dt_sp = softplus_device(dt_val);
     const float decay = expf(-dt_sp * a_value);
-    const float candidate = tanhf(state_t);
+    // Readout candidate: linear (h) for the proper diagonal SSM, tanh(h) for
+    // the legacy path.  dcandidate/dh is 1 (linear) or (1 - tanh^2) (legacy).
+    const float candidate = linear_readout ? state_t : tanhf(state_t);
+    const float dcand = linear_readout ? 1.0f : (1.0f - candidate * candidate);
 
-    // dC = grad_y * tanh(h)
+    // dC = grad_y * candidate
     grad_C[idx] = grad_y[idx] * candidate;
 
-    // dh = grad_y * C * (1 - tanh^2(h)) + dh_next
+    // dh = grad_y * C * dcandidate + dh_next
     const float grad_candidate = grad_y[idx] * c_value;
-    const float grad_state =
-        grad_candidate * (1.0f - candidate * candidate) + grad_state_next;
+    const float grad_state = grad_candidate * dcand + grad_state_next;
 
     // dx = dh * B  ;  dB = dh * x
     grad_x[idx] = grad_state * B_in[idx];
@@ -595,7 +602,8 @@ void launch_mamba_selective_scan_forward(
   const int threads = 256;
   const int blocks = (total_channels + threads - 1) / threads;
   mamba_selective_scan_forward_kernel<<<blocks, threads>>>(
-      x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D);
+      x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D,
+      /*linear_readout=*/false);
 }
 
 void launch_mamba_selective_scan_backward(
@@ -615,7 +623,118 @@ void launch_mamba_selective_scan_backward(
   const int blocks = (total_channels + threads - 1) / threads;
   mamba_selective_scan_backward_kernel<<<blocks, threads>>>(
       grad_y, x, dt, A, B_in, C_in, state_history, grad_x, grad_dt, grad_A,
-      grad_B, grad_C, Batch, Seq, D);
+      grad_B, grad_C, Batch, Seq, D, /*linear_readout=*/false);
+}
+
+// ── Proper diagonal SSM (linear readout y = h*C) ─────────────────────────────
+// GPU-resident path for Mamba2SSD::forward_proper/backward_proper.  Same affine
+// recurrence + state_history contract as the legacy selective scan, but with the
+// LINEAR readout (no tanh), so the corrected diagonal SSM runs on device instead
+// of falling back to host.
+void launch_mamba_proper_scan_forward(
+    const float *x, const float *dt, const float *A, const float *B_in,
+    const float *C_in, float *y, float *state_history, int Batch, int Seq,
+    int D) {
+  const int total_channels = Batch * D;
+  if (total_channels <= 0 || Seq <= 0) {
+    return;
+  }
+  const int threads = 256;
+  const int blocks = (total_channels + threads - 1) / threads;
+  mamba_selective_scan_forward_kernel<<<blocks, threads>>>(
+      x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D,
+      /*linear_readout=*/true);
+}
+
+void launch_mamba_proper_scan_backward(
+    const float *grad_y, const float *x, const float *dt, const float *A,
+    const float *B_in, const float *C_in, const float *state_history,
+    float *grad_x, float *grad_dt, float *grad_A, float *grad_B,
+    float *grad_C, int Batch, int Seq, int D) {
+  const int total_channels = Batch * D;
+  if (total_channels <= 0 || Seq <= 0) {
+    return;
+  }
+  cudaMemsetAsync(grad_A, 0, static_cast<size_t>(D) * sizeof(float));
+  const int threads = 256;
+  const int blocks = (total_channels + threads - 1) / threads;
+  mamba_selective_scan_backward_kernel<<<blocks, threads>>>(
+      grad_y, x, dt, A, B_in, C_in, state_history, grad_x, grad_dt, grad_A,
+      grad_B, grad_C, Batch, Seq, D, /*linear_readout=*/true);
+}
+
+// ── Causal depthwise conv1d (proper path local token mixing) ─────────────────
+// in/out: [Batch, Seq, D] ; weight: [D, K].
+//   out[b,t,c] = sum_{j=0..K-1} weight[c,j] * in[b, t-(K-1)+j, c]   (in[<0]=0)
+__global__ void conv1d_causal_forward_kernel(
+    const float *__restrict__ in, const float *__restrict__ weight,
+    float *__restrict__ out, int batch, int seq, int dim, int K) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch * seq * dim;
+  if (tid >= total) return;
+  const int c = tid % dim;
+  const int t = (tid / dim) % seq;
+  const int b = tid / (dim * seq);
+  float acc = 0.0f;
+  for (int j = 0; j < K; ++j) {
+    const int st = t - (K - 1) + j;
+    if (st < 0) continue;
+    acc += weight[c * K + j] * in[(b * seq + st) * dim + c];
+  }
+  out[tid] = acc;
+}
+
+__global__ void conv1d_causal_backward_kernel(
+    const float *__restrict__ grad_out, const float *__restrict__ in,
+    const float *__restrict__ weight, float *__restrict__ grad_in,
+    float *__restrict__ grad_weight, int batch, int seq, int dim, int K) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch * seq * dim;
+  if (tid >= total) return;
+  const int c = tid % dim;
+  const int t = (tid / dim) % seq;
+  const int b = tid / (dim * seq);
+  const float go = grad_out[tid];
+  for (int j = 0; j < K; ++j) {
+    const int st = t - (K - 1) + j;
+    if (st < 0) continue;
+    const int sidx = (b * seq + st) * dim + c;
+    atomicAdd(&grad_in[sidx], go * weight[c * K + j]);
+    atomicAdd(&grad_weight[c * K + j], go * in[sidx]);
+  }
+}
+
+void launch_conv1d_causal_forward(const float *in, const float *weight,
+                                  float *out, int batch, int seq, int dim,
+                                  int K) {
+  const int total = batch * seq * dim;
+  if (total <= 0 || K <= 0) {
+    return;
+  }
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  conv1d_causal_forward_kernel<<<blocks, threads>>>(in, weight, out, batch, seq,
+                                                    dim, K);
+}
+
+void launch_conv1d_causal_backward(const float *grad_out, const float *in,
+                                   const float *weight, float *grad_in,
+                                   float *grad_weight, int batch, int seq,
+                                   int dim, int K) {
+  const int total = batch * seq * dim;
+  if (total <= 0 || K <= 0) {
+    return;
+  }
+  // grad_in / grad_weight accumulate via atomicAdd; zero them first (async on
+  // the default stream, serializes with the kernel below).
+  cudaMemsetAsync(grad_in, 0, static_cast<size_t>(total) * sizeof(float));
+  cudaMemsetAsync(grad_weight, 0,
+                  static_cast<size_t>(dim) * static_cast<size_t>(K) *
+                      sizeof(float));
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  conv1d_causal_backward_kernel<<<blocks, threads>>>(
+      grad_out, in, weight, grad_in, grad_weight, batch, seq, dim, K);
 }
 
 }  // namespace cuda

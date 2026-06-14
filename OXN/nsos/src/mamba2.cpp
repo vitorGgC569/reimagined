@@ -547,82 +547,78 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
     }
     const int rows = batch * seq;
     const int K = conv_kernel_;
+    const Device dev = u.get_device();  // GPU-first: stay on the input's device
 
-    Tensor u_host = u.get_device() == Device::GPU ? u.cpu() : u;
-    Tensor u_flat = u_host.reshape({rows, dim});
+    Tensor u_flat = rank_2 ? u : u.reshape({rows, dim});
 
-    // Independent projections (host).  Each BitLinear caches its own input.
+    // Independent projections — BitLinear is device-agnostic (GPU or CPU).
     Tensor xv = x_proj_->forward(u_flat).reshape({rows, dim});
     Tensor z = z_proj_->forward(u_flat).reshape({rows, dim});
     Tensor Bt = B_proj_->forward(u_flat).reshape({rows, dim});
     Tensor Ct = C_proj_->forward(u_flat).reshape({rows, dim});
     Tensor dt = dt_proj_->forward(u_flat).reshape({rows, dim});
 
-    // Causal depthwise conv on x, then SiLU (Mamba's local mixing).
-    Tensor conv_pre({rows, dim}, Device::CPU);
-    conv1d_causal_forward(xv.data(), conv_weight_.data.data(), conv_pre.data(),
-                          batch, seq, dim, K);
-    Tensor xc({rows, dim}, Device::CPU);
+    // Causal depthwise conv on x (GPU kernel on device; ordered host loop on CPU).
+    Tensor conv_pre(std::vector<int>{rows, dim}, dev);
+#ifdef USE_CUDA
+    if (dev == Device::GPU) {
+        cuda::launch_conv1d_causal_forward(xv.raw_data(),
+                                           conv_weight_.data.raw_data(),
+                                           conv_pre.raw_data(), batch, seq, dim, K);
+    } else
+#endif
     {
-        const float* cp = conv_pre.data();
-        float* xp = xc.data();
-        const int n = rows * dim;
-        for (int i = 0; i < n; ++i) xp[i] = silu_stable(cp[i]);
+        conv1d_causal_forward(xv.data(), conv_weight_.data.data(),
+                              conv_pre.data(), batch, seq, dim, K);
     }
 
-    Tensor a_host = A.data.get_device() == Device::GPU ? A.data.cpu() : A.data;
-    const float* a_ptr = a_host.data();
-
-    Tensor h_hist({rows, dim}, Device::CPU);
-    Tensor y_ssd({rows, dim}, Device::CPU);
-    const float* b_ptr = Bt.data();
-    const float* c_ptr = Ct.data();
-    const float* dt_ptr = dt.data();
-    const float* xc_ptr = xc.data();
-    float* h_ptr = h_hist.data();
-    float* y_ptr = y_ssd.data();
+    // xc = silu(conv_pre) = conv_pre * sigmoid(conv_pre) — device-agnostic.
+    Tensor xc = conv_pre.mul(conv_pre.sigmoid());
 
     // Diagonal selective recurrence: h_t = decay_t*h_{t-1} + B_t*xc_t;
-    // y_t = h_t * C_t  (C applied exactly ONCE, linear readout).
-    for (int b = 0; b < batch; ++b) {
-        std::vector<float> state(static_cast<size_t>(dim), 0.0f);
-        for (int t = 0; t < seq; ++t) {
-            const size_t row = static_cast<size_t>(b) * seq + t;
-            for (int c = 0; c < dim; ++c) {
-                const size_t idx = row * dim + c;
-                const float a_value = std::max(a_ptr[c], 1e-3f);
-                const float decay =
-                    std::exp(-softplus_stable(dt_ptr[idx]) * a_value);
-                state[static_cast<size_t>(c)] =
-                    decay * state[static_cast<size_t>(c)] + b_ptr[idx] * xc_ptr[idx];
-                h_ptr[idx] = state[static_cast<size_t>(c)];
-                y_ptr[idx] = state[static_cast<size_t>(c)] * c_ptr[idx];
+    // y_t = h_t * C_t (linear readout, C once).  GPU kernel on device; the
+    // sequential recurrence runs as an ordered host loop on CPU.
+    Tensor h_hist(std::vector<int>{rows, dim}, dev);
+    Tensor y_ssd(std::vector<int>{rows, dim}, dev);
+#ifdef USE_CUDA
+    if (dev == Device::GPU) {
+        cuda::launch_mamba_proper_scan_forward(
+            xc.raw_data(), dt.raw_data(), A.data.raw_data(), Bt.raw_data(),
+            Ct.raw_data(), y_ssd.raw_data(), h_hist.raw_data(), batch, seq, dim);
+    } else
+#endif
+    {
+        const float* a_ptr = A.data.data();
+        const float* b_ptr = Bt.data();
+        const float* c_ptr = Ct.data();
+        const float* dt_ptr = dt.data();
+        const float* xc_ptr = xc.data();
+        float* h_ptr = h_hist.data();
+        float* y_ptr = y_ssd.data();
+        for (int b = 0; b < batch; ++b) {
+            std::vector<float> state(static_cast<size_t>(dim), 0.0f);
+            for (int t = 0; t < seq; ++t) {
+                const size_t row = static_cast<size_t>(b) * seq + t;
+                for (int c = 0; c < dim; ++c) {
+                    const size_t idx = row * dim + c;
+                    const float a_value = std::max(a_ptr[c], 1e-3f);
+                    const float decay =
+                        std::exp(-softplus_stable(dt_ptr[idx]) * a_value);
+                    state[static_cast<size_t>(c)] =
+                        decay * state[static_cast<size_t>(c)] +
+                        b_ptr[idx] * xc_ptr[idx];
+                    h_ptr[idx] = state[static_cast<size_t>(c)];
+                    y_ptr[idx] = state[static_cast<size_t>(c)] * c_ptr[idx];
+                }
             }
         }
     }
 
-    // Separate SiLU gate: y = y_ssd * silu(z).
-    Tensor gated({rows, dim}, Device::CPU);
-    {
-        const float* zp = z.data();
-        float* gp = gated.data();
-        const int n = rows * dim;
-        for (int i = 0; i < n; ++i) gp[i] = y_ptr[i] * silu_stable(zp[i]);
-    }
-
+    // Separate SiLU gate, out projection and D skip — all device-agnostic.
+    Tensor gated = y_ssd.mul(z.mul(z.sigmoid()));
     Tensor projected = out_proj.forward(gated).reshape({rows, dim});
-    Tensor d_host = D.data.get_device() == Device::GPU ? D.data.cpu() : D.data;
-    const float* d_ptr = d_host.data();
-    const float* u_ptr = u_flat.data();
-    const float* pj = projected.data();
-    Tensor result({rows, dim}, Device::CPU);
-    float* rp = result.data();
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < dim; ++c) {
-            const size_t idx = static_cast<size_t>(r) * dim + c;
-            rp[idx] = pj[idx] + u_ptr[idx] * d_ptr[c];
-        }
-    }
+    Tensor skip = u_flat.mul(D.data);  // D is [dim], broadcast over rows
+    Tensor result = projected.add(skip);
 
     pp_u_ = u_flat;
     pp_xv_ = xv;
@@ -638,8 +634,7 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
     pp_seq_ = seq;
     proper_active_ = true;
 
-    Tensor out_shaped = rank_2 ? result : result.reshape({batch, seq, dim});
-    return u.get_device() == Device::GPU ? out_shaped.to(Device::GPU) : out_shaped;
+    return rank_2 ? result : result.reshape({batch, seq, dim});
 }
 
 Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
@@ -648,136 +643,124 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
     const int dim = d_model;
     const int K = conv_kernel_;
     const int rows = batch * seq;
+    const Device dev = grad_output.get_device();  // GPU-first: stay on device
 
-    Tensor g_host =
-        grad_output.get_device() == Device::GPU ? grad_output.cpu() : grad_output;
-    Tensor g = g_host.reshape({rows, dim});
-    const float* gp = g.data();
+    Tensor g = grad_output.shape.size() == 2 ? grad_output
+                                             : grad_output.reshape({rows, dim});
 
-    Tensor a_host = A.data.get_device() == Device::GPU ? A.data.cpu() : A.data;
-    Tensor d_host = D.data.get_device() == Device::GPU ? D.data.cpu() : D.data;
-    const float* a_ptr = a_host.data();
-    const float* d_ptr = d_host.data();
-    const float* u_ptr = pp_u_.data();
+    // SiLU derivative d/dx[x·σ(x)] = σ(x)·(1 + x·(1 - σ(x))) — device-agnostic.
+    auto dsilu = [&](const Tensor& pre) {
+        Tensor s = pre.sigmoid();
+        Tensor one = Tensor::ones(std::vector<int>{rows, dim}, dev);
+        return s.mul(one.add(pre.mul(one.sub(s))));
+    };
 
-    // Skip path: result = out_proj(...) + u*D.
-    Tensor grad_D = Tensor::zeros({dim}, Device::CPU);
-    float* gD = grad_D.data();
-    Tensor g_u = Tensor::zeros({rows, dim}, Device::CPU);
-    float* gu = g_u.data();
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < dim; ++c) {
-            const size_t idx = static_cast<size_t>(r) * dim + c;
-            gD[c] += gp[idx] * u_ptr[idx];
-            gu[idx] += gp[idx] * d_ptr[c];
-        }
-    }
+    // Skip path: result = out_proj(...) + u*D.  grad_D = Σ_rows(g·u); the input
+    // gradient via the skip is g·D (broadcast).  Device-agnostic Tensor ops.
+    Tensor grad_D = g.mul(pp_u_).sum(0, false);
+    Tensor g_u = g.mul(D.data);
 
     // out_proj backward -> grad wrt gated.
     Tensor g_gated = out_proj.backward(g).reshape({rows, dim});
-    const float* gg = g_gated.data();
 
-    // Gate y = y_ssd * silu(z).
-    const float* z_ptr = pp_z_.data();
-    const float* yssd_ptr = pp_y_ssd_.data();
-    Tensor g_yssd({rows, dim}, Device::CPU);
-    Tensor g_z({rows, dim}, Device::CPU);
-    float* gy = g_yssd.data();
-    float* gz = g_z.data();
+    // Gate y = y_ssd · silu(z).
+    Tensor silu_z = pp_z_.mul(pp_z_.sigmoid());
+    Tensor g_yssd = g_gated.mul(silu_z);
+    Tensor g_z = g_gated.mul(pp_y_ssd_).mul(dsilu(pp_z_));
+
+    // Scan backward (linear readout): GPU kernel on device, ordered host loop on
+    // CPU.  Produces grads wrt the scan input xc, dt, A, B and C.
+    Tensor g_xc = Tensor::zeros(std::vector<int>{rows, dim}, dev);
+    Tensor g_dt = Tensor::zeros(std::vector<int>{rows, dim}, dev);
+    Tensor g_B = Tensor::zeros(std::vector<int>{rows, dim}, dev);
+    Tensor g_C = Tensor::zeros(std::vector<int>{rows, dim}, dev);
+    Tensor grad_A = Tensor::zeros({dim}, dev);
+#ifdef USE_CUDA
+    if (dev == Device::GPU) {
+        cuda::launch_mamba_proper_scan_backward(
+            g_yssd.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
+            A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
+            pp_h_hist_.raw_data(), g_xc.raw_data(), g_dt.raw_data(),
+            grad_A.raw_data(), g_B.raw_data(), g_C.raw_data(), batch, seq, dim);
+    } else
+#endif
     {
-        const int n = rows * dim;
-        for (int i = 0; i < n; ++i) {
-            const float zz = z_ptr[i];
-            const float sz = sigmoid_stable(zz);
-            gy[i] = gg[i] * (zz * sz);                 // * silu(z)
-            gz[i] = gg[i] * yssd_ptr[i] * d_silu_stable(zz, sz);
-        }
-    }
-
-    // Scan backward.  G_t = g_yssd_t*C_t + decay_{t+1}*G_{t+1}; carry = decay*G.
-    const float* h_ptr = pp_h_hist_.data();
-    const float* c_ptr = pp_C_.data();
-    const float* b_ptr = pp_B_.data();
-    const float* dt_ptr = pp_dt_.data();
-    const float* xc_ptr = pp_xc_.data();
-    Tensor gB = Tensor::zeros({rows, dim}, Device::CPU);
-    Tensor gC = Tensor::zeros({rows, dim}, Device::CPU);
-    Tensor gDt = Tensor::zeros({rows, dim}, Device::CPU);
-    Tensor gXc = Tensor::zeros({rows, dim}, Device::CPU);
-    Tensor grad_A = Tensor::zeros({dim}, Device::CPU);
-    float* gBp = gB.data();
-    float* gCp = gC.data();
-    float* gDtp = gDt.data();
-    float* gXcp = gXc.data();
-    float* gA = grad_A.data();
-    for (int b = 0; b < batch; ++b) {
-        std::vector<float> carry(static_cast<size_t>(dim), 0.0f);
-        for (int t = seq - 1; t >= 0; --t) {
-            const size_t row = static_cast<size_t>(b) * seq + t;
-            for (int c = 0; c < dim; ++c) {
-                const size_t idx = row * dim + c;
-                const float h_t = h_ptr[idx];
-                const float h_prev =
-                    t == 0 ? 0.0f
-                           : h_ptr[(static_cast<size_t>(b) * seq + (t - 1)) * dim + c];
-                const float a_value = std::max(a_ptr[c], 1e-3f);
-                const float sp = softplus_stable(dt_ptr[idx]);
-                const float decay = std::exp(-sp * a_value);
-                gCp[idx] += gy[idx] * h_t;
-                const float grad_h = gy[idx] * c_ptr[idx] + carry[static_cast<size_t>(c)];
-                gBp[idx] += grad_h * xc_ptr[idx];
-                gXcp[idx] += grad_h * b_ptr[idx];
-                const float grad_decay = grad_h * h_prev;
-                gDtp[idx] += grad_decay * decay * (-a_value) *
-                             sigmoid_stable(dt_ptr[idx]);
-                if (a_ptr[c] > 1e-3f) {
-                    gA[c] += grad_decay * decay * (-sp);
+        const float* gy = g_yssd.data();
+        const float* h_ptr = pp_h_hist_.data();
+        const float* c_ptr = pp_C_.data();
+        const float* b_ptr = pp_B_.data();
+        const float* dt_ptr = pp_dt_.data();
+        const float* xc_ptr = pp_xc_.data();
+        const float* a_ptr = A.data.data();
+        float* gBp = g_B.data();
+        float* gCp = g_C.data();
+        float* gDtp = g_dt.data();
+        float* gXcp = g_xc.data();
+        float* gA = grad_A.data();
+        for (int b = 0; b < batch; ++b) {
+            std::vector<float> carry(static_cast<size_t>(dim), 0.0f);
+            for (int t = seq - 1; t >= 0; --t) {
+                const size_t row = static_cast<size_t>(b) * seq + t;
+                for (int c = 0; c < dim; ++c) {
+                    const size_t idx = row * dim + c;
+                    const float h_t = h_ptr[idx];
+                    const float h_prev =
+                        t == 0 ? 0.0f
+                               : h_ptr[(static_cast<size_t>(b) * seq + (t - 1)) * dim + c];
+                    const float a_value = std::max(a_ptr[c], 1e-3f);
+                    const float sp = softplus_stable(dt_ptr[idx]);
+                    const float decay = std::exp(-sp * a_value);
+                    gCp[idx] = gy[idx] * h_t;
+                    const float grad_h =
+                        gy[idx] * c_ptr[idx] + carry[static_cast<size_t>(c)];
+                    gBp[idx] = grad_h * xc_ptr[idx];
+                    gXcp[idx] = grad_h * b_ptr[idx];
+                    const float grad_decay = grad_h * h_prev;
+                    gDtp[idx] = grad_decay * decay * (-a_value) *
+                                sigmoid_stable(dt_ptr[idx]);
+                    if (a_ptr[c] > 1e-3f) {
+                        gA[c] += grad_decay * decay * (-sp);
+                    }
+                    carry[static_cast<size_t>(c)] = grad_h * decay;
                 }
-                carry[static_cast<size_t>(c)] = grad_h * decay;
             }
         }
     }
 
-    // xc = silu(conv_pre) -> grad_conv_pre.
-    const float* cp = pp_conv_pre_.data();
-    Tensor grad_conv_pre({rows, dim}, Device::CPU);
-    {
-        float* gcp = grad_conv_pre.data();
-        const int n = rows * dim;
-        for (int i = 0; i < n; ++i) {
-            const float v = cp[i];
-            gcp[i] = gXcp[i] * d_silu_stable(v, sigmoid_stable(v));
-        }
-    }
+    // xc = silu(conv_pre) -> grad_conv_pre (device-agnostic).
+    Tensor grad_conv_pre = g_xc.mul(dsilu(pp_conv_pre_));
 
-    // conv1d backward.
-    Tensor grad_xv = Tensor::zeros({rows, dim}, Device::CPU);
-    Tensor grad_conv_w = Tensor::zeros({dim, K}, Device::CPU);
-    conv1d_causal_backward(grad_conv_pre.data(), pp_xv_.data(),
-                           conv_weight_.data.data(), grad_xv.data(),
-                           grad_conv_w.data(), batch, seq, dim, K);
+    // conv1d backward: GPU kernel on device, ordered host loop on CPU.
+    Tensor grad_xv = Tensor::zeros(std::vector<int>{rows, dim}, dev);
+    Tensor grad_conv_w = Tensor::zeros({dim, K}, dev);
+#ifdef USE_CUDA
+    if (dev == Device::GPU) {
+        cuda::launch_conv1d_causal_backward(
+            grad_conv_pre.raw_data(), pp_xv_.raw_data(),
+            conv_weight_.data.raw_data(), grad_xv.raw_data(),
+            grad_conv_w.raw_data(), batch, seq, dim, K);
+    } else
+#endif
+    {
+        conv1d_causal_backward(grad_conv_pre.data(), pp_xv_.data(),
+                               conv_weight_.data.data(), grad_xv.data(),
+                               grad_conv_w.data(), batch, seq, dim, K);
+    }
     conv_weight_.add_grad(grad_conv_w);
 
     // Project grads back to the layer input and accumulate projection params.
-    auto accumulate = [&](BitLinear* proj, const Tensor& grad) {
-        Tensor dxu = proj->backward(grad).reshape({rows, dim});
-        const float* s = dxu.data();
-        const int n = rows * dim;
-        for (int i = 0; i < n; ++i) gu[i] += s[i];
-    };
-    accumulate(x_proj_.get(), grad_xv);
-    accumulate(B_proj_.get(), gB);
-    accumulate(C_proj_.get(), gC);
-    accumulate(dt_proj_.get(), gDt);
-    accumulate(z_proj_.get(), g_z);
+    // All BitLinear backwards are device-agnostic; the adds run on `dev`.
+    g_u = g_u.add(x_proj_->backward(grad_xv).reshape({rows, dim}));
+    g_u = g_u.add(B_proj_->backward(g_B).reshape({rows, dim}));
+    g_u = g_u.add(C_proj_->backward(g_C).reshape({rows, dim}));
+    g_u = g_u.add(dt_proj_->backward(g_dt).reshape({rows, dim}));
+    g_u = g_u.add(z_proj_->backward(g_z).reshape({rows, dim}));
 
     A.add_grad(grad_A);
     D.add_grad(grad_D);
 
     const bool rank_2 = grad_output.shape.size() == 2;
-    Tensor gu_shaped = rank_2 ? g_u : g_u.reshape({batch, seq, dim});
-    return grad_output.get_device() == Device::GPU ? gu_shaped.to(Device::GPU)
-                                                   : gu_shaped;
+    return rank_2 ? g_u : g_u.reshape({batch, seq, dim});
 }
 
 Tensor Mamba2SSD::apply_gating(const Tensor& y_ssd, const Tensor& x,
@@ -1034,12 +1017,19 @@ void Mamba2SSD::reset_runtime_telemetry() {
 
 void Mamba2SSD::to(Device dev) {
     if (config_.proper_selective_ssm) {
-        // Proper path v1 computes the conv/scan on the host and keeps its
-        // projections (incl. out_proj) on CPU so the host math is device-
-        // consistent; forward_proper bridges GPU inputs/outputs (it .cpu()s the
-        // input and .to()s the result back).  A/D may live on either device —
-        // forward/backward_proper copy them host-side.  A GPU-resident proper
-        // path is a tracked follow-up (lands with the N-state CUDA kernel).
+        // GPU-first: move ALL proper-path components onto the device so the
+        // forward/backward run fully on-device (conv1d + linear-readout scan
+        // CUDA kernels; projections via BitLinear GPU path; gate/skip via Tensor
+        // GPU ops).  No host round-trip.
+        if (x_proj_) x_proj_->to(dev);
+        if (z_proj_) z_proj_->to(dev);
+        if (B_proj_) B_proj_->to(dev);
+        if (C_proj_) C_proj_->to(dev);
+        if (dt_proj_) dt_proj_->to(dev);
+        out_proj.to(dev);
+        if (conv_weight_.data.size > 0) {
+            conv_weight_.data = conv_weight_.data.to(dev);
+        }
         A.data = A.data.to(dev);
         D.data = D.data.to(dev);
         return;
