@@ -257,6 +257,10 @@ os.environ['NSOS_MAMBA_CONV_K']     = '3'
 os.environ['NSOS_MOE_FP_ROUTER']    = '1'
 os.environ['NSOS_MOE_SWITCH_AUX']   = '1'
 os.environ['NSOS_MAMBA_A_LOGSPACED'] = '1'
+# Mamba-2 SSD COMPLETO (estado h em R^{H x P x N}) — kernels CUDA validados por
+# paridade GPU no T4 (test_gpu_parity_mamba_nstate PASS).  '1' = treina o Mamba-2
+# completo (mais capacidade); '0' = via diagonal proper (provada: 73% held-out).
+os.environ['NSOS_MAMBA_STATE_EXPANSION'] = '0'
 os.environ['NSOS_GPU_POOL'] = '1'        # caching allocator (GPU-first)
 
 sys.path.insert(0, str(__import__('pathlib').Path('/content/nsos_ext_v2')))

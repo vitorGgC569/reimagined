@@ -1479,6 +1479,13 @@ JambaBlock::JambaBlock(int dm,
                     config.conv_kernel = kv;
                 }
             }
+            // Full Mamba-2 SSD N-state expansion (h in R^{H x P x N}); requires
+            // the proper path.  Default OFF keeps the diagonal scalar state.
+            // GPU-resident (mamba_nstate_* kernels, parity-validated on T4).
+            if (const char* se = std::getenv("NSOS_MAMBA_STATE_EXPANSION");
+                se != nullptr && se[0] == '1') {
+                config.proper_state_expansion = true;
+            }
         }
         mamba_layer = std::make_unique<Mamba2SSD>(dm, std::max(dm / 2, 8),
                                                   std::max(dm / 16, 1), config);
