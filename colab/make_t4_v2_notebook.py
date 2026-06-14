@@ -387,6 +387,138 @@ print('      -> a partir daqui, train_supervised usa o passo por-camada do SNR.'
 tr.clear_lr_scales()  # limpa para nao afetar runs subsequentes desta sessao
 """))
 
+cells.append(md("""## 10 — ABLAÇÃO atribuível: stack CORRIGIDO vs ANTIGO (mesma tarefa/seed)
+
+Prova que as **correções causaram** a generalização. Treina os dois stacks na MESMA
+tarefa, MESMA seed de init (`nsos.set_seed`) e MESMA ordem de dados — só muda o
+stack. **Cada variante roda num SUBPROCESSO próprio** porque alguns flags
+(`NSOS_MOE_SWITCH_AUX`, `NSOS_MOE_ROUTER_GRAD`) são lidos uma vez por processo
+(static); flipá-los na mesma sessão seria inválido. ~7 min (2 variantes × 2 seeds)."""))
+cells.append(code("""import os, sys, subprocess, json
+import numpy as np
+
+# Worker: roda UMA variante num processo proprio -> statics frescos, flags 100%
+# honrados.  Reconstroi o dataset de forma deterministica (identico a celula 5).
+WORKER = '''
+import os, sys, json, random, math
+import numpy as np
+sys.path.insert(0, os.environ['NSOS_EXT_DIR'])
+import nsos_ext as nsos
+NW=['zero','um','dois','tres','quatro','cinco','seis','sete','oito','nove','dez','onze','doze','treze','catorze','quinze','dezesseis','dezessete','dezoito']
+VOC=['quanto','e','mais','?','<eos>']+NW
+ST={w:i for i,w in enumerate(VOC)}; EOS=ST['<eos>']; V=len(VOC)
+def P(a,b): return [ST['quanto'],ST['e'],ST[NW[a]],ST['mais'],ST[NW[b]],ST['?']]
+def AQ(a,b): return [ST[NW[a+b]],EOS]
+ap=[(a,b) for a in range(10) for b in range(10)]; random.Random(7).shuffle(ap)
+train=sorted(ap[15:]); held=sorted(ap[:15])
+seed=int(os.environ['ABL_SEED']); ep=int(os.environ['ABL_EPOCHS'])
+dev=nsos.Device.GPU; nsos.set_seed(seed)
+c=nsos.ModelConfig(); c.num_layers=4; c.d_model=128; c.vocab_size=V; c.n_heads=4; c.n_kv_heads=2
+c.use_moe=True; c.num_experts=4; c.num_experts_per_token=2; c.moe_period=2; c.moe_slot=1
+c.attention_period=4; c.attention_slot=3; c.use_ttt=False; c.dropout=0.0
+c.max_context_tokens=64; c.use_exact_attention_training=True
+m=nsos.JambaModel(c,dev); m.to(dev); m.set_training_mode(True)
+t=nsos.Trainer(m,2e-3); t.warmup_steps=100; t.eos_token_id=EOS; t.moe_aux_loss_scale=0.01
+t.total_training_steps=ep*len(train)
+r=random.Random(seed)
+for e in range(ep):
+    o=train[:]; r.shuffle(o)
+    for (a,b) in o: t.train_supervised(P(a,b),AQ(a,b))
+m.set_training_mode(False)
+def ev(prs):
+    nll=0.0; nt=0; cor=0
+    for (a,b) in prs:
+        p=P(a,b); an=AQ(a,b); sq=p+an
+        lg=np.asarray(m.forward_ids(sq).cpu().numpy()).reshape(len(sq),V)
+        if int(np.argmax(lg[len(p)-1]))==an[0]: cor+=1
+        for q in range(len(p),len(sq)):
+            row=lg[q-1].astype('float64'); row-=row.max(); pr=np.exp(row); pr/=pr.sum()
+            nll+=-math.log(max(pr[sq[q]],1e-12)); nt+=1
+    return math.exp(nll/max(nt,1)), cor/len(prs)
+ptr,etr=ev(train); phe,ehe=ev(held)
+print('RESULT_JSON='+json.dumps(dict(ppl_tr=ptr,em_tr=etr,ppl_he=phe,em_he=ehe)))
+'''
+
+CORR={'NSOS_MAMBA_PROPER_SSM':'1','NSOS_MAMBA_CONV_K':'3','NSOS_MOE_FP_ROUTER':'1','NSOS_MOE_SWITCH_AUX':'1','NSOS_MAMBA_A_LOGSPACED':'1'}
+OLD ={'NSOS_MAMBA_PROPER_SSM':'0','NSOS_MOE_FP_ROUTER':'0','NSOS_MOE_SWITCH_AUX':'0','NSOS_MAMBA_A_LOGSPACED':'0'}
+ALLK=set(CORR)|set(OLD)|{'NSOS_MAMBA_STATE_EXPANSION'}
+
+def run_variant(flags, seed, epochs):
+    env=dict(os.environ)
+    for k in ALLK: env.pop(k, None)
+    env.update(flags)
+    env['NSOS_EXT_DIR']=str(EXT_DIR); env['ABL_SEED']=str(seed); env['ABL_EPOCHS']=str(epochs)
+    rr=subprocess.run([sys.executable,'-c',WORKER], capture_output=True, text=True, env=env)
+    ln=[l for l in rr.stdout.splitlines() if l.startswith('RESULT_JSON=')]
+    if not ln:
+        print(rr.stdout[-1200:]); print('STDERR:', rr.stderr[-1200:]); raise RuntimeError('variante falhou')
+    return json.loads(ln[0][len('RESULT_JSON='):])
+
+ABL_EPOCHS=60; ABL_SEEDS=[7,123]
+abl={'CORRIGIDO':[], 'ANTIGO':[]}
+for nm,fl in [('CORRIGIDO',CORR),('ANTIGO',OLD)]:
+    for s in ABL_SEEDS:
+        abl[nm].append(run_variant(fl,s,ABL_EPOCHS)); print(f'[abl] {nm} seed={s} ok')
+
+base=1.0/19
+print('\\n'+'='*66)
+print(f'{"variante":<12}{"train EM":>10}{"held EM":>10}{"held ppl":>10}   (baseline EM={base:.3f})')
+for nm in ('CORRIGIDO','ANTIGO'):
+    rs=abl[nm]; emh=[r['em_he'] for r in rs]; pph=[r['ppl_he'] for r in rs]; emt=[r['em_tr'] for r in rs]
+    print(f'{nm:<12}{np.mean(emt):>10.3f}{np.mean(emh):>10.3f}{np.mean(pph):>10.3f}   seeds held EM={[round(x,2) for x in emh]}')
+print('='*66)
+d=np.mean([r['em_he'] for r in abl['CORRIGIDO']])-np.mean([r['em_he'] for r in abl['ANTIGO']])
+print(f'GANHO ATRIBUIVEL (corrigido - antigo) held-out EM = {d:+.3f}')
+print('-> ganho positivo = evidencia de que as CORRECOES causaram a generalizacao.')
+"""))
+
+cells.append(md("""## 11 — Generalização SISTEMÁTICA (holdout de operando, teste difícil)
+
+Esconde um operando inteiro (**A=7**) do treino. O valor 7 ainda aparece como
+**B** e como **saída** (`sete`) em outros pares — então acertar `7 + b` exige que a
+representação do operando-A **transfira** para um valor nunca visto NAQUELA posição.
+Bem mais difícil que o holdout aleatório (que é interpolação num grid quase cheio).
+Roda o stack corrigido (flags já ativos da célula 6), in-process. ~2 min."""))
+cells.append(code("""import random, numpy as np, time
+A_HOLD = 7
+sys_train = [(a, b) for a in range(10) for b in range(10) if a != A_HOLD]
+sys_test  = [(A_HOLD, b) for b in range(10)]
+out_train = {a + b for (a, b) in sys_train}
+assert all((A_HOLD + b) in out_train for b in range(10)), 'saida do teste sem cobertura'
+print(f'[sys] train={len(sys_train)} (A!={A_HOLD})  test={len(sys_test)} (A={A_HOLD}, inedito nessa posicao)')
+
+nsos.set_seed(7)
+cs = nsos.ModelConfig()
+cs.num_layers=4; cs.d_model=128; cs.vocab_size=V; cs.n_heads=4; cs.n_kv_heads=2
+cs.use_moe=True; cs.num_experts=4; cs.num_experts_per_token=2; cs.moe_period=2; cs.moe_slot=1
+cs.attention_period=4; cs.attention_slot=3; cs.use_ttt=False; cs.dropout=0.0
+cs.max_context_tokens=64; cs.use_exact_attention_training=True
+ms = nsos.JambaModel(cs, dev); ms.to(dev); ms.set_training_mode(True)
+tsr = nsos.Trainer(ms, 2e-3); tsr.warmup_steps=100; tsr.eos_token_id=EOS; tsr.moe_aux_loss_scale=0.01
+EP=80; tsr.total_training_steps=EP*len(sys_train)
+rsd=random.Random(7); t0=time.perf_counter()
+for e in range(EP):
+    o=sys_train[:]; rsd.shuffle(o)
+    for (a,b) in o: tsr.train_supervised(prompt_ids(a,b), answer_ids(a,b))
+ms.set_training_mode(False)
+def evs(prs):
+    cor=0
+    for (a,b) in prs:
+        p=prompt_ids(a,b)
+        lg=np.asarray(ms.forward_ids(p).cpu().numpy()).reshape(len(p),V)
+        if VOCAB[int(np.argmax(lg[-1]))]==NUM_WORDS[a+b]: cor+=1
+    return cor/len(prs)
+em_tr=evs(sys_train); em_te=evs(sys_test); base=1.0/19
+print('='*60)
+print(f'SISTEMATICO   train EM={em_tr:.3f}   test(A={A_HOLD}) EM={em_te:.3f}   baseline={base:.3f}  ({time.perf_counter()-t0:.0f}s)')
+print('='*60)
+v = 'GENERALIZACAO SISTEMATICA' if em_te>3*base else ('parcial' if em_te>base else 'falhou (decorou a posicao)')
+print(f'VEREDITO: {v}')
+for (a,b) in sys_test:
+    p=prompt_ids(a,b); lg=np.asarray(ms.forward_ids(p).cpu().numpy()).reshape(len(p),V)
+    print(f'  {NUM_WORDS[a]} + {NUM_WORDS[b]} = {NUM_WORDS[a+b]:>10} | modelo: {VOCAB[int(np.argmax(lg[-1]))]}')
+"""))
+
 nb = {
     "cells": cells,
     "metadata": {
