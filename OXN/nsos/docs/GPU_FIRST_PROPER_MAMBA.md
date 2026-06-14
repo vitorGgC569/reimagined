@@ -47,9 +47,15 @@ Caminho host preservado como fallback (CPU) — mesma matemática.
 4. **Decode incremental.** `forward()` na via proper recomputa o scan inteiro a
    cada chamada (sem cache de streaming) → decode autoregressivo é O(n²). Um
    caminho single-token com estado persistente (como o legado) é otimização futura.
-5. **N-state (Mamba-2 completo) — #13.** O `mamba_ssd_forward_kernel` (expansão de
-   estado N-dimensional) segue presente porém não-ligado; a via diagonal corrigida
-   é a que está GPU-residente. Ligar o N-state (fwd+bwd CPU+GPU) é o realce restante.
+5. **N-state (Mamba-2 completo) — #13 — FEITO.** Implementado sob
+   `MambaConfig::proper_state_expansion`: estado h ∈ R^{H×P×N}, dt/A por-cabeça,
+   B/C por-cabeça N-dim, readout linear y=Σ_n h·C. CPU forward+backward (BPTT com
+   reduções cross-p/cross-n) gradcheck-ado (mamba2-nstate d/input 1.19e-2, d/A
+   5.9e-4, d/conv1d 1.5e-2). Kernels CUDA GPU-residentes `mamba_nstate_forward/
+   backward` (estado em registradores, atomicAdd onde há contenção entre canais p;
+   fallback host se N>MAX_N=64), com paridade `test_gpu_parity_mamba_nstate`
+   (validar no T4). NOTA: o `mamba_ssd_forward_kernel` chunked legado segue
+   presente mas o caminho novo usa kernels próprios casados 1:1 com o host.
 
 ## Oportunidades GPU-first pré-existentes (fora desta entrega)
 

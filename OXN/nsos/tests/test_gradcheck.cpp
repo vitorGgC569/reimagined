@@ -250,6 +250,45 @@ void check_mamba2_proper() {
                    "mamba2-proper d/dconv1d", kTolScan);
 }
 
+// ── Module: full Mamba-2 SSD with N-state expansion (proper_state_expansion) ──
+void check_mamba2_nstate() {
+  const int H = 2, P = 4, N = 3, L = 5;
+  const int D = H * P;  // d_model must equal n_heads * d_head
+  MambaConfig cfg;
+  cfg.proper_selective_ssm = true;
+  cfg.proper_state_expansion = true;
+  cfg.conv_kernel = 3;
+  Mamba2SSD layer(D, N, H, cfg);
+  Tensor x({L, D});
+  fill_smooth(x, 0.6f, 0.39f);
+
+  auto loss_fn = [&]() { return sum_sq(layer.forward(x)); };
+
+  zero_all_grads(layer.parameters());
+  Tensor y = layer.forward(x);
+  Tensor dy = y.clone();
+  Context ctx;
+  Tensor dx = layer.backward(dy, ctx);
+
+  Parameter *A = find_param(layer.parameters(), "A");
+  Parameter *conv = find_param(layer.parameters(), "conv1d_weight");
+  assert(A != nullptr && conv != nullptr &&
+         "nstate Mamba2SSD must expose A and conv1d_weight");
+  std::vector<float> gA(static_cast<size_t>(A->grad.size));
+  std::vector<float> gW(static_cast<size_t>(conv->grad.size));
+  for (int i = 0; i < A->grad.size; ++i)
+    gA[static_cast<size_t>(i)] = A->grad.data()[i];
+  for (int i = 0; i < conv->grad.size; ++i)
+    gW[static_cast<size_t>(i)] = conv->grad.data()[i];
+
+  gradcheck_buffer(x.data(), x.size, dx.data(), loss_fn,
+                   "mamba2-nstate d/dinput", kTolScan);
+  gradcheck_buffer(A->data.data(), A->data.size, gA.data(), loss_fn,
+                   "mamba2-nstate d/dA", kTolScan);
+  gradcheck_buffer(conv->data.data(), conv->data.size, gW.data(), loss_fn,
+                   "mamba2-nstate d/dconv1d", kTolScan);
+}
+
 // ── Module: BitFastKAN layer (end-to-end forward/backward) ───────────────────
 void check_kan() {
   const int in = 5, out = 3, rows = 4, grid = 5;
@@ -364,6 +403,7 @@ int main() {
   check_matmul();
   check_mamba2();
   check_mamba2_proper();
+  check_mamba2_nstate();
   check_moe_switch_aux();
   check_moe_router_grad();
   check_kan();

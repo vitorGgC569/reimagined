@@ -145,6 +145,29 @@ void launch_conv1d_causal_backward(const float *grad_out, const float *in,
                                    const float *weight, float *grad_in,
                                    float *grad_weight, int batch, int seq,
                                    int dim, int K);
+
+// =====================================================================
+// Full Mamba-2 SSD with N-dimensional state expansion (GPU-resident).
+// One thread per (batch, head, p-channel), N-vector state in registers.
+//   xc,y : [B,Seq,dim] (dim=H*P, channel=h*P+p)
+//   dt   : [B,Seq,H]   A : [H]   B_in,C_in : [B,Seq,H,N]
+//   state_history : [B,Seq,dim,N]  (h_t after update; nullptr to skip)
+// N must be <= mamba_nstate_max_n(); the launcher no-ops otherwise so the
+// caller falls back to the host scan.  Backward: gB/gC/gDt/gA accumulate via
+// atomicAdd (the launcher zeroes them); gXc is written fully.  No internal sync.
+// =====================================================================
+int mamba_nstate_max_n();
+void launch_mamba_nstate_forward(const float *xc, const float *dt,
+                                 const float *A, const float *B_in,
+                                 const float *C_in, float *y,
+                                 float *state_history, int Batch, int Seq, int H,
+                                 int P, int N);
+void launch_mamba_nstate_backward(const float *gy, const float *xc,
+                                  const float *dt, const float *A,
+                                  const float *B_in, const float *C_in,
+                                  const float *state_history, float *gXc,
+                                  float *gDt, float *gA, float *gB, float *gC,
+                                  int Batch, int Seq, int H, int P, int N);
 #endif
 
 }  // namespace cuda

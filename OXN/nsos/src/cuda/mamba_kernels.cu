@@ -737,5 +737,142 @@ void launch_conv1d_causal_backward(const float *grad_out, const float *in,
       grad_out, in, weight, grad_in, grad_weight, batch, seq, dim, K);
 }
 
+// ── Full Mamba-2 SSD with N-dimensional state expansion ──────────────────────
+// One thread per (batch, head, p-channel); each carries an N-vector state in
+// registers and walks the sequence.  Layout matches the host path in
+// src/mamba2.cpp::forward_proper_nstate:
+//   xc,y : [B,Seq,dim]  (dim=H*P, channel = h*P+p)
+//   dt   : [B,Seq,H]    A : [H]    B_in,C_in : [B,Seq,H,N]
+//   state_history : [B,Seq,dim,N]  (h_t after update; nullptr to skip)
+// N must be <= MAX_N (caller checks via mamba_nstate_max_n()).
+int mamba_nstate_max_n() { return MAX_N; }
+
+__global__ void mamba_nstate_forward_kernel(
+    const float *__restrict__ xc, const float *__restrict__ dt,
+    const float *__restrict__ A, const float *__restrict__ B_in,
+    const float *__restrict__ C_in, float *__restrict__ y,
+    float *__restrict__ state_history, int Batch, int Seq, int H, int P, int N) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = Batch * H * P;
+  if (tid >= total) return;
+  const int p = tid % P;
+  const int h = (tid / P) % H;
+  const int b = tid / (P * H);
+  const int dim = H * P;
+  const int chan = h * P + p;
+  const size_t HPN = (size_t)dim * N;
+  float state[MAX_N];
+  for (int n = 0; n < N; ++n) state[n] = 0.0f;
+  const float a_value = fmaxf(A[h], 1e-3f);
+  for (int t = 0; t < Seq; ++t) {
+    const int row = b * Seq + t;
+    const float decay = expf(-softplus_device(dt[row * H + h]) * a_value);
+    const float xcv = xc[(size_t)row * dim + chan];
+    float y_acc = 0.0f;
+    for (int n = 0; n < N; ++n) {
+      const size_t bcidx = (size_t)row * (H * N) + h * N + n;
+      const float hv = decay * state[n] + B_in[bcidx] * xcv;
+      state[n] = hv;
+      if (state_history != nullptr) {
+        state_history[(size_t)row * HPN + (size_t)chan * N + n] = hv;
+      }
+      y_acc += hv * C_in[bcidx];
+    }
+    y[(size_t)row * dim + chan] = y_acc;
+  }
+}
+
+__global__ void mamba_nstate_backward_kernel(
+    const float *__restrict__ gy, const float *__restrict__ xc,
+    const float *__restrict__ dt, const float *__restrict__ A,
+    const float *__restrict__ B_in, const float *__restrict__ C_in,
+    const float *__restrict__ state_history, float *__restrict__ gXc,
+    float *__restrict__ gDt, float *__restrict__ gA, float *__restrict__ gB,
+    float *__restrict__ gC, int Batch, int Seq, int H, int P, int N) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = Batch * H * P;
+  if (tid >= total) return;
+  const int p = tid % P;
+  const int h = (tid / P) % H;
+  const int b = tid / (P * H);
+  const int dim = H * P;
+  const int chan = h * P + p;
+  const size_t HPN = (size_t)dim * N;
+  float carry[MAX_N];
+  for (int n = 0; n < N; ++n) carry[n] = 0.0f;
+  const float a_value = fmaxf(A[h], 1e-3f);
+  // gC/gB/gDt/gA are shared across the P threads of a head -> atomicAdd.
+  // gXc is unique per (b,h,p) channel -> direct write.
+  for (int t = Seq - 1; t >= 0; --t) {
+    const int row = b * Seq + t;
+    const float dt_val = dt[row * H + h];
+    const float sp = softplus_device(dt_val);
+    const float decay = expf(-sp * a_value);
+    const float xcv = xc[(size_t)row * dim + chan];
+    const float gyv = gy[(size_t)row * dim + chan];
+    float ddecay = 0.0f;
+    float gxc_acc = 0.0f;
+    for (int n = 0; n < N; ++n) {
+      const size_t bcidx = (size_t)row * (H * N) + h * N + n;
+      const float h_t = state_history[(size_t)row * HPN + (size_t)chan * N + n];
+      const float h_prev =
+          (t == 0) ? 0.0f
+                   : state_history[(size_t)(row - 1) * HPN + (size_t)chan * N + n];
+      const float cval = C_in[bcidx];
+      const float bval = B_in[bcidx];
+      atomicAdd(&gC[bcidx], gyv * h_t);
+      const float grad_h = gyv * cval + carry[n];
+      atomicAdd(&gB[bcidx], grad_h * xcv);
+      gxc_acc += grad_h * bval;
+      ddecay += grad_h * h_prev;
+      carry[n] = grad_h * decay;
+    }
+    gXc[(size_t)row * dim + chan] = gxc_acc;
+    const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_val));
+    atomicAdd(&gDt[row * H + h], ddecay * decay * (-a_value) * sigmoid_dt);
+    if (A[h] > 1e-3f) {
+      atomicAdd(&gA[h], ddecay * decay * (-sp));
+    }
+  }
+}
+
+void launch_mamba_nstate_forward(const float *xc, const float *dt,
+                                 const float *A, const float *B_in,
+                                 const float *C_in, float *y,
+                                 float *state_history, int Batch, int Seq, int H,
+                                 int P, int N) {
+  const int total = Batch * H * P;
+  if (total <= 0 || Seq <= 0 || N <= 0 || N > MAX_N) {
+    return;
+  }
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  mamba_nstate_forward_kernel<<<blocks, threads>>>(
+      xc, dt, A, B_in, C_in, y, state_history, Batch, Seq, H, P, N);
+}
+
+void launch_mamba_nstate_backward(const float *gy, const float *xc,
+                                  const float *dt, const float *A,
+                                  const float *B_in, const float *C_in,
+                                  const float *state_history, float *gXc,
+                                  float *gDt, float *gA, float *gB, float *gC,
+                                  int Batch, int Seq, int H, int P, int N) {
+  const int total = Batch * H * P;
+  if (total <= 0 || Seq <= 0 || N <= 0 || N > MAX_N) {
+    return;
+  }
+  // gB/gC/gDt/gA accumulate via atomicAdd -> zero first (async, serializes
+  // with the kernel on the default stream).  gXc is written fully by the kernel.
+  cudaMemsetAsync(gB, 0, (size_t)Batch * Seq * H * N * sizeof(float));
+  cudaMemsetAsync(gC, 0, (size_t)Batch * Seq * H * N * sizeof(float));
+  cudaMemsetAsync(gDt, 0, (size_t)Batch * Seq * H * sizeof(float));
+  cudaMemsetAsync(gA, 0, (size_t)H * sizeof(float));
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  mamba_nstate_backward_kernel<<<blocks, threads>>>(
+      gy, xc, dt, A, B_in, C_in, state_history, gXc, gDt, gA, gB, gC, Batch, Seq,
+      H, P, N);
+}
+
 }  // namespace cuda
 }  // namespace nsos

@@ -107,6 +107,15 @@ Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
   // SSM scan parameters).  See trainer.cpp apply_progressive_qat_phase.
   in_proj_sensitive.set_quantization_sensitive(true);
 
+  // N-state (full Mamba-2 SSD) uses a PER-HEAD decay A ∈ R^H instead of the
+  // per-channel A ∈ R^{d_model}.  Resize BEFORE the optional log-spaced init so
+  // that init fills the correct length.
+  const bool proper_nstate_ctor =
+      config_.proper_selective_ssm && config_.proper_state_expansion;
+  if (proper_nstate_ctor) {
+    A.data = Tensor::ones({std::max(n_heads, 1)}, Device::CPU);
+  }
+
   // OXTA-CRIT Lei 2 (docs/OXTA_CRIT_THEORY.md): A = ones gives a fully
   // DEGENERATE memory spectrum — every channel forgets at the same rate
   // (tau ~ 1/A identical everywhere; measured by scripts/criticality_probe.py:
@@ -146,9 +155,17 @@ Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
     conv_kernel_ = std::max(config_.conv_kernel, 1);
     x_proj_  = std::make_unique<BitLinear>(d_model, d_model, true);
     z_proj_  = std::make_unique<BitLinear>(d_model, d_model, true);
-    B_proj_  = std::make_unique<BitLinear>(d_model, d_model, true);
-    C_proj_  = std::make_unique<BitLinear>(d_model, d_model, true);
-    dt_proj_ = std::make_unique<BitLinear>(d_model, d_model, true);
+    if (proper_nstate_ctor) {
+      // Full SSD: dt and A are per-head; B and C are per-head N-dimensional.
+      const int N = std::max(d_state, 1);
+      dt_proj_ = std::make_unique<BitLinear>(d_model, std::max(n_heads, 1), true);
+      B_proj_  = std::make_unique<BitLinear>(d_model, std::max(n_heads, 1) * N, true);
+      C_proj_  = std::make_unique<BitLinear>(d_model, std::max(n_heads, 1) * N, true);
+    } else {
+      B_proj_  = std::make_unique<BitLinear>(d_model, d_model, true);
+      C_proj_  = std::make_unique<BitLinear>(d_model, d_model, true);
+      dt_proj_ = std::make_unique<BitLinear>(d_model, d_model, true);
+    }
     // dt/B/C carry the SSM's selectivity — keep them off the ternary path during
     // QAT (mixed precision), exactly as the legacy in_proj_sensitive does.
     dt_proj_->set_quantization_sensitive(true);
@@ -763,6 +780,289 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
     return rank_2 ? g_u : g_u.reshape({batch, seq, dim});
 }
 
+// ===========================================================================
+// Full Mamba-2 SSD with N-dimensional state expansion (proper_state_expansion).
+// State h ∈ R^{H×P×N}; B,C per-head N-dim; dt,A per-head; linear readout
+//   y_{t,h,p} = Σ_n h_{t,h,p,n} C_{t,h,n}.  Scan + BPTT on host (v1); the conv
+// and projections/gate use the device-aware kernels/Tensor ops.  All gradients
+// hand-derived; gradchecked (check_mamba2_nstate).
+// ===========================================================================
+Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
+    const bool rank_2 = u.shape.size() == 2;
+    const int batch = rank_2 ? 1 : u.shape[0];
+    const int seq = rank_2 ? u.shape[0] : u.shape[1];
+    const int dim = u.shape.back();
+    if (dim != d_model) {
+        throw std::runtime_error("Mamba2SSD nstate: last dim != d_model");
+    }
+    const int H = std::max(n_heads, 1);
+    const int P = d_head;
+    const int N = std::max(d_state, 1);
+    if (H * P != dim) {
+        throw std::runtime_error("Mamba2SSD nstate: d_model must equal n_heads*d_head");
+    }
+    const int rows = batch * seq;
+    const int K = conv_kernel_;
+    const Device dev = u.get_device();
+
+    Tensor u_flat = rank_2 ? u : u.reshape({rows, dim});
+
+    // Projections (device-agnostic).  x,z:[rows,dim]; B,C:[rows,H*N]; dt:[rows,H].
+    Tensor xv = x_proj_->forward(u_flat).reshape({rows, dim});
+    Tensor z = z_proj_->forward(u_flat).reshape({rows, dim});
+    Tensor Bt = B_proj_->forward(u_flat).reshape({rows, H * N});
+    Tensor Ct = C_proj_->forward(u_flat).reshape({rows, H * N});
+    Tensor dt = dt_proj_->forward(u_flat).reshape({rows, H});
+
+    // Causal conv on x then SiLU.
+    Tensor conv_pre(std::vector<int>{rows, dim}, dev);
+#ifdef USE_CUDA
+    if (dev == Device::GPU) {
+        cuda::launch_conv1d_causal_forward(xv.raw_data(),
+                                           conv_weight_.data.raw_data(),
+                                           conv_pre.raw_data(), batch, seq, dim, K);
+    } else
+#endif
+    {
+        conv1d_causal_forward(xv.data(), conv_weight_.data.data(),
+                              conv_pre.data(), batch, seq, dim, K);
+    }
+    Tensor xc = conv_pre.mul(conv_pre.sigmoid());
+
+    // ── N-state SSD scan ── GPU-resident kernel (state in registers) on device;
+    // ordered host loop on CPU or when N exceeds the kernel's MAX_N.  Full state
+    // history saved for BPTT.
+    Tensor y_ssd(std::vector<int>{rows, dim}, dev);
+    Tensor hist(std::vector<int>{rows, H, P, N}, dev);
+    bool nstate_scan_done = false;
+#ifdef USE_CUDA
+    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n()) {
+        cuda::launch_mamba_nstate_forward(
+            xc.raw_data(), dt.raw_data(), A.data.raw_data(), Bt.raw_data(),
+            Ct.raw_data(), y_ssd.raw_data(), hist.raw_data(), batch, seq, H, P, N);
+        nstate_scan_done = true;
+    }
+#endif
+    if (!nstate_scan_done) {
+    Tensor xc_h = xc.get_device() == Device::GPU ? xc.cpu() : xc;
+    Tensor Bt_h = Bt.get_device() == Device::GPU ? Bt.cpu() : Bt;
+    Tensor Ct_h = Ct.get_device() == Device::GPU ? Ct.cpu() : Ct;
+    Tensor dt_h = dt.get_device() == Device::GPU ? dt.cpu() : dt;
+    Tensor A_h = A.data.get_device() == Device::GPU ? A.data.cpu() : A.data;
+    Tensor y_h(std::vector<int>{rows, dim}, Device::CPU);
+    Tensor hist_h(std::vector<int>{rows, H, P, N}, Device::CPU);
+    const float* xcp = xc_h.data();
+    const float* bp = Bt_h.data();
+    const float* cp = Ct_h.data();
+    const float* dtp = dt_h.data();
+    const float* ap = A_h.data();
+    float* yp = y_h.data();
+    float* histp = hist_h.data();
+    const size_t HPN = static_cast<size_t>(H) * P * N;
+    std::vector<float> state(HPN, 0.0f);
+    for (int b = 0; b < batch; ++b) {
+        std::fill(state.begin(), state.end(), 0.0f);
+        for (int t = 0; t < seq; ++t) {
+            const int row = b * seq + t;
+            for (int h = 0; h < H; ++h) {
+                const float a_value = std::max(ap[h], 1e-3f);
+                const float decay =
+                    std::exp(-softplus_stable(dtp[row * H + h]) * a_value);
+                for (int p = 0; p < P; ++p) {
+                    const int chan = h * P + p;
+                    const float xcv = xcp[static_cast<size_t>(row) * dim + chan];
+                    float y_acc = 0.0f;
+                    for (int n = 0; n < N; ++n) {
+                        const size_t sidx = (static_cast<size_t>(h) * P + p) * N + n;
+                        const float bval = bp[static_cast<size_t>(row) * (H * N) + h * N + n];
+                        const float cval = cp[static_cast<size_t>(row) * (H * N) + h * N + n];
+                        const float hv = decay * state[sidx] + bval * xcv;
+                        state[sidx] = hv;
+                        histp[static_cast<size_t>(row) * HPN + sidx] = hv;
+                        y_acc += hv * cval;
+                    }
+                    yp[static_cast<size_t>(row) * dim + chan] = y_acc;
+                }
+            }
+        }
+    }
+        y_ssd = dev == Device::GPU ? y_h.to(Device::GPU) : y_h;
+        hist = dev == Device::GPU ? hist_h.to(Device::GPU) : hist_h;
+    }
+
+    // Gate + out_proj + skip (device-agnostic).
+    Tensor gated = y_ssd.mul(z.mul(z.sigmoid()));
+    Tensor projected = out_proj.forward(gated).reshape({rows, dim});
+    Tensor skip = u_flat.mul(D.data);
+    Tensor result = projected.add(skip);
+
+    pp_u_ = u_flat;
+    pp_xv_ = xv;
+    pp_conv_pre_ = conv_pre;
+    pp_xc_ = xc;
+    pp_z_ = z;
+    pp_B_ = Bt;
+    pp_C_ = Ct;
+    pp_dt_ = dt;
+    pp_y_ssd_ = y_ssd;
+    pp_state_hist_ = hist;
+    pp_batch_ = batch;
+    pp_seq_ = seq;
+    proper_active_ = true;
+
+    return rank_2 ? result : result.reshape({batch, seq, dim});
+}
+
+Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
+    const int batch = pp_batch_;
+    const int seq = pp_seq_;
+    const int dim = d_model;
+    const int K = conv_kernel_;
+    const int rows = batch * seq;
+    const int H = std::max(n_heads, 1);
+    const int P = d_head;
+    const int N = std::max(d_state, 1);
+    const Device dev = grad_output.get_device();
+    Tensor g = grad_output.shape.size() == 2 ? grad_output
+                                             : grad_output.reshape({rows, dim});
+
+    auto dsilu = [&](const Tensor& pre) {
+        Tensor s = pre.sigmoid();
+        Tensor one = Tensor::ones(std::vector<int>{rows, dim}, dev);
+        return s.mul(one.add(pre.mul(one.sub(s))));
+    };
+
+    // Skip + out_proj + gate (device-agnostic).
+    Tensor grad_D = g.mul(pp_u_).sum(0, false);
+    Tensor g_u = g.mul(D.data);
+    Tensor g_gated = out_proj.backward(g).reshape({rows, dim});
+    Tensor silu_z = pp_z_.mul(pp_z_.sigmoid());
+    Tensor g_yssd = g_gated.mul(silu_z);
+    Tensor g_z = g_gated.mul(pp_y_ssd_).mul(dsilu(pp_z_));
+
+    // ── N-state SSD scan backward ── GPU-resident kernel on device; ordered
+    // host loop on CPU or when N exceeds the kernel's MAX_N.
+    Tensor gXc(std::vector<int>{rows, dim}, dev);
+    Tensor gB(std::vector<int>{rows, H * N}, dev);
+    Tensor gC(std::vector<int>{rows, H * N}, dev);
+    Tensor gDt(std::vector<int>{rows, H}, dev);
+    Tensor gA(std::vector<int>{H}, dev);
+    bool nstate_bwd_done = false;
+#ifdef USE_CUDA
+    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n()) {
+        cuda::launch_mamba_nstate_backward(
+            g_yssd.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
+            A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
+            pp_state_hist_.raw_data(), gXc.raw_data(), gDt.raw_data(),
+            gA.raw_data(), gB.raw_data(), gC.raw_data(), batch, seq, H, P, N);
+        nstate_bwd_done = true;
+    }
+#endif
+    if (!nstate_bwd_done) {
+    Tensor gy_h = g_yssd.get_device() == Device::GPU ? g_yssd.cpu() : g_yssd;
+    Tensor xc_h = pp_xc_.get_device() == Device::GPU ? pp_xc_.cpu() : pp_xc_;
+    Tensor Bt_h = pp_B_.get_device() == Device::GPU ? pp_B_.cpu() : pp_B_;
+    Tensor Ct_h = pp_C_.get_device() == Device::GPU ? pp_C_.cpu() : pp_C_;
+    Tensor dt_h = pp_dt_.get_device() == Device::GPU ? pp_dt_.cpu() : pp_dt_;
+    Tensor A_h = A.data.get_device() == Device::GPU ? A.data.cpu() : A.data;
+    const float* gyp = gy_h.data();
+    const float* xcp = xc_h.data();
+    const float* bp = Bt_h.data();
+    const float* cp = Ct_h.data();
+    const float* dtp = dt_h.data();
+    const float* ap = A_h.data();
+    const float* histp = pp_state_hist_.data();
+    Tensor gB_h = Tensor::zeros({rows, H * N}, Device::CPU);
+    Tensor gC_h = Tensor::zeros({rows, H * N}, Device::CPU);
+    Tensor gDt_h = Tensor::zeros({rows, H}, Device::CPU);
+    Tensor gXc_h = Tensor::zeros({rows, dim}, Device::CPU);
+    Tensor gA_h = Tensor::zeros({H}, Device::CPU);
+    float* gBp = gB_h.data();
+    float* gCp = gC_h.data();
+    float* gDtp = gDt_h.data();
+    float* gXcp = gXc_h.data();
+    float* gAp = gA_h.data();
+    const size_t HPN = static_cast<size_t>(H) * P * N;
+    std::vector<float> carry(HPN, 0.0f);
+    for (int b = 0; b < batch; ++b) {
+        std::fill(carry.begin(), carry.end(), 0.0f);
+        for (int t = seq - 1; t >= 0; --t) {
+            const int row = b * seq + t;
+            const int prevrow = b * seq + (t - 1);
+            for (int h = 0; h < H; ++h) {
+                const float a_value = std::max(ap[h], 1e-3f);
+                const float sp = softplus_stable(dtp[row * H + h]);
+                const float decay = std::exp(-sp * a_value);
+                float ddecay = 0.0f;
+                for (int p = 0; p < P; ++p) {
+                    const int chan = h * P + p;
+                    const float xcv = xcp[static_cast<size_t>(row) * dim + chan];
+                    const float gyv = gyp[static_cast<size_t>(row) * dim + chan];
+                    for (int n = 0; n < N; ++n) {
+                        const size_t sidx = (static_cast<size_t>(h) * P + p) * N + n;
+                        const float h_t = histp[static_cast<size_t>(row) * HPN + sidx];
+                        const float h_prev =
+                            t == 0 ? 0.0f
+                                   : histp[static_cast<size_t>(prevrow) * HPN + sidx];
+                        const size_t bcidx = static_cast<size_t>(row) * (H * N) + h * N + n;
+                        const float cval = cp[bcidx];
+                        const float bval = bp[bcidx];
+                        gCp[bcidx] += gyv * h_t;
+                        const float grad_h = gyv * cval + carry[sidx];
+                        gBp[bcidx] += grad_h * xcv;
+                        gXcp[static_cast<size_t>(row) * dim + chan] += grad_h * bval;
+                        ddecay += grad_h * h_prev;
+                        carry[sidx] = grad_h * decay;
+                    }
+                }
+                gDtp[row * H + h] =
+                    ddecay * decay * (-a_value) * sigmoid_stable(dtp[row * H + h]);
+                if (ap[h] > 1e-3f) {
+                    gAp[h] += ddecay * decay * (-sp);
+                }
+            }
+        }
+    }
+
+        gXc = dev == Device::GPU ? gXc_h.to(Device::GPU) : gXc_h;
+        gB = dev == Device::GPU ? gB_h.to(Device::GPU) : gB_h;
+        gC = dev == Device::GPU ? gC_h.to(Device::GPU) : gC_h;
+        gDt = dev == Device::GPU ? gDt_h.to(Device::GPU) : gDt_h;
+        gA = dev == Device::GPU ? gA_h.to(Device::GPU) : gA_h;
+    }
+    A.add_grad(gA);
+
+    // conv SiLU backward + conv1d backward.
+    Tensor grad_conv_pre = gXc.mul(dsilu(pp_conv_pre_));
+    Tensor grad_xv = Tensor::zeros(std::vector<int>{rows, dim}, dev);
+    Tensor grad_conv_w = Tensor::zeros({dim, K}, dev);
+#ifdef USE_CUDA
+    if (dev == Device::GPU) {
+        cuda::launch_conv1d_causal_backward(
+            grad_conv_pre.raw_data(), pp_xv_.raw_data(),
+            conv_weight_.data.raw_data(), grad_xv.raw_data(),
+            grad_conv_w.raw_data(), batch, seq, dim, K);
+    } else
+#endif
+    {
+        conv1d_causal_backward(grad_conv_pre.data(), pp_xv_.data(),
+                               conv_weight_.data.data(), grad_xv.data(),
+                               grad_conv_w.data(), batch, seq, dim, K);
+    }
+    conv_weight_.add_grad(grad_conv_w);
+
+    // Projections backward into the layer input.
+    g_u = g_u.add(x_proj_->backward(grad_xv).reshape({rows, dim}));
+    g_u = g_u.add(B_proj_->backward(gB).reshape({rows, dim}));
+    g_u = g_u.add(C_proj_->backward(gC).reshape({rows, dim}));
+    g_u = g_u.add(dt_proj_->backward(gDt).reshape({rows, dim}));
+    g_u = g_u.add(z_proj_->backward(g_z).reshape({rows, dim}));
+    D.add_grad(grad_D);
+
+    const bool rank_2 = grad_output.shape.size() == 2;
+    return rank_2 ? g_u : g_u.reshape({batch, seq, dim});
+}
+
 Tensor Mamba2SSD::apply_gating(const Tensor& y_ssd, const Tensor& x,
                                const Tensor& z, Tensor* grad_buffer) {
     (void)x;
@@ -818,7 +1118,8 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
     // when the flag is on.
     if (config_.proper_selective_ssm) {
         (void)ctx;
-        return forward_proper(u);
+        return config_.proper_state_expansion ? forward_proper_nstate(u)
+                                              : forward_proper(u);
     }
 
     const bool single_token_rank2 =
@@ -948,7 +1249,9 @@ Tensor Mamba2SSD::backward(const Tensor& grad_output, Context& ctx) {
             throw std::runtime_error(
                 "Mamba2SSD proper backward called before forward_proper");
         }
-        return backward_proper(grad_output);
+        return config_.proper_state_expansion
+                   ? backward_proper_nstate(grad_output)
+                   : backward_proper(grad_output);
     }
     if (saved_input_.size == 0 || saved_x_proj_.size == 0 || saved_gate_.size == 0) {
         throw std::runtime_error("Mamba2SSD backward called before forward");
@@ -1007,6 +1310,7 @@ void Mamba2SSD::reset() {
     pp_dt_ = Tensor();
     pp_h_hist_ = Tensor();
     pp_y_ssd_ = Tensor();
+    pp_state_hist_ = Tensor();
 }
 
 void Mamba2SSD::reset_runtime_telemetry() {

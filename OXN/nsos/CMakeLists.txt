@@ -533,6 +533,13 @@ if (NSOS_BUILD_TESTS)
     target_include_directories(test_gpu_parity_mamba_proper PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_mamba_proper COMMAND test_gpu_parity_mamba_proper)
 
+    # Full Mamba-2 SSD with N-state expansion: mamba_nstate_* CUDA kernels
+    # (per-head dt/A, N-dim B/C, h in R^{H*P*N}) vs the host reference.
+    add_executable(test_gpu_parity_mamba_nstate tests/gpu/test_gpu_parity_mamba_nstate.cpp)
+    target_link_libraries(test_gpu_parity_mamba_nstate PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_mamba_nstate PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_mamba_nstate COMMAND test_gpu_parity_mamba_nstate)
+
     add_executable(test_gpu_parity_jamba tests/gpu/test_gpu_parity_jamba.cpp)
     target_link_libraries(test_gpu_parity_jamba PRIVATE nsos_core)
     target_include_directories(test_gpu_parity_jamba PRIVATE tests/gpu)

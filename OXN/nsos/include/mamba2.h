@@ -32,12 +32,24 @@ struct MambaConfig {
   //   y_t    = h_t * C_t
   //   out    = out_proj(y * silu(z)) + u * D
   // This removes the delta==C / double-C degeneracy and gives the time axis its
-  // own selectivity.  The state is still diagonal (per-channel scalar); the
-  // N-dimensional SSD state expansion (wiring mamba_ssd_forward_kernel) is the
-  // next sub-step and is tracked separately.  All gradients are hand-derived and
-  // covered by tests/test_gradcheck.cpp.
+  // own selectivity.  By itself the state is diagonal (per-channel scalar); set
+  // proper_state_expansion below for the full N-dimensional SSD state.  All
+  // gradients are hand-derived and covered by tests/test_gradcheck.cpp.
   bool proper_selective_ssm = false;
   int conv_kernel = 4; // causal depthwise conv width for the proper path
+
+  // ── N-dimensional state expansion (full Mamba-2 SSD) — OPT-IN ──────────────
+  // Requires proper_selective_ssm.  The diagonal proper path above keeps a
+  // per-channel SCALAR state; this expands it to the true SSD state h ∈ R^{H×P×N}
+  // (H heads, P=d_head channels/head, N=d_state).  B and C become per-head
+  // N-dimensional, dt and A become per-head:
+  //   decay_{t,h} = exp(-softplus(dt_{t,h}) * A_h)
+  //   h_{t,h,p,n} = decay_{t,h} * h_{t-1,h,p,n} + B_{t,h,n} * xc_{t,h,p}
+  //   y_{t,h,p}   = Σ_n h_{t,h,p,n} * C_{t,h,n}
+  // This is the state-space duality form (Gu & Dao 2024).  Default false keeps
+  // the diagonal proper path (and its parameter set) unchanged.  All gradients
+  // hand-derived and covered by tests/test_gradcheck.cpp (check_mamba2_nstate).
+  bool proper_state_expansion = false;
 };
 
 struct MambaStreamSnapshot {
@@ -90,6 +102,12 @@ private:
   // historical CPU scan fallback.  All gradients hand-derived; gradchecked.
   Tensor forward_proper(const Tensor &u);
   Tensor backward_proper(const Tensor &grad_output);
+  // N-state (full Mamba-2 SSD) variant of the proper path — config_.
+  // proper_state_expansion.  Same conv1d + SiLU gate, but the recurrence carries
+  // an H×P×N state and B/C/dt/A are per-head.  Scan + its BPTT run on host in v1
+  // (GPU kernels wired in Phase B); projections/gate via device-agnostic ops.
+  Tensor forward_proper_nstate(const Tensor &u);
+  Tensor backward_proper_nstate(const Tensor &grad_output);
   // Causal depthwise conv1d over [rows, dim] laid out as `batch` sequences of
   // `seq` steps.  weight is [dim, K]; out[t,c] = sum_j weight[c,j]*in[t-(K-1)+j,c]
   // with left zero-padding.  Pure host math.
@@ -158,8 +176,9 @@ private:
   Tensor pp_B_;              // B projection
   Tensor pp_C_;              // C projection
   Tensor pp_dt_;             // dt projection raw
-  Tensor pp_h_hist_;         // state history h_t [rows, dim]
+  Tensor pp_h_hist_;         // diagonal state history h_t [rows, dim]
   Tensor pp_y_ssd_;          // h_t * C_t (pre-gate)
+  Tensor pp_state_hist_;     // N-state SSD history [rows, H, P, N] (BPTT)
   int pp_batch_ = 0;
   int pp_seq_ = 0;
 
