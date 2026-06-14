@@ -62,7 +62,7 @@ void test_memory_system_thread_safety() {
             Tensor result = mem.retrieve(query);
 
             // Check for NaN in result
-            for (int j = 0; j < std::min(10, result.size); ++j) {
+            for (int j = 0; j < std::min<int64_t>(10, result.size); ++j) {
               if (std::isnan(result.data()[j])) {
                 error_count++;
                 return;
@@ -187,7 +187,7 @@ void test_tensor_ops_thread_safety() {
             }
 
             // Check for NaN
-            for (int j = 0; j < std::min(10, c.size); ++j) {
+            for (int j = 0; j < std::min<int64_t>(10, c.size); ++j) {
               if (std::isnan(c.data()[j])) {
                 error_count++;
                 return;
@@ -248,7 +248,7 @@ void test_jamba_concurrent_inference() {
 
             // Check output validity
             bool valid = true;
-            for (int j = 0; j < std::min(10, out.size); ++j) {
+            for (int j = 0; j < std::min<int64_t>(10, out.size); ++j) {
               if (std::isnan(out.data()[j]) || std::isinf(out.data()[j])) {
                 valid = false;
                 break;

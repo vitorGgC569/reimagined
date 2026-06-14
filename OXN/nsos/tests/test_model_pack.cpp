@@ -75,7 +75,7 @@ int main() {
     auto* lhs = lhs_params.front();
     auto* rhs = rhs_params.front();
     require(lhs->data.size == rhs->data.size, "parameter size mismatch");
-    for (int i = 0; i < std::min(lhs->data.size, 32); ++i) {
+    for (int i = 0; i < std::min<int64_t>(lhs->data.size, 32); ++i) {
       if (std::abs(lhs->data.data()[i] - rhs->data.data()[i]) >= 1e-5f) {
         throw std::runtime_error("reloaded weight mismatch at index " + std::to_string(i));
       }

@@ -120,7 +120,7 @@ void test_moe_block_integration() {
 
     // Check for NaN/Inf in output
     bool stable = true;
-    for (int i = 0; i < std::min(100, output.size); ++i) {
+    for (int i = 0; i < std::min<int64_t>(100, output.size); ++i) {
       if (std::isnan(output.data()[i]) || std::isinf(output.data()[i])) {
         stable = false;
         break;
