@@ -520,7 +520,8 @@ __global__ void mamba_selective_scan_forward_parallel_kernel(
     const float *__restrict__ x, const float *__restrict__ dt,
     const float *__restrict__ A, const float *__restrict__ B_in,
     const float *__restrict__ C_in, float *__restrict__ y,
-    float *__restrict__ state_history, int Batch, int Seq, int D) {
+    float *__restrict__ state_history, int Batch, int Seq, int D,
+    bool linear_readout) {
   extern __shared__ float smem[];   // [0,Seq) = a (decay prod), [Seq,2Seq) = b
   float *sa = smem;
   float *sb = smem + Seq;
@@ -558,7 +559,7 @@ __global__ void mamba_selective_scan_forward_parallel_kernel(
   if (state_history != nullptr) {
     state_history[idx] = h_t;
   }
-  y[idx] = tanhf(h_t) * C_in[idx];
+  y[idx] = (linear_readout ? h_t : tanhf(h_t)) * C_in[idx];
 }
 
 // Runtime toggle (default from NSOS_MAMBA_PARALLEL_SCAN).  Atomic so a parity
@@ -596,7 +597,8 @@ void launch_mamba_selective_scan_forward(
     const size_t shmem = static_cast<size_t>(2) * static_cast<size_t>(Seq) *
                          sizeof(float);
     mamba_selective_scan_forward_parallel_kernel<<<blocks, threads, shmem>>>(
-        x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D);
+        x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D,
+        /*linear_readout=*/false);
     return;
   }
   const int threads = 256;
@@ -637,6 +639,19 @@ void launch_mamba_proper_scan_forward(
     int D) {
   const int total_channels = Batch * D;
   if (total_channels <= 0 || Seq <= 0) {
+    return;
+  }
+  // Opt-in O(log Seq) parallel-prefix scan (NSOS_MAMBA_PARALLEL_SCAN), same
+  // associative affine recurrence as the diagonal proper path but with the
+  // LINEAR readout.  Default OFF keeps the validated sequential kernel.
+  if (mamba_parallel_scan_enabled() && Seq <= 1024) {
+    const int threads = Seq;
+    const int blocks = total_channels;
+    const size_t shmem = static_cast<size_t>(2) * static_cast<size_t>(Seq) *
+                         sizeof(float);
+    mamba_selective_scan_forward_parallel_kernel<<<blocks, threads, shmem>>>(
+        x, dt, A, B_in, C_in, y, state_history, Batch, Seq, D,
+        /*linear_readout=*/true);
     return;
   }
   const int threads = 256;

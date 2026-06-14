@@ -30,14 +30,16 @@ Caminho host preservado como fallback (CPU) — mesma matemática.
 
 ## Oportunidades de melhoria (revisão — itens honestos, rastreados)
 
-1. **Parallel-prefix para o scan proper.** O kernel proper usa o scan sequencial
-   (paralelo sobre B·D canais). A recorrência é a MESMA afim do scan legado, que
-   já tem variante prefix `O(log Seq)`; estendê-la com readout linear acelera o
-   regime poucos-canais / sequência-longa (inferência batch=1). Hoje GPU porém
-   sequencial no tempo.
-2. **Kernel fundido de SiLU/dSiLU.** silu e sua derivada usam várias ops `Tensor`
-   elementwise (várias launches + temporários `ones`). Um kernel fundido cortaria
-   launches e alocações no forward/backward da via proper.
+1. **Parallel-prefix para o scan proper — FEITO.** O kernel Hillis-Steele afim já
+   validado ganhou o readout linear (flag `linear_readout`) e
+   `launch_mamba_proper_scan_forward` roteia para ele sob `NSOS_MAMBA_PARALLEL_SCAN`
+   (Seq≤1024): forward `O(log Seq)` para a via diagonal proper. Default OFF mantém
+   o kernel sequencial como referência; validar paridade no T4. (Backward proper
+   segue sequencial — paraleliza sobre B·D canais, que satura no treino.)
+2. **Kernel fundido de SiLU/dSiLU — micro-opt documentada.** silu e sua derivada
+   usam ops `Tensor` elementwise (já GPU). Fundir num kernel único cortaria
+   ~poucas launches por silo; ganho marginal, deixado como opt futura (não vale
+   CUDA adicional não-testável localmente para ganho negligível).
 3. **Determinismo na via proper-GPU.** A conv1d-backward (`grad_in`/`grad_weight`)
    e o `grad_A` do scan usam `atomicAdd` (não-determinístico). `NSOS_DETERMINISTIC`
    AINDA NÃO roteia a via proper-GPU para host (o caminho host já é determinístico).
