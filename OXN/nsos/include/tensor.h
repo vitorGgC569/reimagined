@@ -5,6 +5,7 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <cstdint>
 #include "nsos_config.h"
 
 #ifdef USE_CUDA
@@ -86,7 +87,12 @@ class Tensor {
 public:
     std::shared_ptr<float> data_ptr;
     TensorShape shape;
-    int size;
+    // Element count.  int64_t (not int) so the type itself never silently
+    // truncates numel() (size_t).  Construction is still bounded by
+    // checked_tensor_size (rejects numel > INT_MAX) so existing index
+    // arithmetic stays valid and no behavior changes; the wider type is the
+    // forward-compatible foundation for lifting that cap later.
+    int64_t size;
     Device device;
     std::shared_ptr<Tensor> grad;
 

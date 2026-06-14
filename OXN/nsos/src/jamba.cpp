@@ -1464,6 +1464,22 @@ JambaBlock::JambaBlock(int dm,
         config.recompute_ssd = use_gradient_checkpointing;
         config.save_intermediates = !use_gradient_checkpointing;
         config.max_seq_for_storage = use_gradient_checkpointing ? 512 : 2048;
+        // Opt-in corrected selective SSM (independent delta/B/C/z projections +
+        // causal conv1d + single-C readout + SiLU gate).  Default OFF preserves
+        // the historical path and existing checkpoints byte-for-byte.  Read per
+        // construction (not static) so an A/B harness can flip it between model
+        // builds in one process — mirrors NSOS_MAMBA_A_LOGSPACED.
+        // See docs and Mamba2SSD::forward_proper.
+        if (const char* e = std::getenv("NSOS_MAMBA_PROPER_SSM");
+            e != nullptr && e[0] == '1') {
+            config.proper_selective_ssm = true;
+            if (const char* k = std::getenv("NSOS_MAMBA_CONV_K"); k != nullptr) {
+                const int kv = std::atoi(k);
+                if (kv >= 1 && kv <= 16) {
+                    config.conv_kernel = kv;
+                }
+            }
+        }
         mamba_layer = std::make_unique<Mamba2SSD>(dm, std::max(dm / 2, 8),
                                                   std::max(dm / 16, 1), config);
     }
@@ -1801,6 +1817,14 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
 }
 #endif  // USE_CUDA
 
+static bool moe_router_grad_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("NSOS_MOE_ROUTER_GRAD");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string& ln) {
     (void)ctx;
     (void)ln;
@@ -1839,10 +1863,15 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
     // on contiguous slices of the permuted input.  This eliminates the
     // ~rows × num_experts host-side bookkeeping that used to dominate
     // forward_moe wall-time at batch_size > 3.
+    // Deterministic mode uses the ordered per-expert path below (its scatter is
+    // a sequence of non-overlapping row copies summed in fixed expert order),
+    // not the batched scatter-add kernel.
     if (target_device == Device::GPU &&
         weights.get_device() == Device::GPU &&
         gpu_custom_kernels_supported() && rows > 0 && num_experts > 0 &&
-        num_experts <= 1024 && dim > 0) {
+        num_experts <= 1024 && dim > 0 &&
+        !determinism::deterministic_reductions_enabled() &&
+        !moe_router_grad_enabled()) {
         return forward_moe_gpu_batched(x, weights, rows, dim,
                                         effective_top_k);
     }
@@ -1857,6 +1886,11 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
     // that don't receive any rows in this forward pass; backward
     // checks size > 0 before applying squared_relu_backward.
     saved_moe_pre_activations_.assign(static_cast<size_t>(num_experts), Tensor());
+    if (moe_router_grad_enabled()) {
+        saved_moe_expert_out_.assign(static_cast<size_t>(num_experts), Tensor());
+    } else {
+        saved_moe_expert_out_.clear();
+    }
     std::vector<int> ranked_experts(static_cast<size_t>(num_experts));
     std::iota(ranked_experts.begin(), ranked_experts.end(), 0);
 
@@ -1916,6 +1950,11 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
         saved_moe_pre_activations_[static_cast<size_t>(expert_idx)] = expert_pre_activation;
         Tensor expert_hidden = expert_pre_activation.squared_relu();
         Tensor expert_out = expert_down[expert_idx]->forward(expert_hidden);
+        if (moe_router_grad_enabled()) {
+            // Save the UNSCALED expert output so backward can form
+            // g_w[r,e] = sum_dim(dy[r] * expert_out_e[r]) for the router grad.
+            saved_moe_expert_out_[static_cast<size_t>(expert_idx)] = expert_out;
+        }
         std::vector<float> selected_weights(selected_rows.size(), 0.0f);
         for (size_t local_row = 0; local_row < selected_rows.size(); ++local_row) {
             const int target_row = selected_rows[local_row];
@@ -2106,9 +2145,12 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
     const Device target_device = dy.get_device();
 
 #ifdef USE_CUDA
+    // Deterministic mode: the batched backward scatters grads via atomicAdd;
+    // use the ordered per-expert host-side accumulation below instead.
     if (target_device == Device::GPU && gpu_custom_kernels_supported() &&
         !saved_moe_rows_.empty() && saved_moe_weights_.size > 0 &&
-        num_experts > 0 && num_experts <= 1024 && x.shape.back() > 0) {
+        num_experts > 0 && num_experts <= 1024 && x.shape.back() > 0 &&
+        !determinism::deterministic_reductions_enabled()) {
         return backward_moe_gpu_batched(dy, x);
     }
 #endif
@@ -2203,6 +2245,37 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
                            static_cast<size_t>(dim) * sizeof(float));
         }
         grad_accum = grad_accum.add(expert_scatter);
+    }
+
+    // Task gradient to the router (opt-in): the forward scaled each expert's
+    // output by w[r,e], so dL/dw[r,e] = sum_dim(dy[r] * expert_out_e[r]).  Feed
+    // that to the router, which backprops through renorm(top-k(softmax)) into
+    // the gate.  Without this the router never learns from the task loss.
+    if (moe_router_grad_enabled() && router &&
+        saved_moe_expert_out_.size() == static_cast<size_t>(num_experts) &&
+        !saved_moe_rows_.empty()) {
+        Tensor dy_host = dy.get_device() == Device::GPU ? dy.cpu() : dy;
+        const float* dy_ptr = dy_host.data();
+        const int rows_total = dim > 0 ? dy_host.size / dim : 0;
+        Tensor g_w = Tensor::zeros({rows_total, num_experts}, Device::CPU);
+        float* gw = g_w.data();
+        for (int e = 0; e < num_experts; ++e) {
+            const Tensor& eo = saved_moe_expert_out_[static_cast<size_t>(e)];
+            const auto& rows_e = saved_moe_rows_[static_cast<size_t>(e)];
+            if (eo.size == 0 || rows_e.empty()) continue;
+            Tensor eo_host = eo.get_device() == Device::GPU ? eo.cpu() : eo;
+            const float* eo_ptr = eo_host.data();
+            for (size_t lr = 0; lr < rows_e.size(); ++lr) {
+                const int r = rows_e[lr];
+                if (r < 0 || r >= rows_total) continue;
+                double acc = 0.0;
+                const float* dyr = dy_ptr + static_cast<size_t>(r) * dim;
+                const float* eor = eo_ptr + lr * dim;
+                for (int d = 0; d < dim; ++d) acc += static_cast<double>(dyr[d]) * eor[d];
+                gw[static_cast<size_t>(r) * num_experts + e] = static_cast<float>(acc);
+            }
+        }
+        router->accumulate_task_router_grad(g_w);
     }
 
     return grad_accum;
@@ -4702,11 +4775,29 @@ MoERouter::MoERouter(int d_model_value, int n, int k)
       top_k(std::min(k, n)),
       aux_loss_coef(0.01f),
       expert_loads(n, 0.0f),
-      gate(std::make_unique<BitLinear>(d_model_value, n, false)) {}
+      gate(std::make_unique<BitLinear>(d_model_value, n, false)) {
+  // Opt-in full-precision router (NSOS_MOE_FP_ROUTER=1).  Routing is sensitive:
+  // under QAT a ternary gate yields coarse, unstable assignments (risk of expert
+  // collapse).  Marking the gate quantization-sensitive keeps it on the float
+  // reference path through QAT (the scheduler honors this flag — see
+  // bitlinear.h set_quantization_sensitive).  Default OFF preserves the
+  // historical ternary-under-QAT behavior byte-for-byte.  Pairs with the
+  // differentiable Switch aux-loss (NSOS_MOE_SWITCH_AUX, trainer.cpp).
+  if (const char* e = std::getenv("NSOS_MOE_FP_ROUTER");
+      e != nullptr && e[0] == '1') {
+    gate->set_quantization_sensitive(true);
+  }
+}
 
 std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
     Tensor logits = gate->forward(x);
     Tensor weights = logits.softmax(-1);
+
+    // Save the PRE-mask softmax probabilities (host copy) for the differentiable
+    // Switch aux loss.  Captured before top-k masking so it is the true routing
+    // distribution p[i,e].  Cheap (rows*num_experts floats); only read when the
+    // Switch aux path is enabled.
+    saved_probs_ = weights.get_device() == Device::GPU ? weights.cpu() : weights.clone();
 
     std::fill(expert_loads.begin(), expert_loads.end(), 0.0f);
     const int rows = x.size / x.shape.back();
@@ -4849,6 +4940,160 @@ float MoERouter::compute_aux_loss() {
         variance += diff * diff;
     }
     return aux_loss_coef * variance / static_cast<float>(expert_loads.size());
+}
+
+Tensor MoERouter::switch_aux_grad_logits(const Tensor& probs, int top_k,
+                                         float coef, float* out_loss) {
+    // probs: [T, N] pre-mask softmax (host or device).  Returns grad wrt the
+    // router logits [T, N].  L = coef·N·Σ_e f_e·P_e, with f_e the hard dispatch
+    // fraction (stop-grad) and P_e = mean_i p[i,e].
+    const int N = probs.shape.back();
+    const int T = N > 0 ? probs.size / N : 0;
+    Tensor grad = Tensor::zeros({std::max(T, 0), std::max(N, 0)}, Device::CPU);
+    if (out_loss) {
+        *out_loss = 0.0f;
+    }
+    if (T <= 0 || N <= 0) {
+        return grad;
+    }
+    const int k = std::clamp(top_k, 1, N);
+    Tensor probs_host = probs.get_device() == Device::GPU ? probs.cpu() : probs;
+    const float* p = probs_host.data();
+    float* gz = grad.data();
+
+    // Hard dispatch fraction f_e = (1/T) Σ_i 1[e ∈ topk(i)]  (treated as const).
+    std::vector<double> f(static_cast<size_t>(N), 0.0);
+    std::vector<int> ranked(static_cast<size_t>(N));
+    for (int i = 0; i < T; ++i) {
+        std::iota(ranked.begin(), ranked.end(), 0);
+        std::partial_sort(ranked.begin(), ranked.begin() + k, ranked.end(),
+                          [&](int a, int b) {
+                              return p[static_cast<size_t>(i) * N + a] >
+                                     p[static_cast<size_t>(i) * N + b];
+                          });
+        for (int r = 0; r < k; ++r) {
+            f[static_cast<size_t>(ranked[static_cast<size_t>(r)])] += 1.0;
+        }
+    }
+    for (int e = 0; e < N; ++e) {
+        f[static_cast<size_t>(e)] /= static_cast<double>(T);
+    }
+
+    if (out_loss) {
+        std::vector<double> P(static_cast<size_t>(N), 0.0);
+        for (int i = 0; i < T; ++i) {
+            for (int e = 0; e < N; ++e) {
+                P[static_cast<size_t>(e)] += p[static_cast<size_t>(i) * N + e];
+            }
+        }
+        double L = 0.0;
+        for (int e = 0; e < N; ++e) {
+            P[static_cast<size_t>(e)] /= static_cast<double>(T);
+            L += f[static_cast<size_t>(e)] * P[static_cast<size_t>(e)];
+        }
+        *out_loss = static_cast<float>(static_cast<double>(coef) * N * L);
+    }
+
+    // grad_z[i,e] = (coef·N/T)·p[i,e]·(f_e − Σ_e' f_e'·p[i,e']).
+    const double scale = static_cast<double>(coef) * static_cast<double>(N) /
+                         static_cast<double>(T);
+    for (int i = 0; i < T; ++i) {
+        double dot = 0.0;
+        for (int e = 0; e < N; ++e) {
+            dot += f[static_cast<size_t>(e)] * p[static_cast<size_t>(i) * N + e];
+        }
+        for (int e = 0; e < N; ++e) {
+            const size_t idx = static_cast<size_t>(i) * N + e;
+            gz[idx] = static_cast<float>(scale * p[idx] *
+                                         (f[static_cast<size_t>(e)] - dot));
+        }
+    }
+    return grad;
+}
+
+float MoERouter::accumulate_switch_aux_grad(float coef) {
+    if (!gate || saved_probs_.size == 0 || coef == 0.0f) {
+        return 0.0f;
+    }
+    float loss = 0.0f;
+    Tensor grad_z = switch_aux_grad_logits(saved_probs_, top_k, coef, &loss);
+    // Backprop the aux grad through the gate (accumulates the gate's weight
+    // grads).  The returned input-gradient is intentionally discarded: the
+    // load-balancing signal shapes the router, the standard Switch treatment.
+    if (gate->weight.data.size > 0 &&
+        gate->weight.data.get_device() != grad_z.get_device()) {
+        grad_z = grad_z.to(gate->weight.data.get_device());
+    }
+    (void)gate->backward(grad_z);
+    return loss;
+}
+
+Tensor MoERouter::router_grad_logits(const Tensor& probs, const Tensor& g_w,
+                                     int top_k) {
+    // probs,g_w: [T,N] host.  Returns dL/dlogits [T,N] from backprop through
+    // renorm(top-k(softmax)): for the kept set K with S=sum_{e in K} p_e,
+    //   w_e = p_e/S
+    //   g_p_j = (1/S)(g_w_j - sum_{e in K} g_w_e w_e)   (j in K, else 0)
+    //   g_z_i = p_i (g_p_i - sum_j p_j g_p_j)           (softmax jacobian)
+    const int N = probs.shape.back();
+    const int T = N > 0 ? probs.size / N : 0;
+    Tensor grad = Tensor::zeros({std::max(T, 0), std::max(N, 0)}, Device::CPU);
+    if (T <= 0 || N <= 0) {
+        return grad;
+    }
+    const int k = std::clamp(top_k, 1, N);
+    Tensor probs_host = probs.get_device() == Device::GPU ? probs.cpu() : probs;
+    Tensor gw_host = g_w.get_device() == Device::GPU ? g_w.cpu() : g_w;
+    const float* p = probs_host.data();
+    const float* gw = gw_host.data();
+    float* gz = grad.data();
+    std::vector<int> ranked(static_cast<size_t>(N));
+    std::vector<float> gp(static_cast<size_t>(N));
+    for (int i = 0; i < T; ++i) {
+        const size_t base = static_cast<size_t>(i) * N;
+        std::iota(ranked.begin(), ranked.end(), 0);
+        std::partial_sort(ranked.begin(), ranked.begin() + k, ranked.end(),
+                          [&](int a, int b) { return p[base + a] > p[base + b]; });
+        double S = 0.0;
+        for (int r = 0; r < k; ++r) S += p[base + ranked[static_cast<size_t>(r)]];
+        if (S <= 0.0) continue;
+        // weighted sum_{e in K} g_w_e * w_e
+        double gw_dot_w = 0.0;
+        for (int r = 0; r < k; ++r) {
+            const int e = ranked[static_cast<size_t>(r)];
+            const double w_e = p[base + e] / S;
+            gw_dot_w += gw[base + e] * w_e;
+        }
+        std::fill(gp.begin(), gp.end(), 0.0f);
+        for (int r = 0; r < k; ++r) {
+            const int j = ranked[static_cast<size_t>(r)];
+            gp[static_cast<size_t>(j)] =
+                static_cast<float>((gw[base + j] - gw_dot_w) / S);
+        }
+        // softmax backward: g_z_i = p_i (g_p_i - sum_j p_j g_p_j)
+        double p_dot_gp = 0.0;
+        for (int j = 0; j < N; ++j) p_dot_gp += p[base + j] * gp[static_cast<size_t>(j)];
+        for (int idx = 0; idx < N; ++idx) {
+            gz[base + idx] = static_cast<float>(
+                p[base + idx] * (gp[static_cast<size_t>(idx)] - p_dot_gp));
+        }
+    }
+    return grad;
+}
+
+void MoERouter::accumulate_task_router_grad(const Tensor& g_w) {
+    if (!gate || saved_probs_.size == 0 || g_w.size == 0) {
+        return;
+    }
+    Tensor g_logits = router_grad_logits(saved_probs_, g_w, top_k);
+    if (gate->weight.data.size > 0 &&
+        gate->weight.data.get_device() != g_logits.get_device()) {
+        g_logits = g_logits.to(gate->weight.data.get_device());
+    }
+    // Accumulates the gate's weight grads.  The input-gradient (dL/dx via the
+    // routing path) is intentionally discarded here — the dominant dL/dx flows
+    // through the expert paths; this term primarily trains the router.
+    (void)gate->backward(g_logits);
 }
 
 std::vector<int> D2FDecoder::generate(

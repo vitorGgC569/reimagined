@@ -184,7 +184,43 @@ public:
   float aux_loss_coef;
   std::vector<float> expert_loads;
   float compute_aux_loss();
+  // ── Differentiable Switch-Transformer load-balancing aux loss ────────────
+  // The legacy load balancing (trainer.cpp apply_moe_aux_regularization) adds a
+  // constant per expert row to the gate gradient — NOT the gradient of any loss,
+  // and largely a no-op once the gate is ternary.  This computes the proper
+  // Switch aux loss  L = coef·N·Σ_e f_e·P_e  (f_e = hard dispatch fraction,
+  // P_e = mean routing prob) and its EXACT gradient w.r.t. the router logits,
+  // then backpropagates it through the gate (accumulating gate weight grads).
+  // Returns the aux loss value (for logging).  Requires a prior forward()
+  // (uses the saved pre-mask softmax probabilities).  Opt-in via the trainer.
+  float accumulate_switch_aux_grad(float coef);
+  // Pure, testable core: given pre-mask softmax probs [T, N] and the active
+  // top_k, returns the gradient of the Switch aux loss w.r.t. the logits
+  // (same shape) and writes the loss value to *out_loss if non-null.  f_e uses
+  // a stop-gradient hard top-k count (standard).  Finite-difference gradchecked
+  // in tests/test_gradcheck.cpp.
+  static Tensor switch_aux_grad_logits(const Tensor &probs, int top_k,
+                                       float coef, float *out_loss);
+  // ── Task gradient to the router (opt-in NSOS_MOE_ROUTER_GRAD) ─────────────
+  // The forward scales each expert output by its routing weight w[r,e], but the
+  // legacy backward never propagated dL/dw to the gate — so the router learned
+  // ONLY from the (aux) balancing term, never from the task loss.  Given
+  // g_w[r,e] = sum_dim(dy[r]·expert_out_e[r]) (the gradient w.r.t. the routing
+  // weights, supplied by the block), this backprops through the top-k
+  // renormalization and the softmax to the logits and into the gate.  Default
+  // OFF preserves the historical behavior.
+  void accumulate_task_router_grad(const Tensor &g_w);
+  // Pure, testable core: gradient of the routing weights w.r.t. the logits,
+  // given pre-mask softmax probs [T,N], the upstream g_w [T,N] and top_k.
+  // Backprops renorm(top-k(softmax)).  Finite-difference gradchecked.
+  static Tensor router_grad_logits(const Tensor &probs, const Tensor &g_w,
+                                   int top_k);
   std::unique_ptr<BitLinear> gate, shared_expert_gate, shared_expert_up, shared_expert_down;
+
+private:
+  // Pre-mask softmax routing probabilities from the last forward (host copy),
+  // needed by accumulate_switch_aux_grad.  Empty until the first forward.
+  Tensor saved_probs_;
 };
 
 class JambaBlock {
@@ -288,6 +324,11 @@ private:
   // This vector is sized to num_experts and only the entries that
   // actually got non-empty input during forward are populated.
   std::vector<Tensor> saved_moe_pre_activations_;
+  // Task-router-grad (NSOS_MOE_ROUTER_GRAD): per-expert UNSCALED output rows
+  // saved by forward_moe, so backward can form g_w[r,e] = sum_dim(dy[r] *
+  // expert_out_e[r]).  Only populated on the non-batched path when the flag is
+  // on; empty otherwise (zero overhead).
+  std::vector<Tensor> saved_moe_expert_out_;
   // AUDIT #4+#5: cache of GPU routing outputs.  Forward populates
   // these from the device buffers (one small D2H copy each).  Backward
   // reuses them instead of re-launching the count/scan/assignment

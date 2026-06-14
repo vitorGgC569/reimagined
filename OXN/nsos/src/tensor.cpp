@@ -2058,7 +2058,7 @@ std::pair<float, Tensor> Tensor::mse_loss(const Tensor& target) const {
     float* grad_ptr = grad.data();
     float loss = 0.0f;
 
-    float inv_size = 1.0f / std::max(size, 1);
+    float inv_size = 1.0f / static_cast<float>(std::max<int64_t>(size, 1));
     for (int i = 0; i < size; ++i) {
         float diff = src[i] - tgt[i];
         loss += diff * diff;
@@ -2081,7 +2081,7 @@ void Tensor::print(const std::string& name, int max_elements) const {
     }
     std::cout << "] Device: " << (device == Device::CPU ? "CPU" : "GPU");
     std::cout << " Values: ";
-    int limit = std::min(size, max_elements);
+    int limit = static_cast<int>(std::min<int64_t>(size, max_elements));
     for (int i = 0; i < limit; ++i) {
         if (i) {
             std::cout << ", ";

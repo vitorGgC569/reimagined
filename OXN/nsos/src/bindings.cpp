@@ -106,6 +106,15 @@ PYBIND11_MODULE(nsos_ext, m) {
     m.def("get_determinism_report", []() {
         return determinism::DeterminismManager::instance().get_determinism_report();
     });
+    // Opt-in bit-reproducible gradients (NSOS_DETERMINISTIC).  Routes the
+    // atomicAdd GPU fast-paths (Mamba grad_A, embedding scatter, MoE scatter)
+    // to their ordered host/per-expert implementations.  Toggle at runtime.
+    m.def("set_deterministic_reductions", [](bool enabled) {
+        determinism::set_deterministic_reductions(enabled);
+    });
+    m.def("deterministic_reductions_enabled", []() {
+        return determinism::deterministic_reductions_enabled();
+    });
 
     // Mixed-precision GEMM control (BF16/FP16 Tensor Cores on sm_75+).
     // 0=FP32 (default), 1=BF16, 2=FP16.  Master weights/optimizer stay FP32;
@@ -270,6 +279,7 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_property_readonly("base_name", [](const Parameter& parameter) { return parameter.base_name; })
         .def_readwrite("data", &Parameter::data)
         .def_readwrite("grad", &Parameter::grad)
+        .def_readwrite("name", &Parameter::name)
         .def("zero_grad", &Parameter::zero_grad);
 
     py::class_<TensorAuditStats>(m, "TensorAuditStats")
@@ -553,6 +563,16 @@ PYBIND11_MODULE(nsos_ext, m) {
         // callback per step.
         .def("train_step", &Trainer::train_step,
              py::call_guard<py::gil_scoped_release>())
+        // Gradients-only (no optimizer step) — for the criticality instrument's
+        // per-layer gradient SNR / backward-Lyapunov probe (OXTA-CRIT §6).
+        .def("accumulate_gradients", &Trainer::accumulate_gradients,
+             py::arg("tokens"), py::arg("targets"),
+             py::call_guard<py::gil_scoped_release>())
+        // §6 closed loop: per-layer lr multiplier (DEPTH axis from the Python
+        // SNR instrument; SPACE axis is the in-loop C++ NSOS_CRIT_LR controller).
+        .def("set_lr_scale_by_name", &Trainer::set_lr_scale_by_name,
+             py::arg("name"), py::arg("scale"))
+        .def("clear_lr_scales", &Trainer::clear_lr_scales)
         .def("train_supervised",
              &Trainer::train_supervised,
              py::arg("prompt_tokens"),

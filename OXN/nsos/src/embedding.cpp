@@ -1,6 +1,7 @@
 #include "embedding.h"
 #include "../include/nsos_config.h"  // NSOS_DEFAULT_EPSILON for Slender quantization
 #include "../include/rierass_core.h"
+#include "../include/nsos/determinism.h"  // deterministic_reductions_enabled()
 #include <algorithm>                  // std::max for Slender per-token reductions
 #include <cmath>
 #include <cstdint>                    // int8_t for Slender ternary weights
@@ -384,7 +385,10 @@ void Embedding::backward_batch(const Tensor& grad_output,
   }
 
 #ifdef USE_CUDA
-  if (weight.data.get_device() == Device::GPU) {
+  // Deterministic mode skips the atomicAdd scatter kernel and uses the ordered
+  // host accumulation below (device-safe: it copies the grad to host first).
+  if (weight.data.get_device() == Device::GPU &&
+      !determinism::deterministic_reductions_enabled()) {
     Tensor grad_device =
         grad_output.get_device() == Device::GPU ? grad_output : grad_output.to(Device::GPU);
     Tensor d_w = Tensor::zeros(weight.data.shape, Device::GPU);
@@ -404,7 +408,11 @@ void Embedding::backward_batch(const Tensor& grad_output,
   }
 #endif
 
-  Tensor grad_host = grad_output;
+  // Device-safe: copy a GPU grad to host so the ordered (deterministic) scatter
+  // loop below can read it.  weight.add_grad(d_w_host) moves the result back to
+  // the weight's device.
+  Tensor grad_host =
+      grad_output.get_device() == Device::GPU ? grad_output.cpu() : grad_output;
   Tensor d_w_host = Tensor::zeros(weight.data.shape, Device::CPU);
   float *dw_ptr = d_w_host.data();
   const float *go_ptr = grad_host.data();

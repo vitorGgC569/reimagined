@@ -22,7 +22,7 @@ uint64_t hash_tensor_state(const Tensor& tensor) {
   uint64_t hash = kOffset;
   const float* data = tensor.data();
   if (data != nullptr) {
-    const int sample_count = std::min(tensor.size, 128);
+    const int sample_count = static_cast<int>(std::min<int64_t>(tensor.size, 128));
     for (int i = 0; i < sample_count; ++i) {
       const auto* bytes = reinterpret_cast<const unsigned char*>(&data[i]);
       for (size_t j = 0; j < sizeof(float); ++j) {
@@ -60,7 +60,7 @@ void ReasoningNode::init(const Tensor &s, float p, ReasoningNode *par, int d) {
   state_hash = 0;
   const float *data = s.data();
   if (data) {
-    for (int i = 0; i < std::min(s.size, 100); ++i) { // Sample para eficiência
+    for (int i = 0; i < std::min<int64_t>(s.size, 100); ++i) { // Sample para eficiência
       state_hash = state_hash * 31 + std::hash<float>{}(data[i]);
     }
   }
@@ -557,7 +557,7 @@ std::vector<ReasoningNode *> MCTSReasoning::expand_children(ReasoningNode *node)
     uint64_t hash = 0;
     const float *data = child_states[k].data();
     if (data) {
-      for (int i = 0; i < std::min(child_states[k].size, 100); ++i) {
+      for (int i = 0; i < std::min<int64_t>(child_states[k].size, 100); ++i) {
         hash = hash * 31 + std::hash<float>{}(data[i]);
       }
     }

@@ -234,7 +234,7 @@ Tensor TTTLayer::backward(const Tensor& g) {
         throw std::runtime_error("TTTLayer backward called before forward");
     }
 
-    Tensor grad_2d = g.shape.size() == 2 ? g : g.reshape({g.size / dim, dim});
+    Tensor grad_2d = g.shape.size() == 2 ? g : g.reshape({static_cast<int>(g.size / dim), dim});
     if (grad_2d.shape[1] != dim) {
         throw std::runtime_error("TTTLayer grad output must end with dim");
     }

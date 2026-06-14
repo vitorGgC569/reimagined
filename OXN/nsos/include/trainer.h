@@ -82,6 +82,31 @@ public:
     std::unordered_map<Parameter*, Tensor> v_state;
     // 4-bit packed Adam state (used when optimizer_state_bits == 4).
     std::unordered_map<Parameter*, Quant4OptState> quant_state;
+    // OXTA-CRIT Lei 1 — baseline do ganho de ramo ternário g0 por Parameter,
+    // capturado na 1a visita do controlador de criticalidade
+    // (apply_criticality_regularization).  Antes era um std::unordered_map
+    // STATIC dentro da função (process-wide): o baseline VAZAVA entre runs e
+    // entre instâncias de Trainer no mesmo processo — quebrando braços A/B e
+    // qualquer teste que construísse dois modelos.  Mantido per-instância junto
+    // de m_state/v_state para que cada Trainer tenha sua própria linha de base.
+    std::unordered_map<Parameter*, float> crit_g0_state;
+
+    // OXTA-CRIT §6 closed loop — per-parameter learning-rate multiplier.  The
+    // optimizer multiplies the global lr by this factor per parameter (default
+    // 1.0 when absent), so a controller can give each layer its own effective
+    // step size.  Two producers: (1) the in-loop C++ branch-gain controller
+    // (NSOS_CRIT_LR=1, SPACE axis); (2) the Python SNR instrument pushing
+    // lr_l ∝ r_l^γ via set_lr_scale_by_name (DEPTH axis / backward Lyapunov).
+    // Empty by default -> exact previous behavior (and the fused GPU optimizer
+    // stays enabled; it is bypassed only when this map is non-empty).
+    std::unordered_map<Parameter*, float> per_param_lr_scale;
+    float lr_scale_for(Parameter* p) const {
+        auto it = per_param_lr_scale.find(p);
+        return it == per_param_lr_scale.end() ? 1.0f : it->second;
+    }
+    void set_lr_scale_by_name(const std::string& name, float scale);
+    void clear_lr_scales() { per_param_lr_scale.clear(); }
+
     TrainPhaseScheduler phase_scheduler;
     AuxiliaryStackStats last_auxiliary_stats;
     Trainer(JambaModel* m, float lr = 0.001f);
@@ -91,6 +116,13 @@ public:
     bool progressive_qat_active() const;
     
     float train_step(const std::vector<int>& tokens, const std::vector<int>& targets);
+    // Forward + loss + backward WITHOUT the optimizer step.  Leaves the freshly
+    // computed gradients in the parameters (zeroes them first, like train_step)
+    // so an external instrument can read them — used by the per-layer gradient
+    // SNR / backward-Lyapunov probe (criticality instrument, OXTA-CRIT §6).
+    // Returns the loss.  Does NOT mutate weights or optimizer (m/v) state.
+    float accumulate_gradients(const std::vector<int>& tokens,
+                               const std::vector<int>& targets);
     float train_supervised(const std::vector<int>& prompt_tokens,
                            const std::vector<int>& answer_tokens);
     float train_supervised_batch(const std::vector<std::vector<int>>& prompt_batch,

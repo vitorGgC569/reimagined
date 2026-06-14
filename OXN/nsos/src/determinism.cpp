@@ -1,9 +1,29 @@
 #include "nsos/determinism.h"
+#include <atomic>
+#include <cstdlib>
 #include <iomanip>
 #include <sstream>
 
 namespace nsos {
 namespace determinism {
+
+// -1 = not yet read from env; 0/1 = explicit.  Atomic so it is safe to query
+// from any thread on the training hot path.
+static std::atomic<int> g_deterministic_reductions{-1};
+
+bool deterministic_reductions_enabled() {
+  int v = g_deterministic_reductions.load(std::memory_order_relaxed);
+  if (v < 0) {
+    const char *e = std::getenv("NSOS_DETERMINISTIC");
+    v = (e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T')) ? 1 : 0;
+    g_deterministic_reductions.store(v, std::memory_order_relaxed);
+  }
+  return v != 0;
+}
+
+void set_deterministic_reductions(bool enabled) {
+  g_deterministic_reductions.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
 
 DeterminismManager &DeterminismManager::instance() {
   static DeterminismManager instance;

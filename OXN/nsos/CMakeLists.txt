@@ -428,6 +428,14 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_kan PRIVATE nsos_core)
     add_test(NAME test_kan COMMAND test_kan)
 
+    # Finite-difference gradient gate: proves every hand-derived backward (the
+    # shared tensor bricks + Mamba2 SSD + KAN) matches the numerical gradient.
+    # No generic autograd exists, so this is the safety net against silent
+    # chain-rule bugs.  Product release gate.
+    add_executable(test_gradcheck tests/test_gradcheck.cpp)
+    target_link_libraries(test_gradcheck PRIVATE nsos_core)
+    add_test(NAME test_gradcheck COMMAND test_gradcheck)
+
     # 4-bit optimizer states (Li et al. 2023): roundtrip error, zero-point
     # robustness of v, end-to-end Adam parity vs FP32, ~8x memory saving.
     add_executable(test_optimizer_4bit tests/test_optimizer_4bit.cpp)

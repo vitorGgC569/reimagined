@@ -709,8 +709,23 @@ void apply_moe_aux_regularization(Trainer& trainer) {
         return;
     }
 
+    // Opt-in: differentiable Switch-Transformer aux loss instead of the legacy
+    // constant-per-row heuristic.  The heuristic is not the gradient of any loss
+    // and is largely a no-op once the gate is ternary; the Switch path computes
+    // the exact gradient w.r.t. the router logits and backprops it through the
+    // gate.  Default OFF preserves the historical behavior byte-for-byte.
+    static const bool switch_aux = [] {
+        const char* e = std::getenv("NSOS_MOE_SWITCH_AUX");
+        return e != nullptr && e[0] == '1';
+    }();
+
     for (auto& layer : trainer.model->layers) {
         if (!layer || !layer->router || !layer->router->gate) {
+            continue;
+        }
+        if (switch_aux) {
+            layer->router->accumulate_switch_aux_grad(
+                layer->router->aux_loss_coef * trainer.moe_aux_loss_scale);
             continue;
         }
         auto& loads = layer->router->expert_loads;
@@ -903,7 +918,9 @@ void apply_criticality_regularization(Trainer& trainer,
     if (trainer.global_step_count % every != 0) {
         return;
     }
-    static std::unordered_map<Parameter*, float> g0_map;
+    // Baseline g0 per-instância (era static process-wide — vazava entre runs e
+    // instâncias).  Vive no Trainer junto de m_state/v_state.
+    std::unordered_map<Parameter*, float>& g0_map = trainer.crit_g0_state;
 
     for (auto* p : params) {
         if (!p || p->data.size == 0 || p->data.shape.size() != 2) continue;
@@ -936,6 +953,52 @@ void apply_criticality_regularization(Trainer& trainer,
         if (std::fabs(log_c) < 1e-5f) continue;
         scale_tensor_inplace(p->data, std::exp(log_c));
         p->mark_updated();
+    }
+}
+
+// OXTA-CRIT §6 — in-loop SPACE-axis learning-rate controller (opt-in
+// NSOS_CRIT_LR=1).  Sets a per-parameter lr multiplier that nudges each rank-2
+// layer toward the critical branch gain g~1: g>1 (over-amplifying) -> lr<1,
+// g<1 (contracting) -> lr>1, with scale = clamp((g_target/g)^eta, 0.5, 2.0).
+// When enabled it OWNS per_param_lr_scale (re-set each step).  For a full
+// 3-axis loop, the Python SNR instrument (DEPTH axis) can multiply on top via
+// set_lr_scale_by_name AFTER the step (documented in criticality_instrument.py).
+void apply_criticality_lr_control(Trainer& trainer,
+                                  const std::vector<Parameter*>& params) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("NSOS_CRIT_LR");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static const float eta = [] {
+        const char* e = std::getenv("NSOS_CRIT_LR_ETA");
+        const float v = e ? std::strtof(e, nullptr) : 0.25f;
+        return (v > 0.0f && v <= 1.0f) ? v : 0.25f;
+    }();
+    const float g_target = 1.0f, lo = 0.5f, hi = 2.0f;
+    for (auto* p : params) {
+        if (!p || p->data.size == 0 || p->data.shape.size() != 2) continue;
+        const int rows = p->data.shape[0];
+        const int cols = p->data.shape[1];
+        if (rows <= 1 || cols <= 1) continue;
+        Tensor host = p->data.get_device() == Device::GPU ? p->data.cpu() : p->data;
+        const float* w = host.data();
+        const int n = host.size;
+        double abs_sum = 0.0;
+        for (int i = 0; i < n; ++i) abs_sum += std::fabs(w[i]);
+        const float gamma = static_cast<float>(abs_sum / std::max(n, 1));
+        if (gamma <= 0.0f) continue;
+        int zeros = 0;
+        const float half_gamma = 0.5f * gamma;
+        for (int i = 0; i < n; ++i) zeros += (std::fabs(w[i]) < half_gamma) ? 1 : 0;
+        const float p0 = static_cast<float>(zeros) / static_cast<float>(n);
+        const float g = gamma * gamma * (1.0f - p0) * static_cast<float>(cols);
+        if (g <= 0.0f) continue;
+        float scale = std::pow(g_target / g, eta);
+        scale = std::clamp(scale, lo, hi);
+        trainer.per_param_lr_scale[p] = scale;
     }
 }
 
@@ -1107,8 +1170,14 @@ void apply_optimizer_step(Trainer& trainer,
                           const std::vector<Parameter*>& params,
                           int accumulation_steps,
                           float* grad_norm_out = nullptr) {
+    // §6 space-axis lr controller (opt-in NSOS_CRIT_LR).  Populates
+    // per_param_lr_scale when enabled, which also forces the per-parameter path
+    // below (the fused optimizer applies a single global lr and is bypassed
+    // whenever per-parameter lr scales are active).
+    apply_criticality_lr_control(trainer, params);
 #ifdef USE_CUDA
-    if (apply_optimizer_step_fused(trainer, params, accumulation_steps,
+    if (trainer.per_param_lr_scale.empty() &&
+        apply_optimizer_step_fused(trainer, params, accumulation_steps,
                                    grad_norm_out)) {
         apply_criticality_regularization(trainer, params);
         return;
@@ -1141,12 +1210,16 @@ void apply_optimizer_step(Trainer& trainer,
     for (auto* p : params) {
         if (!p || p->grad.size == 0) continue;
 
+        // §6 closed loop: effective lr = global lr * per-parameter scale
+        // (1.0 when no controller is active).
+        const float p_lr = cur_lr * trainer.lr_scale_for(p);
+
         // 4-bit optimizer states (CPU path).  GPU params fall through to the
         // FP32 launch_adamw_update_kernel path below until the 4-bit CUDA
         // kernel lands.
         if (trainer.optimizer_state_bits == 4 &&
             p->data.get_device() == Device::CPU) {
-            apply_adam_step_4bit(trainer, p, cur_lr, bc1, bc2);
+            apply_adam_step_4bit(trainer, p, p_lr, bc1, bc2);
             continue;
         }
 
@@ -1179,7 +1252,7 @@ void apply_optimizer_step(Trainer& trainer,
                 trainer.beta2,
                 bc1,
                 bc2,
-                cur_lr,
+                p_lr,
                 trainer.eps,
                 trainer.weight_decay,
                 should_apply_weight_decay(*p) ? 1 : 0);
@@ -1202,9 +1275,9 @@ void apply_optimizer_step(Trainer& trainer,
             const float v_hat = v[i] / bc2;
 
             if (trainer.weight_decay > 0.0f && should_apply_weight_decay(*p)) {
-                w[i] -= cur_lr * trainer.weight_decay * w[i];
+                w[i] -= p_lr * trainer.weight_decay * w[i];
             }
-            w[i] -= cur_lr * m_hat / (std::sqrt(v_hat) + trainer.eps);
+            w[i] -= p_lr * m_hat / (std::sqrt(v_hat) + trainer.eps);
         }
         p->mark_updated();
     }
@@ -1790,8 +1863,19 @@ bool Trainer::progressive_qat_active() const {
            global_step_count >= effective.qat_start_step;
 }
 
-float Trainer::train_step(const std::vector<int>& tokens,
-                          const std::vector<int>& targets) {
+void Trainer::set_lr_scale_by_name(const std::string& name, float scale) {
+    if (!model) {
+        return;
+    }
+    for (auto* p : model->parameters()) {
+        if (p && p->name == name) {
+            per_param_lr_scale[p] = scale;
+        }
+    }
+}
+
+float Trainer::accumulate_gradients(const std::vector<int>& tokens,
+                                    const std::vector<int>& targets) {
     if (!model) throw std::runtime_error("Trainer requires model");
     model->set_training_mode(true);
 
@@ -1840,10 +1924,20 @@ float Trainer::train_step(const std::vector<int>& tokens,
     model->backward_external(grad, ctx);
     apply_qat_regularization(*this);
     apply_moe_aux_regularization(*this);
+    return loss;
+}
+
+float Trainer::train_step(const std::vector<int>& tokens,
+                          const std::vector<int>& targets) {
+    // Gradients only (no weight update), then the optimizer step + audit.
+    // Factored so the criticality instrument can read gradients without
+    // mutating weights (Trainer::accumulate_gradients).  Behavior identical
+    // to the previous monolithic train_step.
+    const float loss = accumulate_gradients(tokens, targets);
+    auto params = model->parameters();
     float grad_norm = 0.0f;
     apply_optimizer_step(*this, params, 1, &grad_norm);
     record_training_audit_step(*this, loss, grad_norm, params.size());
-
     return loss;
 }
 

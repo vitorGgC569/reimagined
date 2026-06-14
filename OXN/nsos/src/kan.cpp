@@ -97,7 +97,7 @@ Tensor BitFastKANLayer::forward(const Tensor& x) {
     std::vector<int> output_shape = x.shape.dims;
     output_shape.back() = output_dim;
 
-    saved_input_ = x.shape.size() == 2 ? x : x.reshape({x.size / input_dim, input_dim});
+    saved_input_ = x.shape.size() == 2 ? x : x.reshape({static_cast<int>(x.size / input_dim), input_dim});
     saved_basis_ = compute_basis(saved_input_);
 
     Tensor base = saved_input_.matmul(base_weight.data.transpose());
@@ -112,7 +112,7 @@ Tensor BitFastKANLayer::backward(const Tensor& grad) {
     }
 
     Tensor grad_2d =
-        grad.shape.size() == 2 ? grad : grad.reshape({grad.size / output_dim, output_dim});
+        grad.shape.size() == 2 ? grad : grad.reshape({static_cast<int>(grad.size / output_dim), output_dim});
     if (grad_2d.shape[1] != output_dim) {
         throw std::runtime_error("BitFastKANLayer gradient dimension mismatch");
     }
