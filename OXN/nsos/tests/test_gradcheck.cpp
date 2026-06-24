@@ -406,6 +406,76 @@ void check_moe_router_grad() {
                    "moe router-grad d/dlogits", kTolStd);
 }
 
+// ── Module: ChrassLayer (sparse topological injection) ───────────────────────
+// Validates the CSR sparse-linear backward: dL/dx (via Wᵀ), dL/dW (the nnz
+// values) and dL/dbias.  Inputs/weights are kept small so the forward stays in
+// the linear band (|out| < 100) and the saturation mask is all-ones — i.e. we
+// gradcheck the differentiable regime the mask preserves.
+void check_chrass() {
+  const int dim = 8, batch = 3;
+  std::vector<float> adj = ChrassLayer::random_adjacency(dim, 0.5f, 1234u);
+  ChrassLayer layer(dim, adj);
+  fill_smooth(layer.values_param.data, 0.3f, 0.23f);
+  fill_smooth(layer.bias.data, 0.1f, 0.37f);
+
+  Tensor x({batch, dim});
+  fill_smooth(x, 0.5f, 0.31f);
+
+  auto loss_fn = [&]() { return sum_sq(layer.forward(x)); };
+
+  zero_all_grads(layer.parameters());
+  Tensor y = layer.forward(x);
+  Tensor dy = y.clone();
+  Tensor dx = layer.backward(dy, x);
+
+  // Snapshot param grads before the finite-difference forwards (backward resets
+  // values_param.grad each call, so the snapshot must precede any re-run).
+  std::vector<float> gW(static_cast<size_t>(layer.values_param.grad.size));
+  for (int i = 0; i < layer.values_param.grad.size; ++i)
+    gW[static_cast<size_t>(i)] = layer.values_param.grad.data()[i];
+  std::vector<float> gB(static_cast<size_t>(layer.bias.grad.size));
+  for (int i = 0; i < layer.bias.grad.size; ++i)
+    gB[static_cast<size_t>(i)] = layer.bias.grad.data()[i];
+
+  gradcheck_buffer(x.data(), x.size, dx.data(), loss_fn, "chrass d/dinput",
+                   kTolStd);
+  gradcheck_buffer(layer.values_param.data.data(), layer.values_param.data.size,
+                   gW.data(), loss_fn, "chrass d/dvalues", kTolStd);
+  gradcheck_buffer(layer.bias.data.data(), layer.bias.data.size, gB.data(),
+                   loss_fn, "chrass d/dbias", kTolStd);
+}
+
+// ── Module: exact GQA causal Attention (proj + RoPE + causal softmax) ────────
+// The most intricate hand-derived backward in the codebase (RoPE rotation,
+// causal softmax Jacobian, GQA head folding, q/kv/out projections).  On a CPU
+// build the exact-training path is pure host math.  We gradcheck the INPUT
+// gradient end-to-end — the chain the attention math is uniquely responsible
+// for (the projection weight grads go through BitLinear's reference path, which
+// test_bitlinear already gradchecks).  Tolerance is the scan band: the softmax
+// over the causal window compounds finite-difference truncation.
+void check_attention() {
+  const int d_model = 8, n_heads = 2, n_kv_heads = 2, seq = 4;
+  Attention attn(d_model, n_heads, /*n_latents=*/d_model, n_kv_heads);
+  attn.set_training_mode(true);
+  attn.set_exact_training_path(true);
+
+  Tensor x({seq, d_model});
+  fill_smooth(x, 0.5f, 0.29f);
+
+  auto loss_fn = [&]() {
+    Context c;
+    return sum_sq(attn.forward(x, &c));
+  };
+
+  Context ctx;
+  Tensor y = attn.forward(x, &ctx);
+  Tensor dy = y.clone();
+  Tensor dx = attn.backward(dy, &ctx);
+
+  gradcheck_buffer(x.data(), x.size, dx.data(), loss_fn, "attention d/dinput",
+                   kTolScan);
+}
+
 } // namespace
 
 int main() {
@@ -424,6 +494,8 @@ int main() {
   check_moe_switch_aux();
   check_moe_router_grad();
   check_kan();
+  check_chrass();
+  check_attention();
   if (g_failures != 0) {
     std::printf("\n[gradcheck] %d check(s) FAILED\n", g_failures);
     return 1;
