@@ -544,7 +544,10 @@ void scale_gradients(const std::vector<Parameter*>& params, float scale) {
 // gradient-norm reduction.  Allocated once so clip_gradients does not cudaMalloc
 // per step.
 float* clip_norm_accumulator() {
-    static float* d_accum = [] {
+    // thread_local: per-thread device scalar so concurrent optimizer/clip paths
+    // never share one accumulator (replica-safety; matches the tensor.cpp
+    // gemm/CE scratch rationale).
+    thread_local float* d_accum = [] {
         float* p = nullptr;
         if (cudaMalloc(&p, sizeof(float)) != cudaSuccess) {
             p = nullptr;
@@ -1016,8 +1019,8 @@ bool fused_optimizer_enabled() {
 // re-upload por step é obrigatório porque add_grad recria o tensor de grad
 // (ponteiro muda a cada backward) — ~30 KB H2D, custo ~µs.
 unsigned char* fused_opt_meta_buffer(size_t bytes) {
-    static unsigned char* buf = nullptr;
-    static size_t cap = 0;
+    thread_local unsigned char* buf = nullptr;
+    thread_local size_t cap = 0;
     if (bytes == 0) return nullptr;
     if (bytes > cap) {
         if (buf) cudaFree(buf);

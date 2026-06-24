@@ -693,7 +693,9 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
     Tensor g_C = Tensor::zeros(std::vector<int>{rows, dim}, dev);
     Tensor grad_A = Tensor::zeros({dim}, dev);
 #ifdef USE_CUDA
-    if (dev == Device::GPU) {
+    // Deterministic mode: the GPU scan backward accumulates grad_A via atomicAdd
+    // (order-nondeterministic); fall to the ordered host loop below.
+    if (dev == Device::GPU && !determinism::deterministic_reductions_enabled()) {
         cuda::launch_mamba_proper_scan_backward(
             g_yssd.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
             A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
@@ -751,7 +753,7 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
     Tensor grad_xv = Tensor::zeros(std::vector<int>{rows, dim}, dev);
     Tensor grad_conv_w = Tensor::zeros({dim, K}, dev);
 #ifdef USE_CUDA
-    if (dev == Device::GPU) {
+    if (dev == Device::GPU && !determinism::deterministic_reductions_enabled()) {
         cuda::launch_conv1d_causal_backward(
             grad_conv_pre.raw_data(), pp_xv_.raw_data(),
             conv_weight_.data.raw_data(), grad_xv.raw_data(),
@@ -949,7 +951,8 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
     Tensor gA(std::vector<int>{H}, dev);
     bool nstate_bwd_done = false;
 #ifdef USE_CUDA
-    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n()) {
+    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n() &&
+        !determinism::deterministic_reductions_enabled()) {
         cuda::launch_mamba_nstate_backward(
             g_yssd.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
             A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
@@ -1037,7 +1040,7 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
     Tensor grad_xv = Tensor::zeros(std::vector<int>{rows, dim}, dev);
     Tensor grad_conv_w = Tensor::zeros({dim, K}, dev);
 #ifdef USE_CUDA
-    if (dev == Device::GPU) {
+    if (dev == Device::GPU && !determinism::deterministic_reductions_enabled()) {
         cuda::launch_conv1d_causal_backward(
             grad_conv_pre.raw_data(), pp_xv_.raw_data(),
             conv_weight_.data.raw_data(), grad_xv.raw_data(),

@@ -219,8 +219,13 @@ struct GemmLowpWorkspace {
 // We never free these on shutdown — CUDA context teardown reclaims
 // the memory, and freeing static buffers during destruction risks
 // touching an already-torn-down CUDA context.
+// thread_local (not a single static): the HTTP server runs concurrent
+// inference replicas, each on its own worker thread.  A shared static would let
+// two threads cudaFree/cudaMalloc/cast into the same staging buffers at once
+// (use-after-free / wrong results).  Per-thread instances make the mixed-
+// precision GEMM path replica-safe; single-threaded training is unaffected.
 GemmLowpWorkspace& gemm_lowp_workspace() {
-    static GemmLowpWorkspace ws;
+    thread_local GemmLowpWorkspace ws;
     return ws;
 }
 
@@ -1937,7 +1942,9 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const 
 // (all synchronizing) -> ~4*batch alloc syncs/step.  Reused buffers remove that.
 // Single-threaded training use (the only caller).
 static float* ce_loss_scratch() {
-    static float* p = [] {
+    // thread_local: per-thread device scratch so concurrent callers never share
+    // the same buffer (matches gemm_lowp_workspace's replica-safety rationale).
+    thread_local float* p = [] {
         float* q = nullptr;
         if (cudaMalloc(&q, sizeof(float)) != cudaSuccess) {
             q = nullptr;
@@ -1948,8 +1955,8 @@ static float* ce_loss_scratch() {
     return p;
 }
 static int* ce_target_scratch(int rows) {
-    static int* p = nullptr;
-    static int cap = 0;
+    thread_local int* p = nullptr;
+    thread_local int cap = 0;
     if (rows <= 0) return nullptr;
     if (rows > cap) {
         if (p) cudaFree(p);

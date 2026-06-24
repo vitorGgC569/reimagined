@@ -167,7 +167,7 @@ __global__ void moe_exclusive_scan_small_kernel(
   const int tid = threadIdx.x;
   if (tid < num_experts) {
     s_data[tid] = counts[tid];
-  } else if (tid <= 1024) {
+  } else if (tid < 1024) {  // s_data has 1024 slots (0..1023); `<= 1024` was OOB
     s_data[tid] = 0;
   }
   __syncthreads();
