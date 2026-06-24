@@ -381,6 +381,10 @@ void Tokenizer::load_text(const std::string &vocab_path) {
       bpe_ranks[{p1, p2}] = rank++;
       std::string merged = p1 + p2;
       if (token_to_id.find(merged) == token_to_id.end()) {
+        if (vocab_size >= kMaxTokenizerVocabSize) {
+          throw std::runtime_error(
+              "Tokenizer vocab exceeds configured limit");
+        }
         int id = vocab_size++;
         token_to_id[merged] = id;
         id_to_token[id] = merged;
