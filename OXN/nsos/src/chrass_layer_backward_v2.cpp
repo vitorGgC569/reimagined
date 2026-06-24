@@ -29,8 +29,15 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
   Tensor d_bias = Tensor::zeros({dim}, bias.data.get_device());
   float *db_ptr = d_bias.data();
 
-  // Reset Sparse Weight Gradients in values_param.grad.
-  // Lazy-allocate if first backward call.
+  // KNOWN FOLLOW-UP (CHRASS is off by default): unlike every other layer here,
+  // this backward RESETS values_param.grad instead of accumulating, so a
+  // multi-bucket optimizer step (Trainer runs several backwards between two
+  // zero_grad calls) keeps only the LAST bucket's weight gradient.  Switching
+  // to the codebase-wide accumulate-then-zero contract requires a coordinated
+  // change (relocate the per-call grad clip below, make the standalone step()
+  // zero the grad, and update the two contract tests in test_chrass_validation)
+  // and is tracked separately.  The reset is preserved here for now to keep the
+  // standalone step() loop and its gate tests correct.
   if (values_param.grad.size != nnz_count) {
     values_param.grad = Tensor::zeros({nnz_count}, bias.data.get_device());
   } else {
@@ -38,6 +45,30 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
                 static_cast<size_t>(nnz_count) * sizeof(float));
   }
   float *gw_ptr = values_param.grad.data();
+
+  // Saturation mask: the forward clamps |out| > 100 and zeroes NaN/Inf, both of
+  // which have zero local derivative.  Recompute the pre-clamp pre-activation so
+  // the backward routes NO gradient through saturated/sanitized outputs (else
+  // dL/dx, dL/dW and dL/db are wrong at clamped elements).
+  const float *bias_ptr = bias.data.data();
+  std::vector<float> active(static_cast<size_t>(batch) * static_cast<size_t>(dim),
+                            1.0f);
+#pragma omp parallel for
+  for (int b = 0; b < batch; ++b) {
+    const float *in_row = x_ptr + b * dim;
+    for (int r = 0; r < dim; ++r) {
+      float sum = 0.0f;
+      const int start = row_ptr[r];
+      const int end = row_ptr[r + 1];
+      for (int i = start; i < end; ++i) {
+        sum += w_ptr[i] * in_row[col_indices[i]];
+      }
+      sum += bias_ptr[r];
+      const bool saturated = std::isnan(sum) || std::isinf(sum) ||
+                             sum > 100.0f || sum < -100.0f;
+      active[static_cast<size_t>(b) * dim + r] = saturated ? 0.0f : 1.0f;
+    }
+  }
 
 // Backward Pass:
 // y = Wx + b
@@ -77,7 +108,7 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
     // gx[c] += value * gy[r]
 
     for (int r = 0; r < dim; ++r) {
-      float g_val = gy_row[r];
+      float g_val = gy_row[r] * active[static_cast<size_t>(b) * dim + r];
       // Skip if gradient is effectively zero (Sparse Backprop)
       if (std::abs(g_val) < 1e-9)
         continue;
@@ -100,7 +131,7 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
     const float *x_row = x_ptr + b * dim;
 
     for (int r = 0; r < dim; ++r) {
-      float grad = gy_row[r];
+      float grad = gy_row[r] * active[static_cast<size_t>(b) * dim + r];
 
       // Bias Grad
       db_ptr[r] += grad;
