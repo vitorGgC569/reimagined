@@ -69,16 +69,26 @@ std::vector<std::filesystem::path> candidate_library_paths(const std::string& ex
     const char* library_name = "liboxta_mem.so";
 #endif
 
-    const auto cwd = std::filesystem::current_path();
-    candidates.push_back(cwd / library_name);
-    candidates.push_back(cwd / "modules" / "oxtamem" / "oxta_engine" / "target" / "release" /
-                         library_name);
-    candidates.push_back(cwd / ".." / "modules" / "oxtamem" / "oxta_engine" / "target" /
-                         "release" / library_name);
-    candidates.push_back(cwd / ".." / ".." / "modules" / "oxtamem" / "oxta_engine" / "target" /
-                         "release" / library_name);
-    candidates.push_back(cwd / ".." / ".." / ".." / "modules" / "oxtamem" / "oxta_engine" /
-                         "target" / "release" / library_name);
+    // SECURITY: do NOT search the current working directory or relative paths
+    // by default — loading a native library from CWD/relative dirs is a classic
+    // DLL/.so planting vector (an attacker who can drop oxta_mem.dll next to the
+    // process gets code execution).  Production resolves the library via the
+    // explicit argument, the NSOS_OXTAMEM_LIBRARY env, or the compile-time
+    // absolute NSOS_OXTAMEM_DEFAULT_LIBRARY above.  The legacy CWD/relative
+    // search is opt-in for local development only.
+    if (const auto allow_cwd = read_env("NSOS_OXTAMEM_ALLOW_CWD");
+        allow_cwd && (*allow_cwd == "1" || *allow_cwd == "true")) {
+        const auto cwd = std::filesystem::current_path();
+        candidates.push_back(cwd / library_name);
+        candidates.push_back(cwd / "modules" / "oxtamem" / "oxta_engine" / "target" /
+                             "release" / library_name);
+        candidates.push_back(cwd / ".." / "modules" / "oxtamem" / "oxta_engine" / "target" /
+                             "release" / library_name);
+        candidates.push_back(cwd / ".." / ".." / "modules" / "oxtamem" / "oxta_engine" /
+                             "target" / "release" / library_name);
+        candidates.push_back(cwd / ".." / ".." / ".." / "modules" / "oxtamem" / "oxta_engine" /
+                             "target" / "release" / library_name);
+    }
     return candidates;
 }
 
@@ -242,14 +252,18 @@ std::vector<std::vector<uint8_t>> OxtaMemFFI::recall(const std::string& key, siz
     const uint64_t count = read_u64_le(cursor);
     cursor += sizeof(uint64_t);
 
-    for (uint64_t i = 0; i < count && cursor + sizeof(uint64_t) <= end; ++i) {
+    // Distance-based bounds (never pointer + size, which can overflow for a
+    // corrupt item_size near UINT64_MAX and wrap past `end`).
+    for (uint64_t i = 0;
+         i < count && static_cast<size_t>(end - cursor) >= sizeof(uint64_t); ++i) {
         const uint64_t item_size = read_u64_le(cursor);
         cursor += sizeof(uint64_t);
-        if (cursor + item_size > end) {
+        if (item_size > static_cast<uint64_t>(end - cursor)) {
             break;
         }
-        values.emplace_back(cursor, cursor + item_size);
-        cursor += item_size;
+        const size_t item_bytes = static_cast<size_t>(item_size);
+        values.emplace_back(cursor, cursor + item_bytes);
+        cursor += item_bytes;
     }
 
     impl_->free_buffer(buffer, length);
