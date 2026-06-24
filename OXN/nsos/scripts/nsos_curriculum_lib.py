@@ -279,6 +279,36 @@ def _boolean_gate(op: str, a: int, b: int) -> int:
     raise ValueError(f"Unknown gate: {op}")
 
 
+def _split_is_train(key: str, train_fraction: float) -> bool:
+    """Deterministic, seed-independent train/eval assignment for one item.
+
+    The split MUST be a pure function of the item's content so that the
+    train-split call and the eval-split call agree on which side every item
+    belongs to.  build_curriculum invokes the phase builders with DIFFERENT
+    seeds for train vs eval; the previous shuffle-then-slice partition used the
+    per-call RNG, so train and eval sliced different permutations of the same
+    corpus and the same source row/chunk could leak into BOTH sides.  Bucketing
+    by a content hash removes that coupling: a given item always lands on
+    exactly one side regardless of seed or iteration order, so train and eval
+    are provably disjoint.
+    """
+    fraction = max(0.0, min(1.0, train_fraction))
+    cut = int(round(fraction * 1000.0))
+    return (int(stable_hash(key), 16) % 1000) < cut
+
+
+def _row_split_key(row: Dict) -> str:
+    """Stable, content-addressed identity for a dataset row.
+
+    Prefers an explicit id; otherwise a canonical serialization so the
+    train/eval assignment is reproducible and independent of dict ordering.
+    """
+    rid = row.get("id")
+    if rid not in (None, ""):
+        return str(rid)
+    return json.dumps(row, sort_keys=True, ensure_ascii=False)
+
+
 def _pick_split_subset(
     items: Sequence[Tuple[str, str, str]],
     split: str,
@@ -287,13 +317,19 @@ def _pick_split_subset(
 ) -> List[Tuple[str, str, str]]:
     if not items:
         return []
-    shuffled = list(items)
-    rng.shuffle(shuffled)
-    if len(shuffled) == 1:
-        return shuffled
-    cut = max(1, min(len(shuffled) - 1, int(round(len(shuffled) * train_fraction))))
-    chosen = shuffled[:cut] if split == "train" else shuffled[cut:]
-    return chosen or shuffled
+    want_train = split == "train"
+    # Partition by CONTENT (seed-independent) so the train and eval calls — made
+    # by build_curriculum with different seeds — stay provably disjoint.
+    chosen = [
+        item
+        for item in items
+        if _split_is_train("\x1f".join(str(part) for part in item), train_fraction)
+        == want_train
+    ]
+    # The RNG only orders WITHIN the already-disjoint side (determinism / any
+    # downstream truncation); it never moves the train/eval boundary.
+    rng.shuffle(chosen)
+    return chosen
 
 
 def _real_dataset_dir(repo_root: Path) -> Path:
@@ -326,15 +362,17 @@ def _pick_split_rows(
 ) -> List[Dict]:
     if not rows:
         return []
-    shuffled = list(rows)
-    rng.shuffle(shuffled)
-    if len(shuffled) == 1:
-        chosen = shuffled
-    else:
-        cut = max(1, min(len(shuffled) - 1, int(round(len(shuffled) * train_fraction))))
-        chosen = shuffled[:cut] if split == "train" else shuffled[cut:]
-        if not chosen:
-            chosen = shuffled
+    want_train = split == "train"
+    # Content-addressed partition (seed-independent) -> train and eval are
+    # disjoint even though build_curriculum passes different per-split seeds.
+    chosen = [
+        row
+        for row in rows
+        if _split_is_train(_row_split_key(row), train_fraction) == want_train
+    ]
+    # Order within the disjoint side with the per-call RNG; max_rows truncation
+    # therefore varies by seed but never crosses the train/eval boundary.
+    rng.shuffle(chosen)
     if max_rows is not None:
         return chosen[:max_rows]
     return chosen
@@ -760,8 +798,10 @@ def _phase3_real_documents(repo_root: Path, split: str, seed: int) -> List[Tuple
     Per-source row limits scale with the v11 phase budget — when the
     caller wants 30,000 phase-3 rows (DEFAULT_PHASE_SIZES_V11), we pull
     more aggressively from the larger sources.  The split parameter
-    'train' vs 'eval' is honored by _pick_split_rows; each source uses
-    a different RNG offset to avoid correlation."""
+    'train' vs 'eval' is honored by _pick_split_rows, which assigns each item
+    to exactly one side by a content hash — so train and eval stay disjoint
+    even though build_curriculum calls the builders with different per-split
+    seeds (no train/eval leakage)."""
     # NSOS_CURRICULUM_LANG=pt: modo PT-first — o produto fala portugues; corta
     # ingles e codigo da fase de texto (o raio-x G6 + o teste qualitativo
     # mostraram a "moda codigo": pool unico ~6:1 codigo:texto real).
