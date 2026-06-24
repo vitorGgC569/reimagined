@@ -910,6 +910,14 @@ void JambaModel::set_training_mode(bool enabled) {
     for (auto& layer : layers) {
         layer->set_training_mode(enabled);
     }
+    // Propagate to every BitLinear so inference (enabled == false) skips the
+    // clone-heavy backward-state saves in BitLinear::forward.  collect_bitlinear
+    // _layers() walks all blocks, sublayers, experts and the value head.
+    for (BitLinear* bl : collect_bitlinear_layers()) {
+        if (bl) {
+            bl->set_training_mode(enabled);
+        }
+    }
 }
 
 void JambaModel::set_audit_collector(LayerAuditCollector* collector) {

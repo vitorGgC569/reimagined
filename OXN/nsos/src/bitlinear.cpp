@@ -290,7 +290,10 @@ Tensor BitLinear::forward(const Tensor &input) {
 
   // Clone so the activation saved for backward (rmsnorm_backward, STE) can
   // never be corrupted by an in-place mutation of the caller's input buffer.
-  saved_input = input.clone();
+  // Inference (training_mode_ == false) never calls backward, so skip the
+  // clone-heavy saves entirely — this is pure per-token, per-layer overhead
+  // on the decode hot path.
+  if (training_mode_) saved_input = input.clone();
   int M = input.shape.numel() / in_features;
   Tensor x = input;
   if (norm_strategy == NormStrategy::RMS_PERI ||
@@ -318,7 +321,7 @@ Tensor BitLinear::forward(const Tensor &input) {
     } else if (linear_input.shape.dims.size() > 2) {
       linear_input = linear_input.reshape({M, in_features});
     }
-    saved_linear_input = linear_input.clone();
+    if (training_mode_) saved_linear_input = linear_input.clone();
 
     Tensor output = linear_input.matmul(weight.data.transpose());
     if (loqa.active) {
@@ -328,7 +331,7 @@ Tensor BitLinear::forward(const Tensor &input) {
       }
     }
 
-    saved_pre_output = output.clone();
+    if (training_mode_) saved_pre_output = output.clone();
     output = output.mul(magnitude.data);
 
     if (use_bias) {
@@ -353,7 +356,7 @@ Tensor BitLinear::forward(const Tensor &input) {
     } else if (linear_input.shape.dims.size() > 2) {
       linear_input = linear_input.reshape({M, in_features});
     }
-    saved_linear_input = linear_input.clone();
+    if (training_mode_) saved_linear_input = linear_input.clone();
 
 #ifdef USE_CUDA
     // Phase 5b GPU __dp4a fast path.  Engaged only when:
@@ -397,7 +400,7 @@ Tensor BitLinear::forward(const Tensor &input) {
           linear_input, cached_gpu_packed_weights_, weight_scale, M,
           in_features, out_features, precision_bits);
 
-      saved_pre_output = y.clone();
+      if (training_mode_) saved_pre_output = y.clone();
       y = y.mul(magnitude.data);
       if (use_bias) {
         y = y.add(bias.data);
@@ -422,7 +425,7 @@ Tensor BitLinear::forward(const Tensor &input) {
       }
     }
 
-    saved_pre_output = output.clone();
+    if (training_mode_) saved_pre_output = output.clone();
     output = output.mul(magnitude.data);
     if (use_bias) {
       output = output.add(bias.data);

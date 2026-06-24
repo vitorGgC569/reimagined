@@ -86,6 +86,15 @@ public:
     return gpu_packed_inference_enabled_;
   }
 
+  // Inference fast path.  When false, forward() skips the clone-heavy
+  // backward-state saves (saved_input / saved_linear_input / saved_pre_output),
+  // which are only ever read by backward().  Default true preserves training
+  // behavior exactly; JambaModel::set_training_mode propagates this so serving
+  // never pays for backward bookkeeping it will not use.  The forward OUTPUT is
+  // byte-identical either way; only the saved state is elided.
+  void set_training_mode(bool enabled) { training_mode_ = enabled; }
+  bool training_mode() const { return training_mode_; }
+
   Tensor forward(const Tensor &input);
   Tensor backward(const Tensor &grad_output);
   void to(Device dev);
@@ -165,6 +174,7 @@ private:
   Tensor cached_gpu_packed_weights_;
   uint64_t cached_gpu_packed_version_ = 0;
   bool gpu_packed_inference_enabled_ = false;
+  bool training_mode_ = true;
 
   // T-MAC block-sparse heat map, lazily computed on first opt-in use.
   // Cleared on any operation that invalidates packed_weights.  See
