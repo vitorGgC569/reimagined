@@ -102,6 +102,10 @@ private:
     std::mutex rate_limit_mutex_;
     std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point>>
         recent_requests_by_client_;
+    // Cadence counter for the idle-client sweep that bounds the rate-limit map
+    // (an idle/transient/spoofed client identity would otherwise leak a map
+    // entry forever — a memory-exhaustion DoS).  Guarded by rate_limit_mutex_.
+    uint64_t rate_limit_sweep_counter_ = 0;
 
     bool initialize_sockets();
     void cleanup_sockets();

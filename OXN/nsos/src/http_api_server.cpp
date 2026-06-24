@@ -43,6 +43,14 @@ constexpr size_t kInvalidReplicaIndex = static_cast<size_t>(-1);
 void append_utf8_codepoint(std::string& out, uint32_t codepoint);
 unsigned int parse_unicode_hex_quad(const std::string& input, size_t& pos);
 
+// Thrown for malformed CLIENT input (bad JSON, out-of-range fields, unsafe
+// paths).  handle_client maps it to HTTP 400 with the message; every OTHER
+// exception is an internal fault -> HTTP 500 with a generic body (the real
+// cause is logged server-side, never leaked to the client).
+struct BadRequest : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct JsonValue {
     enum class Type { Null, Bool, Number, String, Array, Object };
 
@@ -97,8 +105,8 @@ private:
     }
 
     [[noreturn]] void error(const std::string& message) const {
-        throw std::runtime_error("JSON parse error at position " + std::to_string(pos_) + ": " +
-                                 message);
+        throw BadRequest("JSON parse error at position " + std::to_string(pos_) + ": " +
+                         message);
     }
 
     void expect(char expected) {
@@ -579,7 +587,7 @@ std::vector<std::string> json_string_array(const JsonValue& object, const std::s
     std::vector<std::string> out;
     for (const auto& item : (*value)->array_value) {
         if (!item.is_string()) {
-            throw std::runtime_error("field '" + key + "' must contain only strings");
+            throw BadRequest("field '" + key + "' must contain only strings");
         }
         out.push_back(item.string_value);
     }
@@ -890,7 +898,7 @@ int bounded_int(const JsonValue& payload,
                 int maximum) {
     int value = json_int(payload, key).value_or(fallback);
     if (value < minimum || value > maximum) {
-        throw std::runtime_error("field '" + key + "' must be between " +
+        throw BadRequest("field '" + key + "' must be between " +
                                  std::to_string(minimum) + " and " +
                                  std::to_string(maximum));
     }
@@ -900,25 +908,25 @@ int bounded_int(const JsonValue& payload,
 void validate_generation_options(GenerationOptions& options,
                                  const HttpApiServerConfig& config) {
     if (options.max_tokens < 0 || options.max_tokens > config.max_generate_tokens) {
-        throw std::runtime_error("field 'max_tokens' must be between 0 and " +
+        throw BadRequest("field 'max_tokens' must be between 0 and " +
                                  std::to_string(config.max_generate_tokens));
     }
     if (options.max_context_tokens <= 0) {
         options.max_context_tokens = config.max_context_tokens_per_request;
     }
     if (options.max_context_tokens > config.max_context_tokens_per_request) {
-        throw std::runtime_error("field 'max_context_tokens' exceeds configured limit " +
+        throw BadRequest("field 'max_context_tokens' exceeds configured limit " +
                                  std::to_string(config.max_context_tokens_per_request));
     }
     if (!std::isfinite(options.temperature) || options.temperature < 0.0f ||
         options.temperature > 5.0f) {
-        throw std::runtime_error("field 'temperature' must be finite and between 0 and 5");
+        throw BadRequest("field 'temperature' must be finite and between 0 and 5");
     }
     if (!std::isfinite(options.top_p) || options.top_p <= 0.0f || options.top_p > 1.0f) {
-        throw std::runtime_error("field 'top_p' must be finite and between 0 and 1");
+        throw BadRequest("field 'top_p' must be finite and between 0 and 1");
     }
     if (options.top_k < 0) {
-        throw std::runtime_error("field 'top_k' must be non-negative");
+        throw BadRequest("field 'top_k' must be non-negative");
     }
 }
 
@@ -933,17 +941,17 @@ std::filesystem::path resolve_pack_output_directory(const HttpApiServerConfig& c
     namespace fs = std::filesystem;
     fs::path requested_path(requested);
     if (requested_path.empty()) {
-        throw std::runtime_error("field 'directory' must not be empty");
+        throw BadRequest("field 'directory' must not be empty");
     }
     if (requested_path.is_absolute()) {
         if (!config.allow_pack_absolute_paths) {
-            throw std::runtime_error("absolute pack directories are disabled for the HTTP API");
+            throw BadRequest("absolute pack directories are disabled for the HTTP API");
         }
         return requested_path.lexically_normal();
     }
     for (const auto& part : requested_path) {
         if (part == "..") {
-            throw std::runtime_error("pack directory must not contain '..'");
+            throw BadRequest("pack directory must not contain '..'");
         }
     }
     fs::path root(config.pack_output_root.empty() ? "artifacts/model_packs"
@@ -1160,11 +1168,11 @@ JsonValue parse_json_body_or_throw(const HttpRequest& request, const HttpApiServ
     if (content_type != request.headers.end()) {
         const std::string lowered = to_lower_copy(content_type->second);
         if (lowered.find("application/json") == std::string::npos) {
-            throw std::runtime_error("content-type must be application/json");
+            throw BadRequest("content-type must be application/json");
         }
     }
     if (request.body.empty()) {
-        throw std::runtime_error("missing JSON body");
+        throw BadRequest("missing JSON body");
     }
     return JsonParser(request.body, config.max_json_depth).parse();
 }
@@ -1548,6 +1556,27 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             } else {
                 remaining = 0;
             }
+            // Bound the rate-limit map: periodically (and whenever it grows
+            // large) sweep out every client whose window has fully expired.
+            // Without this, an endless stream of distinct identities (e.g. a
+            // spoofed X-Forwarded-For per request) leaks one map entry each,
+            // forever — a memory-exhaustion DoS.  Runs under rate_limit_mutex_.
+            constexpr size_t kRateLimitMaxClients = 100000;
+            if (((++rate_limit_sweep_counter_) & 0x3FFu) == 0 ||
+                recent_requests_by_client_.size() > kRateLimitMaxClients) {
+                for (auto it = recent_requests_by_client_.begin();
+                     it != recent_requests_by_client_.end();) {
+                    auto& dq = it->second;
+                    while (!dq.empty() && now - dq.front() > window) {
+                        dq.pop_front();
+                    }
+                    if (dq.empty()) {
+                        it = recent_requests_by_client_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
         }
         if (!allowed) {
             rate_limited_requests_.fetch_add(1);
@@ -1729,10 +1758,10 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             validate_generation_options(options, config_);
             const auto prompts = json_string_array(payload, "prompts");
             if (prompts.empty()) {
-                throw std::runtime_error("field 'prompts' must contain at least one prompt");
+                throw BadRequest("field 'prompts' must contain at least one prompt");
             }
             if (prompts.size() > config_.max_prompts_per_batch) {
-                throw std::runtime_error("field 'prompts' exceeds configured batch limit " +
+                throw BadRequest("field 'prompts' exceeds configured batch limit " +
                                          std::to_string(config_.max_prompts_per_batch));
             }
 
@@ -1862,10 +1891,10 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             const std::string text = json_string(payload, "text").value_or("");
             const int steps = bounded_int(payload, "steps", 1, 1, config_.max_train_steps);
             if (text.empty()) {
-                throw std::runtime_error("field 'text' must not be empty");
+                throw BadRequest("field 'text' must not be empty");
             }
             if (text.size() > config_.max_train_text_bytes) {
-                throw std::runtime_error("field 'text' exceeds configured byte limit");
+                throw BadRequest("field 'text' exceeds configured byte limit");
             }
 
             float loss = 0.0f;
@@ -1897,15 +1926,15 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             const auto texts = json_string_array(payload, "texts");
             const int epochs = bounded_int(payload, "epochs", 1, 1, config_.max_train_epochs);
             if (texts.empty()) {
-                throw std::runtime_error("field 'texts' must contain at least one text sample");
+                throw BadRequest("field 'texts' must contain at least one text sample");
             }
             if (texts.size() > config_.max_prompts_per_batch) {
-                throw std::runtime_error("field 'texts' exceeds configured batch limit " +
+                throw BadRequest("field 'texts' exceeds configured batch limit " +
                                          std::to_string(config_.max_prompts_per_batch));
             }
             for (const auto& text : texts) {
                 if (text.size() > config_.max_train_text_bytes) {
-                    throw std::runtime_error("field 'texts' contains an item exceeding configured byte limit");
+                    throw BadRequest("field 'texts' contains an item exceeding configured byte limit");
                 }
             }
 
@@ -1949,10 +1978,10 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             const int max_steps =
                 bounded_int(payload, "max_steps", 120, 1, config_.max_train_corpus_steps);
             if (corpus.empty()) {
-                throw std::runtime_error("field 'corpus' must not be empty");
+                throw BadRequest("field 'corpus' must not be empty");
             }
             if (corpus.size() > config_.max_body_bytes) {
-                throw std::runtime_error("field 'corpus' exceeds configured byte limit");
+                throw BadRequest("field 'corpus' exceeds configured byte limit");
             }
 
             float last_loss = 0.0f;
@@ -2011,7 +2040,7 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             const JsonValue payload = parse_json_body_or_throw(request, config_);
             const std::string directory = json_string(payload, "directory").value_or("");
             if (directory.empty()) {
-                throw std::runtime_error("field 'directory' must not be empty");
+                throw BadRequest("field 'directory' must not be empty");
             }
             const std::filesystem::path output_directory =
                 resolve_pack_output_directory(config_, directory);
@@ -2036,6 +2065,14 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
 
         const HttpResponse response = make_error_response(
             404, "Not Found", request_id, "unknown_endpoint", "requested endpoint was not found");
+        send_all(client_socket, build_http_response(response));
+    } catch (const BadRequest& ex) {
+        // Explicit client-input error: surface the message with 400 (the
+        // project deliberately returns actionable validation messages, and the
+        // HTTP gate asserts this).  Distinct telemetry from internal faults.
+        parse_failures_.fetch_add(1);
+        const HttpResponse response =
+            make_error_response(400, "Bad Request", request_id, "bad_request", ex.what());
         send_all(client_socket, build_http_response(response));
     } catch (const std::exception& ex) {
         internal_errors_.fetch_add(1);
