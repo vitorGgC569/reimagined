@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -521,33 +522,70 @@ std::vector<int> Tokenizer::bpe_encode_word(const std::string &word) {
   if (word.empty())
     return {};
 
-  // Initialize symbols as individual characters
-  std::vector<std::string> symbols;
-  symbols.reserve(word.length());
-  for (unsigned char c : word) {
-    symbols.emplace_back(1, static_cast<char>(c));
+  // Efficient BPE merge: a doubly-linked list of symbols + a min-heap of merge
+  // candidates keyed by (rank, left position).  Byte-identical to the previous
+  // O(n^2) "scan-all-pairs, merge the global-min-rank pair, ties -> leftmost"
+  // algorithm: initial positions preserve left-to-right order, so the heap's
+  // min-(rank, pos) is exactly the lowest-current-index min-rank pair; stale
+  // entries are skipped by re-checking the pair's rank on pop.  This removes the
+  // quadratic blow-up on a long no-space / CJK run (one giant pretokenized word).
+  const int n = static_cast<int>(word.length());
+  std::vector<std::string> node(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    node[static_cast<size_t>(i)] = std::string(1, word[static_cast<size_t>(i)]);
+  }
+  std::vector<int> prev_idx(static_cast<size_t>(n));
+  std::vector<int> next_idx(static_cast<size_t>(n));
+  std::vector<char> alive(static_cast<size_t>(n), 1);
+  for (int i = 0; i < n; ++i) {
+    prev_idx[static_cast<size_t>(i)] = i - 1;
+    next_idx[static_cast<size_t>(i)] = (i + 1 < n) ? i + 1 : -1;
   }
 
-  // BPE merge loop
-  while (symbols.size() >= 2) {
-    // Find the pair with minimum rank (highest priority)
-    int best_rank = std::numeric_limits<int>::max();
-    size_t best_idx = static_cast<size_t>(-1);
+  struct MergeCand {
+    int rank;
+    int pos;
+  };
+  const auto cand_cmp = [](const MergeCand &a, const MergeCand &b) {
+    return a.rank != b.rank ? a.rank > b.rank : a.pos > b.pos;
+  };
+  std::priority_queue<MergeCand, std::vector<MergeCand>, decltype(cand_cmp)> heap(
+      cand_cmp);
+  const auto push_pair = [&](int i) {
+    if (i < 0 || next_idx[static_cast<size_t>(i)] < 0) return;
+    auto it = bpe_ranks.find(
+        {node[static_cast<size_t>(i)],
+         node[static_cast<size_t>(next_idx[static_cast<size_t>(i)])]});
+    if (it != bpe_ranks.end()) heap.push({it->second, i});
+  };
+  for (int i = 0; i < n; ++i) push_pair(i);
 
-    for (size_t i = 0; i < symbols.size() - 1; ++i) {
-      auto it = bpe_ranks.find({symbols[i], symbols[i + 1]});
-      if (it != bpe_ranks.end() && it->second < best_rank) {
-        best_rank = it->second;
-        best_idx = i;
-      }
+  while (!heap.empty()) {
+    const MergeCand cand = heap.top();
+    heap.pop();
+    const int i = cand.pos;
+    if (!alive[static_cast<size_t>(i)]) continue;
+    const int j = next_idx[static_cast<size_t>(i)];
+    if (j < 0 || !alive[static_cast<size_t>(j)]) continue;
+    auto it = bpe_ranks.find(
+        {node[static_cast<size_t>(i)], node[static_cast<size_t>(j)]});
+    if (it == bpe_ranks.end() || it->second != cand.rank) continue;  // stale
+    node[static_cast<size_t>(i)] += node[static_cast<size_t>(j)];
+    alive[static_cast<size_t>(j)] = 0;
+    next_idx[static_cast<size_t>(i)] = next_idx[static_cast<size_t>(j)];
+    if (next_idx[static_cast<size_t>(j)] >= 0) {
+      prev_idx[static_cast<size_t>(next_idx[static_cast<size_t>(j)])] = i;
     }
+    push_pair(i);
+    push_pair(prev_idx[static_cast<size_t>(i)]);
+  }
 
-    if (best_idx == static_cast<size_t>(-1))
-      break; // No more merges possible
-
-    // Perform merge
-    symbols[best_idx] += symbols[best_idx + 1];
-    symbols.erase(symbols.begin() + best_idx + 1);
+  // Surviving symbols in left-to-right order (position 0 is never merged away,
+  // so it heads the chain); the id conversion below consumes this unchanged.
+  std::vector<std::string> symbols;
+  symbols.reserve(static_cast<size_t>(n));
+  for (int i = (n > 0 ? 0 : -1); i >= 0; i = next_idx[static_cast<size_t>(i)]) {
+    symbols.push_back(node[static_cast<size_t>(i)]);
   }
 
   // Convert symbols to IDs
