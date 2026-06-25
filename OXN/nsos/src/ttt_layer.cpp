@@ -229,6 +229,35 @@ Tensor TTTLayer::forward(const Tensor& x) {
     return output.reshape({x.shape[0], x.shape[1], dim});
 }
 
+// ---------------------------------------------------------------------------
+// TRUNCATED BACKWARD — precise scope of what is and is NOT differentiated.
+//
+// The training forward (above) runs an inner test-time gradient-descent loop:
+// for each row r it produces
+//     output[r] = w_out(values[r]) + keys[r] @ A_r
+// where A_r ("adaptation") is the running test-time state.  A_r is updated
+// AFTER output[r] is read, using local_grad = keys[r]^T @ error[r] and the
+// momentum recurrence (lines ~207-214).  Critically, A_r therefore depends on
+// keys[<r], values[<r] and w_out from EARLIER rows.
+//
+// This backward computes EXACTLY these terms, all of which are correct:
+//   * d/d(values) through base = w_out(values):  grad_values = w_out.backward(g)
+//     then grad_from_values = w_v.backward(grad_values).        [exact]
+//   * d/d(keys) through the keys[r] @ A_r term, holding A_r fixed:
+//     grad_key_row = g[r] @ saved_pre_adaptation_[r]^T, then
+//     grad_from_keys = w_k.backward(grad_keys).                 [exact]
+//   * grad_input = grad_from_values + grad_from_keys.           [exact sum]
+//
+// What is DELIBERATELY TRUNCATED (stop-gradient): the dependence of A_r on the
+// parameters via the inner update loop.  saved_pre_adaptation_[r] is treated as
+// a constant; gradients do NOT flow back through local_grad / the momentum
+// recurrence into keys[<r], values[<r] or w_out at earlier rows.  This is a
+// first-order / truncated-BPTT-through-the-inner-loop approximation (the same
+// stop-gradient family used by first-order MAML and TTT references).  It is a
+// known, intentional approximation — NOT a silent identity backward: every term
+// that is returned is a real, correct gradient; only the inner-loop sensitivity
+// is omitted.  Do not "fix" this by faking the missing terms.
+// ---------------------------------------------------------------------------
 Tensor TTTLayer::backward(const Tensor& g) {
     if (saved_input_.size == 0 || saved_keys_.size == 0 || saved_values_.size == 0) {
         throw std::runtime_error("TTTLayer backward called before forward");
@@ -240,6 +269,13 @@ Tensor TTTLayer::backward(const Tensor& g) {
     }
 
     const int rows = saved_input_.shape[0];
+    // The per-row loop below slices grad_2d at every saved forward row; if the
+    // incoming gradient has fewer rows than the saved forward pass, those
+    // slices would read out of bounds.  Require an exact row match.
+    if (grad_2d.shape[0] != rows) {
+        throw std::runtime_error(
+            "TTTLayer backward row count does not match the saved forward pass");
+    }
     Tensor grad_keys({rows, hidden}, grad_2d.get_device());
 
     for (int row = 0; row < rows; ++row) {

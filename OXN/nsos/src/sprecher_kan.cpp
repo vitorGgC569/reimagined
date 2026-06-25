@@ -286,11 +286,19 @@ Tensor SprecherKAN::backward(const Tensor &grad_output) {
 
         switch (act_type_) {
         case ActivationType::CHEBYSHEV: {
-          const float normalized = clamp_unit(
-              u_value / safe_denominator(grid_config_.grid_range));
+          const float raw = u_value / safe_denominator(grid_config_.grid_range);
+          const float normalized = clamp_unit(raw);
           const float scale = 1.0f / safe_denominator(grid_config_.grid_range);
           basis = chebyshev_t(g, normalized);
-          dbasis_du = g == 0 ? 0.0f : g * chebyshev_u(g - 1, normalized) * scale;
+          // The forward clamps `normalized` to [-1, 1]; in the saturated
+          // region the output is constant w.r.t. u, so its derivative is
+          // exactly zero.  The previous code evaluated the Chebyshev
+          // derivative at the clamped endpoint, leaking a spurious non-zero
+          // gradient through saturated activations.  Honor the clamp here.
+          const bool saturated = (raw <= -1.0f) || (raw >= 1.0f);
+          dbasis_du = (g == 0 || saturated)
+                          ? 0.0f
+                          : g * chebyshev_u(g - 1, normalized) * scale;
           break;
         }
         case ActivationType::RBF:
