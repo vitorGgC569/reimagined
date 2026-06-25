@@ -21,6 +21,11 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include "../include/cuda/kernels.cuh"
+#endif
+
 namespace nsos {
 
 namespace {
@@ -590,6 +595,50 @@ int select_best_token_fallback(const std::vector<float>& scaled,
     return best;
 }
 
+// Single source of truth for the no-repeat-ngram banned set, used by both the
+// host sampler (greedy + stochastic branches) and the GPU greedy sampler.
+// Fills `banned` with the tokens that would complete a repeated n-gram given the
+// current generated suffix; clears it when there is not enough history.  Extracted
+// verbatim from the previously-inlined logic so host and GPU never drift.
+void compute_no_repeat_ngram_banned(const std::vector<int>& output_tokens,
+                                    size_t prompt_tokens_used,
+                                    int no_repeat_ngram_size,
+                                    size_t generated_so_far,
+                                    std::vector<int>& banned) {
+    banned.clear();
+    if (generated_so_far == 0 || no_repeat_ngram_size <= 1) {
+        return;
+    }
+    const int ngram = no_repeat_ngram_size;
+    if (generated_so_far + 1 < static_cast<size_t>(ngram)) {
+        return;
+    }
+    if (ngram == 2) {
+        const int last_token = output_tokens.back();
+        for (size_t i = prompt_tokens_used; i + 1 < output_tokens.size(); ++i) {
+            if (output_tokens[i] == last_token) {
+                banned.push_back(output_tokens[i + 1]);
+            }
+        }
+    } else {
+        const size_t prefix_len = static_cast<size_t>(ngram - 1);
+        const size_t prefix_start = output_tokens.size() - prefix_len;
+        for (size_t i = prompt_tokens_used;
+             i + static_cast<size_t>(ngram) <= output_tokens.size(); ++i) {
+            bool prefix_match = true;
+            for (size_t j = 0; j < prefix_len; ++j) {
+                if (output_tokens[i + j] != output_tokens[prefix_start + j]) {
+                    prefix_match = false;
+                    break;
+                }
+            }
+            if (prefix_match) {
+                banned.push_back(output_tokens[i + prefix_len]);
+            }
+        }
+    }
+}
+
 int sample_from_host_logits_row(const float* raw,
                                 int vocab_size,
                                 int top_k,
@@ -623,38 +672,12 @@ int sample_from_host_logits_row(const float* raw,
         float best_value = -1e30f;
         workspace.seen.assign(static_cast<size_t>(vocab_size), 0);
         if (generated_so_far > 0 && options.no_repeat_ngram_size > 1) {
-            const int ngram = options.no_repeat_ngram_size;
-            if (generated_so_far + 1 >= static_cast<size_t>(ngram)) {
-                workspace.banned.clear();
-                if (ngram == 2) {
-                    const int last_token = output_tokens.back();
-                    for (size_t i = prompt_tokens_used; i + 1 < output_tokens.size(); ++i) {
-                        if (output_tokens[i] == last_token) {
-                            workspace.banned.push_back(output_tokens[i + 1]);
-                        }
-                    }
-                } else {
-                    const size_t prefix_len = static_cast<size_t>(ngram - 1);
-                    const size_t prefix_start = output_tokens.size() - prefix_len;
-                    for (size_t i = prompt_tokens_used;
-                         i + static_cast<size_t>(ngram) <= output_tokens.size();
-                         ++i) {
-                        bool prefix_match = true;
-                        for (size_t j = 0; j < prefix_len; ++j) {
-                            if (output_tokens[i + j] != output_tokens[prefix_start + j]) {
-                                prefix_match = false;
-                                break;
-                            }
-                        }
-                        if (prefix_match) {
-                            workspace.banned.push_back(output_tokens[i + prefix_len]);
-                        }
-                    }
-                }
-                for (int token : workspace.banned) {
-                    if (token >= 0 && token < vocab_size) {
-                        workspace.seen[static_cast<size_t>(token)] = 1;
-                    }
+            compute_no_repeat_ngram_banned(output_tokens, prompt_tokens_used,
+                                           options.no_repeat_ngram_size,
+                                           generated_so_far, workspace.banned);
+            for (int token : workspace.banned) {
+                if (token >= 0 && token < vocab_size) {
+                    workspace.seen[static_cast<size_t>(token)] = 1;
                 }
             }
         }
@@ -768,38 +791,12 @@ int sample_from_host_logits_row(const float* raw,
 
     workspace.seen.assign(static_cast<size_t>(vocab_size), 0);
     if (generated_so_far > 0 && options.no_repeat_ngram_size > 1) {
-        const int ngram = options.no_repeat_ngram_size;
-        if (generated_so_far + 1 >= static_cast<size_t>(ngram)) {
-            workspace.banned.clear();
-            if (ngram == 2) {
-                const int last_token = output_tokens.back();
-                for (size_t i = prompt_tokens_used; i + 1 < output_tokens.size(); ++i) {
-                    if (output_tokens[i] == last_token) {
-                        workspace.banned.push_back(output_tokens[i + 1]);
-                    }
-                }
-            } else {
-                const size_t prefix_len = static_cast<size_t>(ngram - 1);
-                const size_t prefix_start = output_tokens.size() - prefix_len;
-                for (size_t i = prompt_tokens_used;
-                     i + static_cast<size_t>(ngram) <= output_tokens.size();
-                     ++i) {
-                    bool prefix_match = true;
-                    for (size_t j = 0; j < prefix_len; ++j) {
-                        if (output_tokens[i + j] != output_tokens[prefix_start + j]) {
-                            prefix_match = false;
-                            break;
-                        }
-                    }
-                    if (prefix_match) {
-                        workspace.banned.push_back(output_tokens[i + prefix_len]);
-                    }
-                }
-            }
-            for (int token : workspace.banned) {
-                if (token >= 0 && token < vocab_size) {
-                    workspace.seen[static_cast<size_t>(token)] = 1;
-                }
+        compute_no_repeat_ngram_banned(output_tokens, prompt_tokens_used,
+                                       options.no_repeat_ngram_size,
+                                       generated_so_far, workspace.banned);
+        for (int token : workspace.banned) {
+            if (token >= 0 && token < vocab_size) {
+                workspace.seen[static_cast<size_t>(token)] = 1;
             }
         }
     }
@@ -920,6 +917,145 @@ int sample_from_host_logits_row(const float* raw,
     }
     return selected;
 }
+
+#ifdef USE_CUDA
+bool gpu_greedy_sampler_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NSOS_GPU_SAMPLER");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+// On-device greedy decode sampler (opt-in NSOS_GPU_SAMPLER).  Keeps the per-token
+// selection on the GPU: a device "repeated" mask maintained incrementally, the
+// per-token "seen" (no-repeat-ngram bans + blocked-EOS) mask, and a one-time
+// "control" mask, fed to launch_decode_greedy_argmax.  Removes the per-token
+// [vocab] D2H + host vocab scan and mirrors sample_from_host_logits_row's greedy
+// branch exactly.  Returns false on any CUDA error so the caller falls back to
+// the host path.  Single-threaded decode use (one instance per generation).
+class GpuGreedySampler {
+public:
+    ~GpuGreedySampler() { free_all(); }
+
+    bool select(const float* raw_row_device, int vocab,
+                const GenerationOptions& options,
+                const std::vector<int>& output_tokens, size_t prompt_tokens_used,
+                const std::function<bool(int, int)>& is_control_token,
+                int& out_token) {
+        if (vocab <= 0 || raw_row_device == nullptr) return false;
+        if (!ensure(vocab)) return false;
+        if (!control_built_) build_control(vocab, is_control_token);
+
+        const size_t generated_so_far =
+            output_tokens.size() > prompt_tokens_used
+                ? (output_tokens.size() - prompt_tokens_used)
+                : 0;
+
+        // repeated mask: incrementally mark the generated tokens (output[prompt:])
+        // so the penalty matches the host's per-token "repeated" set.
+        for (size_t i = prompt_tokens_used + marked_count_;
+             i < output_tokens.size(); ++i) {
+            const int t = output_tokens[i];
+            if (t >= 0 && t < vocab) {
+                cudaMemsetAsync(d_repeated_ + t, 1, 1, 0);
+            }
+        }
+        marked_count_ = generated_so_far;
+
+        // seen mask: zero, then scatter no-repeat-ngram bans + blocked-EOS.
+        cudaMemsetAsync(d_seen_, 0, static_cast<size_t>(vocab), 0);
+        if (generated_so_far > 0 && options.no_repeat_ngram_size > 1) {
+            compute_no_repeat_ngram_banned(output_tokens, prompt_tokens_used,
+                                           options.no_repeat_ngram_size,
+                                           generated_so_far, banned_);
+            for (int t : banned_) {
+                if (t >= 0 && t < vocab) {
+                    cudaMemsetAsync(d_seen_ + t, 1, 1, 0);
+                }
+            }
+        }
+        const bool block_eos =
+            generated_so_far <
+                static_cast<size_t>(std::max(options.min_new_tokens, 0)) &&
+            options.eos_token_id >= 0 && options.eos_token_id < vocab;
+        if (block_eos) {
+            cudaMemsetAsync(d_seen_ + options.eos_token_id, 1, 1, 0);
+        }
+        const bool suppress_control =
+            generated_so_far <
+                static_cast<size_t>(std::max(options.min_new_tokens, 0)) &&
+            options.suppress_control_tokens_at_start;
+        const bool penalty_active =
+            generated_so_far > 0 && options.repetition_penalty > 1.0f;
+        const float penalty =
+            penalty_active ? std::max(options.repetition_penalty, 1.0f) : 1.0f;
+
+        launch_decode_greedy_argmax(raw_row_device, vocab,
+                                    penalty_active ? d_repeated_ : nullptr,
+                                    d_seen_, d_control_,
+                                    suppress_control ? 1 : 0, penalty, d_result_);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        int token = options.eos_token_id;
+        if (cudaMemcpy(&token, d_result_, sizeof(int),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+        out_token = token;
+        return true;
+    }
+
+private:
+    bool ensure(int vocab) {
+        if (vocab_ == vocab && d_seen_ != nullptr) return true;
+        free_all();
+        const size_t bytes = static_cast<size_t>(vocab);
+        if (cudaMalloc(&d_repeated_, bytes) != cudaSuccess ||
+            cudaMalloc(&d_seen_, bytes) != cudaSuccess ||
+            cudaMalloc(&d_control_, bytes) != cudaSuccess ||
+            cudaMalloc(&d_result_, sizeof(int)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            free_all();
+            return false;
+        }
+        cudaMemset(d_repeated_, 0, bytes);
+        cudaMemset(d_control_, 0, bytes);
+        vocab_ = vocab;
+        control_built_ = false;
+        marked_count_ = 0;
+        return true;
+    }
+    void build_control(int vocab,
+                       const std::function<bool(int, int)>& is_control_token) {
+        std::vector<unsigned char> host(static_cast<size_t>(vocab), 0);
+        for (int t = 0; t < vocab; ++t) {
+            host[static_cast<size_t>(t)] = is_control_token(t, vocab) ? 1 : 0;
+        }
+        cudaMemcpy(d_control_, host.data(), static_cast<size_t>(vocab),
+                   cudaMemcpyHostToDevice);
+        control_built_ = true;
+    }
+    void free_all() {
+        if (d_repeated_) cudaFree(d_repeated_);
+        if (d_seen_) cudaFree(d_seen_);
+        if (d_control_) cudaFree(d_control_);
+        if (d_result_) cudaFree(d_result_);
+        d_repeated_ = d_seen_ = d_control_ = nullptr;
+        d_result_ = nullptr;
+        vocab_ = 0;
+        control_built_ = false;
+        marked_count_ = 0;
+    }
+    unsigned char* d_repeated_ = nullptr;
+    unsigned char* d_seen_ = nullptr;
+    unsigned char* d_control_ = nullptr;
+    int* d_result_ = nullptr;
+    int vocab_ = 0;
+    bool control_built_ = false;
+    size_t marked_count_ = 0;
+    std::vector<int> banned_;
+};
+#endif  // USE_CUDA
 
 } // namespace
 
@@ -1249,7 +1385,36 @@ std::string InferenceEngine::generate_stream(
         return token_piece_cache[static_cast<size_t>(token)];
     };
 
+#ifdef USE_CUDA
+    GpuGreedySampler gpu_greedy_sampler;
+#endif
     auto sample_next_token = [&](const Tensor& logits) -> int {
+#ifdef USE_CUDA
+        // On-device greedy decode (opt-in NSOS_GPU_SAMPLER): keep selection on
+        // the GPU, skipping the per-token [vocab] D2H + host vocab scan.  Falls
+        // back to the host path for stochastic sampling or on any CUDA error.
+        if (gpu_greedy_sampler_enabled() && logits.get_device() == Device::GPU &&
+            logits.size > 0) {
+            const int gpu_vocab = logits.shape.back();
+            const bool greedy = options.temperature <= 1e-5f || top_k == 1;
+            const bool top_p_can_change =
+                top_k != 1 && options.top_p < 1.0f && options.top_p > 0.0f;
+            if (greedy && !top_p_can_change && gpu_vocab > 0) {
+                const float* raw_row =
+                    logits.raw_data() + (logits.size - gpu_vocab);
+                int gpu_tok = options.eos_token_id;
+                if (gpu_greedy_sampler.select(
+                        raw_row, gpu_vocab, options, output, prompt_tokens_used,
+                        [&](int token, int v) {
+                            return cached_token_piece(token, v).rfind("<|", 0) ==
+                                   0;
+                        },
+                        gpu_tok)) {
+                    return gpu_tok;
+                }
+            }
+        }
+#endif
         Tensor host_logits = (logits.get_device() == Device::GPU) ? logits.cpu() : logits;
         if (host_logits.size == 0) {
             return options.eos_token_id;
