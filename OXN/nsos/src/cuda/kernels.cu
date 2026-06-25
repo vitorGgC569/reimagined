@@ -1196,30 +1196,56 @@ __global__ void gqa_causal_attention_kernel(const float *q_flat,
 
   __syncthreads();
 
-  if (thread_index == 0) {
-    float max_score = -1e30f;
-    for (int source_index = 0; source_index <= token_index; ++source_index) {
-      max_score = fmaxf(max_score, shared_scores[source_index]);
-    }
+  // Block-parallel softmax + output (replaces the single-thread serial path so
+  // the whole block, not thread 0 alone, does the O(n_keys*head_dim) work).
+  // Math is equivalent: max is order-independent; the per-dim output is summed
+  // over sources in the same order as before (bit-identical per dim); only the
+  // softmax denominator's reduction order changes (within parity tolerance).
+  // redbuf is static shared sized to the launcher's fixed 128-thread block.
+  __shared__ float redbuf[128];
+  const int n_keys = token_index + 1;
 
-    float denom = 0.0f;
-    for (int source_index = 0; source_index <= token_index; ++source_index) {
-      const float stabilized = expf(shared_scores[source_index] - max_score);
-      shared_scores[source_index] = stabilized;
-      denom += stabilized;
+  float local_max = -1e30f;
+  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+    local_max = fmaxf(local_max, shared_scores[s]);
+  }
+  redbuf[thread_index] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (thread_index < stride) {
+      redbuf[thread_index] =
+          fmaxf(redbuf[thread_index], redbuf[thread_index + stride]);
     }
-    denom = fmaxf(denom, 1e-9f);
+    __syncthreads();
+  }
+  const float max_score = redbuf[0];
+  __syncthreads();
 
-    for (int dim = 0; dim < head_dim; ++dim) {
-      float acc = 0.0f;
-      for (int source_index = 0; source_index <= token_index; ++source_index) {
-        const int value_base =
-            source_index * 2 * kv_dim + kv_dim + kv_head * head_dim;
-        acc += (shared_scores[source_index] / denom) *
-               kv_flat[value_base + dim];
-      }
-      out[token_index * d_model + head_index * head_dim + dim] = acc;
+  float local_sum = 0.0f;
+  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+    const float stabilized = expf(shared_scores[s] - max_score);
+    shared_scores[s] = stabilized;
+    local_sum += stabilized;
+  }
+  redbuf[thread_index] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (thread_index < stride) {
+      redbuf[thread_index] += redbuf[thread_index + stride];
     }
+    __syncthreads();
+  }
+  const float denom = fmaxf(redbuf[0], 1e-9f);
+  __syncthreads();
+
+  for (int dim = thread_index; dim < head_dim; dim += blockDim.x) {
+    float acc = 0.0f;
+    for (int source_index = 0; source_index < n_keys; ++source_index) {
+      const int value_base =
+          source_index * 2 * kv_dim + kv_dim + kv_head * head_dim;
+      acc += (shared_scores[source_index] / denom) * kv_flat[value_base + dim];
+    }
+    out[token_index * d_model + head_index * head_dim + dim] = acc;
   }
 }
 
@@ -1311,29 +1337,52 @@ __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
 
   __syncthreads();
 
-  if (thread_index == 0) {
-    float max_score = -1e30f;
-    for (int source_index = 0; source_index <= token_index; ++source_index) {
-      max_score = fmaxf(max_score, shared_scores[source_index]);
-    }
+  // Block-parallel softmax + output (see the single-batch kernel above for the
+  // equivalence argument).  redbuf is static shared sized to the 128-thread block.
+  __shared__ float redbuf[128];
+  const int n_keys = token_index + 1;
 
-    float denom = 0.0f;
-    for (int source_index = 0; source_index <= token_index; ++source_index) {
-      const float stabilized = expf(shared_scores[source_index] - max_score);
-      shared_scores[source_index] = stabilized;
-      denom += stabilized;
+  float local_max = -1e30f;
+  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+    local_max = fmaxf(local_max, shared_scores[s]);
+  }
+  redbuf[thread_index] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (thread_index < stride) {
+      redbuf[thread_index] =
+          fmaxf(redbuf[thread_index], redbuf[thread_index + stride]);
     }
-    denom = fmaxf(denom, 1e-9f);
+    __syncthreads();
+  }
+  const float max_score = redbuf[0];
+  __syncthreads();
 
-    for (int dim = 0; dim < head_dim; ++dim) {
-      float acc = 0.0f;
-      for (int source_index = 0; source_index <= token_index; ++source_index) {
-        const int value_base =
-            source_index * 2 * kv_dim + kv_dim + kv_head * head_dim;
-        acc += (shared_scores[source_index] / denom) * kv_batch[value_base + dim];
-      }
-      out_batch[token_index * d_model + head_index * head_dim + dim] = acc;
+  float local_sum = 0.0f;
+  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+    const float stabilized = expf(shared_scores[s] - max_score);
+    shared_scores[s] = stabilized;
+    local_sum += stabilized;
+  }
+  redbuf[thread_index] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (thread_index < stride) {
+      redbuf[thread_index] += redbuf[thread_index + stride];
     }
+    __syncthreads();
+  }
+  const float denom = fmaxf(redbuf[0], 1e-9f);
+  __syncthreads();
+
+  for (int dim = thread_index; dim < head_dim; dim += blockDim.x) {
+    float acc = 0.0f;
+    for (int source_index = 0; source_index < n_keys; ++source_index) {
+      const int value_base =
+          source_index * 2 * kv_dim + kv_dim + kv_head * head_dim;
+      acc += (shared_scores[source_index] / denom) * kv_batch[value_base + dim];
+    }
+    out_batch[token_index * d_model + head_index * head_dim + dim] = acc;
   }
 }
 
