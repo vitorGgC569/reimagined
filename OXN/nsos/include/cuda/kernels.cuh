@@ -161,6 +161,18 @@ void launch_check_stability_kernel(int *d_found_issue, const float *in,
 void launch_moe_topk_kernel(const float *logits, float *weights, float *indices,
                             int batch, int num_experts, int k);
 
+// Decode-time greedy token selection on-device (#2 GPU sampler, greedy path).
+// argmax over allowed tokens with repetition penalty, mirroring the host greedy
+// branch in nsos_sdk.cpp.  repeated/seen/control are uint8[vocab] device masks
+// (any may be null); out_token is a device int.  Removes the per-token [vocab]
+// D2H + host vocab scan.  See src/cuda/kernels.cu for the exact value rule.
+void launch_decode_greedy_argmax(const float *raw, int vocab,
+                                 const unsigned char *repeated,
+                                 const unsigned char *seen,
+                                 const unsigned char *control,
+                                 int suppress_control, float penalty,
+                                 int *out_token);
+
 // =====================================================================
 // Generic top-k mask + renormalization for MoE routing.
 //

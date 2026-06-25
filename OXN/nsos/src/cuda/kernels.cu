@@ -1552,3 +1552,75 @@ extern "C" void launch_moe_topk_kernel(const float *logits, float *weights,
   moe_topk_kernel<<<blocks, threads>>>(logits, weights, indices, batch,
                                        num_experts, k);
 }
+
+// =====================================================================
+// Decode-time greedy token selection ON-DEVICE (#2 GPU sampler, greedy path).
+// Mirrors the host greedy branch in nsos_sdk.cpp::sample_from_host_logits_row:
+//   value(t) = banned(t)   ? -inf
+//            : repeated(t)  ? (raw[t] >= 0 ? raw[t]/penalty : raw[t]*penalty)
+//            : raw[t]
+//   banned(t) = seen[t]  (no-repeat-ngram bans + blocked-EOS, scattered by host)
+//             | (suppress_control && control[t])  (piece starts with "<|")
+// argmax with ties -> LOWEST index (host uses strict '>', keeping the first max).
+// repeated/seen/control are uint8[vocab] device masks; any may be null.
+// Single block; shared-memory (value,index) reduction.  Removes the per-token
+// [vocab] D2H + host scan and keeps selection on-device (graph-capturable).
+// =====================================================================
+__global__ void decode_greedy_argmax_kernel(const float *raw, int vocab,
+                                            const unsigned char *repeated,
+                                            const unsigned char *seen,
+                                            const unsigned char *control,
+                                            int suppress_control, float penalty,
+                                            int *out_token) {
+  extern __shared__ unsigned char gsa_smem[];
+  float *sval = reinterpret_cast<float *>(gsa_smem);
+  int *sidx = reinterpret_cast<int *>(sval + blockDim.x);
+  const int tid = static_cast<int>(threadIdx.x);
+  float best = -3.0e38f;
+  int best_i = -1;
+  for (int t = tid; t < vocab; t += static_cast<int>(blockDim.x)) {
+    if (seen && seen[t]) continue;
+    if (suppress_control && control && control[t]) continue;
+    float v = raw[t];
+    if (repeated && repeated[t] && penalty > 1.0f) {
+      v = (v >= 0.0f) ? (v / penalty) : (v * penalty);
+    }
+    if (v > best) {
+      best = v;
+      best_i = t;
+    }
+  }
+  sval[tid] = best;
+  sidx[tid] = best_i;
+  __syncthreads();
+  for (int s = static_cast<int>(blockDim.x) / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      const float ov = sval[tid + s];
+      const int oi = sidx[tid + s];
+      const bool take =
+          (oi >= 0) && (ov > sval[tid] ||
+                        (ov == sval[tid] && (sidx[tid] < 0 || oi < sidx[tid])));
+      if (take) {
+        sval[tid] = ov;
+        sidx[tid] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    *out_token = (sidx[0] >= 0) ? sidx[0] : 0;
+  }
+}
+
+extern "C" void launch_decode_greedy_argmax(const float *raw, int vocab,
+                                            const unsigned char *repeated,
+                                            const unsigned char *seen,
+                                            const unsigned char *control,
+                                            int suppress_control, float penalty,
+                                            int *out_token) {
+  const int block = 256;
+  const size_t smem =
+      static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
+  decode_greedy_argmax_kernel<<<1, block, smem>>>(
+      raw, vocab, repeated, seen, control, suppress_control, penalty, out_token);
+}
