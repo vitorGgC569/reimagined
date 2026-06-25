@@ -141,6 +141,24 @@ void SmartLoader::worker_loop() {
     if (req->destination == nullptr) {
       result.error_msg = "[SmartLoader] null destination tensor: " + req->filepath;
       std::cerr << result.error_msg << std::endl;
+    } else if (req->destination->get_device() == Device::GPU) {
+      // The worker performs a host pread directly into Tensor::data().  A
+      // GPU-resident destination would have the kernel write into device
+      // memory through a host pointer -> memory corruption.  Reject instead.
+      result.error_msg =
+          "[SmartLoader] GPU destination tensor unsupported: " + req->filepath;
+      std::cerr << result.error_msg << std::endl;
+    } else if (req->size >
+               static_cast<size_t>(req->destination->size) * sizeof(float)) {
+      // Refuse to read more bytes than the destination tensor can hold; a
+      // positioned read into a too-small buffer is a heap overflow.
+      result.error_msg =
+          "[SmartLoader] read size " + std::to_string(req->size) +
+          " exceeds destination capacity " +
+          std::to_string(static_cast<size_t>(req->destination->size) *
+                         sizeof(float)) +
+          " bytes: " + req->filepath;
+      std::cerr << result.error_msg << std::endl;
     } else {
       const int fd = NSOS_OPEN(req->filepath.c_str(), NSOS_O_RDONLY);
       if (fd < 0) {

@@ -138,7 +138,11 @@ CauchyGaussianExpansion::CauchyGaussianExpansion(float cauchy_scale,
                                                  float gaussian_std,
                                                  int sparsity_period)
     : cauchy_scale_(cauchy_scale), gaussian_std_(gaussian_std),
-      sparsity_period_(sparsity_period) {}
+      // sparsity_period_ is used as a modulus (j % sparsity_period_) in
+      // expand(); a value <= 0 would be a division by zero / UB.  Clamp to at
+      // least 1 at construction so every code path is safe.  The default
+      // (5) and any positive value are unchanged.
+      sparsity_period_(std::max(sparsity_period, 1)) {}
 
 std::vector<Tensor> CauchyGaussianExpansion::expand(const Tensor &state,
                                                     int num_children, int depth,

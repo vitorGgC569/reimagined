@@ -145,17 +145,33 @@ void MemorySystem::store_episodic(const Tensor &state) {
   // Initialize cluster's access time
   auto now = std::chrono::system_clock::now();
 
+  // The centroid math below dereferences host pointers, so the incoming
+  // state (which may live on GPU) must be materialized on the host first.
+  // Without this, state.data() returns a device pointer that is read on
+  // the CPU -> undefined behavior / segfault.  The clones stored in the
+  // cluster preserve the original device so retrieval semantics and
+  // checkpoint contents are unchanged for CPU callers.
+  Tensor state_cpu = (state.get_device() == Device::GPU) ? state.cpu() : state;
+
   // Clustered episodic storage with centroid routing.
   float best_dist = 1e9;
   int best_cluster = -1;
 
   // Find best cluster
   for (size_t i = 0; i < clusters.size(); ++i) {
-    // Euclidean distance to centroid (simplistic)
+    // Euclidean distance to centroid (simplistic).  Guard against a size
+    // mismatch between this state and a previously stored centroid (states
+    // of differing dimensionality must never index past either buffer).
+    Tensor centroid_cpu = clusters[i].centroid.get_device() == Device::GPU
+                              ? clusters[i].centroid.cpu()
+                              : clusters[i].centroid;
+    if (centroid_cpu.size != state_cpu.size) {
+      continue;
+    }
     float dist = 0;
-    float *c = clusters[i].centroid.data();
-    const float *s = state.data();
-    for (int k = 0; k < state.size; ++k)
+    const float *c = centroid_cpu.data();
+    const float *s = state_cpu.data();
+    for (int k = 0; k < state_cpu.size; ++k)
       dist += (c[k] - s[k]) * (c[k] - s[k]);
 
     if (dist < best_dist) {
@@ -177,12 +193,23 @@ void MemorySystem::store_episodic(const Tensor &state) {
     // Add to existing
     clusters[best_cluster].items.push_back(state.clone());
     clusters[best_cluster].last_access = now;
-    // Update centroid (Moving Average)
+    // Update centroid (Moving Average).  Operate on a host copy then write
+    // the result back onto the centroid in its original device, keeping the
+    // host-pointer arithmetic safe for GPU-resident centroids.
     float alpha = 0.1f;
-    float *c = clusters[best_cluster].centroid.data();
-    const float *s = state.data();
-      for (int k = 0; k < state.size; ++k)
-      c[k] = (1 - alpha) * c[k] + alpha * s[k];
+    const Device centroid_device = clusters[best_cluster].centroid.get_device();
+    Tensor centroid_cpu = centroid_device == Device::GPU
+                              ? clusters[best_cluster].centroid.cpu()
+                              : clusters[best_cluster].centroid;
+    if (centroid_cpu.size == state_cpu.size) {
+      float *c = centroid_cpu.data();
+      const float *s = state_cpu.data();
+      for (int k = 0; k < state_cpu.size; ++k)
+        c[k] = (1 - alpha) * c[k] + alpha * s[k];
+      clusters[best_cluster].centroid =
+          centroid_device == Device::GPU ? centroid_cpu.to(centroid_device)
+                                         : centroid_cpu;
+    }
   }
 
   if (causal_store) {
@@ -222,7 +249,10 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
         clusters[i].centroid.get_device() == Device::GPU ? clusters[i].centroid.cpu()
                                                          : clusters[i].centroid;
     const float *c = centroid_cpu.data();
-    for (int k = 0; k < query_cpu.size; ++k) {
+    // Centroids of a different dimensionality than the query must not be
+    // indexed past their buffer; only the overlapping prefix contributes.
+    const int centroid_extent = std::min(query_cpu.size, centroid_cpu.size);
+    for (int k = 0; k < centroid_extent; ++k) {
       dot += c[k] * query_ptr[k];
       centroid_norm_sq += c[k] * c[k];
     }
@@ -261,12 +291,17 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
       Tensor mem_cpu = mem.get_device() == Device::GPU ? mem.cpu() : mem;
       float dot = 0;
       const float *mem_ptr = mem_cpu.data();
-      for (int i = 0; i < mem_cpu.size; ++i)
+      // The query, the stored item, and the accumulation buffer may differ
+      // in length; clamp every access to their common extent so neither
+      // query_ptr, mem_ptr nor context_cpu is indexed out of bounds.
+      const int mem_extent =
+          std::min(mem_cpu.size, std::min(query_cpu.size, context_cpu.size));
+      for (int i = 0; i < mem_extent; ++i)
         dot += query_ptr[i] * mem_ptr[i];
 
       float weight = stable_similarity_weight(dot);
 
-      for (int i = 0; i < mem_cpu.size; ++i)
+      for (int i = 0; i < mem_extent; ++i)
         context_cpu.data()[i] += mem_ptr[i] * weight;
       total_weight += weight;
     }
@@ -277,9 +312,13 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
             float dot = tq_engine->dot(query_vec, compressed_mem);
             float weight = stable_similarity_weight(dot);
 
-            // Decode entirely to reconstruct the state as we need it for weighting
+            // Decode entirely to reconstruct the state as we need it for weighting.
+            // The decoded vector length need not match the accumulation buffer,
+            // so clamp to the smaller extent to avoid writing past context_cpu.
             std::vector<float> decoded = tq_engine->decode(compressed_mem);
-            for (size_t i = 0; i < decoded.size(); ++i) {
+            const size_t decoded_extent =
+                std::min(decoded.size(), static_cast<size_t>(context_cpu.size));
+            for (size_t i = 0; i < decoded_extent; ++i) {
                 context_cpu.data()[i] += decoded[i] * weight;
             }
             total_weight += weight;
@@ -309,7 +348,8 @@ std::vector<Tensor> MemorySystem::retrieve(const Tensor &query, size_t top_k) {
                                                      : cluster.centroid;
     const float *centroid_ptr = centroid_cpu.data();
     float dot = 0.0f;
-    for (int i = 0; i < query_cpu.size; ++i) {
+    const int extent = std::min(query_cpu.size, centroid_cpu.size);
+    for (int i = 0; i < extent; ++i) {
       dot += query_ptr[i] * centroid_ptr[i];
     }
     ranked.push_back({dot, cluster.centroid});

@@ -1,4 +1,5 @@
 #include "fabric.h"
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -77,23 +78,34 @@ Fabric::~Fabric() {}
 void Fabric::barrier() {}
 
 void Fabric::send(const nsos::Tensor &t, int dest_rank) {
-  if (dest_rank >= 8)
+  // The fallback ring buffers are a fixed array of 8 slots; reject any rank
+  // index outside [0, 8) so a negative or oversized rank (e.g. a garbage
+  // RANK env var) cannot index the static arrays out of bounds.
+  if (dest_rank < 0 || dest_rank >= 8)
     return;
   std::unique_lock<std::mutex> lock(rank_mutexes[dest_rank]);
-  shared_buffers[dest_rank].resize(t.size);
+  shared_buffers[dest_rank].resize(static_cast<size_t>(t.size));
   std::memcpy(shared_buffers[dest_rank].data(), t.data(),
-              t.size * sizeof(float));
+              static_cast<size_t>(t.size) * sizeof(float));
   data_ready[dest_rank] = true;
   rank_cvs[dest_rank].notify_one();
 }
 
 nsos::Tensor Fabric::recv(int src_rank, std::vector<int> shape) {
-  if (rank >= 8)
+  if (rank < 0 || rank >= 8)
     return nsos::Tensor::zeros(shape, Device::CPU);
   std::unique_lock<std::mutex> lock(rank_mutexes[rank]);
   rank_cvs[rank].wait(lock, [this]() { return data_ready[rank]; });
   nsos::Tensor t(shape, Device::CPU);
-  std::memcpy(t.data(), shared_buffers[rank].data(), t.size * sizeof(float));
+  // The sender may have published fewer floats than this receiver's shape
+  // requests; copy only the overlap so we never read past the shared buffer.
+  const size_t available = shared_buffers[rank].size();
+  const size_t requested = static_cast<size_t>(t.size);
+  const size_t copy_count = std::min(available, requested);
+  if (copy_count > 0) {
+    std::memcpy(t.data(), shared_buffers[rank].data(),
+                copy_count * sizeof(float));
+  }
   data_ready[rank] = false;
   return t;
 }
