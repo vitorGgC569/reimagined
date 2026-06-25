@@ -170,7 +170,7 @@ std::string HolographicMemory::query(const Tensor &query_vec) {
   // A caller may pass a query shorter than the stored hypervector
   // dimensionality; only the overlapping prefix may be dotted to avoid
   // reading past the query buffer.  For a full-length query this is a no-op.
-  const int score_extent = std::min(dim, query_cpu.size);
+  const int score_extent = std::min(dim, static_cast<int>(query_cpu.size));
   for (int i = 0; i < current_size; ++i) {
     float score = 0.0f;
     const float *concept_ptr = memory_ptr + static_cast<size_t>(i) * dim;
@@ -202,7 +202,7 @@ Tensor HolographicMemory::retrieve_vector(const Tensor &query_vec, int top_k,
   // Clamp the dot-product to the overlap between the query and the stored
   // hypervector dimensionality (see query()); avoids reading past a short
   // query buffer while leaving full-length queries unaffected.
-  const int score_extent = std::min(dim, query_cpu.size);
+  const int score_extent = std::min(dim, static_cast<int>(query_cpu.size));
   for (int i = 0; i < current_size; ++i) {
     float score = 0.0f;
     const float *concept_ptr = memory_ptr + static_cast<size_t>(i) * dim;
