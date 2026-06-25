@@ -37,6 +37,7 @@
 #include <device_launch_parameters.h>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 
 #ifndef NSOS_FLASH_ATTN_BR
 #define NSOS_FLASH_ATTN_BR 64   // Query block size (rows per block)
@@ -283,6 +284,19 @@ extern "C" void launch_flash_attention_kernel(const float* Q, const float* K,
                                                int seq_len, int num_heads,
                                                int num_kv_heads, int head_dim,
                                                int kv_group_size, float scale) {
+    // OOB guard: the kernel stores Q_i/O_i in fixed-size MAX_HEAD_DIM=128
+    // register arrays (and scores[Bc]); a head_dim beyond that overflows the
+    // per-thread stack.  Refuse to launch (caller must fall back to the dense
+    // gqa_causal_attention path) rather than corrupt memory.  This path is
+    // opt-in (NSOS_USE_FLASH_ATTENTION) and currently unwired, so the guard is
+    // a landmine-defuse for whoever enables it.
+    if (head_dim <= 0 || head_dim > 128) {
+        std::fprintf(stderr,
+                     "[flash_attn] head_dim=%d unsupported (max 128); skipping "
+                     "flash kernel — use dense attention\n",
+                     head_dim);
+        return;
+    }
     const int Br = NSOS_FLASH_ATTN_BR;
     const int Bc = NSOS_FLASH_ATTN_BC;
     const dim3 grid((seq_len + Br - 1) / Br, num_heads, 1);

@@ -446,7 +446,7 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     // Load tile of A into shared memory
     int a_col = t * TILE_DIM + tx;
     if (row < M && a_col < K) {
-      As[ty][tx] = A[row * K + a_col];
+      As[ty][tx] = A[static_cast<size_t>(row) * K + a_col];
     } else {
       As[ty][tx] = 0.0f;
     }
@@ -454,7 +454,7 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
     // Load tile of B into shared memory
     int b_row = t * TILE_DIM + ty;
     if (b_row < K && col < N) {
-      Bs[ty][tx] = B[b_row * N + col];
+      Bs[ty][tx] = B[static_cast<size_t>(b_row) * N + col];
     } else {
       Bs[ty][tx] = 0.0f;
     }
@@ -472,7 +472,7 @@ __global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
 
   // Write result
   if (row < M && col < N) {
-    C[row * N + col] = sum;
+    C[static_cast<size_t>(row) * N + col] = sum;
   }
 }
 
@@ -493,14 +493,14 @@ __global__ void transpose2d_kernel(float *out, const float *in, int rows,
   int y = blockIdx.y * TILE_DIM + threadIdx.y;
 
   if (x < cols && y < rows) {
-    tile[threadIdx.y][threadIdx.x] = in[y * cols + x];
+    tile[threadIdx.y][threadIdx.x] = in[static_cast<size_t>(y) * cols + x];
   }
   __syncthreads();
 
   x = blockIdx.y * TILE_DIM + threadIdx.x;
   y = blockIdx.x * TILE_DIM + threadIdx.y;
   if (x < rows && y < cols) {
-    out[y * rows + x] = tile[threadIdx.x][threadIdx.y];
+    out[static_cast<size_t>(y) * rows + x] = tile[threadIdx.x][threadIdx.y];
   }
 }
 
@@ -529,7 +529,7 @@ __global__ void bitnet_gemm_kernel(const int8_t *A, const uint32_t *W, float *C,
         (K + 15) / 16; // Each uint32 packs 16 ternary weights (2 bits each)
 
     for (int kb = 0; kb < k_blocks; kb++) {
-      uint32_t w_pack = W[col * k_blocks + kb];
+      uint32_t w_pack = W[static_cast<size_t>(col) * k_blocks + kb];
       int base_k = kb * 16;
 
 // Process 16 weights in groups of 4 using __dp4a
@@ -553,10 +553,10 @@ __global__ void bitnet_gemm_kernel(const int8_t *A, const uint32_t *W, float *C,
                        ((w3 & 0xFF) << 24);
 
         // Load 4 activation values and pack into int32
-        int8_t a0 = (k_start + 0 < K) ? A[row * K + k_start + 0] : 0;
-        int8_t a1 = (k_start + 1 < K) ? A[row * K + k_start + 1] : 0;
-        int8_t a2 = (k_start + 2 < K) ? A[row * K + k_start + 2] : 0;
-        int8_t a3 = (k_start + 3 < K) ? A[row * K + k_start + 3] : 0;
+        int8_t a0 = (k_start + 0 < K) ? A[static_cast<size_t>(row) * K + k_start + 0] : 0;
+        int8_t a1 = (k_start + 1 < K) ? A[static_cast<size_t>(row) * K + k_start + 1] : 0;
+        int8_t a2 = (k_start + 2 < K) ? A[static_cast<size_t>(row) * K + k_start + 2] : 0;
+        int8_t a3 = (k_start + 3 < K) ? A[static_cast<size_t>(row) * K + k_start + 3] : 0;
         int a_packed = (a0 & 0xFF) | ((a1 & 0xFF) << 8) | ((a2 & 0xFF) << 16) |
                        ((a3 & 0xFF) << 24);
 
@@ -564,7 +564,7 @@ __global__ void bitnet_gemm_kernel(const int8_t *A, const uint32_t *W, float *C,
         acc = __dp4a(a_packed, w_packed, acc);
       }
     }
-    C[row * N + col] = (float)acc * scale;
+    C[static_cast<size_t>(row) * N + col] = (float)acc * scale;
   }
 }
 
