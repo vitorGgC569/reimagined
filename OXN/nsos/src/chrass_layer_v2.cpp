@@ -158,4 +158,11 @@ void ChrassLayer::step(float lr) {
     if (w_ptr[i] > 10.0f)     w_ptr[i] = 10.0f;
     if (w_ptr[i] < -10.0f)    w_ptr[i] = -10.0f;
   }
+
+  // Standalone-optimizer contract: backward ACCUMULATES into values_param.grad,
+  // so clear it after applying the update — the next forward/backward/step
+  // iteration must start from zero.  (The Trainer path uses its own zero_grad
+  // and never calls this method.)
+  std::memset(values_param.grad.data(), 0,
+              static_cast<size_t>(size) * sizeof(float));
 }

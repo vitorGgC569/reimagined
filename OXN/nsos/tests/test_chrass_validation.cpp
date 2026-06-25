@@ -720,36 +720,50 @@ bool test_numerical_adversarial_magnitudes() {
     return true;
 }
 
-bool test_repeated_backward_no_grad_accumulation_overflow() {
-    // 100 chamadas de backward seguidas sem reset externo de grad — o reset
-    // está DENTRO de backward (std::fill). Grad final deve ser exatamente
-    // o do último backward, não acumulado.
+bool test_repeated_backward_accumulates_and_resets() {
+    // CHRASS backward follows the codebase-wide autograd contract: it ACCUMULATES
+    // into values_param.grad; the caller zeroes between optimizer steps (the
+    // Trainer's zero_model_gradients, or the standalone step() which clears the
+    // grad after applying).  Verify (a) repeated backward without zeroing
+    // accumulates, and (b) zero_grad resets it.  The previous "reset-inside-
+    // backward" behavior silently dropped all but the last micro-batch in a
+    // multi-bucket optimizer step.
     int dim = 8;
     auto A = random_adjacency(dim, 0.5f, 7);
     ChrassLayer layer(dim, A);
 
     Tensor X = make_input(random_vector(dim, 8), 1, dim);
     layer.forward(X);
+    // Small upstream grad so the accumulated sum stays below CHRASS's per-call
+    // [-1, 1] gradient clip (we are exercising accumulation, not the clip).
+    Tensor dY({1, dim}, nsos::Device::CPU);
+    for (int i = 0; i < dim; ++i) dY.data()[i] = 0.01f;
 
-    Tensor dY = Tensor::ones({1, dim}, nsos::Device::CPU);
+    layer.values_param.zero_grad();
     layer.backward(dY, X);
-    int gnnz = layer.values_param.grad.size;
-    std::vector<float> grads_after_1(
-        layer.values_param.grad.data(),
-        layer.values_param.grad.data() + gnnz);
+    const int gnnz = layer.values_param.grad.size;
+    std::vector<float> g1(layer.values_param.grad.data(),
+                          layer.values_param.grad.data() + gnnz);
 
-    for (int k = 0; k < 99; ++k) {
-        layer.backward(dY, X);
+    // Two more backwards WITHOUT zeroing -> grads must accumulate (~3x).
+    layer.backward(dY, X);
+    layer.backward(dY, X);
+    std::vector<float> g3(layer.values_param.grad.data(),
+                          layer.values_param.grad.data() + gnnz);
+    for (size_t i = 0; i < g1.size(); ++i) {
+        CHECK(is_close(g3[i], 3.0f * g1[i], 1e-5f),
+              "grad must accumulate across backward calls at idx " << i
+              << " 1x=" << g1[i] << " 3x=" << g3[i]);
     }
-    std::vector<float> grads_after_100(
-        layer.values_param.grad.data(),
-        layer.values_param.grad.data() + gnnz);
 
-    for (size_t i = 0; i < grads_after_1.size(); ++i) {
-        CHECK(is_close(grads_after_1[i], grads_after_100[i], 1e-6f),
-              "grad accumulation bug at idx " << i
-              << " 1-call=" << grads_after_1[i]
-              << " 100-call=" << grads_after_100[i]);
+    // zero_grad() then one backward -> back to the single-call gradient.
+    layer.values_param.zero_grad();
+    layer.backward(dY, X);
+    std::vector<float> gr(layer.values_param.grad.data(),
+                          layer.values_param.grad.data() + gnnz);
+    for (size_t i = 0; i < g1.size(); ++i) {
+        CHECK(is_close(g1[i], gr[i], 1e-6f),
+              "zero_grad must reset accumulation at idx " << i);
     }
     return true;
 }
@@ -836,7 +850,7 @@ int main() {
     RUN(test_stress_1024x1024_sparse);
     RUN(test_stress_long_training_loop_converges);
     RUN(test_numerical_adversarial_magnitudes);
-    RUN(test_repeated_backward_no_grad_accumulation_overflow);
+    RUN(test_repeated_backward_accumulates_and_resets);
     RUN(test_topology_hash_stable_over_steps);
 
     std::cout << "============================================================" << std::endl;

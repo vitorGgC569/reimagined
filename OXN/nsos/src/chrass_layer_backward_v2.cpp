@@ -29,20 +29,15 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
   Tensor d_bias = Tensor::zeros({dim}, bias.data.get_device());
   float *db_ptr = d_bias.data();
 
-  // KNOWN FOLLOW-UP (CHRASS is off by default): unlike every other layer here,
-  // this backward RESETS values_param.grad instead of accumulating, so a
-  // multi-bucket optimizer step (Trainer runs several backwards between two
-  // zero_grad calls) keeps only the LAST bucket's weight gradient.  Switching
-  // to the codebase-wide accumulate-then-zero contract requires a coordinated
-  // change (relocate the per-call grad clip below, make the standalone step()
-  // zero the grad, and update the two contract tests in test_chrass_validation)
-  // and is tracked separately.  The reset is preserved here for now to keep the
-  // standalone step() loop and its gate tests correct.
+  // Sparse weight gradients ACCUMULATE into values_param.grad — the codebase-wide
+  // autograd contract.  The Trainer zeroes every parameter grad once per optimizer
+  // step and then runs the micro-batch backwards; the standalone step() clears the
+  // grad after applying its update.  Never reset here: doing so would drop all but
+  // the last micro-batch's gradient in a multi-bucket step (the bias path already
+  // accumulates via add_grad — the weight must match).  Lazy-allocate on the first
+  // call / shape change.
   if (values_param.grad.size != nnz_count) {
     values_param.grad = Tensor::zeros({nnz_count}, bias.data.get_device());
-  } else {
-    std::memset(values_param.grad.data(), 0,
-                static_cast<size_t>(nnz_count) * sizeof(float));
   }
   float *gw_ptr = values_param.grad.data();
 
