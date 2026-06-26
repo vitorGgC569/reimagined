@@ -891,6 +891,13 @@ bool JambaModel::supports_batched_streaming_inference() const {
         if (!layer->mamba_layer && !layer->ttt_layer && !layer->attn_layer) {
             return false;
         }
+        // The corrected selective-SSM path keeps its SSD state + conv window in a
+        // per-layer cache that batched fork/restore does not snapshot; fall back
+        // to the (correct) non-streaming decode for proper-path models.
+        if (layer->mamba_layer &&
+            layer->mamba_layer->proper_selective_ssm_enabled()) {
+            return false;
+        }
     }
     return !layers.empty();
 }

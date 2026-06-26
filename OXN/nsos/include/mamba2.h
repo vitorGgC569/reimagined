@@ -69,6 +69,12 @@ public:
   std::vector<Parameter *> parameters();
   void set_streaming_mode(bool enabled);
   bool streaming_mode() const { return streaming_inference_; }
+  // True when the corrected selective-SSM path is active.  Used to gate batched
+  // fork/restore streaming (that path snapshots only the legacy [1,d_model]
+  // state, not the proper SSD state + conv window).
+  bool proper_selective_ssm_enabled() const {
+    return config_.proper_selective_ssm;
+  }
   MambaStreamSnapshot snapshot_streaming_state() const;
   void restore_streaming_state(const MambaStreamSnapshot& snapshot);
   std::vector<MambaStreamSnapshot> snapshot_streaming_state_batch() const;
@@ -108,6 +114,15 @@ private:
   // (GPU kernels wired in Phase B); projections/gate via device-agnostic ops.
   Tensor forward_proper_nstate(const Tensor &u);
   Tensor backward_proper_nstate(const Tensor &grad_output);
+  // Single-token incremental decode for the proper path.  Carries the SSD state
+  // and a (K-1)-tap conv window (pp_stream_*) across calls so each generated
+  // token is O(1) instead of re-scanning the whole prefix.  Numerically mirrors
+  // the corresponding forward_proper* one step at a time.
+  Tensor forward_proper_step(const Tensor &u);
+  Tensor forward_proper_nstate_step(const Tensor &u);
+  // Shared conv step: xv_host [1,dim] -> xc=silu(causal_conv) [1,dim] using the
+  // carried window, then advances the window.  Host math (parity with the scan).
+  Tensor proper_stream_conv_(const Tensor &xv_host);
   // Causal depthwise conv1d over [rows, dim] laid out as `batch` sequences of
   // `seq` steps.  weight is [dim, K]; out[t,c] = sum_j weight[c,j]*in[t-(K-1)+j,c]
   // with left zero-padding.  Pure host math.
@@ -181,6 +196,16 @@ private:
   Tensor pp_state_hist_;     // N-state SSD history [rows, H, P, N] (BPTT)
   int pp_batch_ = 0;
   int pp_seq_ = 0;
+
+  // ── Incremental proper-path streaming decode (opt-in) ──────────────────────
+  // Primed by the prefill forward_proper*/nstate when streaming_inference_ is on,
+  // then advanced one token per call by forward_proper_step*.  pp_stream_state_
+  // is the carried SSD state ([dim] diagonal / [H*P*N] nstate); pp_stream_ring_
+  // is the (K-1)-tap causal-conv window over x_proj ([slot*dim + c], slot 0 =
+  // oldest).  Cleared on reset()/set_streaming_mode().
+  std::vector<float> pp_stream_state_;
+  std::vector<float> pp_stream_ring_;
+  bool pp_stream_active_ = false;
 
   // Reusable buffers for scan operation
   struct ThreadBuffers {

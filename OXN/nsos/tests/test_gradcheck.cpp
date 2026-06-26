@@ -306,6 +306,56 @@ void check_mamba2_nstate() {
                    "mamba2-nstate d/dconv1d", kTolScan);
 }
 
+// ── Module: proper-path incremental streaming decode ─────────────────────────
+// The single-token decode (prefill + forward_proper_step) must reproduce the
+// full-sequence scan token-for-token.  Both run the same host conv1d + recurrence
+// so the carried state + conv window are byte-faithful — this catches any drift
+// in the streaming bookkeeping (window shift, prime, state carry) on CPU, before
+// it ever burns T4 quota.
+static void check_proper_streaming_parity(bool nstate) {
+  const int H = nstate ? 2 : 1;
+  const int P = 4;
+  const int N = nstate ? 3 : 4;
+  const int D = nstate ? H * P : 4;
+  const int L = 6;
+  MambaConfig cfg;
+  cfg.proper_selective_ssm = true;
+  cfg.proper_state_expansion = nstate;
+  cfg.conv_kernel = 3;
+  Mamba2SSD layer(D, N, H, cfg);
+  Tensor x({L, D});
+  fill_smooth(x, 0.6f, nstate ? 0.39f : 0.41f);
+
+  Tensor full = layer.forward(x);  // full scan, streaming off -> [L, D]
+
+  layer.reset();
+  layer.set_streaming_mode(true);
+  float max_abs = 0.0f;
+  for (int t = 0; t < L; ++t) {
+    Tensor xt({1, D});
+    for (int c = 0; c < D; ++c)
+      xt.data()[c] = x.data()[static_cast<size_t>(t) * D + c];
+    Tensor yt = layer.forward(xt);  // prefill (t==0) then incremental steps
+    for (int c = 0; c < D; ++c) {
+      const float diff =
+          std::fabs(yt.data()[c] - full.data()[static_cast<size_t>(t) * D + c]);
+      if (diff > max_abs) max_abs = diff;
+    }
+  }
+  layer.set_streaming_mode(false);
+
+  const char *name =
+      nstate ? "mamba2-nstate streaming==scan" : "mamba2-proper streaming==scan";
+  const float tol = 1e-4f;
+  if (max_abs <= tol) {
+    std::printf("[gradcheck] %-32s OK   (max|delta|=%.2e)\n", name, max_abs);
+  } else {
+    std::printf("[gradcheck] %-32s FAIL (max|delta|=%.2e > %.1e)\n", name,
+                max_abs, tol);
+    ++g_failures;
+  }
+}
+
 // ── Module: BitFastKAN layer (end-to-end forward/backward) ───────────────────
 void check_kan() {
   const int in = 5, out = 3, rows = 4, grid = 5;
@@ -491,6 +541,8 @@ int main() {
   check_mamba2();
   check_mamba2_proper();
   check_mamba2_nstate();
+  check_proper_streaming_parity(false);
+  check_proper_streaming_parity(true);
   check_moe_switch_aux();
   check_moe_router_grad();
   check_kan();

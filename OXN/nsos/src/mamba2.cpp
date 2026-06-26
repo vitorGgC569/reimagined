@@ -651,6 +651,31 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
     pp_seq_ = seq;
     proper_active_ = true;
 
+    // Prime the incremental stream: carry the final SSD state + the last (K-1)
+    // x_proj taps so subsequent single tokens decode in O(1) (forward_proper_step).
+    if (streaming_inference_) {
+        Tensor h_h = dev == Device::GPU ? h_hist.cpu() : h_hist;
+        Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
+        pp_stream_state_.assign(static_cast<size_t>(dim), 0.0f);
+        const float* hp = h_h.data();
+        for (int c = 0; c < dim; ++c) {
+            pp_stream_state_[static_cast<size_t>(c)] =
+                hp[static_cast<size_t>(rows - 1) * dim + c];
+        }
+        const int taps = std::max(K - 1, 0);
+        pp_stream_ring_.assign(static_cast<size_t>(taps) * dim, 0.0f);
+        const float* xvp = xv_h.data();
+        for (int s = 0; s < taps; ++s) {
+            const int src_row = rows - taps + s;
+            if (src_row < 0) continue;
+            for (int c = 0; c < dim; ++c) {
+                pp_stream_ring_[static_cast<size_t>(s) * dim + c] =
+                    xvp[static_cast<size_t>(src_row) * dim + c];
+            }
+        }
+        pp_stream_active_ = true;
+    }
+
     return rank_2 ? result : result.reshape({batch, seq, dim});
 }
 
@@ -912,6 +937,31 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
     pp_seq_ = seq;
     proper_active_ = true;
 
+    // Prime the incremental stream (nstate): carry the final H*P*N state + last
+    // (K-1) x_proj taps for O(1) single-token decode (forward_proper_nstate_step).
+    if (streaming_inference_) {
+        Tensor st_h = dev == Device::GPU ? hist.cpu() : hist;
+        Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
+        const size_t HPN = static_cast<size_t>(H) * P * N;
+        pp_stream_state_.assign(HPN, 0.0f);
+        const float* hp = st_h.data();
+        for (size_t k = 0; k < HPN; ++k) {
+            pp_stream_state_[k] = hp[static_cast<size_t>(rows - 1) * HPN + k];
+        }
+        const int taps = std::max(K - 1, 0);
+        pp_stream_ring_.assign(static_cast<size_t>(taps) * dim, 0.0f);
+        const float* xvp = xv_h.data();
+        for (int s = 0; s < taps; ++s) {
+            const int src_row = rows - taps + s;
+            if (src_row < 0) continue;
+            for (int c = 0; c < dim; ++c) {
+                pp_stream_ring_[static_cast<size_t>(s) * dim + c] =
+                    xvp[static_cast<size_t>(src_row) * dim + c];
+            }
+        }
+        pp_stream_active_ = true;
+    }
+
     return rank_2 ? result : result.reshape({batch, seq, dim});
 }
 
@@ -1109,6 +1159,163 @@ void Mamba2SSD::update_streaming_state_from_history(const Tensor& input) {
     streaming_state_ = std::make_shared<Tensor>(std::move(target_state));
 }
 
+Tensor Mamba2SSD::proper_stream_conv_(const Tensor& xv_host) {
+    // xv_host: host [1,dim].  Builds the K-tap causal window (carried taps +
+    // current x), runs the same host conv1d the full scan uses, returns
+    // xc=silu(conv_pre) for the current token, then advances the window.
+    const int dim = d_model;
+    const int K = std::max(conv_kernel_, 1);
+    Tensor cw_h = conv_weight_.data.get_device() == Device::GPU
+                      ? conv_weight_.data.cpu()
+                      : conv_weight_.data;
+    Tensor win(std::vector<int>{1, K, dim}, Device::CPU);
+    float* wptr = win.data();
+    const bool have_ring =
+        static_cast<int>(pp_stream_ring_.size()) == (K - 1) * dim;
+    for (int s = 0; s < K - 1; ++s) {
+        for (int c = 0; c < dim; ++c) {
+            wptr[static_cast<size_t>(s) * dim + c] =
+                have_ring ? pp_stream_ring_[static_cast<size_t>(s) * dim + c]
+                          : 0.0f;
+        }
+    }
+    const float* xvp = xv_host.data();
+    for (int c = 0; c < dim; ++c) {
+        wptr[static_cast<size_t>(K - 1) * dim + c] = xvp[c];
+    }
+    Tensor conv_full(std::vector<int>{1, K, dim}, Device::CPU);
+    conv1d_causal_forward(win.data(), cw_h.data(), conv_full.data(), 1, K, dim, K);
+    Tensor conv_pre(std::vector<int>{1, dim}, Device::CPU);
+    std::memcpy(conv_pre.data(),
+                conv_full.data() + static_cast<size_t>(K - 1) * dim,
+                static_cast<size_t>(dim) * sizeof(float));
+    Tensor xc = conv_pre.mul(conv_pre.sigmoid());
+    // Advance the window: drop the oldest tap, append the current x.
+    if (K - 1 > 0) {
+        if (!have_ring) {
+            pp_stream_ring_.assign(static_cast<size_t>(K - 1) * dim, 0.0f);
+        }
+        for (int s = 0; s + 1 < K - 1; ++s) {
+            for (int c = 0; c < dim; ++c) {
+                pp_stream_ring_[static_cast<size_t>(s) * dim + c] =
+                    pp_stream_ring_[static_cast<size_t>(s + 1) * dim + c];
+            }
+        }
+        for (int c = 0; c < dim; ++c) {
+            pp_stream_ring_[static_cast<size_t>(K - 2) * dim + c] = xvp[c];
+        }
+    }
+    return xc;
+}
+
+Tensor Mamba2SSD::forward_proper_step(const Tensor& u) {
+    const int dim = d_model;
+    const Device dev = u.get_device();
+    Tensor u_flat = u.reshape({1, dim});
+
+    // Projections (device-agnostic), pulled to host for the scalar recurrence.
+    Tensor xv = x_proj_->forward(u_flat).reshape({1, dim});
+    Tensor z = z_proj_->forward(u_flat).reshape({1, dim});
+    Tensor Bt = B_proj_->forward(u_flat).reshape({1, dim});
+    Tensor Ct = C_proj_->forward(u_flat).reshape({1, dim});
+    Tensor dt = dt_proj_->forward(u_flat).reshape({1, dim});
+    Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
+    Tensor Bt_h = dev == Device::GPU ? Bt.cpu() : Bt;
+    Tensor Ct_h = dev == Device::GPU ? Ct.cpu() : Ct;
+    Tensor dt_h = dev == Device::GPU ? dt.cpu() : dt;
+    Tensor A_h = A.data.get_device() == Device::GPU ? A.data.cpu() : A.data;
+
+    Tensor xc = proper_stream_conv_(xv_h);  // host [1,dim]
+    const float* xcp = xc.data();
+
+    if (static_cast<int>(pp_stream_state_.size()) != dim) {
+        pp_stream_state_.assign(static_cast<size_t>(dim), 0.0f);
+    }
+    const float* bp = Bt_h.data();
+    const float* cp = Ct_h.data();
+    const float* dtp = dt_h.data();
+    const float* ap = A_h.data();
+    Tensor y_ssd(std::vector<int>{1, dim}, Device::CPU);
+    float* yp = y_ssd.data();
+    for (int c = 0; c < dim; ++c) {
+        const float a_value = std::max(ap[c], 1e-3f);
+        const float decay = std::exp(-softplus_stable(dtp[c]) * a_value);
+        const float st =
+            decay * pp_stream_state_[static_cast<size_t>(c)] + bp[c] * xcp[c];
+        pp_stream_state_[static_cast<size_t>(c)] = st;
+        yp[c] = st * cp[c];
+    }
+
+    // Gate on host (parity), then project + skip on the input device.
+    Tensor z_h = dev == Device::GPU ? z.cpu() : z;
+    Tensor gated_h = y_ssd.mul(z_h.mul(z_h.sigmoid()));
+    Tensor gated = dev == Device::GPU ? gated_h.to(Device::GPU) : gated_h;
+    Tensor projected = out_proj.forward(gated).reshape({1, dim});
+    Tensor skip = u_flat.mul(D.data);
+    Tensor result = projected.add(skip);
+    return u.shape.size() == 2 ? result : result.reshape({1, 1, dim});
+}
+
+Tensor Mamba2SSD::forward_proper_nstate_step(const Tensor& u) {
+    const int dim = d_model;
+    const int H = std::max(n_heads, 1);
+    const int P = d_head;
+    const int N = std::max(d_state, 1);
+    const Device dev = u.get_device();
+    Tensor u_flat = u.reshape({1, dim});
+
+    Tensor xv = x_proj_->forward(u_flat).reshape({1, dim});
+    Tensor z = z_proj_->forward(u_flat).reshape({1, dim});
+    Tensor Bt = B_proj_->forward(u_flat).reshape({1, H * N});
+    Tensor Ct = C_proj_->forward(u_flat).reshape({1, H * N});
+    Tensor dt = dt_proj_->forward(u_flat).reshape({1, H});
+    Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
+    Tensor Bt_h = dev == Device::GPU ? Bt.cpu() : Bt;
+    Tensor Ct_h = dev == Device::GPU ? Ct.cpu() : Ct;
+    Tensor dt_h = dev == Device::GPU ? dt.cpu() : dt;
+    Tensor A_h = A.data.get_device() == Device::GPU ? A.data.cpu() : A.data;
+
+    Tensor xc = proper_stream_conv_(xv_h);  // host [1,dim]
+    const float* xcp = xc.data();
+
+    const size_t HPN = static_cast<size_t>(H) * P * N;
+    if (pp_stream_state_.size() != HPN) {
+        pp_stream_state_.assign(HPN, 0.0f);
+    }
+    const float* bp = Bt_h.data();
+    const float* cp = Ct_h.data();
+    const float* dtp = dt_h.data();
+    const float* ap = A_h.data();
+    Tensor y_ssd(std::vector<int>{1, dim}, Device::CPU);
+    float* yp = y_ssd.data();
+    for (int h = 0; h < H; ++h) {
+        const float a_value = std::max(ap[h], 1e-3f);
+        const float decay = std::exp(-softplus_stable(dtp[h]) * a_value);
+        for (int p = 0; p < P; ++p) {
+            const int chan = h * P + p;
+            const float xcv = xcp[chan];
+            float y_acc = 0.0f;
+            for (int n = 0; n < N; ++n) {
+                const size_t sidx = (static_cast<size_t>(h) * P + p) * N + n;
+                const float bval = bp[static_cast<size_t>(h) * N + n];
+                const float cval = cp[static_cast<size_t>(h) * N + n];
+                const float hv = decay * pp_stream_state_[sidx] + bval * xcv;
+                pp_stream_state_[sidx] = hv;
+                y_acc += hv * cval;
+            }
+            yp[chan] = y_acc;
+        }
+    }
+
+    Tensor z_h = dev == Device::GPU ? z.cpu() : z;
+    Tensor gated_h = y_ssd.mul(z_h.mul(z_h.sigmoid()));
+    Tensor gated = dev == Device::GPU ? gated_h.to(Device::GPU) : gated_h;
+    Tensor projected = out_proj.forward(gated).reshape({1, dim});
+    Tensor skip = u_flat.mul(D.data);
+    Tensor result = projected.add(skip);
+    return u.shape.size() == 2 ? result : result.reshape({1, 1, dim});
+}
+
 Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
     if (u.shape.size() != 2 && u.shape.size() != 3) {
         throw std::runtime_error("Mamba2SSD expects rank-2 or rank-3 input");
@@ -1121,6 +1328,16 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
     // when the flag is on.
     if (config_.proper_selective_ssm) {
         (void)ctx;
+        // Incremental single-token decode: once the prefill has primed the stream
+        // (pp_stream_active_), each subsequent single token advances the carried
+        // SSD state + conv window in O(1) instead of re-scanning the prefix.
+        const bool single =
+            (u.shape.size() == 2 && u.shape[0] == 1) ||
+            (u.shape.size() == 3 && u.shape[0] == 1 && u.shape[1] == 1);
+        if (streaming_inference_ && single && pp_stream_active_) {
+            return config_.proper_state_expansion ? forward_proper_nstate_step(u)
+                                                  : forward_proper_step(u);
+        }
         return config_.proper_state_expansion ? forward_proper_nstate(u)
                                               : forward_proper(u);
     }
@@ -1314,6 +1531,10 @@ void Mamba2SSD::reset() {
     pp_h_hist_ = Tensor();
     pp_y_ssd_ = Tensor();
     pp_state_hist_ = Tensor();
+    // Proper-path incremental decode cache.
+    pp_stream_state_.clear();
+    pp_stream_ring_.clear();
+    pp_stream_active_ = false;
 }
 
 void Mamba2SSD::reset_runtime_telemetry() {
@@ -1385,6 +1606,11 @@ std::vector<Parameter*> Mamba2SSD::parameters() {
 
 void Mamba2SSD::set_streaming_mode(bool enabled) {
     streaming_inference_ = enabled;
+    // Each streaming toggle starts a fresh proper-path stream: drop the carried
+    // SSD state + conv window so the next prefill re-primes from zero.
+    pp_stream_state_.clear();
+    pp_stream_ring_.clear();
+    pp_stream_active_ = false;
     if (!enabled) {
         streaming_state_.reset();
     } else if (!streaming_state_ || streaming_state_->shape.back() != d_model) {
