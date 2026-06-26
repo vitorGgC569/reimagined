@@ -328,31 +328,45 @@ static void check_proper_streaming_parity(bool nstate) {
 
   Tensor full = layer.forward(x);  // full scan, streaming off -> [L, D]
 
-  layer.reset();
-  layer.set_streaming_mode(true);
-  float max_abs = 0.0f;
-  for (int t = 0; t < L; ++t) {
-    Tensor xt({1, D});
-    for (int c = 0; c < D; ++c)
-      xt.data()[c] = x.data()[static_cast<size_t>(t) * D + c];
-    Tensor yt = layer.forward(xt);  // prefill (t==0) then incremental steps
-    for (int c = 0; c < D; ++c) {
-      const float diff =
-          std::fabs(yt.data()[c] - full.data()[static_cast<size_t>(t) * D + c]);
-      if (diff > max_abs) max_abs = diff;
-    }
-  }
-  layer.set_streaming_mode(false);
-
   const char *name =
       nstate ? "mamba2-nstate streaming==scan" : "mamba2-proper streaming==scan";
   const float tol = 1e-4f;
-  if (max_abs <= tol) {
-    std::printf("[gradcheck] %-32s OK   (max|delta|=%.2e)\n", name, max_abs);
-  } else {
-    std::printf("[gradcheck] %-32s FAIL (max|delta|=%.2e > %.1e)\n", name,
-                max_abs, tol);
-    ++g_failures;
+  // Two scenarios: prefix=1 (prefill a single token, then step) and prefix=3 (the
+  // production path: the whole prompt primes in ONE multi-token forward, then
+  // single-token steps).  Both must reproduce the full scan token-for-token.
+  for (int prefix : {1, 3}) {
+    layer.reset();
+    layer.set_streaming_mode(true);
+    float max_abs = 0.0f;
+    // Multi-token prefill: forward the first `prefix` rows in one call.
+    Tensor xp({prefix, D});
+    for (int i = 0; i < prefix * D; ++i) xp.data()[i] = x.data()[i];
+    Tensor yp = layer.forward(xp);  // [prefix, D] -> primes the stream
+    for (int i = 0; i < prefix * D; ++i) {
+      const float diff = std::fabs(yp.data()[i] - full.data()[i]);
+      if (diff > max_abs) max_abs = diff;
+    }
+    // Incremental steps for the remaining tokens.
+    for (int t = prefix; t < L; ++t) {
+      Tensor xt({1, D});
+      for (int c = 0; c < D; ++c)
+        xt.data()[c] = x.data()[static_cast<size_t>(t) * D + c];
+      Tensor yt = layer.forward(xt);
+      for (int c = 0; c < D; ++c) {
+        const float diff = std::fabs(
+            yt.data()[c] - full.data()[static_cast<size_t>(t) * D + c]);
+        if (diff > max_abs) max_abs = diff;
+      }
+    }
+    layer.set_streaming_mode(false);
+    if (max_abs <= tol) {
+      std::printf("[gradcheck] %-28s OK   (prefix=%d max|delta|=%.2e)\n", name,
+                  prefix, max_abs);
+    } else {
+      std::printf("[gradcheck] %-28s FAIL (prefix=%d max|delta|=%.2e > %.1e)\n",
+                  name, prefix, max_abs, tol);
+      ++g_failures;
+    }
   }
 }
 

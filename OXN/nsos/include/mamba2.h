@@ -55,6 +55,12 @@ struct MambaConfig {
 struct MambaStreamSnapshot {
   bool enabled = false;
   std::shared_ptr<Tensor> state;
+  // Proper-path incremental decode state (see Mamba2SSD::pp_stream_*).  Carried
+  // through fork/restore so multi-sequence streaming does not bleed SSD state /
+  // conv window across sequences (single-session snapshot path).
+  std::vector<float> proper_state;
+  std::vector<float> proper_ring;
+  bool proper_active = false;
 };
 
 class Mamba2SSD {

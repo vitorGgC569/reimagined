@@ -1623,6 +1623,11 @@ MambaStreamSnapshot Mamba2SSD::snapshot_streaming_state() const {
     MambaStreamSnapshot snapshot;
     snapshot.enabled = streaming_inference_;
     snapshot.state = streaming_state_;
+    // Proper-path incremental decode state: carry per-sequence so fork/restore
+    // does not bleed the SSD state + conv window across sequences.
+    snapshot.proper_state = pp_stream_state_;
+    snapshot.proper_ring = pp_stream_ring_;
+    snapshot.proper_active = pp_stream_active_;
     return snapshot;
 }
 
@@ -1634,6 +1639,9 @@ void Mamba2SSD::restore_streaming_state(const MambaStreamSnapshot& snapshot) {
         streaming_state_ =
             std::make_shared<Tensor>(Tensor::zeros({1, d_model}, A.data.get_device()));
     }
+    pp_stream_state_ = snapshot.proper_state;
+    pp_stream_ring_ = snapshot.proper_ring;
+    pp_stream_active_ = snapshot.proper_active;
 }
 
 std::vector<MambaStreamSnapshot> Mamba2SSD::snapshot_streaming_state_batch() const {

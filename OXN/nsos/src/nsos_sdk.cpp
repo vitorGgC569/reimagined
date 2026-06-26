@@ -1001,6 +1001,10 @@ public:
                        cudaMemcpyDeviceToHost) != cudaSuccess) {
             return false;
         }
+        // -1 sentinel: every candidate was masked.  Fall back to the host greedy
+        // branch, which scans for the first allowed token then EOS/0 (the GPU
+        // kernel cannot reproduce that scan), so behaviour matches exactly.
+        if (token < 0) return false;
         out_token = token;
         return true;
     }

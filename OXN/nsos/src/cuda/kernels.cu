@@ -1523,28 +1523,60 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
 
   __syncthreads();
 
-  if (thread_index == 0) {
-    float max_score = -1e30f;
-    for (int source_index = 0; source_index < cached_tokens; ++source_index) {
-      max_score = fmaxf(max_score, shared_scores[source_index]);
-    }
+  // Block-parallel softmax + output (was a single-thread serial path).  Same math
+  // as the prefill kernel's parallelization (commit ca7c4a9): block-reduce max,
+  // exp in place + block-reduce denom, then per-dim parallel output.  The denom
+  // reduction reorders the sum (within softmax parity tolerance); the per-dim
+  // accumulation keeps the source order, so outputs match to fp tolerance.
+  __shared__ float redbuf[128];
+  __shared__ float s_max;
+  __shared__ float s_denom;
 
-    float denom = 0.0f;
-    for (int source_index = 0; source_index < cached_tokens; ++source_index) {
-      const float stabilized = expf(shared_scores[source_index] - max_score);
-      shared_scores[source_index] = stabilized;
-      denom += stabilized;
+  float local_max = -1e30f;
+  for (int source_index = thread_index; source_index < cached_tokens;
+       source_index += blockDim.x) {
+    local_max = fmaxf(local_max, shared_scores[source_index]);
+  }
+  redbuf[thread_index] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (thread_index < stride) {
+      redbuf[thread_index] =
+          fmaxf(redbuf[thread_index], redbuf[thread_index + stride]);
     }
-    denom = fmaxf(denom, 1e-9f);
+    __syncthreads();
+  }
+  if (thread_index == 0) s_max = redbuf[0];
+  __syncthreads();
+  const float max_score = s_max;
 
-    for (int dim = 0; dim < head_dim; ++dim) {
-      float acc = 0.0f;
-      for (int source_index = 0; source_index < cached_tokens; ++source_index) {
-        const int value_base = source_index * kv_dim + kv_head * head_dim;
-        acc += (shared_scores[source_index] / denom) * value_cache[value_base + dim];
-      }
-      out[head_index * head_dim + dim] = acc;
+  float local_sum = 0.0f;
+  for (int source_index = thread_index; source_index < cached_tokens;
+       source_index += blockDim.x) {
+    const float stabilized = expf(shared_scores[source_index] - max_score);
+    shared_scores[source_index] = stabilized;
+    local_sum += stabilized;
+  }
+  redbuf[thread_index] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (thread_index < stride) {
+      redbuf[thread_index] += redbuf[thread_index + stride];
     }
+    __syncthreads();
+  }
+  if (thread_index == 0) s_denom = fmaxf(redbuf[0], 1e-9f);
+  __syncthreads();
+  const float denom = s_denom;
+
+  for (int dim = thread_index; dim < head_dim; dim += blockDim.x) {
+    float acc = 0.0f;
+    for (int source_index = 0; source_index < cached_tokens; ++source_index) {
+      const int value_base = source_index * kv_dim + kv_head * head_dim;
+      acc +=
+          (shared_scores[source_index] / denom) * value_cache[value_base + dim];
+    }
+    out[head_index * head_dim + dim] = acc;
   }
 }
 
@@ -1659,7 +1691,10 @@ __global__ void decode_greedy_argmax_kernel(const float *raw, int vocab,
     __syncthreads();
   }
   if (tid == 0) {
-    *out_token = (sidx[0] >= 0) ? sidx[0] : 0;
+    // sidx[0] == -1 when every candidate is masked: emit the -1 sentinel so the
+    // caller falls back to the host path (which scans for the first allowed token
+    // then EOS/0), instead of silently forcing token 0.
+    *out_token = sidx[0];
   }
 }
 
