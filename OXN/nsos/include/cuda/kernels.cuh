@@ -321,6 +321,20 @@ void launch_gqa_cached_attention_decode_kernel(const float *q_flat,
                                                int kv_group_size,
                                                float theta);
 
+// ── CUDA Graphs (opt-in NSOS_CUDA_GRAPH) ─────────────────────────────────────
+// Decode-step launch-overhead amortization: capture the per-token kernel sequence
+// once, then replay the executable graph each token.  Graph-capture validity is a
+// GPU-runtime property (no host build can establish it), so the mechanism ships
+// with a runtime self-test:
+//   cuda_graphs_supported() -> device/driver advertises graph support (nonzero).
+//   cuda_graph_self_test()  -> captures a kernel sequence into a graph, replays
+//                              it, and verifies graphed result == eager result;
+//                              returns nonzero on success, 0 if graphs are
+//                              unavailable/broken.  Run once on the target GPU
+//                              before relying on graphed decode.
+int cuda_graphs_supported(void);
+int cuda_graph_self_test(void);
+
 #ifdef __cplusplus
 }
 #endif

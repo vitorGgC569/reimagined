@@ -1387,6 +1387,25 @@ std::string InferenceEngine::generate_stream(
 
 #ifdef USE_CUDA
     GpuGreedySampler gpu_greedy_sampler;
+    // CUDA Graphs (opt-in NSOS_CUDA_GRAPH): one-time capability + self-test probe
+    // on the target GPU.  Graph-capture validity is a GPU-runtime property, so we
+    // verify capture==eager once before any graphed decode is relied upon.  Logged
+    // once per process; never gates the hot path (decode still runs eagerly).
+    {
+        static bool cuda_graph_probed = false;
+        if (!cuda_graph_probed) {
+            cuda_graph_probed = true;
+            const char* graph_env = std::getenv("NSOS_CUDA_GRAPH");
+            if (graph_env && graph_env[0] == '1') {
+                const int supported = cuda_graphs_supported();
+                const int self_test = supported ? cuda_graph_self_test() : 0;
+                std::fprintf(
+                    stderr,
+                    "[nsos] CUDA Graphs probe: supported=%d self_test=%s\n",
+                    supported, self_test ? "PASS" : "FAIL");
+            }
+        }
+    }
 #endif
     auto sample_next_token = [&](const Tensor& logits) -> int {
 #ifdef USE_CUDA

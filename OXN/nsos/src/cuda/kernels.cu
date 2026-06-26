@@ -1,7 +1,9 @@
 #include "cuda/bitnet_math.cuh"
+#include <cmath>
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <vector>
 
 // =========================================================================
 // HPC-Optimized CUDA Kernels for NSOS/OXN
@@ -1672,4 +1674,106 @@ extern "C" void launch_decode_greedy_argmax(const float *raw, int vocab,
       static_cast<size_t>(block) * (sizeof(float) + sizeof(int));
   decode_greedy_argmax_kernel<<<1, block, smem>>>(
       raw, vocab, repeated, seen, control, suppress_control, penalty, out_token);
+}
+
+// =====================================================================
+// CUDA Graphs (opt-in NSOS_CUDA_GRAPH): decode-step launch-overhead amortization.
+// Capture a per-token kernel sequence once, then replay the executable graph each
+// token.  Graph-capture validity is a GPU-runtime property, so the mechanism is
+// shipped with a runtime self-test that captures + replays a known sequence and
+// checks the graphed result against an eager run.
+// =====================================================================
+__global__ void graph_selftest_add_one_kernel(float *buf, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) buf[i] += 1.0f;
+}
+
+extern "C" int cuda_graphs_supported(void) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+  int major = 0;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) !=
+      cudaSuccess) {
+    return 0;
+  }
+  // CUDA Graphs are supported on the entire graph runtime API (CUDA 10+); a
+  // compute-capable device is the practical gate.
+  return major >= 3 ? 1 : 0;
+}
+
+extern "C" int cuda_graph_self_test(void) {
+  const int n = 1024;
+  const int block = 256;
+  const int grid = (n + block - 1) / block;
+  const size_t bytes = static_cast<size_t>(n) * sizeof(float);
+
+  float *d_buf = nullptr;
+  float *d_eager = nullptr;
+  cudaStream_t stream = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  int ok = 0;
+
+  if (cudaMalloc(&d_buf, bytes) != cudaSuccess) goto cleanup;
+  if (cudaMalloc(&d_eager, bytes) != cudaSuccess) goto cleanup;
+  if (cudaStreamCreate(&stream) != cudaSuccess) goto cleanup;
+
+  // Eager reference: zero, then +1 three times -> 3.0 everywhere.
+  cudaMemsetAsync(d_eager, 0, bytes, stream);
+  for (int k = 0; k < 3; ++k) {
+    graph_selftest_add_one_kernel<<<grid, block, 0, stream>>>(d_eager, n);
+  }
+  if (cudaStreamSynchronize(stream) != cudaSuccess) goto cleanup;
+
+  // Capture the identical sequence into a graph.
+  if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) !=
+      cudaSuccess) {
+    goto cleanup;
+  }
+  cudaMemsetAsync(d_buf, 0, bytes, stream);
+  for (int k = 0; k < 3; ++k) {
+    graph_selftest_add_one_kernel<<<grid, block, 0, stream>>>(d_buf, n);
+  }
+  if (cudaStreamEndCapture(stream, &graph) != cudaSuccess) {
+    (void)cudaGetLastError();
+    goto cleanup;
+  }
+  if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) goto cleanup;
+
+  // Replay twice; the in-graph memset makes each replay independent, so the
+  // result equals a single eager pass (3.0).  Exercises capture + repeated replay.
+  if (cudaGraphLaunch(exec, stream) != cudaSuccess) goto cleanup;
+  if (cudaGraphLaunch(exec, stream) != cudaSuccess) goto cleanup;
+  if (cudaStreamSynchronize(stream) != cudaSuccess) goto cleanup;
+
+  {
+    std::vector<float> h_buf(static_cast<size_t>(n));
+    std::vector<float> h_eager(static_cast<size_t>(n));
+    if (cudaMemcpy(h_buf.data(), d_buf, bytes, cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
+      goto cleanup;
+    }
+    if (cudaMemcpy(h_eager.data(), d_eager, bytes, cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
+      goto cleanup;
+    }
+    ok = 1;
+    for (int i = 0; i < n; ++i) {
+      if (fabsf(h_buf[static_cast<size_t>(i)] - h_eager[static_cast<size_t>(i)]) >
+              1e-5f ||
+          fabsf(h_buf[static_cast<size_t>(i)] - 3.0f) > 1e-5f) {
+        ok = 0;
+        break;
+      }
+    }
+  }
+
+cleanup:
+  if (exec) cudaGraphExecDestroy(exec);
+  if (graph) cudaGraphDestroy(graph);
+  if (stream) cudaStreamDestroy(stream);
+  if (d_buf) cudaFree(d_buf);
+  if (d_eager) cudaFree(d_eager);
+  (void)cudaGetLastError();
+  return ok;
 }
