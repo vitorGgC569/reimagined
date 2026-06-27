@@ -1,28 +1,28 @@
 """Generator for colab/train_genbench_mqar_copy.ipynb.
 
 Gold-standard ARCHITECTURE evaluation suite (branch feature/nsos-gpu-phases12),
-phase 1: MQAR (multi-query associative recall) + selective-copy length
-extrapolation -- the two most decisive synthetic probes the field uses to judge a
-sequence-model architecture cheaply, BEFORE scaling.
+phase 1: associative recall (capacity curve) + selective-copy length extrapolation
+-- the two most decisive synthetic probes the field uses to judge a sequence-model
+architecture cheaply, BEFORE scaling.
 
-Why these two:
-  * MQAR (Arora et al., "Zoology", HazyResearch): in-context associative recall
-    explains ~82% of the quality gap between sub-quadratic mixers and attention on
-    real LM. It is the single most predictive synthetic. Multi-query = several
-    recalls per forward pass (the version that reflects real language).
-  * Selective copy with length extrapolation (Mamba, Gu & Dao): content-selective
-    copy that must EXTRAPOLATE to sequences longer than training -- the headline
-    strength of a good SSM (linear-time + generalizes in length).
+v2 of this notebook (the v1 run found ALL variants -- including the attention
+positive control -- stuck at the random baseline, i.e. the HARNESS/regime was
+broken, not the architecture).  Fixes in v2:
+  * POSITIVE CONTROL FIRST: single-query associative recall (query in the prompt,
+    answer = just the value) -> loss is pure recall signal (no random-token noise).
+    A Transformer must solve this; if it doesn't, we declare the harness/regime
+    insufficient and DO NOT draw architecture conclusions.
+  * BATCHED training (train_supervised_batch) -> ~batch x more data per step, and
+    many more total examples (a from-scratch model needs ~1e4-1e5 examples to
+    INDUCE recall, not 2e3).
+  * first_token_loss_scale = eos_loss_scale = 1.0 (don't over-weight token 0).
+  * prints training loss (visibility) + a pre-registered verdict with the
+    attention control as the gate.
 
-Methodology (gold standard): isolate the SEQUENCE MIXER by comparing three pure
-variants at equal size -- attention-only (Transformer baseline), Mamba-only
-(proper selective SSM), and the NSOS hybrid -- across multiple seeds, reporting
-mean +/- std vs the random baseline, plus capacity (MQAR n_kv) and length
-(copy field length) curves.  Pre-registered verdict at the end.
-
-These tasks are pure synthetic token-id sequences: NO tokenizer, NO dataset
-download, tiny models -> runs in minutes, so you can iterate without spending the
-contabil-scale T4 budget.
+Tasks are pure synthetic token-id sequences: NO tokenizer, NO dataset download,
+tiny models -> minutes.  Methodology: isolate the SEQUENCE MIXER by comparing
+three equal-size pure variants -- attention-only (Transformer baseline),
+Mamba-only (proper selective SSM), and the NSOS hybrid -- across seeds.
 
 Run once (pure JSON authoring, no GPU): python colab/make_genbench_notebook.py
 """
@@ -44,25 +44,24 @@ def code(text):
 
 cells = []
 
-cells.append(md("""# NSOS — Suíte de generalização (padrão-ouro): MQAR + extrapolação de comprimento
+cells.append(md("""# NSOS — Suíte de generalização (padrão-ouro) v2: recall associativo + extrapolação
 
-Fase 1 da avaliação de **arquitetura** (branch `%BRANCH%`): as duas sondas
-sintéticas mais decisivas que a área usa pra julgar um mixer de sequência **barato,
-antes de escalar**.
+Fase 1 da avaliação de **arquitetura** (branch `%BRANCH%`). **v2** corrige o harness:
+na v1 **todas** as variantes — incluindo o controle de **atenção** — ficaram no
+baseline aleatório, o que indica **teste quebrado, não arquitetura ruim** (um
+Transformer resolve recall trivialmente). Correções:
 
-- **MQAR** (associative recall multi-query, *Zoology*/HazyResearch): recall em
-  contexto explica ~82% do gap de qualidade entre mixers sub-quadráticos e atenção
-  em LM real. É a sonda mais preditiva que existe.
-- **Selective copy com extrapolação de comprimento** (Mamba): cópia seletiva que
-  precisa **extrapolar** pra sequências mais longas que o treino — a força do SSM.
+- **Controle positivo primeiro:** AR single-query (query no prompt, resposta = só o
+  valor) → loss 100% sinal de recall. A atenção *tem* que passar; se não passar,
+  o veredito é "harness insuficiente" e **não** se conclui nada de arquitetura.
+- **Treino em batch** (`train_supervised_batch`) → ~batch× mais dados/step e MUITO
+  mais exemplos totais (um modelo do zero precisa de ~1e4-1e5 exemplos pra
+  **induzir** recall, não 2e3).
+- `first_token_loss_scale = eos_loss_scale = 1.0`; **imprime a loss**; veredito
+  pré-registrado com a atenção como gate.
 
-**Método (padrão-ouro):** isola o MIXER comparando 3 variantes do MESMO tamanho —
-**atenção-pura** (baseline Transformer), **Mamba-puro** (SSM seletivo correto) e o
-**híbrido NSOS** — com várias seeds, média ± desvio vs baseline aleatório, + curvas
-de capacidade (MQAR n_kv) e comprimento (copy). **Veredito pré-registrado** no fim.
-
-Tarefas 100% sintéticas (ids): **sem tokenizer, sem download**, modelos minúsculos
-→ roda em **minutos**."""))
+Tarefas 100% sintéticas (ids): **sem tokenizer, sem download** → minutos. Compara o
+MIXER isolado: **atenção-pura** vs **Mamba-puro** (proper SSM) vs **híbrido NSOS**."""))
 
 cells.append(md("## 1 — GPU + (opcional) Drive p/ cache do build"))
 cells.append(code("""import os, subprocess
@@ -138,7 +137,6 @@ else:
     shutil.copy2(so[0], EXT_DIR/'nsos_ext.so'); CACHE_SO.parent.mkdir(parents=True,exist_ok=True)
     shutil.copy2(so[0], CACHE_SO); os.environ['NSOS_BUILD_GENBENCH']=BUILD
     print('[build] ok')
-# gate de gradcheck (rapido)
 B = os.environ['NSOS_BUILD_GENBENCH']
 for cand in (f'{B}/test_gradcheck', f'{B}/Release/test_gradcheck', f'{B}/test_gradcheck.exe'):
     if os.path.exists(cand):
@@ -146,32 +144,29 @@ for cand in (f'{B}/test_gradcheck', f'{B}/Release/test_gradcheck', f'{B}/test_gr
         print('[gradcheck]', 'PASS' if rr.returncode==0 else 'FAIL'); break
 """))
 
-cells.append(md("""## 4 — Definição das tarefas (geradores sintéticos + avaliação)
+cells.append(md("""## 4 — Tarefas (sintéticas) + avaliação
 
-**MQAR:** `[BOS k1 v1 ... kN vN SEP]` no prompt; resposta `[q1 v1 q2 v2 ...]` —
-o modelo, em cada query `qi`, deve emitir o valor `vi` ligado a ela. A loss
-(`train_supervised`) cai na resposta; a acurácia é medida **só nas posições de
-valor** (recall). `n_kv` = nº de pares (capacidade).
+**AR (recall associativo, single-query):** prompt `[BOS k1 v1 ... kN vN SEP q]`,
+resposta `[valor de q]`. Loss = só o valor → **100% sinal de recall**. `n_kv` =
+capacidade (mais pares = mais difícil). É o **controle positivo**: atenção tem que
+acertar ~1.0.
 
-**Selective copy:** `[BOS <campo de comprimento L com K dados entre BLANK> MARK]`;
-resposta `[os K dados em ordem]`. Treina campo curto, testa campo **mais longo**
-(extrapolação). Métrica = exact-match dos K tokens."""))
+**Selective copy:** prompt `[BOS <campo L com K dados entre BLANK> MARK]`, resposta
+`[os K dados em ordem]`. Treina campo curto, testa **mais longo** (extrapolação).
+Métrica = exact-match."""))
 cells.append(code("""import random, numpy as np
 
-def make_mqar(rng, n_kv, n_q, n_sym):
+def make_ar(rng, n_kv, n_sym):
     BOS, SEP = n_sym, n_sym + 1
     keys = rng.sample(range(n_sym), n_kv)
     vals = [rng.randrange(n_sym) for _ in range(n_kv)]
     kv = dict(zip(keys, vals))
+    q = rng.choice(keys)
     prompt = [BOS]
     for k, v in zip(keys, vals):
         prompt += [k, v]
-    prompt += [SEP]
-    qk = [rng.choice(keys) for _ in range(n_q)]
-    answer = []
-    for q in qk:
-        answer += [q, kv[q]]
-    return prompt, answer, qk, kv
+    prompt += [SEP, q]
+    return prompt, [kv[q]]          # (prompt, answer=[value])
 
 def make_selcopy(rng, field_len, n_data, n_sym):
     BLANK, MARK, BOS = n_sym, n_sym + 1, n_sym + 2
@@ -180,37 +175,34 @@ def make_selcopy(rng, field_len, n_data, n_sym):
     field = [BLANK] * field_len
     for p, d in zip(pos, data):
         field[p] = d
-    prompt = [BOS] + field + [MARK]
-    return prompt, data, None, None  # (prompt, answer, _, _)
+    return [BOS] + field + [MARK], data   # (prompt, answer=data)
 
-def eval_mqar(model, data, V):
+def eval_ar(model, data, V):
     cor = tot = 0
-    for (prompt, answer, qk, kv) in data:
-        seq = prompt + answer
-        lg = np.asarray(model.forward_ids(seq).cpu().numpy()).reshape(-1, V)
-        for i, q in enumerate(qk):
-            pred = int(np.argmax(lg[len(prompt) + 2 * i]))  # posicao da query qi
-            cor += int(pred == kv[q]); tot += 1
+    for prompt, ans in data:
+        lg = np.asarray(model.forward_ids(prompt).cpu().numpy()).reshape(-1, V)
+        cor += int(int(np.argmax(lg[-1])) == ans[0]); tot += 1   # último token prevê o valor
     return cor / max(tot, 1)
 
 def eval_copy(model, data, V):
     cor = tot = 0
-    for (prompt, answer, _, _) in data:
-        seq = prompt + answer
+    for prompt, ans in data:
+        seq = prompt + ans
         lg = np.asarray(model.forward_ids(seq).cpu().numpy()).reshape(-1, V)
-        ok = all(int(np.argmax(lg[len(prompt) + j - 1])) == answer[j] for j in range(len(answer)))
+        ok = all(int(np.argmax(lg[len(prompt) + j - 1])) == ans[j] for j in range(len(ans)))
         cor += int(ok); tot += 1
-    return cor / max(tot, 1)  # exact-match (cópia inteira certa)
+    return cor / max(tot, 1)         # exact-match (cópia inteira certa)
 
-print('[tasks] MQAR + selective-copy definidos')
+print('[tasks] AR + selective-copy definidos')
 """))
 
-cells.append(md("""## 5 — Variantes do MIXER (mesmo tamanho) + flags corrigidos
+cells.append(md("""## 5 — Variantes do MIXER (mesmo tamanho) + treino em batch
 
 3 variantes isolando o mixer: **atenção-pura**, **Mamba-puro** (proper SSM),
-**híbrido NSOS**. MoE/KAN/TTT OFF aqui de propósito — a comparação é do *mixer de
-sequência* (é o que o recall mede). Flags corrigidos das vias Mamba ligados."""))
-cells.append(code("""import os, sys
+**híbrido NSOS**. MoE/KAN/TTT OFF (a comparação é do mixer). Treino em batch via
+`train_supervised_batch`, com `first_token_loss_scale=eos_loss_scale=1.0` e loss
+impressa."""))
+cells.append(code("""import os, sys, random
 os.environ['NSOS_MAMBA_PROPER_SSM']  = '1'
 os.environ['NSOS_MAMBA_CONV_K']      = '3'
 os.environ['NSOS_MAMBA_A_LOGSPACED'] = '1'
@@ -228,127 +220,132 @@ def build_variant(variant, V):
     c.use_exact_attention_training = True; c.use_flash_attn = False
     c.use_moe = False; c.use_kan = False; c.use_ttt = False; c.dropout = 0.0
     if variant == 'attn':
-        c.attention_period = 1; c.attention_slot = 0      # toda camada = atencao
+        c.attention_period = 1; c.attention_slot = 0
     elif variant == 'mamba':
-        c.attention_period = 4; c.attention_slot = 4      # slot>=period => nenhuma atencao
-    else:  # hybrid (NSOS)
-        c.attention_period = 2; c.attention_slot = 1      # metade atencao / metade Mamba
+        c.attention_period = 4; c.attention_slot = 4   # slot>=period => nenhuma atencao
+    else:
+        c.attention_period = 2; c.attention_slot = 1
     m = nsos.JambaModel(c, dev); m.to(dev)
     return m
 
-def train_on(model, lr, steps, sampler, seed):
+def train_batched(model, lr, steps, batch, sampler, seed, label):
     tr = nsos.Trainer(model, lr); tr.warmup_steps = max(50, steps // 10)
     tr.total_training_steps = steps
+    tr.first_token_loss_scale = 1.0; tr.eos_loss_scale = 1.0
     rng = random.Random(seed * 991 + 7)
     model.set_training_mode(True)
+    win = max(1, steps // 6); run = 0.0
     for s in range(steps):
-        p, a, _, _ = sampler(rng)
-        if len(p) >= 2 and len(a) >= 1:
-            tr.train_supervised(p, a)
+        ps, ans = [], []
+        bs = sampler(rng)              # (field_len fixo p/ o batch) decidido dentro
+        for _ in range(batch):
+            p, a = bs()
+            ps.append(p); ans.append(a)
+        run += tr.train_supervised_batch(ps, ans)
+        if (s + 1) % win == 0:
+            print(f'    [{label}] step {s+1}/{steps}  loss~{run/win:.3f}'); run = 0.0
     model.set_training_mode(False)
 
 VARIANTS = ['attn', 'mamba', 'hybrid']
 SEEDS = [int(x) for x in os.environ.get('NSOS_GEN_SEEDS', '0,1').split(',')]
-STEPS = int(os.environ.get('NSOS_GEN_STEPS', '2000'))
-print(f'[cfg] L={NUM_LAYERS} d={DMODEL} | variantes={VARIANTS} | seeds={SEEDS} | steps={STEPS}')
+STEPS = int(os.environ.get('NSOS_GEN_STEPS', '1500'))
+BATCH = int(os.environ.get('NSOS_GEN_BATCH', '16'))
+print(f'[cfg] L={NUM_LAYERS} d={DMODEL} | variantes={VARIANTS} | seeds={SEEDS} | steps={STEPS} batch={BATCH} (= {STEPS*BATCH} exemplos/run)')
 """))
 
-cells.append(md("""## 6 — MQAR: capacidade de recall (treina n_kv=8, testa n_kv=8 e 16)
+cells.append(md("""## 6 — Recall associativo: capacidade (treina n_kv=8, testa 8/16/32)
 
-Baseline aleatório = 1/n_sym. **A pergunta:** o híbrido NSOS acompanha a atenção?
-O Mamba-puro colapsa quando há mais pares (n_kv=16)? (resultado clássico do Zoology)"""))
+Baseline aleatório = 1/n_sym. **Controle positivo:** a atenção tem que acertar
+~1.0 em n_kv=8. A pergunta científica: o híbrido NSOS acompanha a atenção quando a
+capacidade sobe (n_kv=16, 32)? O Mamba-puro cai? (resultado clássico do Zoology)"""))
 cells.append(code("""import time, numpy as np, random
-N_SYM = int(os.environ.get('NSOS_MQAR_SYM', '32')); N_Q = 4
-V = N_SYM + 2
-base = 1.0 / N_SYM
-mqar = {}
-t0 = time.time()
+N_SYM = int(os.environ.get('NSOS_AR_SYM', '32')); V = N_SYM + 2
+base = 1.0 / N_SYM; KV_TEST = [8, 16, 32]
+ar = {}; t0 = time.time()
 for variant in VARIANTS:
-    in8, hard16 = [], []
+    accs = {k: [] for k in KV_TEST}
     for seed in SEEDS:
         nsos.set_seed(seed)
         m = build_variant(variant, V)
-        train_on(m, 2e-3, STEPS, lambda r: make_mqar(r, 8, N_Q, N_SYM), seed)
+        train_batched(m, 2e-3, STEPS, BATCH,
+                      lambda r: (lambda: make_ar(r, 8, N_SYM)), seed, f'AR {variant} s{seed}')
         ev = random.Random(seed * 13 + 5)
-        d8  = [make_mqar(ev, 8,  N_Q, N_SYM) for _ in range(200)]
-        d16 = [make_mqar(ev, 16, N_Q, N_SYM) for _ in range(200)]
-        in8.append(eval_mqar(m, d8, V)); hard16.append(eval_mqar(m, d16, V))
-        print(f'  [{variant:6s} seed {seed}] n_kv=8: {in8[-1]:.3f}  n_kv=16: {hard16[-1]:.3f}')
-    mqar[variant] = (np.mean(in8), np.std(in8), np.mean(hard16), np.std(hard16))
-print('\\n' + '=' * 64)
-print(f'MQAR (acuracia de recall; baseline aleatorio={base:.3f})   ({time.time()-t0:.0f}s)')
-print(f'{"variante":<10}{"n_kv=8 (treino)":>20}{"n_kv=16 (capacidade)":>24}')
+        for k in KV_TEST:
+            d = [make_ar(ev, k, N_SYM) for _ in range(300)]
+            accs[k].append(eval_ar(m, d, V))
+        print(f'  [{variant:6s} seed {seed}] ' + '  '.join(f'n_kv={k}:{accs[k][-1]:.3f}' for k in KV_TEST))
+    ar[variant] = {k: (np.mean(accs[k]), np.std(accs[k])) for k in KV_TEST}
+print('\\n' + '=' * 70)
+print(f'RECALL ASSOCIATIVO (acuracia; baseline aleatorio={base:.3f})   ({time.time()-t0:.0f}s)')
+print(f'{"variante":<10}' + ''.join(f'{("n_kv="+str(k)):>16}' for k in KV_TEST))
 for v in VARIANTS:
-    a, sa, b, sb = mqar[v]
-    print(f'{v:<10}{a:>12.3f}+/-{sa:.3f}{b:>16.3f}+/-{sb:.3f}')
-print('=' * 64)
+    print(f'{v:<10}' + ''.join(f'{ar[v][k][0]:>10.3f}+/-{ar[v][k][1]:.2f}' for k in KV_TEST))
+print('=' * 70)
 """))
 
 cells.append(md("""## 7 — Selective copy: extrapolação de comprimento (treina ≤64, testa 64/128/256)
 
-Métrica = exact-match. **A pergunta:** o Mamba/híbrido **extrapola** pra campos mais
-longos que o treino? A atenção costuma cair (codificação posicional). Esse é o
-*upside* estrutural do SSM."""))
+Métrica = exact-match. O Mamba/híbrido extrapola pra campos mais longos que o
+treino? A atenção costuma cair (posicional). Upside estrutural do SSM."""))
 cells.append(code("""import time, numpy as np, random
 N_SYM_C = int(os.environ.get('NSOS_COPY_SYM', '20')); N_DATA = 4
-LT = int(os.environ.get('NSOS_COPY_LEN', '64'))
-Vc = N_SYM_C + 3
-base_c = (1.0 / N_SYM_C) ** N_DATA
-copy = {}
-t0 = time.time()
-TEST_LENS = [LT, 2 * LT, 4 * LT]
+LT = int(os.environ.get('NSOS_COPY_LEN', '64')); Vc = N_SYM_C + 3
+base_c = (1.0 / N_SYM_C) ** N_DATA; TEST_LENS = [LT, 2 * LT, 4 * LT]
+copy = {}; t0 = time.time()
 for variant in VARIANTS:
     rows = {L: [] for L in TEST_LENS}
     for seed in SEEDS:
         nsos.set_seed(seed)
         m = build_variant(variant, Vc)
-        # treino: comprimento de campo uniforme em [16, LT]
-        def samp(r):
-            return make_selcopy(r, r.randint(16, LT), N_DATA, N_SYM_C)
-        train_on(m, 2e-3, STEPS, samp, seed)
+        # cada step do batch usa UM comprimento de campo (16..LT) -> batch homogeneo
+        def sampler(r):
+            L = r.randint(16, LT)
+            return lambda: make_selcopy(r, L, N_DATA, N_SYM_C)
+        train_batched(m, 2e-3, STEPS, BATCH, sampler, seed, f'COPY {variant} s{seed}')
         ev = random.Random(seed * 29 + 3)
         for L in TEST_LENS:
-            d = [make_selcopy(ev, L, N_DATA, N_SYM_C) for _ in range(200)]
+            d = [make_selcopy(ev, L, N_DATA, N_SYM_C) for _ in range(300)]
             rows[L].append(eval_copy(m, d, Vc))
         print(f'  [{variant:6s} seed {seed}] ' + '  '.join(f'L={L}:{rows[L][-1]:.3f}' for L in TEST_LENS))
     copy[variant] = {L: (np.mean(rows[L]), np.std(rows[L])) for L in TEST_LENS}
-print('\\n' + '=' * 64)
+print('\\n' + '=' * 70)
 print(f'SELECTIVE COPY exact-match (baseline~{base_c:.1e}; treino campo<=64)   ({time.time()-t0:.0f}s)')
-hdr = f'{"variante":<10}' + ''.join(f'{("L="+str(L)+("(treino)" if L==LT else "(extrap)")):>16}' for L in TEST_LENS)
-print(hdr)
+print(f'{"variante":<10}' + ''.join(f'{("L="+str(L)+("(tr)" if L==LT else "(ex)")):>16}' for L in TEST_LENS))
 for v in VARIANTS:
     print(f'{v:<10}' + ''.join(f'{copy[v][L][0]:>16.3f}' for L in TEST_LENS))
-print('=' * 64)
+print('=' * 70)
 """))
 
-cells.append(md("""## 8 — VEREDITO (régua pré-registrada)
+cells.append(md("""## 8 — VEREDITO (régua pré-registrada, com a ATENÇÃO como gate)
 
-Decidida ANTES de rodar (anti-auto-engano). Lê os resultados acima e classifica."""))
-cells.append(code("""def grade(cond): return 'OK' if cond else 'FALHOU'
-
-attn8, _, attn16, _ = mqar['attn']
-hyb8,  _, hyb16,  _ = mqar['hybrid']
-mam8,  _, mam16,  _ = mqar['mamba']
-print('=' * 66)
-print('1) TABLE STAKES — todas resolvem o recall facil (n_kv=8 >> baseline)?')
-for v in VARIANTS:
-    print(f'   {v:<8} n_kv=8={mqar[v][0]:.3f}  -> {grade(mqar[v][0] > 0.5)}')
-print('\\n2) DISCRIMINADOR — hibrido NSOS acompanha a atencao na CAPACIDADE (n_kv=16)?')
-print(f'   atencao={attn16:.3f}  hibrido={hyb16:.3f}  mamba-puro={mam16:.3f}')
-print(f'   hibrido perto da atencao (>= 0.85*attn): {grade(hyb16 >= 0.85*attn16)}')
-print(f'   (esperado classico: mamba-puro cai vs atencao -> gap de recall)')
-print('\\n3) UPSIDE — Mamba/hibrido EXTRAPOLAM em comprimento (copy L=4x vs treino)?')
-for v in VARIANTS:
-    tr_acc = copy[v][LT][0]; ex_acc = copy[v][4*LT][0]
-    print(f'   {v:<8} treino(L={LT})={tr_acc:.3f}  extrap(L={4*LT})={ex_acc:.3f}  -> {grade(ex_acc >= 0.5)}')
-print('=' * 66)
-print('LEITURA:')
-print(' - Vale escalar se: table stakes OK + hibrido ~ atencao no MQAR n_kv=16 +')
-print('   Mamba/hibrido extrapolam em comprimento.')
-print(' - Sinal de rework se: hibrido colapsa no MQAR (gap de recall) E nao extrapola')
-print('   -> nem tao bom quanto atencao, nem entrega o upside de SSM.')
-print(' - As camadas de atencao do hibrido DEVEM fechar o gap de recall do Mamba-puro;')
-print('   se fecharem, e a evidencia central de que a arquitetura NSOS se sustenta.')
+Primeiro o gate de sanidade: **se a atenção não resolve o AR fácil, o teste está
+insuficiente** (suba `NSOS_GEN_STEPS`/`NSOS_GEN_BATCH`) e NÃO se conclui nada de
+arquitetura. Só com o controle verde a comparação vale."""))
+cells.append(code("""def g(c): return 'OK' if c else 'FALHOU'
+attn8 = ar['attn'][8][0]
+GATE = attn8 >= 0.80
+print('=' * 70)
+print(f'GATE (controle positivo) — atencao resolve AR n_kv=8?  attn={attn8:.3f}  -> {g(GATE)}')
+if not GATE:
+    print('  >> HARNESS/REGIME INSUFICIENTE: a atencao (que deveria acertar ~1.0)')
+    print('     nao aprendeu. NAO conclua nada de arquitetura. Acoes: suba')
+    print('     NSOS_GEN_STEPS (ex. 4000) e/ou NSOS_GEN_BATCH (ex. 32), ou')
+    print('     NSOS_GEN_LAYERS=4 NSOS_GEN_DMODEL=128 ja default. Rerode esta celula.')
+else:
+    print('\\n1) TABLE STAKES — todas resolvem AR n_kv=8?')
+    for v in VARIANTS:
+        print(f'   {v:<8} {ar[v][8][0]:.3f}  -> {g(ar[v][8][0] > 0.7)}')
+    print('\\n2) DISCRIMINADOR — hibrido acompanha a atencao na CAPACIDADE (n_kv=32)?')
+    a32, h32, m32 = ar['attn'][32][0], ar['hybrid'][32][0], ar['mamba'][32][0]
+    print(f'   atencao={a32:.3f}  hibrido={h32:.3f}  mamba-puro={m32:.3f}')
+    print(f'   hibrido >= 0.85*atencao: {g(h32 >= 0.85*a32)}   (classico: mamba-puro cai)')
+    print('\\n3) UPSIDE — Mamba/hibrido EXTRAPOLAM (copy L=4x)?')
+    for v in VARIANTS:
+        print(f'   {v:<8} treino(L={LT})={copy[v][LT][0]:.3f}  extrap(L={4*LT})={copy[v][4*LT][0]:.3f}  -> {g(copy[v][4*LT][0] >= 0.5)}')
+    print('\\nLEITURA: vale escalar se table-stakes OK + hibrido~atencao no recall de')
+    print('capacidade + Mamba/hibrido extrapolam. As camadas de atencao do hibrido')
+    print('DEVEM fechar o gap de recall do Mamba-puro -> evidencia central do NSOS.')
+print('=' * 70)
 """))
 
 nb = {
