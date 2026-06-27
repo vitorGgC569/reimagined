@@ -131,6 +131,16 @@ void launch_mamba_proper_scan_backward(
     float *grad_x, float *grad_dt, float *grad_A, float *grad_B,
     float *grad_C, int Batch, int Seq, int D);
 
+// Fused single-token incremental decode step for the proper diagonal path.
+// xv/z/B_in/C_in/dt/A are [dim]; convw is [dim*K]; ring is [(K-1)*dim] (in/out,
+// the carried conv window); h is [dim] (in/out, the carried SSD state); gated is
+// [dim] (out).  Device-resident carry -> no per-token host round-trip.
+void launch_mamba_proper_step(const float *xv, const float *z,
+                              const float *B_in, const float *C_in,
+                              const float *dt, const float *A,
+                              const float *convw, float *ring, float *h,
+                              float *gated, int dim, int K);
+
 // =====================================================================
 // Causal depthwise conv1d (proper-path local mixing).
 //   in/out : [Batch, Seq, D]   weight : [D, K]

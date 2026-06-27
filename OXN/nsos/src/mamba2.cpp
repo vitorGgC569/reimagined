@@ -13,6 +13,18 @@ namespace nsos {
 
 namespace {
 
+// Opt-in (NSOS_MAMBA_GPU_STEP): route the proper diagonal single-token decode
+// through the fused on-device step kernel (device-resident SSD state + conv ring,
+// no per-token host round-trip).  Default OFF -> the host step (locally proven
+// byte-identical to the full scan) runs; the GPU step's parity is validated on T4.
+bool mamba_gpu_step_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NSOS_MAMBA_GPU_STEP");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
 bool can_use_gpu_mamba_scan(const Tensor& x, const Tensor& delta,
                             const Tensor& a_data) {
 #ifdef USE_CUDA
@@ -674,6 +686,7 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
             }
         }
         pp_stream_active_ = true;
+        pp_stream_dev_live_ = false;  // re-sync device carry on next GPU step
     }
 
     return rank_2 ? result : result.reshape({batch, seq, dim});
@@ -960,6 +973,7 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
             }
         }
         pp_stream_active_ = true;
+        pp_stream_dev_live_ = false;  // re-sync device carry on next GPU step
     }
 
     return rank_2 ? result : result.reshape({batch, seq, dim});
@@ -1219,6 +1233,49 @@ Tensor Mamba2SSD::forward_proper_step(const Tensor& u) {
     Tensor Bt = B_proj_->forward(u_flat).reshape({1, dim});
     Tensor Ct = C_proj_->forward(u_flat).reshape({1, dim});
     Tensor dt = dt_proj_->forward(u_flat).reshape({1, dim});
+
+#ifdef USE_CUDA
+    // Fully on-device step (opt-in): keep the SSD state h + conv ring resident on
+    // the GPU across tokens; one fused kernel does conv+recurrence+gate.  No
+    // per-token D2H/H2D.  Host vectors stay canonical for snapshot/restore, so we
+    // sync them into the device buffers once after each (re)prime/restore.
+    if (dev == Device::GPU && mamba_gpu_step_enabled()) {
+        const int K = std::max(conv_kernel_, 1);
+        const int taps = std::max(K - 1, 0);
+        if (!pp_stream_dev_live_) {
+            Tensor h0(std::vector<int>{dim}, Device::CPU);
+            std::memset(h0.data(), 0, static_cast<size_t>(dim) * sizeof(float));
+            if (static_cast<int>(pp_stream_state_.size()) == dim) {
+                std::memcpy(h0.data(), pp_stream_state_.data(),
+                            static_cast<size_t>(dim) * sizeof(float));
+            }
+            pp_stream_h_dev_ = h0.to(Device::GPU);
+            const int ringlen = std::max(taps * dim, 1);
+            Tensor r0(std::vector<int>{ringlen}, Device::CPU);
+            std::memset(r0.data(), 0,
+                        static_cast<size_t>(ringlen) * sizeof(float));
+            if (taps > 0 &&
+                static_cast<int>(pp_stream_ring_.size()) == taps * dim) {
+                std::memcpy(r0.data(), pp_stream_ring_.data(),
+                            static_cast<size_t>(taps) * dim * sizeof(float));
+            }
+            pp_stream_ring_dev_ = r0.to(Device::GPU);
+            pp_stream_dev_live_ = true;
+        }
+        Tensor gated(std::vector<int>{1, dim}, Device::GPU);
+        cuda::launch_mamba_proper_step(
+            xv.raw_data(), z.raw_data(), Bt.raw_data(), Ct.raw_data(),
+            dt.raw_data(), A.data.raw_data(), conv_weight_.data.raw_data(),
+            pp_stream_ring_dev_.raw_data(), pp_stream_h_dev_.raw_data(),
+            gated.raw_data(), dim, K);
+        Tensor projected = out_proj.forward(gated).reshape({1, dim});
+        Tensor skip = u_flat.mul(D.data);
+        Tensor result = projected.add(skip);
+        return u.shape.size() == 2 ? result : result.reshape({1, 1, dim});
+    }
+#endif
+
+    // Host step (default): pull projections to host for the scalar recurrence.
     Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
     Tensor Bt_h = dev == Device::GPU ? Bt.cpu() : Bt;
     Tensor Ct_h = dev == Device::GPU ? Ct.cpu() : Ct;
@@ -1535,6 +1592,9 @@ void Mamba2SSD::reset() {
     pp_stream_state_.clear();
     pp_stream_ring_.clear();
     pp_stream_active_ = false;
+    pp_stream_h_dev_ = Tensor();
+    pp_stream_ring_dev_ = Tensor();
+    pp_stream_dev_live_ = false;
 }
 
 void Mamba2SSD::reset_runtime_telemetry() {
@@ -1611,6 +1671,9 @@ void Mamba2SSD::set_streaming_mode(bool enabled) {
     pp_stream_state_.clear();
     pp_stream_ring_.clear();
     pp_stream_active_ = false;
+    pp_stream_h_dev_ = Tensor();
+    pp_stream_ring_dev_ = Tensor();
+    pp_stream_dev_live_ = false;
     if (!enabled) {
         streaming_state_.reset();
     } else if (!streaming_state_ || streaming_state_->shape.back() != d_model) {
@@ -1625,8 +1688,26 @@ MambaStreamSnapshot Mamba2SSD::snapshot_streaming_state() const {
     snapshot.state = streaming_state_;
     // Proper-path incremental decode state: carry per-sequence so fork/restore
     // does not bleed the SSD state + conv window across sequences.
-    snapshot.proper_state = pp_stream_state_;
-    snapshot.proper_ring = pp_stream_ring_;
+    // If the device buffers hold the live state (GPU step path after >=1 token),
+    // the host vectors are stale -> download the current device state instead.
+    if (pp_stream_dev_live_ && pp_stream_h_dev_.size > 0) {
+#ifdef USE_CUDA
+        Tensor hc = pp_stream_h_dev_.cpu();
+        snapshot.proper_state.assign(hc.data(), hc.data() + hc.size);
+        if (pp_stream_ring_dev_.size > 0) {
+            Tensor rc = pp_stream_ring_dev_.cpu();
+            snapshot.proper_ring.assign(rc.data(), rc.data() + rc.size);
+        } else {
+            snapshot.proper_ring = pp_stream_ring_;
+        }
+#else
+        snapshot.proper_state = pp_stream_state_;
+        snapshot.proper_ring = pp_stream_ring_;
+#endif
+    } else {
+        snapshot.proper_state = pp_stream_state_;
+        snapshot.proper_ring = pp_stream_ring_;
+    }
     snapshot.proper_active = pp_stream_active_;
     return snapshot;
 }
@@ -1642,6 +1723,9 @@ void Mamba2SSD::restore_streaming_state(const MambaStreamSnapshot& snapshot) {
     pp_stream_state_ = snapshot.proper_state;
     pp_stream_ring_ = snapshot.proper_ring;
     pp_stream_active_ = snapshot.proper_active;
+    // Force the device buffers to re-sync from the restored host vectors on the
+    // next GPU step (the previous device state belonged to another sequence).
+    pp_stream_dev_live_ = false;
 }
 
 std::vector<MambaStreamSnapshot> Mamba2SSD::snapshot_streaming_state_batch() const {

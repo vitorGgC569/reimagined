@@ -889,5 +889,63 @@ void launch_mamba_nstate_backward(const float *gy, const float *xc,
       H, P, N);
 }
 
+// =====================================================================
+// Fused single-token incremental decode step (proper diagonal path).
+// One thread per channel.  Mirrors forward_proper_step's host math exactly:
+//   conv_pre = sum_j convw[c,j] * window[j]   (window = [ring taps..., xv])
+//   xc       = silu(conv_pre)
+//   h        = decay*h + B*xc ; decay = exp(-softplus(dt)*max(A,1e-3))
+//   y        = h*C
+//   gated    = y * silu(z)
+// then advances the conv ring in place (shift left, append xv).  Keeps the SSD
+// state h and ring resident on the device across tokens -> no per-token host
+// round-trip, and capturable by a CUDA graph.
+// =====================================================================
+__global__ void mamba_proper_step_kernel(
+    const float *__restrict__ xv, const float *__restrict__ z,
+    const float *__restrict__ B_in, const float *__restrict__ C_in,
+    const float *__restrict__ dt, const float *__restrict__ A,
+    const float *__restrict__ convw, float *__restrict__ ring,
+    float *__restrict__ h, float *__restrict__ gated, int dim, int K) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= dim) return;
+
+  float conv_pre = 0.0f;
+  for (int j = 0; j < K; ++j) {
+    const float src = (j < K - 1) ? ring[j * dim + c] : xv[c];
+    conv_pre += convw[c * K + j] * src;
+  }
+  const float xc = conv_pre * (1.0f / (1.0f + expf(-conv_pre)));  // silu
+
+  const float a_value = fmaxf(A[c], 1e-3f);
+  const float decay = expf(-softplus_device(dt[c]) * a_value);
+  const float st = decay * h[c] + B_in[c] * xc;
+  h[c] = st;
+  const float y = st * C_in[c];
+  const float gate = z[c] * (1.0f / (1.0f + expf(-z[c])));  // silu(z)
+  gated[c] = y * gate;
+
+  // Advance the conv window: shift taps left, append current xv.  Each thread
+  // owns channel c, so this is race-free across channels and the reads above
+  // used the pre-shift ring.
+  for (int s = 0; s + 1 < K - 1; ++s) {
+    ring[s * dim + c] = ring[(s + 1) * dim + c];
+  }
+  if (K - 1 > 0) {
+    ring[(K - 2) * dim + c] = xv[c];
+  }
+}
+
+void launch_mamba_proper_step(const float *xv, const float *z,
+                              const float *B_in, const float *C_in,
+                              const float *dt, const float *A,
+                              const float *convw, float *ring, float *h,
+                              float *gated, int dim, int K) {
+  const int block = 256;
+  const int grid = (dim + block - 1) / block;
+  mamba_proper_step_kernel<<<grid, block>>>(xv, z, B_in, C_in, dt, A, convw,
+                                            ring, h, gated, dim, K);
+}
+
 }  // namespace cuda
 }  // namespace nsos

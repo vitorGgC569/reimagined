@@ -533,6 +533,13 @@ if (NSOS_BUILD_TESTS)
     target_include_directories(test_gpu_parity_mamba_proper PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_mamba_proper COMMAND test_gpu_parity_mamba_proper)
 
+    # Proper-path on-device single-token decode (NSOS_MAMBA_GPU_STEP):
+    # mamba_proper_step_kernel vs the GPU full-sequence scan.
+    add_executable(test_gpu_parity_mamba_proper_stream tests/gpu/test_gpu_parity_mamba_proper_stream.cpp)
+    target_link_libraries(test_gpu_parity_mamba_proper_stream PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_mamba_proper_stream PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_mamba_proper_stream COMMAND test_gpu_parity_mamba_proper_stream)
+
     # Full Mamba-2 SSD with N-state expansion: mamba_nstate_* CUDA kernels
     # (per-head dt/A, N-dim B/C, h in R^{H*P*N}) vs the host reference.
     add_executable(test_gpu_parity_mamba_nstate tests/gpu/test_gpu_parity_mamba_nstate.cpp)
@@ -656,6 +663,7 @@ if (NSOS_BUILD_TESTS)
             test_gpu_parity_basic
             test_gpu_parity_bitlinear
             test_gpu_parity_mamba_stream
+            test_gpu_parity_mamba_proper_stream
             test_gpu_parity_mamba_scan
             test_gpu_parity_jamba
             test_gpu_parity_moe_router

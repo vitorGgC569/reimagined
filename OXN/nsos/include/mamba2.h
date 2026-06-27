@@ -212,6 +212,15 @@ private:
   std::vector<float> pp_stream_state_;
   std::vector<float> pp_stream_ring_;
   bool pp_stream_active_ = false;
+  // GPU incremental decode step (opt-in NSOS_MAMBA_GPU_STEP, diagonal path): the
+  // SSD state h + conv ring live device-resident across tokens so the per-token
+  // decode has NO host round-trip (and is CUDA-graph capturable).  The host
+  // vectors above stay canonical for snapshot/restore; these device buffers are
+  // synced from them on (re)prime/restore and back to them on snapshot.  mutable:
+  // snapshot_streaming_state() is const but must read the live device state.
+  mutable Tensor pp_stream_h_dev_;
+  mutable Tensor pp_stream_ring_dev_;
+  mutable bool pp_stream_dev_live_ = false;
 
   // Reusable buffers for scan operation
   struct ThreadBuffers {
