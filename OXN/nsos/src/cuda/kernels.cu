@@ -1744,6 +1744,7 @@ extern "C" int cuda_graph_self_test(void) {
 
   float *d_buf = nullptr;
   float *d_eager = nullptr;
+  float *d_mid = nullptr;  // allocated DURING capture (capture-safe-alloc proof)
   cudaStream_t stream = nullptr;
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t exec = nullptr;
@@ -1751,7 +1752,12 @@ extern "C" int cuda_graph_self_test(void) {
 
   if (cudaMalloc(&d_buf, bytes) != cudaSuccess) goto cleanup;
   if (cudaMalloc(&d_eager, bytes) != cudaSuccess) goto cleanup;
-  if (cudaStreamCreate(&stream) != cudaSuccess) goto cleanup;
+  // Capture on a dedicated NON-BLOCKING stream (CuPy does the same): the legacy
+  // default stream cannot be captured, and a non-blocking stream won't serialize
+  // against unrelated default-stream work.
+  if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+    goto cleanup;
+  }
 
   // Eager reference: zero, then +1 three times -> 3.0 everywhere.
   cudaMemsetAsync(d_eager, 0, bytes, stream);
@@ -1760,8 +1766,12 @@ extern "C" int cuda_graph_self_test(void) {
   }
   if (cudaStreamSynchronize(stream) != cudaSuccess) goto cleanup;
 
-  // Capture the identical sequence into a graph.
-  if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) !=
+  // Capture the identical sequence into a graph.  Use the RELAXED capture mode:
+  // CuPy defaults to it (cupy/cuda/stream.pyx begin_capture) because a memory
+  // pool backed by cudaMalloc/cudaMallocManaged may need to grow mid-capture,
+  // which stricter modes forbid.  The real decode graph will allocate from the
+  // Tensor pool during capture, so the mechanism must be proven under Relaxed.
+  if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed) !=
       cudaSuccess) {
     goto cleanup;
   }
@@ -1769,11 +1779,26 @@ extern "C" int cuda_graph_self_test(void) {
   for (int k = 0; k < 3; ++k) {
     graph_selftest_add_one_kernel<<<grid, block, 0, stream>>>(d_buf, n);
   }
+  // Capture-safe allocation: under RELAXED mode a (synchronous) allocation during
+  // capture is permitted instead of aborting the capture.  This is the exact
+  // pattern the real decode graph relies on when the Tensor pool must grow
+  // mid-capture.  Allocate here, then operate on the new buffer in the same graph.
+  if (cudaMallocManaged(&d_mid, bytes) != cudaSuccess) {
+    (void)cudaStreamEndCapture(stream, &graph);  // abandon the in-flight capture
+    goto cleanup;
+  }
+  cudaMemsetAsync(d_mid, 0, bytes, stream);
+  for (int k = 0; k < 3; ++k) {
+    graph_selftest_add_one_kernel<<<grid, block, 0, stream>>>(d_mid, n);
+  }
   if (cudaStreamEndCapture(stream, &graph) != cudaSuccess) {
     (void)cudaGetLastError();
     goto cleanup;
   }
   if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) goto cleanup;
+  // Pre-upload the executable graph (CuPy Graph.upload) so the first launch does
+  // not pay the upload cost — relevant when the decode graph replays every token.
+  if (cudaGraphUpload(exec, stream) != cudaSuccess) goto cleanup;
 
   // Replay twice; the in-graph memset makes each replay independent, so the
   // result equals a single eager pass (3.0).  Exercises capture + repeated replay.
@@ -1784,6 +1809,7 @@ extern "C" int cuda_graph_self_test(void) {
   {
     std::vector<float> h_buf(static_cast<size_t>(n));
     std::vector<float> h_eager(static_cast<size_t>(n));
+    std::vector<float> h_mid(static_cast<size_t>(n));
     if (cudaMemcpy(h_buf.data(), d_buf, bytes, cudaMemcpyDeviceToHost) !=
         cudaSuccess) {
       goto cleanup;
@@ -1792,11 +1818,16 @@ extern "C" int cuda_graph_self_test(void) {
         cudaSuccess) {
       goto cleanup;
     }
+    if (cudaMemcpy(h_mid.data(), d_mid, bytes, cudaMemcpyDeviceToHost) !=
+        cudaSuccess) {
+      goto cleanup;
+    }
     ok = 1;
     for (int i = 0; i < n; ++i) {
-      if (fabsf(h_buf[static_cast<size_t>(i)] - h_eager[static_cast<size_t>(i)]) >
-              1e-5f ||
-          fabsf(h_buf[static_cast<size_t>(i)] - 3.0f) > 1e-5f) {
+      const size_t idx = static_cast<size_t>(i);
+      if (fabsf(h_buf[idx] - h_eager[idx]) > 1e-5f ||
+          fabsf(h_buf[idx] - 3.0f) > 1e-5f ||
+          fabsf(h_mid[idx] - 3.0f) > 1e-5f) {  // buffer allocated mid-capture
         ok = 0;
         break;
       }
@@ -1809,6 +1840,7 @@ cleanup:
   if (stream) cudaStreamDestroy(stream);
   if (d_buf) cudaFree(d_buf);
   if (d_eager) cudaFree(d_eager);
+  if (d_mid) cudaFree(d_mid);
   (void)cudaGetLastError();
   return ok;
 }
