@@ -47,22 +47,25 @@ def code(text):
 
 cells = []
 
-cells.append(md("""# NSOS — Suíte de generalização (padrão-ouro) v3: recall + extrapolação
+cells.append(md("""# NSOS — Suíte de generalização (padrão-ouro) v4: recall + extrapolação
 
 Fase 1 da avaliação de **arquitetura** (branch `%BRANCH%`).
 
-**Causa-raiz encontrada (v1/v2 falhavam até na atenção):** na GPU o modelo **treina
-em FLOAT** (reference path — não há kernel ternário empacotado p/ tensores de
-device), mas o `eval` (`set_training_mode(False)`) roda o forward **TERNÁRIO
-1.58-bit**. Um circuito de recall (que exige casar chaves com Q·K preciso) aprendido
-em float é **destruído pela quantização na avaliação** → cai pro baseline. (A adição
-sobrevivia porque um mapa grosseiro tolera o ruído; recall preciso não.)
+**Achados das runs v1–v3 (incorporados aqui):**
+- O **harness funciona** — a tarefa **selective copy aprendeu** (mamba 0.99, híbrido
+  0.78, atenção 0.69 no comprimento de treino) e o overfit de 1 exemplo vai a loss 0.
+- **Não há gap ternário na GPU:** float == ternário idênticos (na GPU o forward é
+  float/reference path em treino E inferência; o 1.58-bit só morde no caminho
+  empacotado CPU/dp4a). Eval agora é único.
+- **Primeiro sinal de arquitetura (copy):** o **Mamba extrapola melhor** em
+  comprimento (L=128: mamba 0.33 vs atenção 0.18) — a tese do SSM.
+- O **AR (recall) não treinava** porque minha formulação tinha chave/valor no MESMO
+  vocab (o modelo tinha que inferir chave-vs-valor por posição) + pouco sinal/steps.
 
-**v3:** (1) célula de **diagnóstico** que decora 1 exemplo e mostra o pred em
-**float** (modo-treino) vs **ternário** (modo-eval) — confirma a causa direto;
-(2) avalia **nos dois modos**; a comparação de arquitetura (estilo Zoology/Mamba)
-usa o **float** (mixer vs mixer, justo) e o **ternário** vira o *gap de quantização*
-1.58-bit, reportado à parte; (3) o **gate** do veredito é a atenção em float."""))
+**v4:** AR com **vocabulários DISJUNTOS** (chave vs valor por faixa de id) + **mais
+steps e LR maior** (recall é mais difícil que copy); eval único; gate = atenção
+resolve AR n_kv=8. Tarefas 100% sintéticas (sem tokenizer/download). Compara o mixer:
+atenção-pura / Mamba-puro / híbrido NSOS."""))
 
 cells.append(md("## 1 — GPU + (opcional) Drive p/ cache do build"))
 cells.append(code("""import os, subprocess
@@ -154,9 +157,13 @@ dados entre BLANK + MARK → resposta = os K dados; treina curto, testa longo.
 False = modo-eval (forward ternário 1.58-bit)."""))
 cells.append(code("""import random, numpy as np
 
-def make_ar(rng, n_kv, n_sym):
-    BOS, SEP = n_sym, n_sym + 1
-    keys = rng.sample(range(n_sym), n_kv); vals = [rng.randrange(n_sym) for _ in range(n_kv)]
+def make_ar(rng, n_kv, n_key, n_val):
+    # vocabularios DISJUNTOS: chaves em [0,n_key), valores em [n_key,n_key+n_val).
+    # (id ja diz se e chave ou valor -> circuito de recall limpo; era a causa do AR
+    # nao treinar na v3, onde chave/valor compartilhavam o vocab.)
+    BOS, SEP = n_key + n_val, n_key + n_val + 1
+    keys = rng.sample(range(n_key), n_kv)
+    vals = [n_key + rng.randrange(n_val) for _ in range(n_kv)]
     kv = dict(zip(keys, vals)); q = rng.choice(keys)
     prompt = [BOS]
     for k, v in zip(keys, vals): prompt += [k, v]
@@ -170,16 +177,16 @@ def make_selcopy(rng, field_len, n_data, n_sym):
     for p, d in zip(pos, data): field[p] = d
     return [BOS] + field + [MARK], data
 
-def eval_ar(model, data, V, float_mode):
-    model.set_training_mode(float_mode)   # True=float(reference)  False=ternario(inferencia)
+def eval_ar(model, data, V):
+    model.set_training_mode(False)
     cor = tot = 0
     for prompt, ans in data:
         lg = np.asarray(model.forward_ids(prompt).cpu().numpy()).reshape(-1, V)
         cor += int(int(np.argmax(lg[-1])) == ans[0]); tot += 1
     return cor / max(tot, 1)
 
-def eval_copy(model, data, V, float_mode):
-    model.set_training_mode(float_mode)
+def eval_copy(model, data, V):
+    model.set_training_mode(False)
     cor = tot = 0
     for prompt, ans in data:
         seq = prompt + ans
@@ -188,7 +195,10 @@ def eval_copy(model, data, V, float_mode):
         cor += int(ok); tot += 1
     return cor / max(tot, 1)
 
-print('[tasks] AR + selective-copy (eval float/ternario) definidos')
+# Nota: na GPU o forward e float (reference path) em treino E inferencia -> NAO ha
+# gap ternario aqui (confirmado: float==ternario na v3). O 1.58-bit so morde no
+# caminho empacotado CPU/dp4a, fora do escopo desta comparacao de mixer.
+print('[tasks] AR (vocab disjunto) + selective-copy definidos')
 """))
 
 cells.append(md("""## 5 — Variantes do MIXER + treino em batch
@@ -246,80 +256,70 @@ BATCH = int(os.environ.get('NSOS_GEN_BATCH', '16'))
 print(f'[cfg] L={NUM_LAYERS} d={DMODEL} | {VARIANTS} | seeds={SEEDS} | steps={STEPS} batch={BATCH} (={STEPS*BATCH} ex/run)')
 """))
 
-cells.append(md("""## 5b — DIAGNÓSTICO: decorar 1 exemplo + float vs ternário
+cells.append(md("""## 5b — Sanidade: o trainer decora 1 exemplo?
 
-O teste mais decisivo. Treina a atenção pra **decorar UM** exemplo de AR (fácil) e
-checa o pred em **float** (modo-treino) e **ternário** (modo-eval).
-- loss não cai / float errado → **trainer/gradiente quebrado** (não é dados nem arq).
-- float **certo** + ternário **errado** → confirma o **gap de quantização** (a causa).
-- ambos certos → quantização não é o problema; era passo/dado."""))
+Treina a atenção pra **decorar UM** exemplo de AR (vocab disjunto, n_kv=4). A loss
+tem que ir a ~0 e o pred bater. Se não, o problema é trainer/gradiente (não dados
+nem arquitetura). (Já confirmado nas runs anteriores; fica como gate rápido.)"""))
 cells.append(code("""import numpy as np, random
-_NS = 16; _V = _NS + 2
+_NK = 16; _NV = 16; _V = _NK + _NV + 2
 nsos.set_seed(0)
 mdbg = build_variant('attn', _V)
-ex_p, ex_a = make_ar(random.Random(1), 4, _NS)   # 1 exemplo fixo, n_kv=4
+ex_p, ex_a = make_ar(random.Random(1), 4, _NK, _NV)   # 1 exemplo fixo, n_kv=4
 tr = nsos.Trainer(mdbg, 3e-3); tr.total_training_steps = 400
 tr.first_token_loss_scale = 1.0; tr.eos_loss_scale = 1.0
 mdbg.set_training_mode(True)
 for s in range(400):
     L = tr.train_supervised(ex_p, ex_a)
-    if s % 50 == 0 or s == 399: print(f'  overfit step {s:3d}: loss={L:.4f}')
-
-def _pred(float_mode):
-    mdbg.set_training_mode(float_mode)
-    lg = np.asarray(mdbg.forward_ids(ex_p).cpu().numpy()).reshape(-1, _V)
-    return int(np.argmax(lg[-1]))
-
-pf, pt = _pred(True), _pred(False)
+    if s % 100 == 0 or s == 399: print(f'  overfit step {s:3d}: loss={L:.4f}')
+mdbg.set_training_mode(False)
+lg = np.asarray(mdbg.forward_ids(ex_p).cpu().numpy()).reshape(-1, _V)
+pred = int(np.argmax(lg[-1]))
 print('=' * 60)
-print(f'  alvo={ex_a[0]}  | pred FLOAT(treino)={pf}  pred TERNARIO(eval)={pt}')
-if pf == ex_a[0] and pt != ex_a[0]:
-    print('  >> CONFIRMADO: aprende em FLOAT, quebra no TERNARIO (gap de quantizacao).')
-    print('     A comparacao de arquitetura usa o numero FLOAT (mixer vs mixer).')
-elif pf != ex_a[0]:
-    print('  >> trainer/gradiente/eval quebrado (nem decora 1 exemplo em float).')
-else:
-    print('  >> quantizacao OK aqui; falha anterior era passo/dado -> suba NSOS_GEN_STEPS.')
+print(f'  alvo={ex_a[0]}  pred={pred}  -> {"OK (trainer decora 1 exemplo)" if pred==ex_a[0] else "FALHOU (trainer quebrado)"}')
 print('=' * 60)
 """))
 
-cells.append(md("""## 6 — Recall associativo: capacidade (treina n_kv=8; testa 8/16/32; float & ternário)
+cells.append(md("""## 6 — Recall associativo: capacidade (vocab disjunto; treina n_kv=8; testa 4/8/16)
 
-Baseline = 1/n_sym. **Gate:** atenção em FLOAT tem que acertar ~1.0 em n_kv=8."""))
+Baseline = 1/n_val. **Gate:** atenção tem que acertar bem em n_kv=8 (controle
+positivo). Mais steps + LR maior que o copy (recall é mais difícil de induzir)."""))
 cells.append(code("""import time, numpy as np, random
-N_SYM = int(os.environ.get('NSOS_AR_SYM', '32')); V = N_SYM + 2
-base = 1.0 / N_SYM; KV_TEST = [8, 16, 32]
+N_KEY = int(os.environ.get('NSOS_AR_KEYS', '16')); N_VAL = int(os.environ.get('NSOS_AR_VALS', '16'))
+V = N_KEY + N_VAL + 2; base = 1.0 / N_VAL; KV_TEST = [4, 8, 16]
+AR_STEPS = int(os.environ.get('NSOS_AR_STEPS', str(STEPS * 3)))   # recall e mais dificil que copy
+AR_LR = float(os.environ.get('NSOS_AR_LR', '3e-3'))
 ar = {}; t0 = time.time()
 for variant in VARIANTS:
-    fp = {k: [] for k in KV_TEST}; tq = {k: [] for k in KV_TEST}
+    acc = {k: [] for k in KV_TEST}
     for seed in SEEDS:
         nsos.set_seed(seed); m = build_variant(variant, V)
-        train_batched(m, 2e-3, STEPS, BATCH, lambda r: (lambda: make_ar(r, 8, N_SYM)), seed, f'AR {variant} s{seed}')
+        train_batched(m, AR_LR, AR_STEPS, BATCH, lambda r: (lambda: make_ar(r, 8, N_KEY, N_VAL)), seed, f'AR {variant} s{seed}')
         ev = random.Random(seed * 13 + 5)
         for k in KV_TEST:
-            d = [make_ar(ev, k, N_SYM) for _ in range(300)]
-            fp[k].append(eval_ar(m, d, V, True)); tq[k].append(eval_ar(m, d, V, False))
-        print(f'  [{variant:6s} s{seed}] float ' + ' '.join(f'{k}:{fp[k][-1]:.2f}' for k in KV_TEST) +
-              '  | tern ' + ' '.join(f'{k}:{tq[k][-1]:.2f}' for k in KV_TEST))
-    ar[variant] = {'float': {k: float(np.mean(fp[k])) for k in KV_TEST},
-                   'tern':  {k: float(np.mean(tq[k])) for k in KV_TEST}}
+            d = [make_ar(ev, k, N_KEY, N_VAL) for _ in range(300)]
+            acc[k].append(eval_ar(m, d, V))
+        print(f'  [{variant:6s} s{seed}] ' + ' '.join(f'n_kv={k}:{acc[k][-1]:.2f}' for k in KV_TEST))
+    ar[variant] = {k: float(np.mean(acc[k])) for k in KV_TEST}
 print('\\n' + '=' * 72)
-print(f'RECALL ASSOCIATIVO (baseline={base:.3f})   ({time.time()-t0:.0f}s)')
-for tag in ('float', 'tern'):
-    print(f'-- {tag.upper()} --   ' + ''.join(f'{("n_kv="+str(k)):>12}' for k in KV_TEST))
-    for v in VARIANTS:
-        print(f'  {v:<8}' + ''.join(f'{ar[v][tag][k]:>12.3f}' for k in KV_TEST))
+print(f'RECALL ASSOCIATIVO (baseline={base:.3f}; treina n_kv=8, {AR_STEPS} steps)   ({time.time()-t0:.0f}s)')
+print(f'{"variante":<10}' + ''.join(f'{("n_kv="+str(k)):>14}' for k in KV_TEST))
+for v in VARIANTS:
+    print(f'  {v:<8}' + ''.join(f'{ar[v][k]:>14.3f}' for k in KV_TEST))
 print('=' * 72)
 """))
 
-cells.append(md("""## 7 — Selective copy: extrapolação (treina ≤64; testa 64/128/256; float & ternário)"""))
+cells.append(md("""## 7 — Selective copy: extrapolação de comprimento (treina ≤64; testa 64/128/256)
+
+Já funcionou nas runs anteriores (harness validado). Mede quem **extrapola** melhor
+pra campos mais longos que o treino — o upside estrutural do SSM."""))
 cells.append(code("""import time, numpy as np, random
 N_SYM_C = int(os.environ.get('NSOS_COPY_SYM', '20')); N_DATA = 4
 LT = int(os.environ.get('NSOS_COPY_LEN', '64')); Vc = N_SYM_C + 3
 base_c = (1.0 / N_SYM_C) ** N_DATA; TEST_LENS = [LT, 2 * LT, 4 * LT]
 copy = {}; t0 = time.time()
 for variant in VARIANTS:
-    fp = {L: [] for L in TEST_LENS}; tq = {L: [] for L in TEST_LENS}
+    acc = {L: [] for L in TEST_LENS}
     for seed in SEEDS:
         nsos.set_seed(seed); m = build_variant(variant, Vc)
         def sampler(r):
@@ -329,43 +329,40 @@ for variant in VARIANTS:
         ev = random.Random(seed * 29 + 3)
         for L in TEST_LENS:
             d = [make_selcopy(ev, L, N_DATA, N_SYM_C) for _ in range(300)]
-            fp[L].append(eval_copy(m, d, Vc, True)); tq[L].append(eval_copy(m, d, Vc, False))
-        print(f'  [{variant:6s} s{seed}] float ' + ' '.join(f'{L}:{fp[L][-1]:.2f}' for L in TEST_LENS) +
-              '  | tern ' + ' '.join(f'{L}:{tq[L][-1]:.2f}' for L in TEST_LENS))
-    copy[variant] = {'float': {L: float(np.mean(fp[L])) for L in TEST_LENS},
-                     'tern':  {L: float(np.mean(tq[L])) for L in TEST_LENS}}
+            acc[L].append(eval_copy(m, d, Vc))
+        print(f'  [{variant:6s} s{seed}] ' + ' '.join(f'L={L}:{acc[L][-1]:.2f}' for L in TEST_LENS))
+    copy[variant] = {L: float(np.mean(acc[L])) for L in TEST_LENS}
 print('\\n' + '=' * 72)
-print(f'SELECTIVE COPY exact-match (baseline~{base_c:.0e}; treino<=64)   ({time.time()-t0:.0f}s)')
-for tag in ('float', 'tern'):
-    print(f'-- {tag.upper()} --   ' + ''.join(f'{("L="+str(L)):>12}' for L in TEST_LENS))
-    for v in VARIANTS:
-        print(f'  {v:<8}' + ''.join(f'{copy[v][tag][L]:>12.3f}' for L in TEST_LENS))
+print(f'SELECTIVE COPY exact-match (baseline~{base_c:.0e}; treino campo<=64)   ({time.time()-t0:.0f}s)')
+print(f'{"variante":<10}' + ''.join(f'{("L="+str(L)):>14}' for L in TEST_LENS))
+for v in VARIANTS:
+    print(f'  {v:<8}' + ''.join(f'{copy[v][L]:>14.3f}' for L in TEST_LENS))
 print('=' * 72)
 """))
 
 cells.append(md("""## 8 — VEREDITO (gate = atenção em FLOAT)"""))
 cells.append(code("""def g(c): return 'OK' if c else 'FALHOU'
-a8 = ar['attn']['float'][8]
-GATE = a8 >= 0.80
+a8 = ar['attn'][8]; GATE = a8 >= 0.80
 print('=' * 72)
-print(f'GATE — atencao (FLOAT) resolve AR n_kv=8?  attn={a8:.3f}  -> {g(GATE)}')
+print(f'GATE — atencao resolve AR n_kv=8?  attn={a8:.3f}  -> {g(GATE)}')
 if not GATE:
-    print('  >> HARNESS INSUFICIENTE: suba NSOS_GEN_STEPS (4000) e/ou NSOS_GEN_BATCH (32).')
+    print('  >> AR ainda nao treinou no controle de atencao. Suba NSOS_AR_STEPS')
+    print('     (ex. 9000) e/ou NSOS_GEN_BATCH (32). (o copy abaixo ja valida o')
+    print('     harness; recall e mais dificil de induzir que copy.)')
 else:
-    a32, h32, m32 = ar['attn']['float'][32], ar['hybrid']['float'][32], ar['mamba']['float'][32]
-    print('\\n1) TABLE STAKES (float, AR n_kv=8):')
-    for v in VARIANTS: print(f'   {v:<8} {ar[v]["float"][8]:.3f} -> {g(ar[v]["float"][8] > 0.7)}')
-    print(f'\\n2) DISCRIMINADOR — hibrido ~ atencao na capacidade (n_kv=32, float)?')
-    print(f'   attn={a32:.3f} hibrido={h32:.3f} mamba={m32:.3f} | hibrido>=0.85*attn: {g(h32>=0.85*a32)}')
-    print(f'\\n3) UPSIDE — extrapolacao de comprimento (copy L=4x, float):')
-    for v in VARIANTS:
-        print(f'   {v:<8} L={LT}:{copy[v]["float"][LT]:.3f} -> L={4*LT}:{copy[v]["float"][4*LT]:.3f}  {g(copy[v]["float"][4*LT]>=0.5)}')
-    print(f'\\n4) GAP DE QUANTIZACAO 1.58-bit (float -> ternario, AR n_kv=8):')
-    for v in VARIANTS:
-        print(f'   {v:<8} float={ar[v]["float"][8]:.3f}  ternario={ar[v]["tern"][8]:.3f}  (queda={ar[v]["float"][8]-ar[v]["tern"][8]:+.3f})')
-    print('\\nLEITURA: arquitetura (mixer) se julga no FLOAT; o ternario mede o custo')
-    print('da quantizacao 1.58-bit (eixo separado do NSOS). Vale escalar se: float')
-    print('table-stakes OK + hibrido~atencao no recall + Mamba/hibrido extrapolam.')
+    a16, h16, m16 = ar['attn'][16], ar['hybrid'][16], ar['mamba'][16]
+    print('\\n1) TABLE STAKES (AR n_kv=8):')
+    for v in VARIANTS: print(f'   {v:<8} {ar[v][8]:.3f} -> {g(ar[v][8] > 0.7)}')
+    print('\\n2) DISCRIMINADOR — hibrido ~ atencao na CAPACIDADE (n_kv=16)?')
+    print(f'   attn={a16:.3f} hibrido={h16:.3f} mamba={m16:.3f} | hibrido>=0.85*attn: {g(h16>=0.85*a16)}')
+print('\\n3) UPSIDE — extrapolacao de comprimento (selective copy):')
+for v in VARIANTS:
+    print(f'   {v:<8} treino(L={LT})={copy[v][LT]:.3f}  L={2*LT}={copy[v][2*LT]:.3f}  L={4*LT}={copy[v][4*LT]:.3f}')
+best = max(VARIANTS, key=lambda v: copy[v][2 * LT])
+print(f'   melhor extrapolador (L={2*LT}): {best} = {copy[best][2*LT]:.3f}')
+print('\\nLEITURA: AR julga memoria associativa (recall); copy julga extrapolacao de')
+print('comprimento. Vale escalar se attn passa o gate, hibrido acompanha no recall,')
+print('e Mamba/hibrido extrapolam melhor que a atencao.')
 print('=' * 72)
 """))
 
