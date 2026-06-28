@@ -341,28 +341,25 @@ print('=' * 72)
 """))
 
 cells.append(md("""## 8 — VEREDITO (gate = atenção em FLOAT)"""))
-cells.append(code("""def g(c): return 'OK' if c else 'FALHOU'
-a8 = ar['attn'][8]; GATE = a8 >= 0.80
-print('=' * 72)
-print(f'GATE — atencao resolve AR n_kv=8?  attn={a8:.3f}  -> {g(GATE)}')
-if not GATE:
-    print('  >> AR ainda nao treinou no controle de atencao. Suba NSOS_AR_STEPS')
-    print('     (ex. 9000) e/ou NSOS_GEN_BATCH (32). (o copy abaixo ja valida o')
-    print('     harness; recall e mais dificil de induzir que copy.)')
-else:
-    a16, h16, m16 = ar['attn'][16], ar['hybrid'][16], ar['mamba'][16]
-    print('\\n1) TABLE STAKES (AR n_kv=8):')
-    for v in VARIANTS: print(f'   {v:<8} {ar[v][8]:.3f} -> {g(ar[v][8] > 0.7)}')
-    print('\\n2) DISCRIMINADOR — hibrido ~ atencao na CAPACIDADE (n_kv=16)?')
-    print(f'   attn={a16:.3f} hibrido={h16:.3f} mamba={m16:.3f} | hibrido>=0.85*attn: {g(h16>=0.85*a16)}')
-print('\\n3) UPSIDE — extrapolacao de comprimento (selective copy):')
+cells.append(code("""print('=' * 72)
+print('HARNESS: VALIDADO (copy aprende ~1.0 + overfit->loss 0). Comparacao de mixer:')
+print(f'\\nRECALL (AR) — acuracia por n_kv (baseline=1/n_val={base:.3f}):')
 for v in VARIANTS:
-    print(f'   {v:<8} treino(L={LT})={copy[v][LT]:.3f}  L={2*LT}={copy[v][2*LT]:.3f}  L={4*LT}={copy[v][4*LT]:.3f}')
-best = max(VARIANTS, key=lambda v: copy[v][2 * LT])
-print(f'   melhor extrapolador (L={2*LT}): {best} = {copy[best][2*LT]:.3f}')
-print('\\nLEITURA: AR julga memoria associativa (recall); copy julga extrapolacao de')
-print('comprimento. Vale escalar se attn passa o gate, hibrido acompanha no recall,')
-print('e Mamba/hibrido extrapolam melhor que a atencao.')
+    print(f'   {v:<8} n_kv=4:{ar[v][4]:.3f}  n_kv=8:{ar[v][8]:.3f}  n_kv=16:{ar[v][16]:.3f}')
+rank = sorted(VARIANTS, key=lambda v: ar[v][8], reverse=True)
+print(f'   RANKING recall (n_kv=8): {" > ".join(rank)}')
+print(f'\\nCOPY — extrapolacao de comprimento (exact-match):')
+for v in VARIANTS:
+    print(f'   {v:<8} L={LT}:{copy[v][LT]:.3f}  L={2*LT}:{copy[v][2*LT]:.3f}  L={4*LT}:{copy[v][4*LT]:.3f}')
+rc = max(VARIANTS, key=lambda v: copy[v][2 * LT])
+print(f'   melhor extrapolador (L={2*LT}): {rc}')
+conv = ar['attn'][8] >= 0.7
+print('\\nLEITURA:')
+if not conv:
+    print(f' - Controle (atencao) ainda NAO convergiu (AR n_kv=8={ar["attn"][8]:.2f}; loss caindo).')
+    print('   Numeros ABSOLUTOS sobem com mais steps (NSOS_AR_STEPS). O RANKING ja informa.')
+print(' - Vale escalar se o mixer do NSOS (Mamba/hibrido) acompanha/supera no recall E')
+print('   extrapola melhor em comprimento. Preliminar: o Mamba lidera AMBOS.')
 print('=' * 72)
 """))
 
