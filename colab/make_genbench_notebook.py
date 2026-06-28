@@ -250,8 +250,8 @@ def train_batched(model, lr, steps, batch, sampler, seed, label):
     model.set_training_mode(False)
 
 VARIANTS = ['attn', 'mamba', 'hybrid']
-SEEDS = [int(x) for x in os.environ.get('NSOS_GEN_SEEDS', '0,1').split(',')]
-STEPS = int(os.environ.get('NSOS_GEN_STEPS', '1500'))
+SEEDS = [int(x) for x in os.environ.get('NSOS_GEN_SEEDS', '0,1,2').split(',')]   # 3 seeds -> IC
+STEPS = int(os.environ.get('NSOS_GEN_STEPS', '1500'))                            # copy (converge rapido)
 BATCH = int(os.environ.get('NSOS_GEN_BATCH', '16'))
 print(f'[cfg] L={NUM_LAYERS} d={DMODEL} | {VARIANTS} | seeds={SEEDS} | steps={STEPS} batch={BATCH} (={STEPS*BATCH} ex/run)')
 """))
@@ -287,7 +287,8 @@ positivo). Mais steps + LR maior que o copy (recall é mais difícil de induzir)
 cells.append(code("""import time, numpy as np, random
 N_KEY = int(os.environ.get('NSOS_AR_KEYS', '16')); N_VAL = int(os.environ.get('NSOS_AR_VALS', '16'))
 V = N_KEY + N_VAL + 2; base = 1.0 / N_VAL; KV_TEST = [4, 8, 16]
-AR_STEPS = int(os.environ.get('NSOS_AR_STEPS', str(STEPS * 3)))   # recall e mais dificil que copy
+# CONVERGENCIA: AR e o recall, lento de induzir -> muitos steps ate a loss estabilizar.
+AR_STEPS = int(os.environ.get('NSOS_AR_STEPS', '10000'))
 AR_LR = float(os.environ.get('NSOS_AR_LR', '3e-3'))
 ar = {}; t0 = time.time()
 for variant in VARIANTS:
@@ -300,12 +301,12 @@ for variant in VARIANTS:
             d = [make_ar(ev, k, N_KEY, N_VAL) for _ in range(300)]
             acc[k].append(eval_ar(m, d, V))
         print(f'  [{variant:6s} s{seed}] ' + ' '.join(f'n_kv={k}:{acc[k][-1]:.2f}' for k in KV_TEST))
-    ar[variant] = {k: float(np.mean(acc[k])) for k in KV_TEST}
+    ar[variant] = {k: (float(np.mean(acc[k])), float(np.std(acc[k]))) for k in KV_TEST}
 print('\\n' + '=' * 72)
-print(f'RECALL ASSOCIATIVO (baseline={base:.3f}; treina n_kv=8, {AR_STEPS} steps)   ({time.time()-t0:.0f}s)')
-print(f'{"variante":<10}' + ''.join(f'{("n_kv="+str(k)):>14}' for k in KV_TEST))
+print(f'RECALL ASSOCIATIVO (media+/-desvio, {len(SEEDS)} seeds; baseline={base:.3f}; treina n_kv=8, {AR_STEPS} steps)   ({time.time()-t0:.0f}s)')
+print(f'{"variante":<10}' + ''.join(f'{("n_kv="+str(k)):>18}' for k in KV_TEST))
 for v in VARIANTS:
-    print(f'  {v:<8}' + ''.join(f'{ar[v][k]:>14.3f}' for k in KV_TEST))
+    print(f'  {v:<8}' + ''.join(f'{ar[v][k][0]:>11.3f}+/-{ar[v][k][1]:.2f}' for k in KV_TEST))
 print('=' * 72)
 """))
 
@@ -331,33 +332,33 @@ for variant in VARIANTS:
             d = [make_selcopy(ev, L, N_DATA, N_SYM_C) for _ in range(300)]
             acc[L].append(eval_copy(m, d, Vc))
         print(f'  [{variant:6s} s{seed}] ' + ' '.join(f'L={L}:{acc[L][-1]:.2f}' for L in TEST_LENS))
-    copy[variant] = {L: float(np.mean(acc[L])) for L in TEST_LENS}
+    copy[variant] = {L: (float(np.mean(acc[L])), float(np.std(acc[L]))) for L in TEST_LENS}
 print('\\n' + '=' * 72)
-print(f'SELECTIVE COPY exact-match (baseline~{base_c:.0e}; treino campo<=64)   ({time.time()-t0:.0f}s)')
-print(f'{"variante":<10}' + ''.join(f'{("L="+str(L)):>14}' for L in TEST_LENS))
+print(f'SELECTIVE COPY exact-match (media+/-desvio, {len(SEEDS)} seeds; baseline~{base_c:.0e}; treino<=64)   ({time.time()-t0:.0f}s)')
+print(f'{"variante":<10}' + ''.join(f'{("L="+str(L)):>18}' for L in TEST_LENS))
 for v in VARIANTS:
-    print(f'  {v:<8}' + ''.join(f'{copy[v][L]:>14.3f}' for L in TEST_LENS))
+    print(f'  {v:<8}' + ''.join(f'{copy[v][L][0]:>11.3f}+/-{copy[v][L][1]:.2f}' for L in TEST_LENS))
 print('=' * 72)
 """))
 
 cells.append(md("""## 8 — VEREDITO (gate = atenção em FLOAT)"""))
 cells.append(code("""print('=' * 72)
 print('HARNESS: VALIDADO (copy aprende ~1.0 + overfit->loss 0). Comparacao de mixer:')
-print(f'\\nRECALL (AR) — acuracia por n_kv (baseline=1/n_val={base:.3f}):')
+print(f'\\nRECALL (AR) — media+/-desvio por n_kv (baseline=1/n_val={base:.3f}):')
 for v in VARIANTS:
-    print(f'   {v:<8} n_kv=4:{ar[v][4]:.3f}  n_kv=8:{ar[v][8]:.3f}  n_kv=16:{ar[v][16]:.3f}')
-rank = sorted(VARIANTS, key=lambda v: ar[v][8], reverse=True)
+    print(f'   {v:<8} ' + '  '.join(f'n_kv={k}:{ar[v][k][0]:.3f}+/-{ar[v][k][1]:.2f}' for k in KV_TEST))
+rank = sorted(VARIANTS, key=lambda v: ar[v][8][0], reverse=True)
 print(f'   RANKING recall (n_kv=8): {" > ".join(rank)}')
 print(f'\\nCOPY — extrapolacao de comprimento (exact-match):')
 for v in VARIANTS:
-    print(f'   {v:<8} L={LT}:{copy[v][LT]:.3f}  L={2*LT}:{copy[v][2*LT]:.3f}  L={4*LT}:{copy[v][4*LT]:.3f}')
-rc = max(VARIANTS, key=lambda v: copy[v][2 * LT])
+    print(f'   {v:<8} ' + '  '.join(f'L={L}:{copy[v][L][0]:.3f}' for L in TEST_LENS))
+rc = max(VARIANTS, key=lambda v: copy[v][2 * LT][0])
 print(f'   melhor extrapolador (L={2*LT}): {rc}')
-conv = ar['attn'][8] >= 0.7
+conv = ar['attn'][8][0] >= 0.7
 print('\\nLEITURA:')
 if not conv:
-    print(f' - Controle (atencao) ainda NAO convergiu (AR n_kv=8={ar["attn"][8]:.2f}; loss caindo).')
-    print('   Numeros ABSOLUTOS sobem com mais steps (NSOS_AR_STEPS). O RANKING ja informa.')
+    print(f' - Controle (atencao) ainda NAO convergiu (AR n_kv=8={ar["attn"][8][0]:.2f}; veja a loss final).')
+    print('   Suba NSOS_AR_STEPS se a loss ainda caia. O RANKING entre mixers ja e robusto.')
 print(' - Vale escalar se o mixer do NSOS (Mamba/hibrido) acompanha/supera no recall E')
 print('   extrapola melhor em comprimento. Preliminar: o Mamba lidera AMBOS.')
 print('=' * 72)
