@@ -217,11 +217,12 @@ import nsos_ext as nsos
 dev = nsos.Device.GPU
 NUM_LAYERS = int(os.environ.get('NSOS_GEN_LAYERS', '4'))
 DMODEL = int(os.environ.get('NSOS_GEN_DMODEL', '128'))
+KVHEADS = int(os.environ.get('NSOS_GEN_KVHEADS', '2'))   # =4 -> MHA (sem GQA), testa a suspeita
 
 def build_variant(variant, V):
     c = nsos.ModelConfig()
     c.num_layers = NUM_LAYERS; c.d_model = DMODEL; c.vocab_size = V
-    c.n_heads = 4; c.n_kv_heads = 2; c.max_context_tokens = 1024
+    c.n_heads = 4; c.n_kv_heads = KVHEADS; c.max_context_tokens = 1024
     c.use_exact_attention_training = True; c.use_flash_attn = False
     c.use_moe = False; c.use_kan = False; c.use_ttt = False; c.dropout = 0.0
     if variant == 'attn':
@@ -289,7 +290,7 @@ N_KEY = int(os.environ.get('NSOS_AR_KEYS', '16')); N_VAL = int(os.environ.get('N
 V = N_KEY + N_VAL + 2; base = 1.0 / N_VAL; KV_TEST = [4, 8, 16]
 # CONVERGENCIA: AR e o recall, lento de induzir -> muitos steps ate a loss estabilizar.
 AR_STEPS = int(os.environ.get('NSOS_AR_STEPS', '10000'))
-AR_LR = float(os.environ.get('NSOS_AR_LR', '3e-3'))
+AR_LR = float(os.environ.get('NSOS_AR_LR', '2e-3'))   # = LR do copy (onde a atencao funcionou)
 ar = {}; t0 = time.time()
 for variant in VARIANTS:
     acc = {k: [] for k in KV_TEST}
