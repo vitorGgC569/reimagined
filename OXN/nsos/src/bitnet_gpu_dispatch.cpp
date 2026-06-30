@@ -14,6 +14,9 @@
 
 #include "bitnet_gpu_dispatch.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -128,5 +131,84 @@ Tensor bitnet_gemm_158bit_gpu(const Tensor& /*x_gpu*/,
 }
 
 #endif  // USE_CUDA
+
+// =====================================================================
+// K3: device-aware QAT fake-quant helpers (GPU kernel + CPU fallback).
+// =====================================================================
+
+Tensor qat_fake_quant_ternary(const Tensor& w, float scale) {
+  Tensor out(w.shape.dims, w.get_device());
+  const int n = static_cast<int>(w.size);
+  if (n <= 0) return out;
+#ifdef USE_CUDA
+  if (w.get_device() == Device::GPU) {
+    launch_fake_quant_ternary_kernel(out.raw_data(), w.raw_data(), scale, n);
+    check_cuda_or_throw("qat_fake_quant_ternary");
+    return out;
+  }
+#endif
+  const float* wp = w.data();
+  float* op = out.data();
+  const float inv = 1.0f / (scale + 1e-8f);
+  for (int i = 0; i < n; ++i) {
+    const float v = wp[i] * inv;
+    const float t = (v > 0.5f) ? 1.0f : ((v < -0.5f) ? -1.0f : 0.0f);
+    op[i] = t * scale;
+  }
+  return out;
+}
+
+Tensor qat_fake_quant_activations(const Tensor& x, int precision_bits) {
+  Tensor out(x.shape.dims, x.get_device());
+  const int K = x.shape.size() > 0 ? x.shape.back() : 0;
+  const int M = (K > 0) ? static_cast<int>(x.size / K) : 0;
+  if (M <= 0 || K <= 0) return out;
+#ifdef USE_CUDA
+  if (x.get_device() == Device::GPU) {
+    launch_fake_quant_activations_kernel(out.raw_data(), x.raw_data(), M, K,
+                                         precision_bits);
+    check_cuda_or_throw("qat_fake_quant_activations");
+    return out;
+  }
+#endif
+  const float* xp = x.data();
+  float* op = out.data();
+  const float q_max = (precision_bits <= 2)
+                          ? 1.0f
+                          : (std::pow(2.0f, static_cast<float>(precision_bits - 1)) - 1.0f);
+  for (int r = 0; r < M; ++r) {
+    const float* row = xp + static_cast<std::size_t>(r) * K;
+    float* orow = op + static_cast<std::size_t>(r) * K;
+    float mx = 0.0f;
+    for (int j = 0; j < K; ++j) mx = std::max(mx, std::fabs(row[j]));
+    const float denom = mx + 1e-8f;
+    const float scale = q_max / denom;
+    const float inv_scale = denom / q_max;
+    for (int j = 0; j < K; ++j) {
+      float v = row[j] * scale;
+      v = std::min(std::max(v, -q_max), q_max);
+      orow[j] = std::round(v) * inv_scale;
+    }
+  }
+  return out;
+}
+
+void qat_ste_clip_weight_grad(Tensor& dW, const Tensor& w, float scale) {
+  const int n = static_cast<int>(dW.size);
+  if (n <= 0 || w.size != dW.size) return;
+#ifdef USE_CUDA
+  if (dW.get_device() == Device::GPU && w.get_device() == Device::GPU) {
+    launch_ste_clip_weight_grad_kernel(dW.raw_data(), w.raw_data(), scale, n);
+    check_cuda_or_throw("qat_ste_clip_weight_grad");
+    return;
+  }
+#endif
+  float* g = dW.data();
+  const float* wp = w.data();
+  const float inv = 1.0f / (scale + 1e-8f);
+  for (int i = 0; i < n; ++i) {
+    if (std::fabs(wp[i] * inv) > 1.0f) g[i] = 0.0f;
+  }
+}
 
 }  // namespace nsos

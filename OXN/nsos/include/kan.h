@@ -20,7 +20,20 @@ public:
     void to(Device dev);
     std::vector<Parameter*> parameters();
 
+    // N5: when true, the base/RBF weight matmuls use ternary fake-quant
+    // (straight-through) so the KAN FFN honors the 1.58-bit invariant like every
+    // other BitLinear in the model — instead of full-precision matmuls that
+    // broke head-to-toe quantization at the edge.  Off in the bare ctor (keeps
+    // the FD gradcheck on the float path); JambaBlock turns it on for the model.
+    void set_quantized(bool enabled) { quantized_ = enabled; }
+    bool quantized() const { return quantized_; }
+
 private:
+    bool quantized_ = false;
+    float base_scale_ = 1.0f;
+    float rbf_scale_ = 1.0f;
+    Tensor saved_base_eff_;   // ternary-dequant base_weight used by the forward
+    Tensor saved_rbf_eff_;    // ternary-dequant rbf_weight used by the forward
     Tensor saved_input_;
     Tensor saved_basis_;
     std::vector<float> centers_;

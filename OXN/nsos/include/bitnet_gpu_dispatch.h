@@ -47,6 +47,29 @@ Tensor bitnet_gemm_158bit_gpu(const Tensor& x_gpu,
                               float weight_scale, int M, int K, int N,
                               int precision_bits);
 
+// =====================================================================
+// K3: device-aware QAT fake-quant (straight-through estimator) helpers.
+// These let BitLinear run TRUE quantization-aware training on the GPU
+// (the dp4a inference path is non-differentiable; the float GPU path did
+// no quantization at all).  Each helper dispatches to a CUDA kernel when
+// the input is on the GPU and to an identical-math host loop on the CPU,
+// so the QAT forward/backward is device-agnostic at the call site and
+// CPU↔GPU numerics match.
+// =====================================================================
+
+// Ternary weight fake-quant: returns clamp(round(w/scale), -1, +1) * scale
+// (same rule as BitLinear::quantize_weights, scaled).  Same shape/device as w.
+Tensor qat_fake_quant_ternary(const Tensor& w, float scale);
+
+// Per-row activation fake-quant (quant→dequant): returns the dequantized
+// float activations the matmul should multiply.  precision_bits selects q_max
+// (2 → ±1 ternary, else 2^(b-1)-1).  x is [M, K]; output matches shape/device.
+Tensor qat_fake_quant_activations(const Tensor& x, int precision_bits);
+
+// STE clip applied in place to the weight gradient: zeros entries whose latent
+// weight already saturated past the ternary band (|w/scale| > 1).
+void qat_ste_clip_weight_grad(Tensor& dW, const Tensor& w, float scale);
+
 }  // namespace nsos
 
 #endif  // NSOS_BITNET_GPU_DISPATCH_H

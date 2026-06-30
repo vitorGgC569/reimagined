@@ -276,6 +276,24 @@ void launch_quantize_activations_bitnet_kernel(const float *x, int8_t *x_q,
 void launch_bitnet_apply_act_scales_kernel(float *y, const float *act_scales,
                                            int M, int N);
 
+// ── K3: GPU QAT fake-quant (straight-through) primitives ────────────────────
+// Weight fake-quant: out[i] = clamp(round(w[i]/scale), -1, +1) * scale
+// (the canonical NSOS ternary rule; identical numerics to
+// BitLinear::quantize_weights * weight_scale).
+void launch_fake_quant_ternary_kernel(float *out, const float *w, float scale,
+                                      int n);
+// Per-row activation fake-quant (quant→dequant in one pass), returns the
+// DEQUANTIZED float activations the matmul should use:
+//   s_row = (max_j|x|+1e-8)/q_max ; out[r,j] = clip(round(x/s_row),±q_max)*s_row
+// q_max from precision_bits (2 → ±1, else 2^(b-1)-1).  Matches
+// BitLinear::quantize_activations_bitnet + dequant.
+void launch_fake_quant_activations_kernel(float *out, const float *x, int M,
+                                          int K, int precision_bits);
+// STE clip: zero grad rows whose latent weight already saturated past the
+// ternary band:  dW[i] = (|w[i]/scale| > 1) ? 0 : dW[i].
+void launch_ste_clip_weight_grad_kernel(float *dW, const float *w, float scale,
+                                        int n);
+
 // HPC Fused Cross-Entropy: softmax + log + NLL in single kernel
 void launch_fused_cross_entropy(float *d_loss, float *grad, const float *logits,
                                 const int *target, int batch, int vocab);

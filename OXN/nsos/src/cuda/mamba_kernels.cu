@@ -32,6 +32,12 @@ __device__ __forceinline__ float softplus_device(float x) {
   return logf(1.0f + expf(x));
 }
 
+// N1 (must match host nsos::mamba_a_eff in src/mamba2.cpp): A is stored in the
+// LOG domain; the effective decay rate is A_eff = exp(A_log) > 0, so the
+// recurrence is unconditionally stable and the gradient flows for every channel
+// (no 1e-3 clamp / mask).  A_log = 0 ⇒ A_eff = 1 (old A = ones default).
+__device__ __forceinline__ float mamba_a_eff_dev(float a_log) { return expf(a_log); }
+
 // =========================================================================
 // Chunk-parallel Mamba SSD Forward Kernel
 //
@@ -90,7 +96,7 @@ __global__ void mamba_ssd_forward_kernel(
   // y: [B, Seq, H, P] -> same strides as x
   // final_state: [B, H, P, N] -> stride: [H*P*N, P*N, N, 1]
 
-  float a_val = A[h];
+  float a_val = mamba_a_eff_dev(A[h]);  // N1: A_log -> A_eff
 
   // Load initial state from previous chunk (or zero for first chunk)
   // We use a per-thread register for the state element
@@ -173,7 +179,7 @@ __global__ void mamba_simple_scan_forward_kernel(
 
   const int b = channel / D;
   const int d = channel % D;
-  const float a_value = fmaxf(A[d], 1e-3f);
+  const float a_value = mamba_a_eff_dev(A[d]);
   float state = 0.0f;
 
   for (int t = 0; t < Seq; ++t) {
@@ -199,7 +205,7 @@ __global__ void mamba_simple_scan_backward_kernel(
   const int b = channel / D;
   const int d = channel % D;
   const float raw_a = A[d];
-  const float a_value = fmaxf(raw_a, 1e-3f);
+  const float a_value = mamba_a_eff_dev(raw_a);
   float grad_state_next = 0.0f;
   float grad_a_local = 0.0f;
 
@@ -223,9 +229,8 @@ __global__ void mamba_simple_scan_backward_kernel(
     const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_value));
     grad_dt[index] = decay_pre * (-a_value) * sigmoid_dt;
 
-    if (raw_a > 1e-3f) {
-      grad_a_local += decay_pre * (-dt_softplus);
-    }
+    // N1: dL/dA_log = dL/dA_eff · A_eff (a_value); unconditional (no clamp/mask).
+    grad_a_local += decay_pre * (-dt_softplus) * a_value;
   }
 
   atomicAdd(&grad_A[d], grad_a_local);
@@ -242,7 +247,7 @@ __global__ void mamba_single_token_update_kernel(
   }
 
   const int d = channel % D;
-  const float a_value = fmaxf(A[d], 1e-3f);
+  const float a_value = mamba_a_eff_dev(A[d]);
   const float decay = expf(-softplus_device(dt[channel]) * a_value);
   const float next_state = x[channel] + state[channel] * decay;
   state[channel] = next_state;
@@ -390,7 +395,7 @@ __global__ void mamba_selective_scan_forward_kernel(
 
   const int b = channel / D;
   const int d = channel % D;
-  const float a_value = fmaxf(A[d], 1e-3f);
+  const float a_value = mamba_a_eff_dev(A[d]);
 
   float state = 0.0f;
   for (int t = 0; t < Seq; ++t) {
@@ -445,7 +450,7 @@ __global__ void mamba_selective_scan_backward_kernel(
   const int b = channel / D;
   const int d = channel % D;
   const float raw_a = A[d];
-  const float a_value = fmaxf(raw_a, 1e-3f);
+  const float a_value = mamba_a_eff_dev(raw_a);
 
   float grad_state_next = 0.0f;
   float grad_a_local = 0.0f;
@@ -487,10 +492,8 @@ __global__ void mamba_selective_scan_backward_kernel(
     const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_val));
     grad_dt[idx] = decay_pre * (-a_value) * sigmoid_dt;
 
-    // dA += dDecay * decay * (-softplus(dt))   — only when A is not clamped
-    if (raw_a > 1e-3f) {
-      grad_a_local += decay_pre * (-dt_sp);
-    }
+    // N1: dA_log += dDecay·decay·(-softplus(dt))·A_eff  (unconditional).
+    grad_a_local += decay_pre * (-dt_sp) * a_value;
   }
 
   if (grad_a_local != 0.0f) {
@@ -532,7 +535,7 @@ __global__ void mamba_selective_scan_forward_parallel_kernel(
   const int d = channel % D;
   const int t = threadIdx.x;        // blockDim.x == Seq, so t in [0,Seq)
 
-  const float a_value = fmaxf(A[d], 1e-3f);
+  const float a_value = mamba_a_eff_dev(A[d]);
   const int idx = (b * Seq + t) * D + d;
   sa[t] = expf(-softplus_device(dt[idx]) * a_value);  // decay_t
   sb[t] = B_in[idx] * x[idx];                         // input term
@@ -778,7 +781,7 @@ __global__ void mamba_nstate_forward_kernel(
   const size_t HPN = (size_t)dim * N;
   float state[MAX_N];
   for (int n = 0; n < N; ++n) state[n] = 0.0f;
-  const float a_value = fmaxf(A[h], 1e-3f);
+  const float a_value = mamba_a_eff_dev(A[h]);
   for (int t = 0; t < Seq; ++t) {
     const int row = b * Seq + t;
     const float decay = expf(-softplus_device(dt[row * H + h]) * a_value);
@@ -815,7 +818,7 @@ __global__ void mamba_nstate_backward_kernel(
   const size_t HPN = (size_t)dim * N;
   float carry[MAX_N];
   for (int n = 0; n < N; ++n) carry[n] = 0.0f;
-  const float a_value = fmaxf(A[h], 1e-3f);
+  const float a_value = mamba_a_eff_dev(A[h]);
   // gC/gB/gDt/gA are shared across the P threads of a head -> atomicAdd.
   // gXc is unique per (b,h,p) channel -> direct write.
   for (int t = Seq - 1; t >= 0; --t) {
@@ -845,9 +848,8 @@ __global__ void mamba_nstate_backward_kernel(
     gXc[(size_t)row * dim + chan] = gxc_acc;
     const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_val));
     atomicAdd(&gDt[row * H + h], ddecay * decay * (-a_value) * sigmoid_dt);
-    if (A[h] > 1e-3f) {
-      atomicAdd(&gA[h], ddecay * decay * (-sp));
-    }
+    // N1: per-head dA_log += dDecay·decay·(-sp)·A_eff (unconditional).
+    atomicAdd(&gA[h], ddecay * decay * (-sp) * a_value);
   }
 }
 
@@ -917,7 +919,7 @@ __global__ void mamba_proper_step_kernel(
   }
   const float xc = conv_pre * (1.0f / (1.0f + expf(-conv_pre)));  // silu
 
-  const float a_value = fmaxf(A[c], 1e-3f);
+  const float a_value = mamba_a_eff_dev(A[c]);
   const float decay = expf(-softplus_device(dt[c]) * a_value);
   const float st = decay * h[c] + B_in[c] * xc;
   h[c] = st;

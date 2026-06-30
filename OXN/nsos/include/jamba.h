@@ -148,6 +148,12 @@ private:
   int ssa_sink_blocks_ = 1;
   Parameter ssa_wsel_;  // learned block-selection routing (init identity)
   void precompute_freqs_cis();
+  // N7 (RoPE length): grow the cos/sin frequency tables so they cover positions
+  // up to `max_pos_exclusive` (doubles max_seq_len until it fits, then
+  // recomputes the tables and forces a GPU re-upload).  Replaces the old silent
+  // clamp at max_seq_len-1, which made every position >= max_seq_len share one
+  // rotation (loss of positional distinction / no length extrapolation).
+  void ensure_freqs_capacity(int max_pos_exclusive);
   void clear_kv_cache();
   void ensure_kv_cache_capacity(int required_tokens, Device device, int batch_size = 1);
   void append_kv_cache_token(const float* key_ptr,
@@ -255,7 +261,14 @@ public:
              uint32_t chrass_seed = 0u,
              // ── KAN FFN ── when true, a non-MoE block uses a BitFastKANLayer
              // in place of the dense gate-up/down FFN.
-             bool use_kan = false);
+             bool use_kan = false,
+             // ── Corrected Mamba-2 SSD (K1) — defaults ON via ModelConfig.
+             // Selects the validated selective-SSM path (independent
+             // projections + conv1d + linear readout + SiLU gate) and the full
+             // N-dimensional SSD state.  Env vars still override per build.
+             bool mamba_proper_ssm = true,
+             bool mamba_state_expansion = true,
+             int mamba_conv_kernel = 4);
   ~JambaBlock();
   Tensor forward(const Tensor &x, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
@@ -481,6 +494,16 @@ private:
   int num_layers, d_model, vocab_size;
   Device device;
   ModelConfig model_config_;
+  // N6 (weight tying): when on, value_head (LM head) shares the embedding's
+  // weight BUFFER (both are [vocab, d_model]).  apply_weight_tying_() re-points
+  // the shared_ptr storage; it is idempotent and re-applied after every to()
+  // (device move reallocates) and load() (deserialize reallocates).  The shared
+  // matrix is trained as ONE parameter (embedding.weight): value_head.weight is
+  // dropped from parameters() and its gradient is folded into embedding.weight
+  // at the end of backward().
+  bool tie_word_embeddings_ = false;
+  bool weight_tied_ = false;
+  void apply_weight_tying_();
   bool streaming_inference_enabled_ = false;
   bool training_mode_ = true;
   std::vector<int> last_input_ids_;

@@ -188,7 +188,14 @@ class MoeWorkspace {
   int    unit_filled_  = 0;  // how many leading elements of unit_ are 1.0f
 };
 MoeWorkspace& moe_workspace() {
-  static MoeWorkspace ws;
+  // K6 (race): thread_local, not a shared static.  The MoE GPU forward/backward
+  // run during inference too; the HTTP server drives concurrent decode replicas
+  // on separate worker threads, and a shared workspace would let two threads
+  // cudaFree/cudaMalloc/scatter into the same device buffers at once
+  // (use-after-free / corrupted routing).  Per-thread instances make the GPU
+  // MoE path replica-safe; single-threaded training is unaffected.  Mirrors
+  // gemm_lowp_workspace()'s rationale (tensor.cpp).
+  thread_local MoeWorkspace ws;
   return ws;
 }
 #endif
@@ -482,11 +489,46 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             model_config_.chrass_density,
             model_config_.chrass_seed,
             // KAN FFN (non-MoE blocks).  off by default.
-            model_config_.use_kan));
+            model_config_.use_kan,
+            // K1: corrected Mamba-2 SSD path, default ON via ModelConfig.
+            model_config_.mamba_proper_ssm,
+            model_config_.mamba_state_expansion,
+            model_config_.mamba_conv_kernel));
     }
 
     value_head = std::make_unique<BitLinear>(d_model, vocab_size);
-    to(dev);
+    tie_word_embeddings_ = model_config_.tie_word_embeddings;  // N6
+    to(dev);  // to() applies weight tying at the end when enabled
+}
+
+// N6: re-point value_head's weight storage at the embedding's weight buffer so
+// the LM head and the token embedding share one matrix.  Idempotent; safe to
+// call after any device move or deserialize (both reallocate the buffers).  Only
+// ties when the shapes match exactly ([vocab, d_model]); otherwise leaves the
+// head independent.
+void JambaModel::apply_weight_tying_() {
+    if (!tie_word_embeddings_ || !embedding || !value_head) {
+        weight_tied_ = false;
+        return;
+    }
+    Tensor& emb = embedding->weight.data;
+    Tensor& head = value_head->weight.data;
+    if (emb.size == 0 || head.size == 0 || emb.shape != head.shape) {
+        weight_tied_ = false;
+        return;
+    }
+    if (emb.get_device() != head.get_device()) {
+        // Bring the head's (about-to-be-discarded) buffer to the embedding device
+        // so the shared buffer is consistent; the data is overwritten by the
+        // share anyway.
+        head = head.to(emb.get_device());
+    }
+    // Share the underlying storage: value_head now reads/writes the embedding's
+    // matrix.  value_head keeps its own magnitude/bias (independent output
+    // affine), so only the [vocab, d_model] matrix is tied.
+    value_head->weight.data = embedding->weight.data;  // shared_ptr buffer share
+    value_head->weight.mark_updated();  // bump version so any cached copy refreshes
+    weight_tied_ = true;
 }
 
 void JambaModel::save(const std::string& filename) {
@@ -495,6 +537,7 @@ void JambaModel::save(const std::string& filename) {
 
 void JambaModel::load(const std::string& filename, bool strict) {
     ModelSerializer::load(this, filename, strict);
+    apply_weight_tying_();  // N6: re-share the buffer after deserialize realloc
 }
 
 Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
@@ -610,6 +653,7 @@ void JambaModel::to(Device dev) {
         layer->to(dev);
     }
     value_head->to(dev);
+    apply_weight_tying_();  // N6: re-share the buffer after the device move
 }
 
 std::vector<Parameter*> JambaModel::parameters() {
@@ -629,7 +673,16 @@ std::vector<Parameter*> JambaModel::parameters() {
     }
     auto head_params = value_head->parameters();
     prefix_parameter_names(head_params, "value_head.");
-    params.insert(params.end(), head_params.begin(), head_params.end());
+    for (Parameter* hp : head_params) {
+        // N6: when tied, the shared [vocab, d_model] matrix is owned/optimized as
+        // embedding.weight — skip value_head.weight so the optimizer steps it
+        // exactly once (its gradient is folded into embedding.weight in
+        // backward()).  value_head's magnitude/bias stay independent.
+        if (weight_tied_ && hp == &value_head->weight) {
+            continue;
+        }
+        params.push_back(hp);
+    }
     return params;
 }
 
@@ -891,13 +944,11 @@ bool JambaModel::supports_batched_streaming_inference() const {
         if (!layer->mamba_layer && !layer->ttt_layer && !layer->attn_layer) {
             return false;
         }
-        // The corrected selective-SSM path keeps its SSD state + conv window in a
-        // per-layer cache that batched fork/restore does not snapshot; fall back
-        // to the (correct) non-streaming decode for proper-path models.
-        if (layer->mamba_layer &&
-            layer->mamba_layer->proper_selective_ssm_enabled()) {
-            return false;
-        }
+        // The corrected selective-SSM path now supports batched streaming: its
+        // SSD state + conv ring are carried per-sequence through the batched
+        // snapshot/restore (Mamba2SSD::{snapshot,restore}_streaming_state_batch)
+        // and advanced per-row by the batched proper decode step.  No fallback
+        // needed.
     }
     return !layers.empty();
 }
@@ -1286,6 +1337,14 @@ void JambaModel::backward(const Tensor& grad, Context& ctx) {
         dy = layers[i]->backward(dy, &ctx);
     }
     backward_embedding(dy, ctx);
+
+    // N6: fold the LM head's gradient for the shared matrix into embedding.weight
+    // (the single trained copy), then clear the head's grad so it never double-
+    // counts (it is excluded from parameters(), so the trainer never zeroes it).
+    if (weight_tied_ && value_head->weight.grad.size > 0) {
+        embedding->weight.add_grad(value_head->weight.grad);
+        value_head->weight.zero_grad();
+    }
 }
 
 void JambaModel::reset_session() {
@@ -1427,7 +1486,10 @@ JambaBlock::JambaBlock(int dm,
                        bool use_chrass,
                        float chrass_density,
                        uint32_t chrass_seed,
-                       bool use_kan)
+                       bool use_kan,
+                       bool mamba_proper_ssm,
+                       bool mamba_state_expansion,
+                       int mamba_conv_kernel)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
@@ -1479,30 +1541,39 @@ JambaBlock::JambaBlock(int dm,
         config.recompute_ssd = use_gradient_checkpointing;
         config.save_intermediates = !use_gradient_checkpointing;
         config.max_seq_for_storage = use_gradient_checkpointing ? 512 : 2048;
-        // Opt-in corrected selective SSM (independent delta/B/C/z projections +
-        // causal conv1d + single-C readout + SiLU gate).  Default OFF preserves
-        // the historical path and existing checkpoints byte-for-byte.  Read per
-        // construction (not static) so an A/B harness can flip it between model
-        // builds in one process — mirrors NSOS_MAMBA_A_LOGSPACED.
-        // See docs and Mamba2SSD::forward_proper.
-        if (const char* e = std::getenv("NSOS_MAMBA_PROPER_SSM");
-            e != nullptr && e[0] == '1') {
-            config.proper_selective_ssm = true;
-            if (const char* k = std::getenv("NSOS_MAMBA_CONV_K"); k != nullptr) {
-                const int kv = std::atoi(k);
-                if (kv >= 1 && kv <= 16) {
-                    config.conv_kernel = kv;
-                }
-            }
-            // Full Mamba-2 SSD N-state expansion (h in R^{H x P x N}); requires
-            // the proper path.  Default OFF keeps the diagonal scalar state.
-            // GPU-resident (mamba_nstate_* kernels, parity-validated on T4).
-            if (const char* se = std::getenv("NSOS_MAMBA_STATE_EXPANSION");
-                se != nullptr && se[0] == '1') {
-                config.proper_state_expansion = true;
+        // K1: corrected selective SSM (independent delta/B/C/z projections +
+        // causal conv1d + single-C linear readout + SiLU gate) is now the
+        // DEFAULT, driven by ModelConfig (mamba_proper_ssm / state_expansion).
+        // The legacy degenerate path is reachable only by explicitly setting the
+        // config flag false (to reload a pre-correction checkpoint).  The env
+        // vars NSOS_MAMBA_PROPER_SSM / NSOS_MAMBA_STATE_EXPANSION still override
+        // per construction so the A/B harness can force either path in one
+        // process (set "1" to force on, "0" to force off).
+        config.proper_selective_ssm = mamba_proper_ssm;
+        config.proper_state_expansion = mamba_state_expansion && mamba_proper_ssm;
+        config.conv_kernel = std::clamp(mamba_conv_kernel, 1, 16);
+        if (const char* e = std::getenv("NSOS_MAMBA_PROPER_SSM"); e != nullptr) {
+            config.proper_selective_ssm = (e[0] == '1');
+            if (!config.proper_selective_ssm) {
+                config.proper_state_expansion = false;
             }
         }
-        mamba_layer = std::make_unique<Mamba2SSD>(dm, std::max(dm / 2, 8),
+        if (const char* se = std::getenv("NSOS_MAMBA_STATE_EXPANSION"); se != nullptr) {
+            config.proper_state_expansion = (se[0] == '1') && config.proper_selective_ssm;
+        }
+        if (const char* k = std::getenv("NSOS_MAMBA_CONV_K"); k != nullptr) {
+            const int kv = std::atoi(k);
+            if (kv >= 1 && kv <= 16) {
+                config.conv_kernel = kv;
+            }
+        }
+        // d_state (N) is capped at the N-state GPU kernel's MAX_N (=64, see
+        // src/cuda/mamba_kernels.cu) so the full SSD scan stays on the device
+        // fast path instead of the host fallback — critical now that the N-state
+        // SSD is the default (K1).  64 is also the standard Mamba-2 head-state
+        // size; the old dm/2 (e.g. 160) was both slower and non-standard.
+        const int mamba_d_state = std::min(std::max(dm / 2, 8), 64);
+        mamba_layer = std::make_unique<Mamba2SSD>(dm, mamba_d_state,
                                                   std::max(dm / 16, 1), config);
     }
 
@@ -1517,6 +1588,9 @@ JambaBlock::JambaBlock(int dm,
         // KAN FFN: a single Kolmogorov-Arnold layer (learnable RBF activations)
         // replaces the dense gate-up -> squared-ReLU -> down FFN.
         kan_ffn = std::make_unique<BitFastKANLayer>(dm, dm);
+        // N5: honor the 1.58-bit invariant — the model's KAN FFN uses ternary
+        // fake-quant (STE) weights like every other BitLinear.
+        kan_ffn->set_quantized(true);
     } else {
         ffn_gate_up = std::make_unique<BitLinear>(dm, default_ffn_hidden);
         ffn_down = std::make_unique<BitLinear>(default_ffn_hidden, dm);
@@ -1840,9 +1914,12 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
 #endif  // USE_CUDA
 
 static bool moe_router_grad_enabled() {
+    // K2: task→router gradient is now ON by default (the router must learn from
+    // the task loss, not only the load-balancing aux).  NSOS_MOE_ROUTER_GRAD=0
+    // disables it (e.g. to reload/compare a checkpoint trained without it).
     static const bool on = [] {
         const char* e = std::getenv("NSOS_MOE_ROUTER_GRAD");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0';
     }();
     return on;
 }
@@ -1870,6 +1947,55 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
         router_top_k = inference_top_k_override_;
     }
     const int effective_top_k = std::clamp(router_top_k, 1, num_experts);
+
+    // N2/N3 (Pacote A.1 parity): when an inference override REDUCES k below the
+    // router's trained top_k, router->forward already masked + renormalized the
+    // weights over the LARGER top_k set, so the surviving weights no longer sum
+    // to 1 over the (smaller) effective set — top-1 decode would attenuate the
+    // expert output (~router prob, e.g. 0.6 instead of 1.0).  Re-mask +
+    // renormalize to effective_top_k here, device-aware and in place, so BOTH
+    // the CPU and GPU-batched paths dispatch and scale by weights that sum to 1
+    // over exactly the experts they use (also keeps CPU/GPU byte-consistent).
+    // Only fires on the override path (effective_top_k < router->top_k) at
+    // inference; the training/normal path is untouched (byte-identical).
+    if (!training_mode_ && effective_top_k < router->top_k && rows > 0) {
+#ifdef USE_CUDA
+        if (weights.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+            launch_moe_topk_mask_kernel(weights.raw_data(), rows, num_experts,
+                                        effective_top_k);
+        } else
+#endif
+        {
+            Tensor wh = weights.get_device() == Device::GPU ? weights.cpu() : weights;
+            float* wp = wh.data();
+            std::vector<int> ranked(static_cast<size_t>(num_experts));
+            std::vector<char> keep(static_cast<size_t>(num_experts), 0);
+            for (int r = 0; r < rows; ++r) {
+                std::iota(ranked.begin(), ranked.end(), 0);
+                std::partial_sort(
+                    ranked.begin(), ranked.begin() + effective_top_k, ranked.end(),
+                    [&](int a, int b) {
+                        return wp[r * num_experts + a] > wp[r * num_experts + b];
+                    });
+                std::fill(keep.begin(), keep.end(), 0);
+                float s = 0.0f;
+                for (int t = 0; t < effective_top_k; ++t) {
+                    keep[static_cast<size_t>(ranked[static_cast<size_t>(t)])] = 1;
+                    s += wp[r * num_experts + ranked[static_cast<size_t>(t)]];
+                }
+                const float inv = 1.0f / std::max(s, 1e-9f);
+                for (int e = 0; e < num_experts; ++e) {
+                    wp[r * num_experts + e] =
+                        keep[static_cast<size_t>(e)] ? wp[r * num_experts + e] * inv : 0.0f;
+                }
+            }
+            if (weights.get_device() == Device::GPU) {
+                weights.copy_from(wh.to(Device::GPU));
+            } else {
+                weights = wh;
+            }
+        }
+    }
 
 #ifdef USE_CUDA
     // Phase 4-extended GPU batched dispatch.
@@ -2172,7 +2298,14 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
     if (target_device == Device::GPU && gpu_custom_kernels_supported() &&
         !saved_moe_rows_.empty() && saved_moe_weights_.size > 0 &&
         num_experts > 0 && num_experts <= 1024 && x.shape.back() > 0 &&
-        !determinism::deterministic_reductions_enabled()) {
+        !determinism::deterministic_reductions_enabled() &&
+        // N4 (parity): the batched GPU backward does NOT compute the task→router
+        // gradient (that path lives only in the ordered host backward below).
+        // forward_moe already bypasses the batched FORWARD when this flag is on
+        // (line ~1896); mirror that here so accumulate_task_router_grad always
+        // runs when NSOS_MOE_ROUTER_GRAD=1 — otherwise the router's task grad is
+        // silently dropped on GPU.
+        !moe_router_grad_enabled()) {
         return backward_moe_gpu_batched(dy, x);
     }
 #endif
@@ -2728,14 +2861,29 @@ void Attention::precompute_freqs_cis() {
     }
 }
 
+void Attention::ensure_freqs_capacity(int max_pos_exclusive) {
+    if (max_pos_exclusive <= max_seq_len) {
+        return;
+    }
+    int new_len = std::max(max_seq_len, 1);
+    while (new_len < max_pos_exclusive) {
+        new_len *= 2;
+    }
+    max_seq_len = new_len;
+    precompute_freqs_cis();   // rebuilds cos_cached/sin_cached for the new length
+    rope_gpu_uploaded_ = 0;   // force ensure_rope_gpu_cache() to re-upload
+}
+
 #ifdef USE_CUDA
 namespace {
 
 // Persistent device buffer for per-batch valid lengths (grows on demand) so the
 // attention GPU backward never cudaMalloc's per call.  Single training thread.
 int* attn_valid_device_buffer(int count) {
-    static int* buf = nullptr;
-    static int cap = 0;
+    // K6: thread_local for replica safety (training is single-threaded today, but
+    // this keeps every persistent device buffer race-free by construction).
+    thread_local int* buf = nullptr;
+    thread_local int cap = 0;
     if (count <= 0) return nullptr;
     if (count > cap) {
         if (buf) cudaFree(buf);
@@ -2798,6 +2946,7 @@ std::pair<Tensor, Tensor> Attention::apply_rope(const Tensor& q, const Tensor& k
     const int q_heads = batched ? q.shape[2] : q.shape[1];
     const int k_heads = batched ? k.shape[2] : k.shape[1];
     const int half_dim = head_dim / 2;
+    ensure_freqs_capacity(start_pos + seq_len);  // N7: grow tables, no silent clamp
 
     Tensor q_rot = q.clone();
     Tensor k_rot = k.clone();
@@ -2806,7 +2955,7 @@ std::pair<Tensor, Tensor> Attention::apply_rope(const Tensor& q, const Tensor& k
 
     for (int b = 0; b < batch; ++b) {
         for (int s = 0; s < seq_len; ++s) {
-            const int pos = std::min(start_pos + s, max_seq_len - 1);
+            const int pos = start_pos + s;  // table guaranteed to cover this (N7)
             for (int h = 0; h < q_heads; ++h) {
                 const size_t q_offset =
                     batched
@@ -2854,6 +3003,7 @@ std::pair<Tensor, Tensor> Attention::apply_rope_backward(const Tensor& grad_q_ro
     const int q_heads = batched ? grad_q_rot.shape[2] : grad_q_rot.shape[1];
     const int k_heads = batched ? grad_k_rot.shape[2] : grad_k_rot.shape[1];
     const int half_dim = head_dim / 2;
+    ensure_freqs_capacity(start_pos + seq_len);  // N7: keep parity with forward tables
 
     Tensor grad_q = grad_q_rot.clone();
     Tensor grad_k = grad_k_rot.clone();
@@ -2862,7 +3012,7 @@ std::pair<Tensor, Tensor> Attention::apply_rope_backward(const Tensor& grad_q_ro
 
     for (int b = 0; b < batch; ++b) {
         for (int s = 0; s < seq_len; ++s) {
-            const int pos = std::min(start_pos + s, max_seq_len - 1);
+            const int pos = start_pos + s;  // table guaranteed to cover this (N7)
             for (int h = 0; h < q_heads; ++h) {
                 const size_t q_offset =
                     batched
@@ -3071,7 +3221,16 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
          input.shape.size() == 3)) {
         return sparse_forward(input, ctx);
     }
-    if (training_mode_ && exact_training_path_ && !streaming_inference_ &&
+    // K5: ALL training forwards take the exact path, which saves q_rot/k_rot/
+    // v_heads + valid_lengths and pairs with the exact softmax-jacobian backward.
+    // The old gate also required exact_training_path_; with it false, training
+    // fell through to the dense forward that does NOT save the cache, so backward
+    // used the jacobian-FREE fallback (no QK^T / probs gradient — attention could
+    // not learn content-based recall).  exact_training_path_ is retained only as
+    // a forward GPU-kernel-vs-CPU hint; it can no longer silently break the
+    // backward.  Inference (training_mode_==false) still uses the fast dense /
+    // cached paths (no backward needed there).
+    if (training_mode_ && !streaming_inference_ &&
         (input.shape.size() == 1 || input.shape.size() == 2 || input.shape.size() == 3)) {
         const Device original_device = input.get_device();
         Tensor project_input = input;
@@ -4805,8 +4964,10 @@ MoERouter::MoERouter(int d_model_value, int n, int k)
   // bitlinear.h set_quantization_sensitive).  Default OFF preserves the
   // historical ternary-under-QAT behavior byte-for-byte.  Pairs with the
   // differentiable Switch aux-loss (NSOS_MOE_SWITCH_AUX, trainer.cpp).
-  if (const char* e = std::getenv("NSOS_MOE_FP_ROUTER");
-      e != nullptr && e[0] == '1') {
+  // K2: full-precision router is ON by default — a ternary gate yields coarse,
+  // unstable routing under QAT (expert collapse).  NSOS_MOE_FP_ROUTER=0 forces
+  // the ternary gate (historical behavior) if ever needed.
+  if (const char* e = std::getenv("NSOS_MOE_FP_ROUTER"); e == nullptr || e[0] != '0') {
     gate->set_quantization_sensitive(true);
   }
 }

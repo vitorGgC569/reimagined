@@ -155,6 +155,15 @@ private:
   Tensor saved_x_quant;
   std::vector<float> saved_act_scales;
 
+  // K3: GPU quantization-aware-training (fake-quant STE) state.  Set by the GPU
+  // forward when QAT is active (training, non-reference, non-sensitive); the
+  // matching backward (checked first) consumes them.  qat_gpu_active_ is reset
+  // at the top of every forward so a later inference/reference forward never
+  // routes into the QAT backward.
+  bool qat_gpu_active_ = false;
+  Tensor saved_qat_x_dq_;   // dequantized activations actually multiplied
+  Tensor saved_qat_pre_;    // pre-(magnitude/bias) output, for the magnitude grad
+
   std::vector<uint32_t> packed_weights;
   std::vector<int8_t> unpacked_weights_i8;
   std::vector<int32_t> unpacked_weight_row_sums;

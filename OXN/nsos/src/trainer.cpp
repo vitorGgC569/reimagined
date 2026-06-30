@@ -2,6 +2,7 @@
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
 #include "../include/layer_audit.h"
+#include "../include/nsos/determinism.h"  // K4: ordered reductions under NSOS_DETERMINISTIC
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -562,8 +563,27 @@ float* clip_norm_accumulator() {
 float clip_gradients(const std::vector<Parameter*>& params, float max_norm) {
     float total_norm = 0.0f;
     bool fused_done = false;
+    // K4: deterministic mode -> ordered host reduction of the global grad norm.
+    // The GPU norm_kernel (and Tensor::norm()) accumulate via atomicAdd, whose
+    // low-bit order is run-to-run nondeterministic; summing per parameter on the
+    // host in a fixed order (double accumulator) is bit-reproducible.  Opt-in
+    // (NSOS_DETERMINISTIC); the fast atomic path stays the default.
+    if (determinism::deterministic_reductions_enabled()) {
+        double total_sq = 0.0;
+        for (auto* p : params) {
+            if (!p || p->grad.size == 0) continue;
+            Tensor g = (p->grad.get_device() == Device::GPU) ? p->grad.cpu() : p->grad;
+            const float* gp = g.data();
+            const int n = static_cast<int>(g.size);
+            double s = 0.0;
+            for (int i = 0; i < n; ++i) s += static_cast<double>(gp[i]) * static_cast<double>(gp[i]);
+            total_sq += s;
+        }
+        total_norm = static_cast<float>(std::sqrt(total_sq));
+        fused_done = true;
+    }
 #ifdef USE_CUDA
-    float* d_accum = gpu_custom_kernels_supported() ? clip_norm_accumulator() : nullptr;
+    float* d_accum = (!fused_done && gpu_custom_kernels_supported()) ? clip_norm_accumulator() : nullptr;
     if (d_accum) {
         // FUSED global grad-norm: accumulate every GPU gradient's sum-of-squares
         // into ONE device scalar (norm_kernel uses atomicAdd) and read it back
@@ -662,12 +682,19 @@ void apply_progressive_qat_phase(Trainer& trainer) {
         // still trains in float.
         const bool on_gpu = layer->has_full_precision_weight() &&
                             layer->weight.data.get_device() == Device::GPU;
-        // Sensitive projections (e.g. Mamba dt/B/C) stay on the float path to
-        // preserve the mixed-precision design.
+        // K3: QAT now runs on the GPU too — BitLinear::forward has a fake-quant
+        // STE path (ternary weights + int8 activations, dequantized so it stays
+        // differentiable) that straight-throughs onto the FP32 latent weights.
+        // So we no longer force the GPU float reference path; train numerics ==
+        // ternary-inference numerics on device.  Sensitive projections (Mamba
+        // dt/B/C, FP router) still stay on the float reference path to preserve
+        // the mixed-precision design.
         const bool train_quantized =
-            quantized_active && !on_gpu && !layer->quantization_sensitive();
+            quantized_active && !layer->quantization_sensitive();
         layer->set_reference_path(!train_quantized);
-        if (train_quantized) {
+        // Only the CPU packed kernel needs current packed codes; the GPU QAT
+        // path recomputes the fake-quant from the latent weight each forward.
+        if (train_quantized && !on_gpu) {
             // Re-quantize the current latent weights so the forward multiplies
             // up-to-date ternary codes (the optimizer just updated them).
             layer->repack_weights();
@@ -717,9 +744,13 @@ void apply_moe_aux_regularization(Trainer& trainer) {
     // and is largely a no-op once the gate is ternary; the Switch path computes
     // the exact gradient w.r.t. the router logits and backprops it through the
     // gate.  Default OFF preserves the historical behavior byte-for-byte.
+    // K2: differentiable Switch-Transformer aux loss is ON by default (the
+    // legacy constant-per-row heuristic is not the gradient of any loss and is
+    // ~a no-op once the gate is ternary).  NSOS_MOE_SWITCH_AUX=0 restores the
+    // legacy heuristic for comparison.
     static const bool switch_aux = [] {
         const char* e = std::getenv("NSOS_MOE_SWITCH_AUX");
-        return e != nullptr && e[0] == '1';
+        return e == nullptr || e[0] != '0';
     }();
 
     for (auto& layer : trainer.model->layers) {
@@ -758,8 +789,8 @@ void apply_moe_aux_regularization(Trainer& trainer) {
                                     layer->router->aux_loss_coef *
                                     trainer.moe_aux_loss_scale;
             }
-            static float* d_imb = nullptr;
-            static size_t d_imb_cap = 0;
+            thread_local float* d_imb = nullptr;   // K6: race-free persistent buffer
+            thread_local size_t d_imb_cap = 0;
             if (loads.size() > d_imb_cap) {
                 if (d_imb) cudaFree(d_imb);
                 d_imb = nullptr;
@@ -1055,6 +1086,12 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
     if (!fused_optimizer_enabled() || !gpu_custom_kernels_supported()) {
         return false;
     }
+    // K4: the fused step folds the atomicAdd clip-norm + multi-tensor AdamW; in
+    // deterministic mode fall back to the ordered per-parameter path (with the
+    // ordered host clip above) for bit-reproducibility.
+    if (determinism::deterministic_reductions_enabled()) {
+        return false;
+    }
     float* d_accum = clip_norm_accumulator();
     if (!d_accum) {
         return false;
@@ -1318,8 +1355,9 @@ bool rul_force_host() {
 // Persistent device buffer for per-sample answer-token uploads (grows on demand)
 // so the GPU loss-adjustment path never cudaMalloc's per call.
 int* loss_token_device_buffer(int count) {
-    static int* buf = nullptr;
-    static int cap = 0;
+    // K6: thread_local persistent device buffer (race-free by construction).
+    thread_local int* buf = nullptr;
+    thread_local int cap = 0;
     if (count <= 0) return nullptr;
     if (count > cap) {
         if (buf) cudaFree(buf);

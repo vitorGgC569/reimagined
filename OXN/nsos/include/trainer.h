@@ -9,7 +9,11 @@
 namespace nsos {
 
 struct TrainPhaseScheduler {
-    bool progressive_qat_enabled = false;
+    // K3: QAT is ON by default now that it runs on the GPU (fake-quant STE in
+    // BitLinear::forward).  The model trains against ternary weights + int8
+    // activations after qat_start_step, so deployment quantization is no longer
+    // a post-hoc cliff.  Set false to train purely in FP32.
+    bool progressive_qat_enabled = true;
     int semantic_warmup_steps = 100;
     int qat_start_step = 300;
     int quantized_precision_bits = 2;

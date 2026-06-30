@@ -94,6 +94,27 @@ struct ModelConfig {
     // Default false preserves the dense-FFN behavior exactly.
     bool use_kan = false;
 
+    // ── Corrected selective SSM (Mamba-2 SSD) — DEFAULT ON ──────────────────
+    // The legacy diagonal gated-EMA path is degenerate (delta≡C, C applied
+    // twice, saturating tanh readout, B=σ(x) self-gate, no input conv).  These
+    // enable the validated corrected path: independent x/z/B/C/dt projections +
+    // causal depthwise conv1d + single-C LINEAR readout + SiLU gate, with the
+    // full N-dimensional SSD state h∈R^{H×P×N} (Gu & Dao 2024).  Hand-derived
+    // gradients, gradchecked (test_gradcheck: check_mamba2_proper / _nstate) and
+    // GPU-parity validated (test_gpu_parity_mamba_proper / _nstate).  The env
+    // vars NSOS_MAMBA_PROPER_SSM / NSOS_MAMBA_STATE_EXPANSION still override
+    // per-construction (A/B harness).  Set false only to reload a pre-correction
+    // checkpoint that was trained on the legacy path.
+    bool mamba_proper_ssm = true;
+    bool mamba_state_expansion = true;
+    int  mamba_conv_kernel = 4;
+
+    // ── Weight tying (N6) — DEFAULT ON ──────────────────────────────────────
+    // Tie the LM head (value_head) to the token embedding matrix (both are
+    // [vocab, d_model]).  Sharing one latent weight cuts parameters and
+    // typically improves small-model generalization (Press & Wolf 2017).
+    bool tie_word_embeddings = true;
+
     // Training Settings
     bool use_gradient_checkpointing = false;
     float dropout = 0.0f;

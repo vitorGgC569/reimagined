@@ -293,6 +293,7 @@ Tensor BitLinear::forward(const Tensor &input) {
   // Inference (training_mode_ == false) never calls backward, so skip the
   // clone-heavy saves entirely — this is pure per-token, per-layer overhead
   // on the decode hot path.
+  qat_gpu_active_ = false;  // K3: only the GPU QAT branch below sets this true
   if (training_mode_) saved_input = input.clone();
   int M = input.shape.numel() / in_features;
   Tensor x = input;
@@ -357,6 +358,45 @@ Tensor BitLinear::forward(const Tensor &input) {
       linear_input = linear_input.reshape({M, in_features});
     }
     if (training_mode_) saved_linear_input = linear_input.clone();
+
+    // ── K3: GPU quantization-aware training (fake-quant STE) ──────────────
+    // Reaching the GPU branch with use_reference_path == false during training
+    // means the QAT scheduler put this (non-sensitive) layer into the quantized
+    // phase.  Run the forward through ternary-weight + int8-activation FAKE
+    // quantization (dequantized, so the matmul stays differentiable) and let
+    // the matching backward (qat_gpu_active_) straight-through the gradient onto
+    // the FP32 latent weights.  This makes train numerics == ternary-inference
+    // numerics ON THE GPU — previously GPU training silently used FP32 weights
+    // (no QAT) and the model only met ternary weights at inference.  Sensitive
+    // layers (Mamba dt/B/C, FP router) keep the float reference path (the
+    // scheduler leaves their reference_path == true, so they return earlier).
+    // LoQA active falls back to the float matmul (its adapter path is folded in
+    // the dedicated reference/STE backward, not here).
+    if (training_mode_ && !quantization_sensitive_ && !loqa.active &&
+        weight.data.size > 0 && M > 0 && in_features > 0 && out_features > 0) {
+      qat_gpu_active_ = true;
+      // Same scale rule as pack_weights()/quantize_weights() so the QAT codes
+      // match what packed inference will use.
+      weight_scale = weight.data.norm() /
+                     (std::sqrt(static_cast<float>(weight.data.shape.numel())) + 1e-8f);
+      Tensor w_eff = qat_fake_quant_ternary(weight.data, weight_scale);       // [out,in]
+      Tensor x_dq = qat_fake_quant_activations(linear_input, precision_bits);  // [M,in]
+      Tensor pre = x_dq.matmul(w_eff.transpose());                            // [M,out]
+      saved_qat_x_dq_ = x_dq;
+      saved_qat_pre_ = pre;
+      Tensor out_q = pre.mul(magnitude.data);
+      if (use_bias) {
+        out_q = out_q.add(bias.data);
+      }
+      if (input.shape.dims.size() == 3) {
+        return out_q.reshape(
+            {input.shape.dims[0], input.shape.dims[1], out_features});
+      }
+      if (input.shape.dims.size() == 1) {
+        return out_q.reshape({out_features});
+      }
+      return out_q;
+    }
 
 #ifdef USE_CUDA
     // Phase 5b GPU __dp4a fast path.  Engaged only when:
@@ -649,6 +689,38 @@ Tensor BitLinear::backward(const Tensor &grad) {
   int M = saved_input.size / in_features;
   Tensor grad_2d = grad.reshape({M, out_features});
   Tensor input_2d = saved_input.reshape({M, in_features});
+
+  // ── K3: GPU QAT backward (fake-quant STE) ─────────────────────────────────
+  // Checked first: the QAT forward saved its own state (x_dq, pre) and used
+  // ternary/int8 fake-quant.  Mirrors the CPU packed STE backward but on
+  // device-agnostic Tensor ops (so it runs on the GPU end-to-end).
+  if (qat_gpu_active_) {
+    if (saved_qat_x_dq_.size == 0 || saved_qat_pre_.size == 0 ||
+        weight.data.size == 0) {
+      throw std::runtime_error("BitLinear QAT backward: missing saved QAT state");
+    }
+    // out = pre * magnitude + bias  ->  exact magnitude/bias grads.
+    magnitude.add_grad(grad_2d.mul(saved_qat_pre_).sum(0));
+    if (use_bias) {
+      bias.add_grad(grad_2d.sum(0));
+    }
+    Tensor grad_pre = grad_2d.mul(magnitude.data);
+    // Weight grad (STE through ternary): dW = grad_pre^T @ x_dq (the dequantized
+    // activations actually multiplied).
+    Tensor dW = grad_pre.transpose().matmul(saved_qat_x_dq_);
+    // STE clip: zero grad for latent weights already saturated past |W/scale|>1.
+    qat_ste_clip_weight_grad(dW, weight.data, weight_scale);
+    weight.add_grad(dW);
+    // Input grad (STE through the int8 activation quantizer): dx = grad_pre @
+    // w_eff, using the effective (fake-quantized) weight that the forward used.
+    Tensor w_eff = qat_fake_quant_ternary(weight.data, weight_scale);
+    Tensor dx = grad_pre.matmul(w_eff);
+    if (norm_strategy == NormStrategy::RMS_PERI ||
+        norm_strategy == NormStrategy::RMS_PRE) {
+      dx = saved_input.rmsnorm_backward(dx, saved_x_norm);
+    }
+    return dx.reshape(saved_input.shape.dims);
+  }
 
   if (use_reference_path) {
     Tensor linear_input = saved_linear_input.size > 0 ? saved_linear_input

@@ -135,7 +135,104 @@ __global__ void bitnet_apply_act_scales_kernel(float *__restrict__ y,
   y[idx] *= act_scales[row];
 }
 
+// =====================================================================
+// K3: GPU QAT fake-quant (straight-through estimator) kernels.
+// =====================================================================
+
+// Weight ternary fake-quant: out = clamp(round(w/scale), -1, +1) * scale.
+__global__ void fake_quant_ternary_kernel(float *__restrict__ out,
+                                          const float *__restrict__ w,
+                                          float scale, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float inv = 1.0f / (scale + 1e-8f);
+  const float v = w[i] * inv;
+  const float t = (v > 0.5f) ? 1.0f : ((v < -0.5f) ? -1.0f : 0.0f);
+  out[i] = t * scale;
+}
+
+// Per-row activation fake-quant (quant→dequant fused): one block per row.
+__global__ void fake_quant_activations_kernel(float *__restrict__ out,
+                                              const float *__restrict__ x,
+                                              int M, int K, int precision_bits) {
+  const int row = blockIdx.x;
+  if (row >= M) return;
+  const float *row_in = x + row * K;
+  float *row_out = out + row * K;
+
+  float partial = 0.0f;
+  for (int j = threadIdx.x; j < K; j += blockDim.x) {
+    partial = fmaxf(partial, fabsf(row_in[j]));
+  }
+  __shared__ float warp_max[BITNET_WARP_SIZE];
+  const int lane = threadIdx.x % BITNET_WARP_SIZE;
+  const int warp_id = threadIdx.x / BITNET_WARP_SIZE;
+  partial = warp_reduce_max_abs(partial);
+  if (lane == 0) warp_max[warp_id] = partial;
+  __syncthreads();
+  const int num_warps = (blockDim.x + BITNET_WARP_SIZE - 1) / BITNET_WARP_SIZE;
+  float max_val = (threadIdx.x < num_warps) ? warp_max[threadIdx.x] : 0.0f;
+  if (warp_id == 0) max_val = warp_reduce_max_abs(max_val);
+
+  __shared__ float s_scale;     // q_max / (max+eps)
+  __shared__ float s_inv_scale; // (max+eps) / q_max
+  if (threadIdx.x == 0) {
+    const float q_max = (precision_bits <= 2)
+                            ? 1.0f
+                            : (powf(2.0f, static_cast<float>(precision_bits - 1)) - 1.0f);
+    const float denom = max_val + 1e-8f;
+    s_scale = q_max / denom;
+    s_inv_scale = denom / q_max;
+  }
+  __syncthreads();
+  const float scale = s_scale;
+  const float inv_scale = s_inv_scale;
+  const float clip = (precision_bits <= 2)
+                         ? 1.0f
+                         : (powf(2.0f, static_cast<float>(precision_bits - 1)) - 1.0f);
+  for (int j = threadIdx.x; j < K; j += blockDim.x) {
+    float v = row_in[j] * scale;
+    v = fminf(fmaxf(v, -clip), clip);
+    row_out[j] = rintf(v) * inv_scale;  // dequantized
+  }
+}
+
+// STE clip: zero dW where the latent weight already saturated past |w/scale|>1.
+__global__ void ste_clip_weight_grad_kernel(float *__restrict__ dW,
+                                            const float *__restrict__ w,
+                                            float scale, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float inv = 1.0f / (scale + 1e-8f);
+  if (fabsf(w[i] * inv) > 1.0f) dW[i] = 0.0f;
+}
+
 extern "C" {
+
+void launch_fake_quant_ternary_kernel(float *out, const float *w, float scale,
+                                      int n) {
+  if (n <= 0) return;
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  fake_quant_ternary_kernel<<<blocks, threads>>>(out, w, scale, n);
+}
+
+void launch_fake_quant_activations_kernel(float *out, const float *x, int M,
+                                          int K, int precision_bits) {
+  if (M <= 0 || K <= 0) return;
+  int threads = (K + BITNET_WARP_SIZE - 1) / BITNET_WARP_SIZE * BITNET_WARP_SIZE;
+  if (threads < BITNET_WARP_SIZE) threads = BITNET_WARP_SIZE;
+  if (threads > 256) threads = 256;
+  fake_quant_activations_kernel<<<M, threads>>>(out, x, M, K, precision_bits);
+}
+
+void launch_ste_clip_weight_grad_kernel(float *dW, const float *w, float scale,
+                                        int n) {
+  if (n <= 0) return;
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  ste_clip_weight_grad_kernel<<<blocks, threads>>>(dW, w, scale, n);
+}
 
 void launch_quantize_activations_bitnet_kernel(const float *x, int8_t *x_q,
                                                float *act_scales, int M, int K,

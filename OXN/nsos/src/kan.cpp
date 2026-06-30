@@ -1,4 +1,5 @@
 #include "../include/kan.h"
+#include "../include/bitnet_gpu_dispatch.h"  // N5: qat_fake_quant_ternary / STE clip
 
 #include <algorithm>
 #include <cmath>
@@ -100,8 +101,23 @@ Tensor BitFastKANLayer::forward(const Tensor& x) {
     saved_input_ = x.shape.size() == 2 ? x : x.reshape({static_cast<int>(x.size / input_dim), input_dim});
     saved_basis_ = compute_basis(saved_input_);
 
-    Tensor base = saved_input_.matmul(base_weight.data.transpose());
-    Tensor enriched = saved_basis_.matmul(rbf_weight.data.transpose());
+    // N5: optional ternary fake-quant (STE) of the base/RBF weights so the KAN
+    // FFN is 1.58-bit like the rest of the model.  Device-aware; off → exact
+    // float path (unchanged, FD-gradcheckable).
+    Tensor bw = base_weight.data;
+    Tensor rw = rbf_weight.data;
+    if (quantized_) {
+        base_scale_ = bw.norm() /
+                      (std::sqrt(static_cast<float>(bw.shape.numel())) + 1e-8f);
+        rbf_scale_ = rw.norm() /
+                     (std::sqrt(static_cast<float>(rw.shape.numel())) + 1e-8f);
+        bw = qat_fake_quant_ternary(bw, base_scale_);
+        rw = qat_fake_quant_ternary(rw, rbf_scale_);
+        saved_base_eff_ = bw;
+        saved_rbf_eff_ = rw;
+    }
+    Tensor base = saved_input_.matmul(bw.transpose());
+    Tensor enriched = saved_basis_.matmul(rw.transpose());
     Tensor output = base.add(enriched).add(bias.data);
     return x.shape.size() == 2 ? output : output.reshape(output_shape);
 }
@@ -117,12 +133,26 @@ Tensor BitFastKANLayer::backward(const Tensor& grad) {
         throw std::runtime_error("BitFastKANLayer gradient dimension mismatch");
     }
 
-    base_weight.add_grad(grad_2d.transpose().matmul(saved_input_));
-    rbf_weight.add_grad(grad_2d.transpose().matmul(saved_basis_));
+    // N5: weight grads (STE through the ternary fake-quant — identical formula,
+    // assigned onto the FP32 latent weights); STE-clip saturated entries.
+    Tensor dbase = grad_2d.transpose().matmul(saved_input_);
+    Tensor drbf = grad_2d.transpose().matmul(saved_basis_);
+    if (quantized_) {
+        qat_ste_clip_weight_grad(dbase, base_weight.data, base_scale_);
+        qat_ste_clip_weight_grad(drbf, rbf_weight.data, rbf_scale_);
+    }
+    base_weight.add_grad(dbase);
+    rbf_weight.add_grad(drbf);
     bias.add_grad(grad_2d.sum(0));
 
-    Tensor grad_input = grad_2d.matmul(base_weight.data);
-    Tensor grad_basis = grad_2d.matmul(rbf_weight.data);
+    // Input/basis grads flow through the EFFECTIVE (fake-quantized) weights the
+    // forward actually multiplied when quantization is on.
+    const Tensor& base_for_dx =
+        (quantized_ && saved_base_eff_.size > 0) ? saved_base_eff_ : base_weight.data;
+    const Tensor& rbf_for_dx =
+        (quantized_ && saved_rbf_eff_.size > 0) ? saved_rbf_eff_ : rbf_weight.data;
+    Tensor grad_input = grad_2d.matmul(base_for_dx);
+    Tensor grad_basis = grad_2d.matmul(rbf_for_dx);
 
     const int rows = saved_input_.shape[0];
 
