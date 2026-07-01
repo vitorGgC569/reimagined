@@ -206,12 +206,13 @@ cells.append(md("""## 4 — Tarefas + avaliação
 **AR:** prompt `[BOS k1 v1 ... kN vN SEP q]`, resposta `[valor de q]` (loss = só o
 valor → 100% sinal de recall). `n_kv` = capacidade. **Selective copy:** campo com K
 dados entre BLANK + MARK → resposta = os K dados; treina curto, testa longo.
-`eval_*` roda com `set_training_mode(False)`. **QAT OFF** (default): modelo na
-GPU → forward float (reference path) — mede a arquitetura em float. **QAT ON**:
-o modelo é movido pra CPU antes do eval (célula 5/6) → forward **ternário 1.58-bit
-real** (o `gemm_158bit` empacotado só roda no host; na GPU o eval cairia em float
-e NÃO mediria o gap de quantização). Assim o número do QAT ON é o de **deployment**
-ternário, comparável ao float do QAT OFF."""))
+`eval_*` roda com `set_training_mode(False)`. **QAT OFF** (default): reference
+path → forward **float** (mede a arquitetura em float). **QAT ON**: as camadas
+não-sensíveis estão em modo quantizado (`reference_path=false`), então o forward
+de inferência roda **ternário 1.58-bit REAL na própria GPU** (BitLinear agora faz
+fake-quant ternário+int8 em treino E inferência quando quantizado; commit que
+corrige o eval-float). Ou seja, o número do QAT ON é o de **deployment** ternário
+na GPU, comparável direto ao float do QAT OFF — sem precisar mover pra CPU."""))
 cells.append(code("""import random, numpy as np
 
 def make_ar(rng, n_kv, n_key, n_val):
@@ -275,11 +276,13 @@ comparação com QAT real ligado (ternário+int8 depois do step 300) e checar se
 ranking do mixer sobrevive à quantização.
 
 **COMO ATIVAR:** rode uma célula `import os; os.environ['NSOS_GEN_QAT']='1'` ANTES
-desta (é lido por Python aqui, então é confiável). Com QAT ON, o eval move o modelo
-pra CPU → **forward ternário 1.58-bit REAL** (deployment); na GPU o eval seria float
-e não mediria o gap. O número comparável em float é a run QAT OFF (que você já tem).
-Para o gap de quantização: rode QAT OFF (baseline float) e QAT ON (ternário) e
-compare — mesma tarefa, mesmos seeds."""))
+desta (é lido por Python aqui, então é confiável). Com QAT ON, o forward de
+inferência roda **ternário 1.58-bit REAL na GPU** (BitLinear faz fake-quant em
+treino E inferência quando a camada está quantizada). Para o gap de quantização:
+rode QAT OFF (baseline float) e QAT ON (ternário na GPU) e compare — mesma tarefa,
+mesmos seeds. (O caminho __dp4a empacotado, mais rápido, continua disponível via
+InferenceEngine.set_gpu_packed_inference; aqui usamos o fake-quant, numericamente
+equivalente e idêntico ao que o treino QAT otimizou.)"""))
 cells.append(code("""import os, sys, random
 os.environ['NSOS_MAMBA_PROPER_SSM']  = '1'
 os.environ['NSOS_MAMBA_CONV_K']      = '3'
@@ -375,9 +378,6 @@ for variant in VARIANTS:
     for seed in SEEDS:
         nsos.set_seed(seed); m = build_variant(variant, V)
         train_batched(m, AR_LR, AR_STEPS, BATCH, lambda r: (lambda: make_ar(r, 8, N_KEY, N_VAL)), seed, f'AR {variant} s{seed}')
-        if QAT_ON:
-            m.to(nsos.Device.CPU)   # QAT: eval no caminho TERNARIO real (deployment 1.58-bit);
-                                    # na GPU o eval seria float (materialize_weight) e nao mediria o gap.
         ev = random.Random(seed * 13 + 5)
         for k in KV_TEST:
             d = [make_ar(ev, k, N_KEY, N_VAL) for _ in range(300)]
@@ -409,8 +409,6 @@ for variant in VARIANTS:
             L = r.randint(16, LT)
             return lambda: make_selcopy(r, L, N_DATA, N_SYM_C)
         train_batched(m, 2e-3, STEPS, BATCH, sampler, seed, f'COPY {variant} s{seed}')
-        if QAT_ON:
-            m.to(nsos.Device.CPU)   # QAT: eval TERNARIO real (deployment); GPU eval seria float
         ev = random.Random(seed * 29 + 3)
         for L in TEST_LENS:
             d = [make_selcopy(ev, L, N_DATA, N_SYM_C) for _ in range(300)]

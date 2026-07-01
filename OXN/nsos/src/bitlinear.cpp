@@ -359,22 +359,26 @@ Tensor BitLinear::forward(const Tensor &input) {
     }
     if (training_mode_) saved_linear_input = linear_input.clone();
 
-    // ── K3: GPU quantization-aware training (fake-quant STE) ──────────────
-    // Reaching the GPU branch with use_reference_path == false during training
-    // means the QAT scheduler put this (non-sensitive) layer into the quantized
-    // phase.  Run the forward through ternary-weight + int8-activation FAKE
-    // quantization (dequantized, so the matmul stays differentiable) and let
-    // the matching backward (qat_gpu_active_) straight-through the gradient onto
-    // the FP32 latent weights.  This makes train numerics == ternary-inference
-    // numerics ON THE GPU — previously GPU training silently used FP32 weights
-    // (no QAT) and the model only met ternary weights at inference.  Sensitive
-    // layers (Mamba dt/B/C, FP router) keep the float reference path (the
-    // scheduler leaves their reference_path == true, so they return earlier).
-    // LoQA active falls back to the float matmul (its adapter path is folded in
-    // the dedicated reference/STE backward, not here).
-    if (training_mode_ && !quantization_sensitive_ && !loqa.active &&
-        weight.data.size > 0 && M > 0 && in_features > 0 && out_features > 0) {
-      qat_gpu_active_ = true;
+    // ── K3: GPU 1.58-bit ternary path (fake-quant), TRAIN + INFERENCE ─────
+    // Reaching the GPU branch means use_reference_path == false, i.e. the QAT
+    // scheduler put this (non-sensitive) layer into the QUANTIZED phase.  Run the
+    // forward through ternary-weight + int8-activation FAKE quantization
+    // (dequantized, so it stays differentiable): during training this is the
+    // QAT STE forward (we also cache x_dq/pre for the matching STE backward);
+    // during INFERENCE it is the real ternary deployment forward on the GPU.
+    // Previously this was gated on training_mode_, so GPU EVAL of a QAT model
+    // silently fell back to a float matmul (materialize_weight_for_device) —
+    // wrong: a quantized layer must infer in ternary on GPU too, not only on the
+    // CPU packed path.  Sensitive layers (Mamba dt/B/C, FP router) keep the float
+    // reference path (reference_path stays true, they return earlier).  When the
+    // caller opted into the faster __dp4a packed kernel
+    // (gpu_packed_inference_enabled_) we defer to it below instead of this
+    // float-of-dequant path.  LoQA active falls back to float matmul.
+    const bool qat_ternary_path =
+        (training_mode_ || !gpu_packed_inference_enabled_) &&
+        !quantization_sensitive_ && !loqa.active && weight.data.size > 0 &&
+        M > 0 && in_features > 0 && out_features > 0;
+    if (qat_ternary_path) {
       // Same scale rule as pack_weights()/quantize_weights() so the QAT codes
       // match what packed inference will use.
       weight_scale = weight.data.norm() /
@@ -382,8 +386,12 @@ Tensor BitLinear::forward(const Tensor &input) {
       Tensor w_eff = qat_fake_quant_ternary(weight.data, weight_scale);       // [out,in]
       Tensor x_dq = qat_fake_quant_activations(linear_input, precision_bits);  // [M,in]
       Tensor pre = x_dq.matmul(w_eff.transpose());                            // [M,out]
-      saved_qat_x_dq_ = x_dq;
-      saved_qat_pre_ = pre;
+      if (training_mode_) {
+        // Backward state — only needed for the STE backward during training.
+        qat_gpu_active_ = true;
+        saved_qat_x_dq_ = x_dq;
+        saved_qat_pre_ = pre;
+      }
       Tensor out_q = pre.mul(magnitude.data);
       if (use_bias) {
         out_q = out_q.add(bias.data);
