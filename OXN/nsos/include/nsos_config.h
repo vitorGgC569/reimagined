@@ -29,6 +29,12 @@ struct ModelConfig {
     int sliding_window = 4096;
     int attention_period = 8;
     int attention_slot = 7;
+    // RoPE base frequency (theta).  Larger theta -> slower rotation -> more
+    // position-invariant per-head dims (helps content-based associative recall,
+    // at the cost of positional resolution); theta -> inf approaches NoPE.  Was
+    // hardcoded 10000 in Attention; now configurable so the recall-vs-RoPE
+    // hypothesis can be tested.  Env NSOS_ROPE_THETA overrides per construction.
+    float rope_theta = 10000.0f;
     
     // MoE Settings
     int num_experts = 8;

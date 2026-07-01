@@ -493,7 +493,8 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             // K1: corrected Mamba-2 SSD path, default ON via ModelConfig.
             model_config_.mamba_proper_ssm,
             model_config_.mamba_state_expansion,
-            model_config_.mamba_conv_kernel));
+            model_config_.mamba_conv_kernel,
+            model_config_.rope_theta));
     }
 
     value_head = std::make_unique<BitLinear>(d_model, vocab_size);
@@ -1489,7 +1490,8 @@ JambaBlock::JambaBlock(int dm,
                        bool use_kan,
                        bool mamba_proper_ssm,
                        bool mamba_state_expansion,
-                       int mamba_conv_kernel)
+                       int mamba_conv_kernel,
+                       float rope_theta)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
@@ -1534,7 +1536,7 @@ JambaBlock::JambaBlock(int dm,
         ttt_layer = std::make_unique<TTTLayer>(dm, default_ffn_hidden);
     } else if (is_attention) {
         attn_layer = std::make_unique<Attention>(dm, std::max(query_heads, 1), 512,
-                                                 std::max(kv_heads, 1));
+                                                 std::max(kv_heads, 1), rope_theta);
         attn_layer->set_exact_training_path(exact_attention_training);
     } else {
         MambaConfig config;
@@ -2824,7 +2826,7 @@ void JambaBlock::restore_session_state_batch(const std::vector<JambaBlockSession
     reset();
 }
 
-Attention::Attention(int d, int n, int l, int n_kv)
+Attention::Attention(int d, int n, int l, int n_kv, float rope_theta)
     : d_model(d),
       n_heads(std::max(n, 1)),
       n_kv_heads(select_kv_heads(std::max(n, 1), n_kv)),
@@ -2838,7 +2840,17 @@ Attention::Attention(int d, int n, int l, int n_kv)
           std::make_unique<BitLinear>(d, 2 * n_kv_heads * head_dim)),
       out_proj(std::make_unique<BitLinear>(d, d)),
       max_seq_len(4096),
-      theta(10000.0f) {
+      theta(rope_theta > 0.0f ? rope_theta : 10000.0f) {
+    // Env override (A/B harness), per-construction: NSOS_ROPE_THETA.  RoPE with
+    // any theta is still exact — the kernels already take theta as a parameter,
+    // so nothing else changes.  Larger theta -> more position-invariant dims
+    // (content recall); theta -> inf approaches NoPE.
+    if (const char* e = std::getenv("NSOS_ROPE_THETA")) {
+        const float parsed = std::strtof(e, nullptr);
+        if (parsed > 0.0f) {
+            theta = parsed;
+        }
+    }
     precompute_freqs_cis();
     // Learned block-selection routing, initialised to identity so SSA
     // selection starts as the mean-key heuristic and is then trained.

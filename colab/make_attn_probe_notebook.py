@@ -99,10 +99,11 @@ sys.path.insert(0, str(__import__('pathlib').Path('/content/nsos_ext_genbench'))
 import nsos_ext as nsos
 dev = nsos.Device.GPU
 
-def build_attn_variant(variant, V, n_heads, n_kv):
+def build_attn_variant(variant, V, n_heads, n_kv, rope_theta=10000.0):
     c = nsos.ModelConfig()
     c.num_layers = 4; c.d_model = 128; c.vocab_size = V
     c.n_heads = n_heads; c.n_kv_heads = n_kv; c.max_context_tokens = 1024
+    c.rope_theta = float(rope_theta)   # config path (portavel; env e instavel no Windows)
     c.use_exact_attention_training = True; c.use_flash_attn = False
     c.use_moe = False; c.use_kan = False; c.use_ttt = False; c.dropout = 0.0
     if variant == 'attn':
@@ -201,6 +202,70 @@ else:
 print('\\nOBS: mesmo destravada, a atencao pode ficar < Mamba nesta escala minuscula')
 print('(o estado SSD e memoria associativa direta). "Superar tudo" precisa de escala real,')
 print('nao de sonda sintetica -- isto aqui decide "vale escalar", nao "e SOTA".')
+print('=' * 78)
+"""))
+
+cells.append(md("""## 8 — Sweep de RoPE `theta` (a atenção melhora com mais dims lentos?)
+
+Teste da hipótese RoPE: `theta` maior → mais pares de frequência giram devagar →
+mais dimensões por-head **invariantes a posição** para casamento por conteúdo
+(recall). **Ressalva honesta:** o par de maior frequência (i=0) gira ~1 rad/token
+independente de `theta` — então `theta` grande **não** vira NoPE, só **adiciona
+dims lentos**. Como dobrar `head_dim` (que também adiciona dims lentos) rendeu só
++0.03, a expectativa aqui é BAIXA — mas o teste é barato e fecha a questão. Roda
+na melhor arquitetura de atenção do sweep anterior (hd64 MHA) + no híbrido."""))
+cells.append(code("""THETAS = [float(x) for x in os.environ.get('NSOS_PROBE_THETAS', '10000,1e6,1e8').split(',')]
+theta_res = {}; t0 = time.time()
+# (rotulo, variante, n_heads, n_kv, lr) -- fixa a melhor arq de atencao (hd64 MHA)
+THETA_CONDS = [
+    ('attn   hd64 MHA(nh2)', 'attn',   2, 2, 2e-3),
+    ('hybrid hd64 MHA(nh2)', 'hybrid', 2, 2, 2e-3),
+]
+for (label, variant, nh, nkv, lr) in THETA_CONDS:
+    for th in THETAS:
+        accs = {k: [] for k in KV_TEST}
+        for seed in SEEDS:
+            nsos.set_seed(seed)
+            m = build_attn_variant(variant, V, nh, nkv, rope_theta=th)
+            train_ar(m, lr, STEPS, BATCH, 8, N_KEY, N_VAL, seed, f'{label} theta={th:.0e} s{seed}')
+            ev = random.Random(seed * 13 + 5)
+            for k in KV_TEST:
+                d = [make_ar(ev, k, N_KEY, N_VAL) for _ in range(300)]
+                accs[k].append(eval_ar(m, d, V))
+            print(f'  [{label} theta={th:.0e} s{seed}] ' + ' '.join(f'n_kv={k}:{accs[k][-1]:.2f}' for k in KV_TEST))
+        theta_res[(label, th)] = {k: (float(np.mean(accs[k])), float(np.std(accs[k]))) for k in KV_TEST}
+print('\\n' + '=' * 78)
+print(f'ROPE THETA SWEEP — AR recall (media+/-desvio, {len(SEEDS)} seeds; baseline={base:.3f})   ({time.time()-t0:.0f}s)')
+print(f'{"cond / theta":<30}' + ''.join(f'{("n_kv="+str(k)):>18}' for k in KV_TEST))
+for (label, variant, nh, nkv, lr) in THETA_CONDS:
+    for th in THETAS:
+        r = theta_res[(label, th)]
+        print(f'  {label+" th="+format(th,".0e"):<28}' + ''.join(f'{r[k][0]:>11.3f}+/-{r[k][1]:.2f}' for k in KV_TEST))
+print('=' * 78)
+"""))
+
+cells.append(md("""## 9 — VEREDITO theta"""))
+cells.append(code("""print('=' * 78)
+attn_th = {th: theta_res[('attn   hd64 MHA(nh2)', th)][8][0] for th in THETAS}
+best_th = max(THETAS, key=lambda th: attn_th[th])
+base_th = attn_th.get(10000.0, attn_th[min(THETAS)])
+print('ROPE THETA (atencao hd64 MHA), recall n_kv=8:')
+for th in THETAS:
+    print(f'  theta={th:.0e}: {attn_th[th]:.3f}')
+print(f'\\n  melhor theta = {best_th:.0e} -> {attn_th[best_th]:.3f}  (baseline theta=1e4 -> {base_th:.3f})')
+delta = attn_th[best_th] - base_th
+print(f'  ganho de theta: +{delta:.3f}')
+print('\\nLEITURA:')
+if attn_th[best_th] >= 0.70:
+    print('  -> RoPE ERA o gargalo: theta grande destravou. Fix principal = rope_theta maior')
+    print('     (e/ou NoPE-em-alguns-heads). Adotar no config da atencao.')
+elif delta >= 0.10:
+    print('  -> RoPE contribui (ganho real mas nao resolve). Combinar theta + QK-norm (codigo).')
+else:
+    print('  -> RoPE NAO e o gargalo principal (ganho <0.10, como o head_dim ja sugeria).')
+    print('     A causa e TRAINABILITY do induction head -> proxima alavanca = QK-norm')
+    print('     (normalizar q,k por head antes do dot; acelera formacao de induction heads),')
+    print('     ou aceitar que o Mamba e o mixer de recall e usar schedule Mamba-pesado.')
 print('=' * 78)
 """))
 

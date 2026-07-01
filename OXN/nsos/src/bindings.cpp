@@ -147,6 +147,7 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("sliding_window", &ModelConfig::sliding_window)
         .def_readwrite("attention_period", &ModelConfig::attention_period)
         .def_readwrite("attention_slot", &ModelConfig::attention_slot)
+        .def_readwrite("rope_theta", &ModelConfig::rope_theta)
         .def_readwrite("num_experts", &ModelConfig::num_experts)
         .def_readwrite("num_experts_per_token", &ModelConfig::num_experts_per_token)
         .def_readwrite("use_moe", &ModelConfig::use_moe)

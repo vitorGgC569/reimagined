@@ -55,7 +55,8 @@ struct RuntimeTelemetrySnapshot {
 
 class Attention {
 public:
-  Attention(int d_model, int n_heads, int n_latents = 512, int n_kv_heads = 0);
+  Attention(int d_model, int n_heads, int n_latents = 512, int n_kv_heads = 0,
+            float rope_theta = 10000.0f);
   Tensor forward(const Tensor &input, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
   void to(Device dev);
@@ -268,7 +269,11 @@ public:
              // N-dimensional SSD state.  Env vars still override per build.
              bool mamba_proper_ssm = true,
              bool mamba_state_expansion = true,
-             int mamba_conv_kernel = 4);
+             int mamba_conv_kernel = 4,
+             // RoPE base (theta) for the attention layers; larger = more
+             // position-invariant (content-recall) dims.  Env NSOS_ROPE_THETA
+             // still overrides per construction.
+             float rope_theta = 10000.0f);
   ~JambaBlock();
   Tensor forward(const Tensor &x, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
