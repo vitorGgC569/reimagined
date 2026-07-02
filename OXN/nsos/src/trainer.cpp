@@ -1130,7 +1130,7 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
     }
 
     const int n = static_cast<int>(active.size());
-    static std::vector<unsigned char> staging;
+    thread_local std::vector<unsigned char> staging;  // K6: replica-safe
     const size_t ptr_bytes = sizeof(float*) * static_cast<size_t>(n) * 4;
     const size_t off_bytes =
         sizeof(unsigned long long) * static_cast<size_t>(n + 1);

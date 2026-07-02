@@ -122,11 +122,17 @@ void BitLinear::pack_weights(const Tensor &w_float) {
                                    sizeof(uint32_t);
   packed_weights.assign(packed_word_count, 0u);
   
-  this->weight_scale = w_float.norm() / (std::sqrt((float)w_float.shape.numel()) + 1e-8f);
+  // Canonical ternary scale = ABSMEAN (BitNet b1.58 reference recipe:
+  // scale = mean(|W|), W_q = clip(round(W/scale), ±1) — arXiv:2402.17764).
+  // Was RMS (||W||/√numel), an undocumented divergence: RMS ≥ absmean always,
+  // so the ternary came out sparser than the recipe proven at 2B/4T scale —
+  // and inconsistent with the rest of this codebase (Slender embedding eq.8
+  // and the OXTA-CRIT branch-gain rule both already use absmean).
+  this->weight_scale = tensor_abs_mean(w_float) + 1e-8f;
 
   // Canonical NSOS ternary rule — single source of truth.  Quantize with
   // quantize_weights() (t = clamp(round(W / scale), -1, +1), scale =
-  // ||W|| / sqrt(numel)) and pack the resulting {-1,0,+1} codes.  This makes
+  // mean(|W|)) and pack the resulting {-1,0,+1} codes.  This makes
   // the packed weights identical to quantize_weights() and to the QAT
   // regularizer target, so quantized training (STE) and packed inference
   // share exactly one quantization rule.
@@ -381,8 +387,7 @@ Tensor BitLinear::forward(const Tensor &input) {
     if (qat_ternary_path) {
       // Same scale rule as pack_weights()/quantize_weights() so the QAT codes
       // match what packed inference will use.
-      weight_scale = weight.data.norm() /
-                     (std::sqrt(static_cast<float>(weight.data.shape.numel())) + 1e-8f);
+      weight_scale = tensor_abs_mean(weight.data) + 1e-8f;  // absmean (BitNet b1.58)
       Tensor w_eff = qat_fake_quant_ternary(weight.data, weight_scale);       // [out,in]
       Tensor x_dq = qat_fake_quant_activations(linear_input, precision_bits);  // [M,in]
       Tensor pre = x_dq.matmul(w_eff.transpose());                            // [M,out]
@@ -948,7 +953,8 @@ Tensor BitLinear::backward(const Tensor &grad) {
 
 Tensor BitLinear::quantize_weights(const Tensor &w_float) {
   Tensor res(w_float.shape.dims, w_float.get_device());
-  float scale = w_float.norm() / (std::sqrt((float)w_float.size) + 1e-8f);
+  // Absmean scale (BitNet b1.58) — must match pack_weights / the QAT forward.
+  float scale = tensor_abs_mean(w_float) + 1e-8f;
   const float *src = w_float.data();
   float *dst = res.data();
 #pragma omp parallel for

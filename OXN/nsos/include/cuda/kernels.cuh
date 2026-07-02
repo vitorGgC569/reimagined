@@ -276,6 +276,9 @@ void launch_quantize_activations_bitnet_kernel(const float *x, int8_t *x_q,
 void launch_bitnet_apply_act_scales_kernel(float *y, const float *act_scales,
                                            int M, int N);
 
+// Σ|x| into a device scalar (caller pre-zeros).  Absmean weight-scale support.
+void launch_abs_sum_kernel(float *d_abs_sum, const float *in, int n);
+
 // ── K3: GPU QAT fake-quant (straight-through) primitives ────────────────────
 // Weight fake-quant: out[i] = clamp(round(w[i]/scale), -1, +1) * scale
 // (the canonical NSOS ternary rule; identical numerics to

@@ -896,7 +896,7 @@ void launch_mamba_nstate_backward(const float *gy, const float *xc,
 // One thread per channel.  Mirrors forward_proper_step's host math exactly:
 //   conv_pre = sum_j convw[c,j] * window[j]   (window = [ring taps..., xv])
 //   xc       = silu(conv_pre)
-//   h        = decay*h + B*xc ; decay = exp(-softplus(dt)*max(A,1e-3))
+//   h        = decay*h + B*xc ; decay = exp(-softplus(dt)*exp(A_log))  (N1)
 //   y        = h*C
 //   gated    = y * silu(z)
 // then advances the conv ring in place (shift left, append xv).  Keeps the SSD

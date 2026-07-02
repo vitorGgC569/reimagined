@@ -7,7 +7,18 @@ namespace nsos {
 
 // Magic Numbers & Constants
 constexpr uint32_t NSOS_MODEL_MAGIC = 0x4E534F53; // "NSOS" in ASCII
-constexpr uint32_t NSOS_MODEL_VERSION = 1;
+// v2 (2026-07): header carries an architecture FINGERPRINT (proper-SSM /
+// state-expansion / weight-tying flags + A-domain marker) so loading a
+// checkpoint into a mismatched architecture fails with an ACTIONABLE message
+// instead of a cryptic "parameter not found", and v1 checkpoints (whose Mamba
+// `A` values are decay RATES, not log-rates) are migrated exactly
+// (A_log = log(max(A, 1e-3))) instead of being silently misread as log-domain.
+constexpr uint32_t NSOS_MODEL_VERSION = 2;
+// Fingerprint bits (v2+ header, uint32 after version):
+constexpr uint32_t NSOS_FP_MAMBA_PROPER    = 1u << 0;
+constexpr uint32_t NSOS_FP_STATE_EXPANSION = 1u << 1;
+constexpr uint32_t NSOS_FP_TIE_EMBEDDINGS  = 1u << 2;
+constexpr uint32_t NSOS_FP_A_LOG_DOMAIN    = 1u << 3;  // always set by v2 saves
 
 constexpr float NSOS_DEFAULT_EPSILON = 1e-6f;
 constexpr float NSOS_ROPE_THETA = 10000.0f;

@@ -127,13 +127,19 @@ void cublas_check(cublasStatus_t status, const char* op) {
     }
 }
 
+// thread_local (K6 replica-safety class): a cublasHandle_t must not be used
+// concurrently from multiple threads (cuBLAS docs) — the HTTP server drives
+// concurrent inference replicas that all call Tensor::matmul.  Per-thread
+// handles are the vendored-recommended pattern; all still launch on the legacy
+// stream 0, so ordering semantics are unchanged for the single-threaded
+// training path (one handle, same behavior as before).
 int& gpu_blas_state() {
-    static int state = -1;
+    thread_local int state = -1;
     return state;
 }
 
 cublasHandle_t& gpu_blas_handle_storage() {
-    static cublasHandle_t handle = nullptr;
+    thread_local cublasHandle_t handle = nullptr;
     return handle;
 }
 
@@ -792,6 +798,28 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
         std::memcpy(dst, src, bytes);
     }
 #endif
+}
+
+float tensor_abs_mean(const Tensor& t) {
+    if (t.size <= 0) {
+        return 0.0f;
+    }
+#ifdef USE_CUDA
+    if (t.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+        CudaBuffer<float> d_sum(1);
+        cudaMemset(d_sum.get(), 0, sizeof(float));
+        launch_abs_sum_kernel(d_sum.get(), t.raw_data(), t.size);
+        sync_cuda();
+        const float total = copy_scalar_from_device(d_sum.get());
+        return total / static_cast<float>(t.size);
+    }
+#endif
+    const float* src = t.data();
+    double total = 0.0;
+    for (int i = 0; i < t.size; ++i) {
+        total += std::fabs(static_cast<double>(src[i]));
+    }
+    return static_cast<float>(total / static_cast<double>(t.size));
 }
 
 PoolStats pool_stats() {

@@ -2,7 +2,10 @@ name: NSOS Industrial CI
 
 on:
   push:
-    branches: [main, develop]
+    # feature/nsos-gpu-phases12 + alias: as branches ativas de pesquisa — uma
+    # suíte vermelha lá é exatamente quando queremos saber (antes a CI só
+    # observava main/develop, então os 51 testes só rodavam manualmente).
+    branches: [main, develop, feature/nsos-gpu-phases12, nsos-gpu-phases12]
   pull_request:
     branches: [main]
   workflow_dispatch:

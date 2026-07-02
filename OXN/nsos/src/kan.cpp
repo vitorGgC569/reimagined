@@ -107,10 +107,8 @@ Tensor BitFastKANLayer::forward(const Tensor& x) {
     Tensor bw = base_weight.data;
     Tensor rw = rbf_weight.data;
     if (quantized_) {
-        base_scale_ = bw.norm() /
-                      (std::sqrt(static_cast<float>(bw.shape.numel())) + 1e-8f);
-        rbf_scale_ = rw.norm() /
-                     (std::sqrt(static_cast<float>(rw.shape.numel())) + 1e-8f);
+        base_scale_ = tensor_abs_mean(bw) + 1e-8f;  // absmean (BitNet b1.58)
+        rbf_scale_ = tensor_abs_mean(rw) + 1e-8f;
         bw = qat_fake_quant_ternary(bw, base_scale_);
         rw = qat_fake_quant_ternary(rw, rbf_scale_);
         saved_base_eff_ = bw;

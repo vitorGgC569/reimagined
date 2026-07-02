@@ -28,6 +28,12 @@ int matmul_precision_mode();
 void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
                        Device src_device, size_t bytes, bool async_d2d = false);
 
+// mean(|x|) — o estatístico "absmean" do BitNet b1.58 (regra canônica do
+// weight-scale ternário).  Kernel GPU quando o tensor é device-resident
+// (uma D2H de 4 bytes); loop host caso contrário.
+class Tensor;
+float tensor_abs_mean(const Tensor& t);
+
 // (auditoria #25/#26) Observabilidade e controle do pool GPU.
 struct PoolStats {
     size_t cached_bytes = 0;   // soma das free-lists

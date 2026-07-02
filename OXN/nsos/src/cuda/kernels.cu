@@ -1033,6 +1033,35 @@ extern "C" void launch_norm_kernel(float *d_sum_sq, const float *in, int n) {
   norm_kernel<<<blocks, threads>>>(d_sum_sq, in, n);
 }
 
+// Σ|x| — block-partial + single atomicAdd per block (same nondeterminism class
+// as norm_kernel).  Powers the BitNet b1.58 absmean weight scale on device.
+__global__ void abs_sum_kernel(float *d_abs_sum, const float *in, int n) {
+  __shared__ float partial[256];
+  float local = 0.0f;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += gridDim.x * blockDim.x) {
+    local += fabsf(in[i]);
+  }
+  partial[threadIdx.x] = local;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      partial[threadIdx.x] += partial[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    atomicAdd(d_abs_sum, partial[0]);
+  }
+}
+
+extern "C" void launch_abs_sum_kernel(float *d_abs_sum, const float *in, int n) {
+  const int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+  if (blocks > 4096) blocks = 4096;  // grid-stride loop covers the rest
+  abs_sum_kernel<<<blocks, threads>>>(d_abs_sum, in, n);
+}
+
 // Repetition-unlikelihood (Welleck et al. 2020) gradient adjustment, on GPU.
 // Mirrors the host loop in trainer.cpp::apply_repetition_unlikelihood EXACTLY,
 // eliminating the per-sample probs.cpu()/grad.cpu() D2H + host loop that was the

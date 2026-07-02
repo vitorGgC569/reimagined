@@ -21,12 +21,19 @@ blocks alternate by type).
     state history $h_t$ and the backward walks time in reverse, propagating gradients through the
     recurrence and the $\tanh$/$C$ readout into $\delta, B, C, A$ and the input. CPU and CUDA
     paths are token-for-token equivalent (`test_gpu_parity` case `mamba_streaming`).
-*   **Full Mamba-2 SSD ($N$-state) — opt-in, in progress**: a state-expanded SSD kernel
-    (`mamba_ssd_forward_kernel`, $h \in \mathbb{R}^{P\times N}$, $y=\sum_n h_n C_n$) plus a
-    short causal conv1d and **separate** $\delta/B/C/z$ projections are being wired behind a
-    `MambaConfig` flag (default OFF preserves the validated path and existing checkpoints).
-    Until that flag is validated, claims of "Mamba-2 SSD / SSD duality" apply only to the opt-in
-    path, not the default.
+*   **Full Mamba-2 SSD ($N$-state) — now the DEFAULT (2026-07)**: the corrected selective
+    SSM (separate $\delta/B/C/z$ projections, short causal conv1d, single-$C$ linear readout,
+    SiLU gate) with the full $h \in \mathbb{R}^{H\times P\times N}$ state expansion ships ON by
+    default via `ModelConfig::mamba_proper_ssm` / `mamba_state_expansion` (dedicated GPU
+    kernels `mamba_nstate_*`, T4-parity-validated; gradchecked end to end).  $A$ is stored in
+    the **log domain** ($A_\mathrm{eff}=\exp(A_{\log})$, S4D/Mamba parameterization) so decay
+    is unconditionally stable and no channel's gradient is ever masked.  The legacy diagonal
+    gated path remains reachable only by explicitly setting the flags false (checkpoint
+    format v2 fingerprints the choice and refuses mismatched loads with an actionable error;
+    v1 checkpoints have their rate-domain $A$ migrated exactly on load).  The old chunked
+    `mamba_ssd_forward_kernel` is dead code (broken inter-chunk carry) kept only pending
+    removal.  Weight quantization uses the **absmean** rule ($\gamma=\mathrm{mean}|W|$,
+    BitNet b1.58 reference), consistent with the Slender embedding and OXTA-CRIT.
 *   **Attention**: MLA-style latent attention with GQA and RoPE blocks are interspersed. We
     implement full backward differentiation for the $Q, K, V, O$ projections (chain rule),
     statically verified and Colab-gated against the host path.

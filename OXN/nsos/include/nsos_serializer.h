@@ -2,6 +2,8 @@
 #include "nsos_config.h"
 #include "tensor.h"
 #include "jamba.h"
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -14,6 +16,17 @@ namespace nsos {
 
 class ModelSerializer {
 public:
+    // v2 fingerprint from the model's live config.  A-domain is always log in
+    // v2 (the N1 reparameterization is unconditional in current code).
+    static uint32_t architecture_fingerprint(const JambaModel* model) {
+        const ModelConfig& cfg = model->model_config();
+        uint32_t fp = NSOS_FP_A_LOG_DOMAIN;
+        if (cfg.mamba_proper_ssm) fp |= NSOS_FP_MAMBA_PROPER;
+        if (cfg.mamba_state_expansion) fp |= NSOS_FP_STATE_EXPANSION;
+        if (cfg.tie_word_embeddings) fp |= NSOS_FP_TIE_EMBEDDINGS;
+        return fp;
+    }
+
     static void save(JambaModel* model, const std::string& filename) {
         std::ofstream fs(filename, std::ios::binary);
         if (!fs) throw std::runtime_error("Cannot open file for writing");
@@ -22,6 +35,9 @@ public:
         uint32_t version = NSOS_MODEL_VERSION;
         fs.write((char*)&magic, 4);
         fs.write((char*)&version, 4);
+        // v2: architecture fingerprint right after the version.
+        uint32_t fingerprint = architecture_fingerprint(model);
+        fs.write((char*)&fingerprint, 4);
 
         auto params = model->parameters();
         uint32_t count = (uint32_t)params.size();
@@ -84,6 +100,46 @@ public:
 
         if (magic != NSOS_MODEL_MAGIC) throw std::runtime_error("Security: Invalid Magic Number");
         if (version > NSOS_MODEL_VERSION) throw std::runtime_error("Security: Version Mismatch");
+
+        // ── v2 fingerprint check (actionable errors instead of cryptic
+        // "parameter not found weight#N" when architectures diverge) ─────────
+        const uint32_t runtime_fp = architecture_fingerprint(model);
+        bool checkpoint_a_is_rate = false;  // v1: A stored as decay RATE
+        if (version >= 2) {
+            uint32_t ckpt_fp = 0;
+            fs.read((char*)&ckpt_fp, 4);
+            if (!fs) throw std::runtime_error("Checkpoint truncado lendo fingerprint");
+            auto flag_mismatch = [&](uint32_t bit, const char* cfg_name) {
+                if ((ckpt_fp & bit) != (runtime_fp & bit)) {
+                    const bool ckpt_on = (ckpt_fp & bit) != 0;
+                    throw std::runtime_error(
+                        std::string("Checkpoint/architecture mismatch: checkpoint was saved with ") +
+                        cfg_name + "=" + (ckpt_on ? "true" : "false") +
+                        " but the runtime model was constructed with " + cfg_name + "=" +
+                        (ckpt_on ? "false" : "true") +
+                        ".  Construct the model with ModelConfig::" + cfg_name +
+                        " matching the checkpoint and retry.");
+                }
+            };
+            flag_mismatch(NSOS_FP_MAMBA_PROPER, "mamba_proper_ssm");
+            flag_mismatch(NSOS_FP_STATE_EXPANSION, "mamba_state_expansion");
+            flag_mismatch(NSOS_FP_TIE_EMBEDDINGS, "tie_word_embeddings");
+            checkpoint_a_is_rate = (ckpt_fp & NSOS_FP_A_LOG_DOMAIN) == 0;
+        } else {
+            // v1 predates the fingerprint AND the A log-domain reparameterization
+            // (N1): its Mamba `A` values are decay RATES in (0, 1].  Loading them
+            // unconverted into the current code (which reads A as A_log and
+            // applies exp) silently corrupts every decay by orders of magnitude.
+            // We migrate exactly below (A_log = log(max(A, 1e-3)) reproduces the
+            // old effective decay bit-for-bit in the recurrence).
+            checkpoint_a_is_rate = true;
+            std::cerr << "[ModelSerializer] AVISO: checkpoint v1 (pre-fingerprint). "
+                         "Migrando Mamba A de rate->log-domain (exato). Se o load "
+                         "falhar com 'parameter not found', o checkpoint foi treinado "
+                         "com outra arquitetura — construa o modelo com os flags "
+                         "ModelConfig correspondentes (mamba_proper_ssm=false / "
+                         "tie_word_embeddings=false sao os defaults da epoca v1).\n";
+        }
 
         uint32_t count;
         fs.read((char*)&count, 4);
@@ -184,10 +240,25 @@ public:
             std::vector<float> buffer(total_elements);
             if (bytes > 0) read_field(buffer.data(), bytes, "payload");
 
+            // v1→v2 A-domain migration: Mamba's decay parameter (stable identity
+            // "A#k"; the only Parameter whose base_name is exactly "A") was a
+            // RATE in v1 and is A_log now.  A_log = log(max(A, 1e-3)) reproduces
+            // the old effective decay exactly (legacy code clamped at 1e-3).
+            if (checkpoint_a_is_rate && name.rfind("A#", 0) == 0) {
+                for (float& value : buffer) {
+                    value = std::log(std::max(value, 1e-3f));
+                }
+            }
+
             const auto it = params_by_name.find(name);
             if (it == params_by_name.end()) {
                 if (strict) {
-                    throw std::runtime_error("Checkpoint parameter not found in runtime model: " + name);
+                    throw std::runtime_error(
+                        "Checkpoint parameter not found in runtime model: " + name +
+                        ".  Likely architecture-flag mismatch — e.g. the checkpoint was "
+                        "trained WITHOUT weight tying (construct with "
+                        "ModelConfig::tie_word_embeddings=false) or with the legacy "
+                        "Mamba path (mamba_proper_ssm=false).");
                 }
                 ++skipped_missing;
                 continue;
@@ -255,7 +326,11 @@ public:
             for (const auto& expected_name : expected_runtime_names) {
                 if (loaded_runtime_names.find(expected_name) == loaded_runtime_names.end()) {
                     throw std::runtime_error(
-                        "Runtime parameter missing from checkpoint: " + expected_name);
+                        "Runtime parameter missing from checkpoint: " + expected_name +
+                        ".  Likely architecture-flag mismatch — construct the model "
+                        "with the ModelConfig flags the checkpoint was trained with "
+                        "(mamba_proper_ssm / mamba_state_expansion / "
+                        "tie_word_embeddings) and retry.");
                 }
             }
         } else {
