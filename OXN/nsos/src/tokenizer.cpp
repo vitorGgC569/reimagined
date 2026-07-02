@@ -452,6 +452,11 @@ void Tokenizer::load_ox3(const std::string &path) {
     bpe_ranks[{s1, s2}] = static_cast<int>(rank);
     std::string merged = s1 + s2;
     if (token_to_id.find(merged) == token_to_id.end()) {
+      if (vocab_size >= kMaxTokenizerVocabSize) {
+        // Same cap as load_text/load_pack — an adversarial .ox3 must not grow
+        // the vocab (and the id space) without bound.
+        throw std::runtime_error("Tokenizer vocab exceeds configured limit");
+      }
       int id = vocab_size++;
       token_to_id[merged] = id;
       id_to_token[id] = merged;

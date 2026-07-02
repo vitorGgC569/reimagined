@@ -403,6 +403,23 @@ void write_model_config(const std::filesystem::path& path, const ModelConfig& co
             {"use_cuda", config.use_cuda ? "true" : "false"},
             {"use_exact_attention_training", config.use_exact_attention_training ? "true" : "false"},
             {"use_flash_attn", config.use_flash_attn ? "true" : "false"},
+            // Architecture fields previously MISSING from the round-trip: a pack
+            // saved with any of these non-default silently flipped back to the
+            // default on load (the checkpoint-v2 fingerprint catches proper/tie
+            // loudly, but rope_theta/KAN/CHRASS/slender/expert-hidden would flip
+            // silently).  Full set now persisted.
+            {"moe_expert_hidden_dim", std::to_string(config.moe_expert_hidden_dim)},
+            {"use_kan", config.use_kan ? "true" : "false"},
+            {"use_chrass", config.use_chrass ? "true" : "false"},
+            {"chrass_density", std::to_string(config.chrass_density)},
+            {"chrass_seed", std::to_string(config.chrass_seed)},
+            {"pantheon_vib_beta", std::to_string(config.pantheon_vib_beta)},
+            {"use_slender_embedding", config.use_slender_embedding ? "true" : "false"},
+            {"mamba_proper_ssm", config.mamba_proper_ssm ? "true" : "false"},
+            {"mamba_state_expansion", config.mamba_state_expansion ? "true" : "false"},
+            {"mamba_conv_kernel", std::to_string(config.mamba_conv_kernel)},
+            {"tie_word_embeddings", config.tie_word_embeddings ? "true" : "false"},
+            {"rope_theta", std::to_string(config.rope_theta)},
         });
 }
 
@@ -461,6 +478,23 @@ ModelConfig read_model_config(const std::filesystem::path& path) {
     config.use_exact_attention_training =
         get_bool("use_exact_attention_training", config.use_exact_attention_training);
     config.use_flash_attn = get_bool("use_flash_attn", config.use_flash_attn);
+    config.moe_expert_hidden_dim =
+        get_int("moe_expert_hidden_dim", config.moe_expert_hidden_dim);
+    config.use_kan = get_bool("use_kan", config.use_kan);
+    config.use_chrass = get_bool("use_chrass", config.use_chrass);
+    config.chrass_density = get_float("chrass_density", config.chrass_density);
+    config.chrass_seed = static_cast<uint32_t>(
+        get_int("chrass_seed", static_cast<int>(config.chrass_seed)));
+    config.pantheon_vib_beta = get_float("pantheon_vib_beta", config.pantheon_vib_beta);
+    config.use_slender_embedding =
+        get_bool("use_slender_embedding", config.use_slender_embedding);
+    config.mamba_proper_ssm = get_bool("mamba_proper_ssm", config.mamba_proper_ssm);
+    config.mamba_state_expansion =
+        get_bool("mamba_state_expansion", config.mamba_state_expansion);
+    config.mamba_conv_kernel = get_int("mamba_conv_kernel", config.mamba_conv_kernel);
+    config.tie_word_embeddings =
+        get_bool("tie_word_embeddings", config.tie_word_embeddings);
+    config.rope_theta = get_float("rope_theta", config.rope_theta);
     return config;
 }
 
@@ -532,6 +566,36 @@ void apply_model_config_overrides(ModelConfig& base, const ModelConfig& override
     }
     if (overrides.use_flash_attn != defaults.use_flash_attn) {
         base.use_flash_attn = overrides.use_flash_attn;
+    }
+    if (overrides.moe_expert_hidden_dim != defaults.moe_expert_hidden_dim) {
+        base.moe_expert_hidden_dim = overrides.moe_expert_hidden_dim;
+    }
+    if (overrides.use_kan != defaults.use_kan) base.use_kan = overrides.use_kan;
+    if (overrides.use_chrass != defaults.use_chrass) base.use_chrass = overrides.use_chrass;
+    if (std::abs(overrides.chrass_density - defaults.chrass_density) > 1e-6f) {
+        base.chrass_density = overrides.chrass_density;
+    }
+    if (overrides.chrass_seed != defaults.chrass_seed) base.chrass_seed = overrides.chrass_seed;
+    if (std::abs(overrides.pantheon_vib_beta - defaults.pantheon_vib_beta) > 1e-9f) {
+        base.pantheon_vib_beta = overrides.pantheon_vib_beta;
+    }
+    if (overrides.use_slender_embedding != defaults.use_slender_embedding) {
+        base.use_slender_embedding = overrides.use_slender_embedding;
+    }
+    if (overrides.mamba_proper_ssm != defaults.mamba_proper_ssm) {
+        base.mamba_proper_ssm = overrides.mamba_proper_ssm;
+    }
+    if (overrides.mamba_state_expansion != defaults.mamba_state_expansion) {
+        base.mamba_state_expansion = overrides.mamba_state_expansion;
+    }
+    if (overrides.mamba_conv_kernel != defaults.mamba_conv_kernel) {
+        base.mamba_conv_kernel = overrides.mamba_conv_kernel;
+    }
+    if (overrides.tie_word_embeddings != defaults.tie_word_embeddings) {
+        base.tie_word_embeddings = overrides.tie_word_embeddings;
+    }
+    if (std::abs(overrides.rope_theta - defaults.rope_theta) > 1e-3f) {
+        base.rope_theta = overrides.rope_theta;
     }
 }
 
