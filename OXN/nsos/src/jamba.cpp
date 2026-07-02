@@ -5122,20 +5122,8 @@ void MoERouter::collect_bitlinear_layers(std::vector<BitLinear*>& out) {
     if (shared_expert_down) out.push_back(shared_expert_down.get());
 }
 
-float MoERouter::compute_aux_loss() {
-    if (expert_loads.empty()) {
-        return 0.0f;
-    }
-    const float mean_load =
-        std::accumulate(expert_loads.begin(), expert_loads.end(), 0.0f) /
-        static_cast<float>(expert_loads.size());
-    float variance = 0.0f;
-    for (float load : expert_loads) {
-        const float diff = load - mean_load;
-        variance += diff * diff;
-    }
-    return aux_loss_coef * variance / static_cast<float>(expert_loads.size());
-}
+// (compute_aux_loss removido — zero call sites; o aux loss vivo é o Switch
+// diferenciável em switch_aux_grad_logits/accumulate_switch_aux_grad.)
 
 Tensor MoERouter::switch_aux_grad_logits(const Tensor& probs, int top_k,
                                          float coef, float* out_loss) {

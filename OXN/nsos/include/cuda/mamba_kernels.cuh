@@ -10,34 +10,14 @@ namespace nsos {
 namespace cuda {
 
 #ifdef USE_CUDA
-// =====================================================================
-// Mamba2 SSD chunked forward kernel (heads × heads_dim × state_dim).
-//
-// Tensors (all device pointers):
-//   x:        [B, Seq, H, P]
-//   dt:       [B, Seq, H]
-//   A:        [H]
-//   B_param:  [B, Seq, H, N]
-//   C_param:  [B, Seq, H, N]
-//   y:        [B, Seq, H, P]   (output)
-//   final_state: [B, H, P, N]  (output / inter-chunk workspace)
-//
-// IMPORTANT: This launcher synchronizes the device internally because
-// the multi-chunk path issues sequential kernels that must serialize on
-// the inter-chunk state.  Callers do NOT need to call
-// cudaDeviceSynchronize() afterwards, but doing so is harmless.
-// =====================================================================
-void launch_mamba_ssd_forward(
-    const float *x, const float *dt, const float *A, const float *B_param,
-    const float *C_param, float *y, float *final_state, int Batch, int Seq,
-    int n_heads, int d_head, int d_state);
+// (launch_mamba_ssd_forward removido — kernel chunked morto, zero callers.)
 
 // =====================================================================
 // Selective scan with B/C gating, matched 1:1 against the CPU
 // implementation in src/mamba2.cpp::Mamba2SSD::ssd_forward.
 //
 // Recurrence (per (batch, dim) channel, sequential over time):
-//   decay     = exp(-softplus(dt[t]) * max(A[d], 1e-3))
+//   decay     = exp(-softplus(dt[t]) * exp(A_log[d]))            (N1)
 //   state[d]  = state[d] * decay + B_in[t,d] * x[t,d]
 //   y[t,d]    = tanh(state[d]) * C_in[t,d]
 //
@@ -94,19 +74,7 @@ void launch_mamba_selective_scan_backward(
     float *grad_x, float *grad_dt, float *grad_A, float *grad_B,
     float *grad_C, int Batch, int Seq, int D);
 
-// =====================================================================
-// Simplified scan used by some legacy tests.  No B/C gating — kept for
-// API stability but new code should prefer launch_mamba_selective_scan_*.
-// =====================================================================
-void launch_mamba_simple_scan_forward(const float *x, const float *dt,
-                                      const float *A, float *y, int Batch,
-                                      int Seq, int D);
-
-void launch_mamba_simple_scan_backward(const float *grad_y, const float *y,
-                                       const float *dt, const float *A,
-                                       float *grad_x, float *grad_dt,
-                                       float *grad_A, int Batch, int Seq,
-                                       int D);
+// (launch_mamba_simple_scan_forward/backward removidos — mortos.)
 
 void launch_mamba_single_token_update(const float *x, const float *dt,
                                       const float *A, float *state, float *y,

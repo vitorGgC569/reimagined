@@ -427,65 +427,8 @@ extern "C" void launch_layernorm_kernel(float *out, const float *in, int n_rows,
 // data reuse and minimize global memory traffic.
 // =========================================================================
 
-__global__ void matmul_kernel(const float *A, const float *B, float *C, int M,
-                              int K, int N) {
-  __shared__ float As[TILE_DIM][TILE_DIM];
-  __shared__ float Bs[TILE_DIM][TILE_DIM];
-
-  int bx = blockIdx.x;  // Column tile index
-  int by = blockIdx.y;  // Row tile index
-  int tx = threadIdx.x; // Thread column within tile
-  int ty = threadIdx.y; // Thread row within tile
-
-  int row = by * TILE_DIM + ty;
-  int col = bx * TILE_DIM + tx;
-
-  float sum = 0.0f;
-
-  // Iterate over tiles along the K dimension
-  int num_tiles = (K + TILE_DIM - 1) / TILE_DIM;
-  for (int t = 0; t < num_tiles; ++t) {
-    // Load tile of A into shared memory
-    int a_col = t * TILE_DIM + tx;
-    if (row < M && a_col < K) {
-      As[ty][tx] = A[static_cast<size_t>(row) * K + a_col];
-    } else {
-      As[ty][tx] = 0.0f;
-    }
-
-    // Load tile of B into shared memory
-    int b_row = t * TILE_DIM + ty;
-    if (b_row < K && col < N) {
-      Bs[ty][tx] = B[static_cast<size_t>(b_row) * N + col];
-    } else {
-      Bs[ty][tx] = 0.0f;
-    }
-
-    __syncthreads();
-
-// Compute partial dot product for this tile
-#pragma unroll
-    for (int k = 0; k < TILE_DIM; ++k) {
-      sum += As[ty][k] * Bs[k][tx];
-    }
-
-    __syncthreads();
-  }
-
-  // Write result
-  if (row < M && col < N) {
-    C[static_cast<size_t>(row) * N + col] = sum;
-  }
-}
-
-extern "C" void launch_matmul_kernel(const float *A, const float *B, float *C,
-                                     int M, int K, int N, int grid_x,
-                                     int grid_y, int block_dim) {
-  // Override caller's grid/block with optimal tiled configuration
-  dim3 grid((N + TILE_DIM - 1) / TILE_DIM, (M + TILE_DIM - 1) / TILE_DIM);
-  dim3 block(TILE_DIM, TILE_DIM);
-  matmul_kernel<<<grid, block>>>(A, B, C, M, K, N);
-}
+// (matmul_kernel + launch_matmul_kernel removidos — zero callers; GEMMs densos
+// vão por cuBLAS em Tensor::matmul/matmul_nt.)
 
 __global__ void transpose2d_kernel(float *out, const float *in, int rows,
                                    int cols) {
@@ -983,26 +926,6 @@ extern "C" void launch_squared_relu_backward_kernel(float *in_grad,
   const int blocks = (n + threads - 1) / threads;
   squared_relu_backward_kernel<<<blocks, threads>>>(in_grad, grad_out,
                                                      pre_activation, n);
-}
-
-__global__ void kaiming_uniform_kernel(float *data, int n, float limit,
-                                       unsigned long long seed) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    unsigned long long x = seed + idx;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    float r = (float)(x % 1000000) / 1000000.0f;
-    data[idx] = -limit + 2.0f * limit * r;
-  }
-}
-
-extern "C" void launch_kaiming_uniform_kernel(float *out, int n, float limit,
-                                              unsigned long long seed) {
-  int threads = 256;
-  int blocks = (n + threads - 1) / threads;
-  kaiming_uniform_kernel<<<blocks, threads>>>(out, n, limit, seed);
 }
 
 __global__ void clamp_kernel(float *out, const float *in, float min_val,
@@ -1619,50 +1542,6 @@ extern "C" void launch_gqa_cached_attention_decode_kernel(
   gqa_cached_attention_decode_kernel<<<grid, threads, shared_bytes>>>(
       q_flat, key_cache, value_cache, out, cached_tokens, d_model, n_heads,
       n_kv_heads, head_dim, kv_group_size, theta);
-}
-
-// -------------------------------------------------------------------------
-// MoE Top-K Kernel (Simplified for k=2)
-// -------------------------------------------------------------------------
-__global__ void moe_topk_kernel(const float *logits, float *weights,
-                                float *indices, int batch, int num_experts,
-                                int k) {
-  int b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b < batch) {
-    float max1 = -1e9f;
-    float max2 = -1e9f;
-    int idx1 = 0;
-    int idx2 = 1;
-
-    for (int e = 0; e < num_experts; ++e) {
-      float val = logits[b * num_experts + e];
-      if (val > max1) {
-        max2 = max1;
-        idx2 = idx1;
-        max1 = val;
-        idx1 = e;
-      } else if (val > max2) {
-        max2 = val;
-        idx2 = e;
-      }
-    }
-
-    // Softmax on top-2
-    float sum = expf(max1 - max1) + expf(max2 - max1);
-    weights[b * k + 0] = expf(max1 - max1) / sum;
-    weights[b * k + 1] = expf(max2 - max1) / sum;
-    indices[b * k + 0] = (float)idx1;
-    indices[b * k + 1] = (float)idx2;
-  }
-}
-
-extern "C" void launch_moe_topk_kernel(const float *logits, float *weights,
-                                       float *indices, int batch,
-                                       int num_experts, int k) {
-  int threads = 256;
-  int blocks = (batch + threads - 1) / threads;
-  moe_topk_kernel<<<blocks, threads>>>(logits, weights, indices, batch,
-                                       num_experts, k);
 }
 
 // =====================================================================

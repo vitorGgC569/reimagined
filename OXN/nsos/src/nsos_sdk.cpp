@@ -1060,11 +1060,17 @@ public:
                                     d_seen_, d_control_,
                                     suppress_control ? 1 : 0, penalty, d_result_);
         if (cudaGetLastError() != cudaSuccess) return false;
+        // D2H de 4 bytes por token no staging PINNED (h_result_): memoria
+        // pageable forca o driver a passar por um buffer intermediario; pinned
+        // faz DMA direto — no caminho por-token do decode isso remove uma copia
+        // extra por passo (item do estudo CuPy).
         int token = options.eos_token_id;
-        if (cudaMemcpy(&token, d_result_, sizeof(int),
+        int* dst = h_result_ ? h_result_ : &token;
+        if (cudaMemcpy(dst, d_result_, sizeof(int),
                        cudaMemcpyDeviceToHost) != cudaSuccess) {
             return false;
         }
+        if (h_result_) token = *h_result_;
         // -1 sentinel: every candidate was masked.  Fall back to the host greedy
         // branch, which scans for the first allowed token then EOS/0 (the GPU
         // kernel cannot reproduce that scan), so behaviour matches exactly.
@@ -1085,6 +1091,12 @@ private:
             (void)cudaGetLastError();
             free_all();
             return false;
+        }
+        // Staging host PINNED para o D2H por-token (opcional: falha degrada
+        // para o caminho pageable via &token, nunca aborta o sampler).
+        if (cudaMallocHost(&h_result_, sizeof(int)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            h_result_ = nullptr;
         }
         cudaMemset(d_repeated_, 0, bytes);
         cudaMemset(d_control_, 0, bytes);
@@ -1108,8 +1120,10 @@ private:
         if (d_seen_) cudaFree(d_seen_);
         if (d_control_) cudaFree(d_control_);
         if (d_result_) cudaFree(d_result_);
+        if (h_result_) cudaFreeHost(h_result_);
         d_repeated_ = d_seen_ = d_control_ = nullptr;
         d_result_ = nullptr;
+        h_result_ = nullptr;
         vocab_ = 0;
         control_built_ = false;
         marked_count_ = 0;
@@ -1118,6 +1132,7 @@ private:
     unsigned char* d_seen_ = nullptr;
     unsigned char* d_control_ = nullptr;
     int* d_result_ = nullptr;
+    int* h_result_ = nullptr;  // pinned staging p/ o D2H por-token
     int vocab_ = 0;
     bool control_built_ = false;
     size_t marked_count_ = 0;

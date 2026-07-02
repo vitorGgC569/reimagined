@@ -13,9 +13,6 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
-extern "C" void launch_matmul_kernel(const float *A, const float *B, float *C,
-                                     int M, int K, int N, int grid_x,
-                                     int grid_y, int block_dim);
 #endif
 
 namespace nsos {

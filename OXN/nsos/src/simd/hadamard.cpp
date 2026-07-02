@@ -1,4 +1,4 @@
-#include "simd_dispatch.h"
+// (simd_dispatch.h removido — include vestigial; este arquivo nao usava nada dele)
 #include <cmath>
 #include <cstring>
 #include <stdexcept>

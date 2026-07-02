@@ -55,23 +55,6 @@ void launch_adamw_update_kernel(float *weights, const float *grad, float *m,
 // New Phase 5 Kernels
 void launch_relu_kernel(float *out, const float *in, int n);
 
-// LEARN C1 (2026-05-16): FlashAttention-2 forward kernel for GQA
-// causal self-attention.  See src/cuda/flash_attention.cu for the
-// full algorithm description.  Strides:
-//   Q, O: [seq_len, num_heads,    head_dim]
-//   K, V: [seq_len, num_kv_heads, head_dim]
-//   kv_group_size = num_heads / num_kv_heads (GQA mapping)
-// scale should be 1/sqrt(head_dim) at call time (caller pre-applies).
-//
-// Opt-in via NSOS_USE_FLASH_ATTENTION=1.  Default keeps the existing
-// gqa_causal_attention_kernel which materializes attention rows in
-// shared memory (works for seq_len <= 1024 with head_dim <= 64).
-void launch_flash_attention_kernel(const float* Q, const float* K,
-                                    const float* V, float* O,
-                                    int seq_len, int num_heads,
-                                    int num_kv_heads, int head_dim,
-                                    int kv_group_size, float scale);
-
 // AUDIT #6 + LEARN B3 (2026-05-16): cast FP32 -> low-precision in
 // place for mixed-precision matmul.  mode=1 -> BF16, mode=2 -> FP16.
 // Output buffer must be `n * 2` bytes pre-allocated by the caller.
@@ -154,12 +137,8 @@ void launch_multi_tensor_adamw(float *const *w, float *const *g,
                                float beta1, float beta2, float bc1, float bc2,
                                float lr, float eps, float weight_decay);
 
-void launch_kaiming_uniform_kernel(float *out, int n, float limit,
-                                   unsigned long long seed);
 void launch_check_stability_kernel(int *d_found_issue, const float *in,
                                    float max_val, int n);
-void launch_moe_topk_kernel(const float *logits, float *weights, float *indices,
-                            int batch, int num_experts, int k);
 
 // Decode-time greedy token selection on-device (#2 GPU sampler, greedy path).
 // argmax over allowed tokens with repetition penalty, mirroring the host greedy

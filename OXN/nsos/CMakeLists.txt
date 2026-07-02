@@ -205,7 +205,6 @@ if (NSOS_ENABLE_CUDA)
             src/cuda/mamba_kernels.cu
             src/cuda/moe_kernels.cu
             src/cuda/bitnet_kernels.cu
-            src/cuda/flash_attention.cu
             src/cuda/kan_kernels.cu
             src/cuda/sparse_attention_kernels.cu
             src/cuda/attention_train_kernels.cu

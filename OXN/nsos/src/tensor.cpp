@@ -934,8 +934,11 @@ Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev,
 
 Tensor Tensor::xavier_uniform(const std::vector<int>& s, Device dev) {
     Tensor t(s, dev);
-    float fan_in = s.empty() ? 1.0f : static_cast<float>(s.front());
-    float fan_out = s.size() > 1 ? static_cast<float>(s.back()) : fan_in;
+    // Pesos são [out, in] row-major: fan_out = s.front(), fan_in = s.back().
+    // (Os rótulos estavam trocados; sem efeito numérico — a fórmula de Xavier
+    // usa fan_in + fan_out simetricamente — corrigido por clareza.)
+    float fan_out = s.empty() ? 1.0f : static_cast<float>(s.front());
+    float fan_in = s.size() > 1 ? static_cast<float>(s.back()) : fan_out;
     float bound = std::sqrt(6.0f / std::max(fan_in + fan_out, 1.0f));
     std::uniform_real_distribution<float> dist(-bound, bound);
     float* dst = t.data();
@@ -1002,6 +1005,7 @@ Tensor Tensor::add(const Tensor& other) const {
         }
     }
 #endif
+    warn_host_fallback_once("add(broadcast nao-padrao)", device);
     TensorIterator iter(result, *this, other);
     iter.parallel_for_each([](float a, float b) { return a + b; });
     return result;
@@ -1020,6 +1024,7 @@ Tensor Tensor::sub(const Tensor& other) const {
         return result;
     }
 #endif
+    warn_host_fallback_once("sub(broadcast nao-padrao)", device);
     TensorIterator iter(result, *this, other);
     iter.parallel_for_each([](float a, float b) { return a - b; });
     return result;
@@ -1048,6 +1053,7 @@ Tensor Tensor::mul(const Tensor& other) const {
         }
     }
 #endif
+    warn_host_fallback_once("mul(broadcast nao-padrao)", device);
     TensorIterator iter(result, *this, other);
     iter.parallel_for_each([](float a, float b) { return a * b; });
     return result;

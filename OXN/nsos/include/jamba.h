@@ -190,7 +190,6 @@ public:
   int num_experts, top_k;
   float aux_loss_coef;
   std::vector<float> expert_loads;
-  float compute_aux_loss();
   // ── Differentiable Switch-Transformer load-balancing aux loss ────────────
   // The legacy load balancing (trainer.cpp apply_moe_aux_regularization) adds a
   // constant per expert row to the gate gradient — NOT the gradient of any loss,
