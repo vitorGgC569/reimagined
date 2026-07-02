@@ -800,6 +800,62 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
 #endif
 }
 
+Tensor matmul_nt(const Tensor& a, const Tensor& b_rowmajor) {
+    // Contrato estrito: b é uma matriz de pesos rank-2 [n, k] (o caso BitLinear/
+    // KAN); a é [..., m, k].  Resultado [..., m, n].
+    if (b_rowmajor.shape.size() != 2 || a.shape.size() < 2 ||
+        a.shape.back() != b_rowmajor.shape[1]) {
+        throw std::runtime_error("matmul_nt expects a[..,m,k] and b[n,k]");
+    }
+#ifdef USE_CUDA
+    // Só o caminho FP32 GPU usa OP_T nativo; precisão mista (BF16/FP16) e CPU
+    // caem no caminho existente (transpose materializada + matmul) — byte-
+    // compatível com o comportamento anterior nesses modos.
+    if (a.get_device() == Device::GPU && b_rowmajor.get_device() == Device::GPU &&
+        a.size > 0 && b_rowmajor.size > 0 && gpu_blas_supported() &&
+        matmul_precision_mode() == 0) {
+        const int rank_a = static_cast<int>(a.shape.size());
+        const int m = a.shape[rank_a - 2];
+        const int k = a.shape[rank_a - 1];
+        const int n = b_rowmajor.shape[0];
+        std::vector<int> out_dims = a.shape.dims;
+        out_dims.back() = n;
+        // GEMM beta=0 sobrescreve 100% de C.
+        Tensor result = Tensor::uninitialized(out_dims, Device::GPU);
+        const int batch = a.size / (m * k);
+        // Row-major C[m,n] = A[m,k] · B[n,k]ᵀ.  Em termos column-major do
+        // cuBLAS (mesma memória): C_cm[n,m] = OP_T(B_mem, ld=k)[n,k] ·
+        // OP_N(A_mem, ld=k)[k,m].  B é compartilhado entre batches (stride 0).
+        cublasHandle_t handle = cublas_handle();
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublas_check(
+            cublasSgemmStridedBatched(handle,
+                                      CUBLAS_OP_T,
+                                      CUBLAS_OP_N,
+                                      n,
+                                      m,
+                                      k,
+                                      &alpha,
+                                      b_rowmajor.raw_data(),
+                                      k,
+                                      0LL,
+                                      a.raw_data(),
+                                      k,
+                                      static_cast<long long>(m) * k,
+                                      &beta,
+                                      result.raw_data(),
+                                      n,
+                                      static_cast<long long>(m) * n,
+                                      batch),
+            "cublasSgemmStridedBatched(NT)");
+        sync_cuda();
+        return result;
+    }
+#endif
+    return a.matmul(b_rowmajor.transpose());
+}
+
 float tensor_abs_mean(const Tensor& t) {
     if (t.size <= 0) {
         return 0.0f;

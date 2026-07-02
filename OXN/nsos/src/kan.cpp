@@ -114,8 +114,8 @@ Tensor BitFastKANLayer::forward(const Tensor& x) {
         saved_base_eff_ = bw;
         saved_rbf_eff_ = rw;
     }
-    Tensor base = saved_input_.matmul(bw.transpose());
-    Tensor enriched = saved_basis_.matmul(rw.transpose());
+    Tensor base = matmul_nt(saved_input_, bw);
+    Tensor enriched = matmul_nt(saved_basis_, rw);
     Tensor output = base.add(enriched).add(bias.data);
     return x.shape.size() == 2 ? output : output.reshape(output_shape);
 }

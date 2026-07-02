@@ -330,7 +330,7 @@ Tensor BitLinear::forward(const Tensor &input) {
     }
     if (training_mode_) saved_linear_input = linear_input.clone();
 
-    Tensor output = linear_input.matmul(weight.data.transpose());
+    Tensor output = matmul_nt(linear_input, weight.data);  // A·Wᵀ sem materializar Wᵀ
     if (loqa.active) {
       Tensor loqa_out = loqa.apply(linear_input);
       if (loqa_out.size > 0) {
@@ -390,7 +390,7 @@ Tensor BitLinear::forward(const Tensor &input) {
       weight_scale = tensor_abs_mean(weight.data) + 1e-8f;  // absmean (BitNet b1.58)
       Tensor w_eff = qat_fake_quant_ternary(weight.data, weight_scale);       // [out,in]
       Tensor x_dq = qat_fake_quant_activations(linear_input, precision_bits);  // [M,in]
-      Tensor pre = x_dq.matmul(w_eff.transpose());                            // [M,out]
+      Tensor pre = matmul_nt(x_dq, w_eff);                                    // [M,out]
       if (training_mode_) {
         // Backward state — only needed for the STE backward during training.
         qat_gpu_active_ = true;
@@ -470,7 +470,7 @@ Tensor BitLinear::forward(const Tensor &input) {
 #endif
 
     const Tensor& effective_weight = materialize_weight_for_device(Device::GPU);
-    Tensor output = linear_input.matmul(effective_weight.transpose());
+    Tensor output = matmul_nt(linear_input, effective_weight);  // OP_T nativo, sem cópia
     if (loqa.active) {
       Tensor loqa_out = loqa.apply(linear_input);
       if (loqa_out.size > 0) {

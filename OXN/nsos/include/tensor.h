@@ -34,6 +34,14 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
 class Tensor;
 float tensor_abs_mean(const Tensor& t);
 
+// C = A · Bᵀ com B [n, k] rank-2 SEM materializar a transposta.  No GPU usa
+// cublas OP_T direto (a leitura integral mostrou que TODO forward de BitLinear
+// fazia weight.transpose() — uma cópia completa da matriz por camada por token
+// — só para alimentar um matmul que o cuBLAS resolveria com um flag).  CPU e
+// modo de precisão mista mantêm o caminho antigo (transpose + matmul) — o CPU
+// está bom como está e o BF16 é opt-in minoritário.
+Tensor matmul_nt(const Tensor& a, const Tensor& b_rowmajor);
+
 // (auditoria #25/#26) Observabilidade e controle do pool GPU.
 struct PoolStats {
     size_t cached_bytes = 0;   // soma das free-lists
