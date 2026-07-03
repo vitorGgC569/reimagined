@@ -1143,15 +1143,25 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
         "with -DNSOS_CUDA_PTDS=ON)";
     return Tensor();
 #else
-    // GPU-first DEFAULT ON in PTDS builds (the build flag already states the
-    // intent); NSOS_CUDA_GRAPH_DECODE=0 opts out.  Guarded adoption below
-    // keeps this safe: any capture problem falls back to eager permanently.
+    // SHELVED (2026-07-03): end-to-end decode-graph capture is disabled.
+    // The captured decode step reproduced eager for the single-token/single-
+    // layer probe but exhibits an elusive optimizer-dependent illegal memory
+    // access on the full MoE + N-state hybrid (traced with compute-sanitizer
+    // to the cached-attention decode reading a garbage position/count that is
+    // valid under -O0/instrumented builds but garbage under -O3 — a UB
+    // heisenbug not resolvable without a debugger on the exact failing binary).
+    // The decode kernels have been reverted to their pos_dev-free form, so the
+    // graph cannot bake the advancing KV position; returning empty routes the
+    // caller to the (correct) eager forward_ids.  The validated GPU-first wins
+    // (N-state device step, MoE device decode, D2H bench) are unaffected.
+    // Opt in for continued debugging ONLY with NSOS_CUDA_GRAPH_DECODE=1.
     static const bool env_enabled = [] {
         const char* v = std::getenv("NSOS_CUDA_GRAPH_DECODE");
-        return v == nullptr || v[0] != '0';
+        return v != nullptr && v[0] == '1';
     }();
     if (!env_enabled) {
-        decode_graph_status_ = "disabled: NSOS_CUDA_GRAPH_DECODE=0";
+        decode_graph_status_ = "shelved: eager fallback (set "
+                               "NSOS_CUDA_GRAPH_DECODE=1 to debug)";
         return Tensor();
     }
     if (decode_graph_disabled_) return Tensor();
@@ -1311,7 +1321,6 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
     // Detach to a uniquely-owned cache now, before BeginCapture, so recording
     // sees a stable buffer and never reallocs.
     attn_layers([](Attention& a) { a.make_kv_cache_unique(); });
-    attn_layers([&](Attention& a) { a.set_decode_graph_pos(dg.d_pos); });
     cudaGraph_t graph = nullptr;
     bool capture_open = false;
     // Make the tensor pool capture-safe for the whole recording: no
@@ -1366,14 +1375,12 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
         // reached Captured, so nothing will replay against those buffers.
         gpu_pool_end_capture();
         gpu_pool_release_capture();
-        attn_layers([](Attention& a) { a.set_decode_graph_pos(nullptr); });
         restore_session(pre_capture);
         disable(std::string("capture failed: ") + e.what());
         return Tensor();
     }
     // The hooks only influence what gets RECORDED; clear them so any later
     // eager forward (e.g. after a mid-generation disable) behaves normally.
-    attn_layers([](Attention& a) { a.set_decode_graph_pos(nullptr); });
 
     // Capture only RECORDS — this launch EXECUTES the captured step.
     if (cudaGraphLaunch(dg.exec, cudaStreamPerThread) != cudaSuccess) {
@@ -3933,8 +3940,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         cached_tokens_,
                         n_kv_heads,
                         head_dim,
-                        theta,
-                        nullptr);
+                        theta);
                     launch_gqa_cached_attention_decode_kernel(
                         q_flat.raw_data() + static_cast<size_t>(batch) * q_row_stride,
                         key_cache_buffer_.raw_data() + static_cast<size_t>(batch) * cache_row_stride,
@@ -3946,9 +3952,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         n_kv_heads,
                         head_dim,
                         kv_group_size,
-                        theta,
-                        nullptr,
-                        0);
+                        theta);
                 }
                 ++cached_tokens_;
 
@@ -4233,10 +4237,6 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         if (streaming_inference_ && seq_len == 1) {
             ensure_kv_cache_capacity(cached_tokens_ + 1, Device::GPU);
             Tensor output_gpu({seq_len, d_model}, Device::GPU);
-            // decode_graph_pos_dev_: set only while JambaModel records the
-            // decode CUDA graph — the kernels then read the position from
-            // device memory (host args freeze at capture) and the decode
-            // kernel sizes its shared scratch for the full cache capacity.
             launch_gqa_append_kv_cache_kernel(
                 kv_flat.raw_data(),
                 key_cache_buffer_.raw_data(),
@@ -4244,8 +4244,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 cached_tokens_,
                 n_kv_heads,
                 head_dim,
-                theta,
-                decode_graph_pos_dev_);
+                theta);
             launch_gqa_cached_attention_decode_kernel(
                 q_flat.raw_data(),
                 key_cache_buffer_.raw_data(),
@@ -4257,9 +4256,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 n_kv_heads,
                 head_dim,
                 kv_group_size,
-                theta,
-                decode_graph_pos_dev_,
-                decode_graph_pos_dev_ != nullptr ? cache_capacity_tokens_ : 0);
+                theta);
             ++cached_tokens_;
 
             cudaError_t status = cudaGetLastError();

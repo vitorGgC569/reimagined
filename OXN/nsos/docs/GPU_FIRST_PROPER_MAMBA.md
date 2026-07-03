@@ -65,7 +65,25 @@ Do `docs/GPU_OPTIMIZATION_ANALYSIS.md`: MoE top-k via `std::partial_sort` no hos
 ausência de pinned memory para H2D; CUDA Graphs para shapes estáticos weight-tied;
 `persistent_kernel` stub a remover. Rastreados para PRs próprios.
 
-## CUDA-graph decode fim-a-fim — FEITO, GPU-FIRST (validação T4)
+## CUDA-graph decode fim-a-fim — ARQUIVADO (2026-07-03)
+
+O decode via CUDA graph fim-a-fim foi **arquivado** (`forward_ids_decode_graph`
+desabilitado por padrão → fallback eager; kernels de atenção revertidos à forma
+sem `pos_dev`).  Ao validá-lo no T4 (e reproduzido localmente no sm_61 sob
+`compute-sanitizer`), a falha foi rastreada a um **bug PRÉ-EXISTENTE fora do
+código do graph**: o decode single-token *streaming* de um híbrido (mixer Mamba
++ atenção GQA) lê posição/contagem de KV **lixo** nos kernels de append/decode
+da atenção — OOB válido sob `-O0`/instrumentado, lixo sob `-O3` (heisenbug de UB
+dependente do otimizador).  Reproduz com o graph revertido, com `NSOS_MAMBA_
+GPU_STEP=0`, com MoE off e com N-state off → **independente de toda mudança
+GPU-first deste branch**; afeta só o decode de INFERÊNCIA de híbridos (TREINO
+não é afetado).  Conserto exige debugger no binário que falha — rastreado como
+bug separado.  **Os ganhos GPU-first VALIDADOS por paridade (T4 + sm_61 local)
+permanecem**: passo Mamba diagonal E N-state device-resident
+(`test_gpu_parity_mamba_proper_stream`, `_nstate_stream`), MoE device
+(`test_gpu_parity_moe_router`), medição D2H pinned vs pageable.
+
+### (histórico) CUDA-graph decode fim-a-fim — mecanismo implementado
 
 `JambaModel::forward_ids_decode_graph` captura UM forward single-token num
 CUDA graph e o replay-a por token: a cascata de launches por token vira 1

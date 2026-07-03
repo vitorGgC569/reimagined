@@ -609,8 +609,13 @@ private:
         // persists across every pooled reuse): hint the driver that this UM
         // block is accessed by host and device so pages stay migratable rather
         // than faulting on host access (sm_61 + Windows lacks demand paging).
+        // NSOS_NO_MEMADVISE opts out: some environments (notably running under
+        // compute-sanitizer) reject cudaMemAdvise with "invalid device
+        // ordinal", flooding the log — the advise is a perf hint, never a
+        // correctness requirement, so skipping it is safe.
+        static const bool skip_advise = std::getenv("NSOS_NO_MEMADVISE") != nullptr;
         int device_id = 0;
-        if (cudaGetDevice(&device_id) == cudaSuccess) {
+        if (!skip_advise && cudaGetDevice(&device_id) == cudaSuccess) {
 #if CUDART_VERSION >= 13000
             cudaMemLocation loc_dev;
             loc_dev.type = cudaMemLocationTypeDevice;

@@ -314,21 +314,10 @@ void launch_batched_gqa_causal_attention_kernel(const float *q_flat,
                                                 int head_dim,
                                                 int kv_group_size,
                                                 float theta);
-// pos_dev: optional DEVICE pointer holding the current cache position.  When
-// non-null the kernels read the position from device memory instead of the
-// host `cache_row`/`cached_tokens` arguments — required for CUDA-graph decode,
-// where host kernel arguments are frozen at capture time but the position
-// advances every replay.  Passing nullptr preserves the historical host-arg
-// behaviour byte-for-byte.
 void launch_gqa_append_kv_cache_kernel(const float *kv_flat, float *key_cache,
                                        float *value_cache, int cache_row,
                                        int n_kv_heads, int head_dim,
-                                       float theta, const int *pos_dev);
-// shared_capacity_tokens: when > 0, sizes the dynamic shared memory for that
-// many cache slots instead of the current `cached_tokens` — required with
-// pos_dev (the shared size is a launch parameter, also frozen in a graph, so
-// it must cover the maximum position the graph will ever replay at).  0 keeps
-// the historical exact-fit sizing.
+                                       float theta);
 void launch_gqa_cached_attention_decode_kernel(const float *q_flat,
                                                const float *key_cache,
                                                const float *value_cache,
@@ -336,8 +325,7 @@ void launch_gqa_cached_attention_decode_kernel(const float *q_flat,
                                                int d_model, int n_heads,
                                                int n_kv_heads, int head_dim,
                                                int kv_group_size,
-                                               float theta, const int *pos_dev,
-                                               int shared_capacity_tokens);
+                                               float theta);
 
 // ── CUDA Graphs (opt-in NSOS_CUDA_GRAPH) ─────────────────────────────────────
 // Decode-step launch-overhead amortization: capture the per-token kernel sequence

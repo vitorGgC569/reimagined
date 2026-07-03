@@ -182,85 +182,32 @@ print(f"D2H 4 bytes x {res['iters']}: pageable={res['pageable_us']:.2f} us/copia
       f"ganho={res['pageable_us']/max(res['pinned_us'],1e-9):.2f}x")
 """))
 
-cells.append(md("""## 5 — tok/s: decode eager vs CUDA graph (ARQUITETURA COMPLETA)
+cells.append(md("""## 5 — Decode-graph fim-a-fim: ARQUIVADO (shelved)
 
-Modelo híbrido GPU-first: Mamba-2 **N-state** (passo device fundido) + atenção
-GQA (camadas 2/4) + **MoE-4 top-2** (caminho denso single-row device — pesos
-top-k mascarados lidos na GPU, zero D2H por token).  A seleção do token é o
-MESMO argmax host nos dois braços — o que muda é só o forward por token
-(cascata de launches vs 1 `cudaGraphLaunch`).  Paridade de tokens é verificada
-in-loco além do gate C++."""))
-cells.append(code("""import os, time
-import numpy as np
-# gates de env ANTES de qualquer uso do modelo (cacheiam na 1a leitura)
-os.environ['NSOS_MAMBA_GPU_STEP'] = '1'
-os.environ['NSOS_CUDA_GRAPH_DECODE'] = '1'
-import nsos_ext as nsos
+O decode via CUDA graph fim-a-fim está **desabilitado por padrão**
+(`forward_ids_decode_graph` retorna vazio → fallback eager).  Ao trazê-lo à
+tona, o `compute-sanitizer` no binário exato rastreou a falha até um **bug
+PRÉ-EXISTENTE que NÃO está no código do graph**: o decode single-token
+*streaming* de um modelo híbrido (mixer Mamba + atenção GQA) lê uma
+posição/contagem de KV **lixo** nos kernels de append/decode da atenção — um
+out-of-bounds válido sob `-O0`/instrumentado mas lixo sob `-O3` (heisenbug de
+UB dependente do otimizador).  Reproduz com o decode-graph revertido, com o
+passo Mamba GPU OFF, com MoE OFF e com N-state OFF — ou seja, é **independente
+de toda mudança GPU-first deste branch**, e só afeta o decode de INFERÊNCIA de
+híbridos (o TREINO, forward+backward de sequência completa, não é afetado).
 
-nsos.set_seed(1234)
-c = nsos.ModelConfig()
-c.num_layers = 4; c.d_model = 128; c.vocab_size = 512
-c.n_heads = 4; c.n_kv_heads = 2
-c.attention_period = 2; c.attention_slot = 1
-# ARQUITETURA COMPLETA sob o graph (GPU-first): N-state Mamba (default do
-# config) via passo device fundido + MoE via caminho denso single-row
-# device-resident (pesos top-k mascarados lidos NA GPU).
-c.use_moe = True; c.num_experts = 4; c.num_experts_per_token = 2
-c.moe_period = 2; c.moe_slot = 0
-c.use_ttt = False
-c.max_context_tokens = 1024; c.use_cuda = True
-model = nsos.JambaModel(c, nsos.Device.GPU); model.to(nsos.Device.GPU)
-model.set_training_mode(False)
-
-PROMPT = [7, 21, 93, 402, 11, 88, 300, 5]
-DECODE = 256
-RESERVE = len(PROMPT) + DECODE + 8
-
-def greedy(logits):
-    arr = logits.cpu().numpy()
-    row = arr.reshape(-1, arr.shape[-1])[-1]
-    return int(row.argmax())
-
-def run(use_graph):
-    model.reset_session()
-    model.set_streaming_inference(True)
-    model.reserve_kv_cache(RESERVE, nsos.Device.GPU, 1)
-    logits = model.forward_ids(PROMPT, None)
-    toks = []
-    tok = greedy(logits)
-    t_steady = None
-    for s in range(DECODE):
-        toks.append(tok)
-        if use_graph:
-            g = model.forward_ids_decode_graph(tok)
-            logits = g if g.size > 0 else model.forward_ids([tok], None)
-        else:
-            logits = model.forward_ids([tok], None)
-        if s == 7:  # descarta warm-up + captura (graph) / aquecimento (eager)
-            t_steady = time.perf_counter()
-        tok = greedy(logits)
-    elapsed = time.perf_counter() - t_steady
-    status = model.decode_graph_status()
-    model.set_streaming_inference(False)
-    return toks, (DECODE - 8) / elapsed, status
-
-toks_eager, tps_eager, _ = run(False)
-toks_graph, tps_graph, status = run(True)
-assert toks_eager == toks_graph, f'PARIDADE QUEBROU: eager={toks_eager[:12]} graph={toks_graph[:12]}'
-print(f'status do graph : {status}')
-print(f'tokens          : {len(toks_graph)} identicos nos 2 bracos')
-print(f'eager           : {tps_eager:8.1f} tok/s')
-print(f'graph           : {tps_graph:8.1f} tok/s')
-print(f'SPEEDUP         : {tps_graph/tps_eager:8.2f}x')
-if status != 'active':
-    print('ATENCAO: graph nao ativou — speedup acima nao mede o graph; status explica o porque')
-"""))
+Por isso NÃO há célula de tok/s aqui (ela dispararia o bug pré-existente).  Os
+ganhos GPU-first VALIDADOS por paridade acima (passo N-state device, MoE
+device) permanecem.  O gate `test_gpu_parity_decode_graph` agora só afirma o
+contrato do arquivamento (skip).  Consertar o bug de streaming precisa de um
+debugger no binário que falha."""))
 
 cells.append(md("""## 6 — O que reportar de volta
 
-Cole no chat: (a) a linha de cada gate da célula 3; (b) as latências D2H da
-célula 4; (c) `status`, `tok/s` e `SPEEDUP` da célula 5.  Se algum gate falhar
-sob PTDS, isso é O achado (semântica de stream) — não seguir para os benches."""))
+Cole no chat: (a) a linha de cada gate da célula 3 (todos devem PASS sob PTDS —
+inclusive `test_gpu_parity_mamba_nstate_stream` e `moe_router`); (b) as
+latências D2H da célula 4 (pageable vs pinned).  Se algum gate falhar sob PTDS,
+isso é O achado (semântica de stream)."""))
 
 nb = {
     "cells": cells,

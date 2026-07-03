@@ -105,13 +105,6 @@ public:
   int num_query_heads() const { return n_heads; }
   int num_kv_heads() const { return n_kv_heads; }
 
-  // ── CUDA-graph decode hooks (set by JambaModel around graph capture) ──
-  // While pos_dev is non-null, the streaming single-token GPU decode kernels
-  // read the KV position from *pos_dev (device memory) instead of the frozen
-  // host argument, and size their shared scratch for the full cache capacity.
-  // pos_dev must outlive the captured graph.  nullptr (default) keeps the
-  // eager path byte-identical.
-  void set_decode_graph_pos(const int* pos_dev) { decode_graph_pos_dev_ = pos_dev; }
   // Detach the KV cache to a uniquely-owned buffer if a session snapshot is
   // sharing it (use_count > 1).  ensure_kv_cache_capacity() reallocates
   // copy-on-write when the buffer is shared; calling this BEFORE a CUDA-graph
@@ -128,7 +121,6 @@ public:
   int kv_cache_capacity() const { return cache_capacity_tokens_; }
 
 private:
-  const int* decode_graph_pos_dev_ = nullptr;
   int d_model;
   int n_heads;
   int n_kv_heads;

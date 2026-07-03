@@ -1366,18 +1366,11 @@ extern "C" void launch_batched_gqa_causal_attention_kernel(const float *q_flat,
 __global__ void gqa_append_kv_cache_kernel(const float *kv_flat, float *key_cache,
                                            float *value_cache, int cache_row,
                                            int n_kv_heads, int head_dim,
-                                           float theta, const int *pos_dev) {
+                                           float theta) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int kv_dim = n_kv_heads * head_dim;
   if (idx >= kv_dim) {
     return;
-  }
-
-  // CUDA-graph decode: the position advances every replay, so it must come
-  // from device memory (host args are frozen at capture).  nullptr keeps the
-  // historical host-arg behaviour byte-for-byte.
-  if (pos_dev != nullptr) {
-    cache_row = *pos_dev;
   }
 
   const int head = idx / head_dim;
@@ -1420,15 +1413,12 @@ extern "C" void launch_gqa_append_kv_cache_kernel(const float *kv_flat,
                                                   int cache_row,
                                                   int n_kv_heads,
                                                   int head_dim,
-                                                  float theta,
-                                                  const int *pos_dev) {
+                                                  float theta) {
   const int kv_dim = n_kv_heads * head_dim;
   const int threads = 256;
   const int blocks = (kv_dim + threads - 1) / threads;
-  gqa_append_kv_cache_kernel<<<blocks, threads>>>(kv_flat, key_cache,
-                                                  value_cache, cache_row,
-                                                  n_kv_heads, head_dim, theta,
-                                                  pos_dev);
+  gqa_append_kv_cache_kernel<<<blocks, threads>>>(
+      kv_flat, key_cache, value_cache, cache_row, n_kv_heads, head_dim, theta);
 }
 
 __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
@@ -1441,21 +1431,13 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
                                                    int n_kv_heads,
                                                    int head_dim,
                                                    int kv_group_size,
-                                                   float theta,
-                                                   const int *pos_dev) {
+                                                   float theta) {
   const int head_index = blockIdx.x;
   const int thread_index = threadIdx.x;
   const int kv_dim = n_kv_heads * head_dim;
   const int kv_head = min(head_index / max(kv_group_size, 1), n_kv_heads - 1);
   const int half_dim = head_dim / 2;
   const float scale = rsqrtf(fmaxf(static_cast<float>(head_dim), 1.0f));
-  // CUDA-graph decode: pos_dev holds the position of the token being decoded
-  // (== cached tokens BEFORE this step), which advances every replay while
-  // host kernel args stay frozen at capture.  nullptr keeps the historical
-  // host-arg behaviour byte-for-byte.
-  if (pos_dev != nullptr) {
-    cached_tokens = *pos_dev + 1;
-  }
   const int query_pos = max(cached_tokens - 1, 0);
 
   extern __shared__ float shared_scores[];
@@ -1553,19 +1535,13 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
 extern "C" void launch_gqa_cached_attention_decode_kernel(
     const float *q_flat, const float *key_cache, const float *value_cache,
     float *out, int cached_tokens, int d_model, int n_heads, int n_kv_heads,
-    int head_dim, int kv_group_size, float theta, const int *pos_dev,
-    int shared_capacity_tokens) {
+    int head_dim, int kv_group_size, float theta) {
   const int threads = 128;
   const dim3 grid(n_heads);
-  // Graph mode (pos_dev set) must size the shared scratch for the WHOLE cache
-  // capacity: the shared size is a launch parameter, frozen inside a captured
-  // graph, while the live token count grows each replay.
-  const int shared_tokens =
-      shared_capacity_tokens > 0 ? shared_capacity_tokens : cached_tokens;
-  const size_t shared_bytes = static_cast<size_t>(shared_tokens) * sizeof(float);
+  const size_t shared_bytes = static_cast<size_t>(cached_tokens) * sizeof(float);
   gqa_cached_attention_decode_kernel<<<grid, threads, shared_bytes>>>(
       q_flat, key_cache, value_cache, out, cached_tokens, d_model, n_heads,
-      n_kv_heads, head_dim, kv_group_size, theta, pos_dev);
+      n_kv_heads, head_dim, kv_group_size, theta);
 }
 
 // =====================================================================
