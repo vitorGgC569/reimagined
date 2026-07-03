@@ -984,9 +984,13 @@ int sample_from_host_logits_row(const float* raw,
 
 #ifdef USE_CUDA
 bool gpu_greedy_sampler_enabled() {
+    // GPU-first DEFAULT ON (NSOS_GPU_SAMPLER=0 opts out).  Greedy-only path
+    // that mirrors the host branch exactly and falls back to it on ANY CUDA
+    // error or fully-masked row (-1 sentinel), so the default is safe: worst
+    // case is the historical host behaviour.
     static const bool enabled = [] {
         const char* v = std::getenv("NSOS_GPU_SAMPLER");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return enabled;
 }

@@ -13,14 +13,16 @@ namespace nsos {
 
 namespace {
 
-// Opt-in (NSOS_MAMBA_GPU_STEP): route the proper diagonal single-token decode
-// through the fused on-device step kernel (device-resident SSD state + conv ring,
-// no per-token host round-trip).  Default OFF -> the host step (locally proven
-// byte-identical to the full scan) runs; the GPU step's parity is validated on T4.
+// GPU-first DEFAULT ON (NSOS_MAMBA_GPU_STEP=0 opts out): route the proper
+// single-token decode (diagonal AND N-state) through the fused on-device step
+// kernels (device-resident SSD state + conv ring, no per-token host
+// round-trip).  Parity gates: test_gpu_parity_mamba_proper_stream (diagonal,
+// T4-validated) and test_gpu_parity_mamba_nstate_stream.  The host step
+// remains the =0 escape hatch and the CPU-device path.
 bool mamba_gpu_step_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("NSOS_MAMBA_GPU_STEP");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return enabled;
 }
@@ -1387,6 +1389,52 @@ Tensor Mamba2SSD::forward_proper_nstate_step(const Tensor& u) {
     Tensor Bt = B_proj_->forward(u_flat).reshape({R, H * N});
     Tensor Ct = C_proj_->forward(u_flat).reshape({R, H * N});
     Tensor dt = dt_proj_->forward(u_flat).reshape({R, H});
+
+#ifdef USE_CUDA
+    // Fully on-device N-state step (GPU-first default; NSOS_MAMBA_GPU_STEP=0
+    // opts out) — single sequence.  The H×P×N state + conv ring stay resident
+    // on the GPU across tokens; one fused kernel does conv+N-state
+    // recurrence+readout+gate.  Mirrors the host loop below 1:1
+    // (test_gpu_parity_mamba_nstate_stream) and is CUDA-graph capturable.
+    if (R == 1 && dev == Device::GPU && mamba_gpu_step_enabled()) {
+        const size_t HPN_sz = static_cast<size_t>(H) * P * N;  // == dim * N
+        const int HPN_i = static_cast<int>(HPN_sz);
+        if (!pp_stream_dev_live_) {
+            Tensor h0(std::vector<int>{HPN_i}, Device::CPU);
+            std::memset(h0.data(), 0,
+                        static_cast<size_t>(HPN_i) * sizeof(float));
+            if (pp_stream_state_.size() == HPN_sz) {
+                std::memcpy(h0.data(), pp_stream_state_.data(),
+                            HPN_sz * sizeof(float));
+            }
+            pp_stream_h_dev_ = h0.to(Device::GPU);
+            const int ringlen = std::max(taps * dim, 1);
+            Tensor r0(std::vector<int>{ringlen}, Device::CPU);
+            std::memset(r0.data(), 0,
+                        static_cast<size_t>(ringlen) * sizeof(float));
+            if (taps > 0 &&
+                static_cast<int>(pp_stream_ring_.size()) == taps * dim) {
+                std::memcpy(r0.data(), pp_stream_ring_.data(),
+                            static_cast<size_t>(taps) * dim * sizeof(float));
+            }
+            pp_stream_ring_dev_ = r0.to(Device::GPU);
+            pp_stream_dev_live_ = true;
+        }
+        Tensor gated(std::vector<int>{1, dim}, Device::GPU);
+        cuda::launch_mamba_nstate_step(
+            xv.raw_data(), z.raw_data(), Bt.raw_data(), Ct.raw_data(),
+            dt.raw_data(), A.data.raw_data(), conv_weight_.data.raw_data(),
+            pp_stream_ring_dev_.raw_data(), pp_stream_h_dev_.raw_data(),
+            gated.raw_data(), dim, K, P, N);
+        Tensor projected = out_proj.forward(gated).reshape({1, dim});
+        Tensor skip = u_flat.mul(D.data);
+        Tensor result = projected.add(skip);
+        return rank3 ? result.reshape({1, 1, dim})
+                     : (u.shape.size() == 2 ? result
+                                            : result.reshape({1, 1, dim}));
+    }
+#endif
+
     Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
     Tensor Bt_h = dev == Device::GPU ? Bt.cpu() : Bt;
     Tensor Ct_h = dev == Device::GPU ? Ct.cpu() : Ct;

@@ -673,5 +673,61 @@ void launch_mamba_proper_step(const float *xv, const float *z,
                                             ring, h, gated, dim, K);
 }
 
+// N-state single-token decode step (full Mamba-2).  One thread per channel
+// c = head*P + p; the per-channel N-vector state lives contiguously at
+// h[c*N .. c*N+N-1] (same layout as the host step's (h*P+p)*N + n indexing).
+__global__ void mamba_nstate_step_kernel(
+    const float *__restrict__ xv, const float *__restrict__ z,
+    const float *__restrict__ B_in, const float *__restrict__ C_in,
+    const float *__restrict__ dt, const float *__restrict__ A,
+    const float *__restrict__ convw, float *__restrict__ ring,
+    float *__restrict__ h, float *__restrict__ gated, int dim, int K, int P,
+    int N) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= dim) return;
+
+  float conv_pre = 0.0f;
+  for (int j = 0; j < K; ++j) {
+    const float src = (j < K - 1) ? ring[j * dim + c] : xv[c];
+    conv_pre += convw[c * K + j] * src;
+  }
+  const float xc = conv_pre * (1.0f / (1.0f + expf(-conv_pre)));  // silu
+
+  const int head = c / max(P, 1);
+  const float a_value = mamba_a_eff_dev(A[head]);
+  const float decay = expf(-softplus_device(dt[head]) * a_value);
+  const float *b_row = B_in + head * N;
+  const float *c_row = C_in + head * N;
+  float *h_row = h + static_cast<size_t>(c) * N;
+  float y_acc = 0.0f;
+  for (int n = 0; n < N; ++n) {
+    const float hv = decay * h_row[n] + b_row[n] * xc;
+    h_row[n] = hv;
+    y_acc += hv * c_row[n];
+  }
+  const float gate = z[c] * (1.0f / (1.0f + expf(-z[c])));  // silu(z)
+  gated[c] = y_acc * gate;
+
+  // Advance the conv window (per-channel, race-free; reads above used the
+  // pre-shift ring).
+  for (int s = 0; s + 1 < K - 1; ++s) {
+    ring[s * dim + c] = ring[(s + 1) * dim + c];
+  }
+  if (K - 1 > 0) {
+    ring[(K - 2) * dim + c] = xv[c];
+  }
+}
+
+void launch_mamba_nstate_step(const float *xv, const float *z,
+                              const float *B_in, const float *C_in,
+                              const float *dt, const float *A,
+                              const float *convw, float *ring, float *h,
+                              float *gated, int dim, int K, int P, int N) {
+  const int block = 256;
+  const int grid = (dim + block - 1) / block;
+  mamba_nstate_step_kernel<<<grid, block>>>(xv, z, B_in, C_in, dt, A, convw,
+                                            ring, h, gated, dim, K, P, N);
+}
+
 }  // namespace cuda
 }  // namespace nsos

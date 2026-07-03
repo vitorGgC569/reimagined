@@ -9,10 +9,10 @@
 // capture (position, shared-memory sizing, staging) — precisely the failure
 // class this gate exists to catch.
 //
-// Model: hybrid mamba-proper + GQA attention, no MoE/TTT (their routing is
-// host-synced; the graph path declines them by design).  Requires an
-// NSOS_CUDA_PTDS build — on a legacy-stream build the test SKIPs (exit 0)
-// because default-stream kernel launches cannot be captured.
+// Model: the FULL architecture — Mamba-2 N-state (default) + GQA attention +
+// MoE (dense single-row device decode path).  Requires an NSOS_CUDA_PTDS
+// build — on a legacy-stream build the test SKIPs (exit 0) because
+// default-stream kernel launches cannot be captured.
 // =====================================================================
 #include "gpu_parity_common.h"
 
@@ -71,11 +71,15 @@ int main() {
     mc.n_kv_heads = 2;
     mc.attention_period = 2;  // layers 2 and 4 are attention
     mc.attention_slot = 1;
-    mc.use_moe = false;
+    // FULL architecture under the graph: N-state Mamba (config default) via
+    // the fused device step, and MoE via the dense single-row device decode
+    // path (top-k-masked weights read on the device).
+    mc.use_moe = true;
+    mc.num_experts = 4;
+    mc.num_experts_per_token = 2;
+    mc.moe_period = 2;   // MoE FFN on layers 1 and 3
+    mc.moe_slot = 0;
     mc.use_ttt = false;
-    // Diagonal proper path: the fused GPU step (NSOS_MAMBA_GPU_STEP) covers
-    // it; the N-state decode step is host-side and the graph path declines it.
-    mc.mamba_state_expansion = false;
     mc.max_context_tokens = 256;
     mc.use_cuda = true;
 

@@ -168,6 +168,12 @@ void launch_decode_greedy_argmax(const float *raw, int vocab,
 void launch_moe_topk_mask_kernel(float *weights, int batch, int num_experts,
                                  int k);
 
+// Dense single-row decode accumulation: out[i] += (*scale_dev) * y[i] with
+// the scale read from DEVICE memory at execution time (no host copy of the
+// routing weight -> no per-token D2H; CUDA-graph capturable).
+void launch_moe_scale_accum_row_kernel(float *out, const float *y,
+                                       const float *scale_dev, int n);
+
 // Accumulates per-expert load (sum of router weights across the batch)
 // directly on the device.  `expert_loads[num_experts]` must be
 // pre-zeroed by the caller (cudaMemsetAsync recommended) — kernel uses

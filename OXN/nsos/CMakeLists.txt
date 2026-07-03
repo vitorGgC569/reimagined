@@ -562,6 +562,13 @@ if (NSOS_BUILD_TESTS)
     target_include_directories(test_gpu_parity_mamba_proper_stream PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_mamba_proper_stream COMMAND test_gpu_parity_mamba_proper_stream)
 
+    # Fused N-STATE decode step (full Mamba-2) vs the full N-state scan —
+    # sibling of the diagonal proper_stream gate above.
+    add_executable(test_gpu_parity_mamba_nstate_stream tests/gpu/test_gpu_parity_mamba_nstate_stream.cpp)
+    target_link_libraries(test_gpu_parity_mamba_nstate_stream PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_mamba_nstate_stream PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_mamba_nstate_stream COMMAND test_gpu_parity_mamba_nstate_stream)
+
     # CUDA-graph decode: graph token sequence == eager token sequence (the
     # graph-frozen-argument failure class).  SKIPs on builds without
     # NSOS_CUDA_PTDS — legacy default stream cannot be captured.

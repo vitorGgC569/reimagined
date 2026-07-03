@@ -1123,12 +1123,15 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
         "with -DNSOS_CUDA_PTDS=ON)";
     return Tensor();
 #else
+    // GPU-first DEFAULT ON in PTDS builds (the build flag already states the
+    // intent); NSOS_CUDA_GRAPH_DECODE=0 opts out.  Guarded adoption below
+    // keeps this safe: any capture problem falls back to eager permanently.
     static const bool env_enabled = [] {
         const char* v = std::getenv("NSOS_CUDA_GRAPH_DECODE");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     if (!env_enabled) {
-        decode_graph_status_ = "disabled: NSOS_CUDA_GRAPH_DECODE unset";
+        decode_graph_status_ = "disabled: NSOS_CUDA_GRAPH_DECODE=0";
         return Tensor();
     }
     if (decode_graph_disabled_) return Tensor();
@@ -1191,9 +1194,19 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
         }
         for (auto& layer : layers) {
             if (layer && layer->uses_moe()) {
-                disable("MoE layer present (routing is host-synced per step; "
-                        "device-resident MoE routing is a documented follow-up)");
-                return Tensor();
+                // Single-row inference MoE runs the dense device path
+                // (all-expert compute + device-weight accumulation) which is
+                // capturable — but only up to its num_experts guard; beyond
+                // it decode falls to the batched dispatch (host-synced
+                // counts), which is not.
+                const int experts =
+                    layer->router ? layer->router->num_experts : 0;
+                if (experts <= 0 || experts > 32) {
+                    disable("MoE layer with num_experts > 32 (dense device "
+                            "decode path guard) — the batched dispatch is "
+                            "host-synced and not capturable");
+                    return Tensor();
+                }
             }
             if (layer && layer->uses_ttt()) {
                 disable("TTT layer present (host-side per-token adaptation)");
@@ -1207,18 +1220,12 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
             }
         }
         const char* step_env = std::getenv("NSOS_MAMBA_GPU_STEP");
-        if (has_mamba && (step_env == nullptr || step_env[0] != '1')) {
-            disable("Mamba layers run the HOST decode step (set "
-                    "NSOS_MAMBA_GPU_STEP=1 so the per-token step is "
-                    "device-resident and capturable)");
-            return Tensor();
-        }
-        if (has_mamba && model_config_.mamba_proper_ssm &&
-            model_config_.mamba_state_expansion) {
-            disable("N-state Mamba decode step is host-side (the fused GPU "
-                    "step covers the diagonal proper path only) — construct "
-                    "with mamba_state_expansion=false for graph decode; the "
-                    "nstate device step is a documented follow-up");
+        // GPU-first: the fused device step (diagonal AND N-state) is default
+        // ON; only an explicit =0 opt-out forces the host step, which does
+        // per-token D2H and cannot be captured.
+        if (has_mamba && step_env != nullptr && step_env[0] == '0') {
+            disable("NSOS_MAMBA_GPU_STEP=0 forces the HOST Mamba decode step "
+                    "(per-token D2H; not capturable)");
             return Tensor();
         }
         if (cuda_graphs_supported() == 0) {
@@ -2327,6 +2334,35 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
     // Deterministic mode uses the ordered per-expert path below (its scatter is
     // a sequence of non-overlapping row copies summed in fixed expert order),
     // not the batched scatter-add kernel.
+    // ── GPU-first single-row decode: dense top-k on the DEVICE ──────────
+    // At inference with one row, run ALL experts on it and accumulate with
+    // the top-k-masked routing weights read from device memory.  Non-selected
+    // experts carry weight 0.0f (masked+renormalized on the device by
+    // router->forward / the N2/N3 block above), so the sum is algebraically
+    // identical to dispatching only the selected experts — and the per-expert
+    // accumulation order (e = 0..E-1) matches the host loop's, so the result
+    // is bit-equal.  With num_experts small the extra expert FLOPs on a
+    // [1, dim] row are negligible next to what this removes: the per-token
+    // weights D2H + host partial_sort (host loop) or counts D2H (batched
+    // path).  No host decision depends on device data -> the path is
+    // CUDA-graph capturable.
+    if (!training_mode_ && rows == 1 && target_device == Device::GPU &&
+        weights.get_device() == Device::GPU &&
+        gpu_custom_kernels_supported() && num_experts > 0 &&
+        num_experts <= 32 && dim > 0) {
+        Tensor row_input = x.reshape({1, dim});
+        Tensor output_accum = Tensor::zeros({1, dim}, Device::GPU);
+        for (int e = 0; e < num_experts; ++e) {
+            Tensor pre = expert_gate_up[static_cast<size_t>(e)]->forward(row_input);
+            Tensor hidden = pre.squared_relu();
+            Tensor expert_out = expert_down[static_cast<size_t>(e)]->forward(hidden);
+            launch_moe_scale_accum_row_kernel(output_accum.raw_data(),
+                                              expert_out.raw_data(),
+                                              weights.raw_data() + e, dim);
+        }
+        return output_accum.reshape(x.shape.dims);
+    }
+
     // moe_router_grad only matters for BACKWARD (it needs the per-expert
     // outputs saved by the host path below); at inference there is no
     // backward, so the router-grad flag must not force decode through the
@@ -5316,8 +5352,15 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
     // Save the PRE-mask softmax probabilities (host copy) for the differentiable
     // Switch aux loss.  Captured before top-k masking so it is the true routing
     // distribution p[i,e].  Cheap (rows*num_experts floats); only read when the
-    // Switch aux path is enabled.
-    saved_probs_ = weights.get_device() == Device::GPU ? weights.cpu() : weights.clone();
+    // Switch aux path is enabled — which is a TRAINING path, so at inference we
+    // skip it entirely: on GPU it is a per-token synchronous D2H that costs
+    // decode latency and aborts CUDA-graph capture.
+    if (gate->training_mode()) {
+        saved_probs_ =
+            weights.get_device() == Device::GPU ? weights.cpu() : weights.clone();
+    } else {
+        saved_probs_ = Tensor();
+    }
 
     std::fill(expert_loads.begin(), expert_loads.end(), 0.0f);
     const int rows = x.size / x.shape.back();
@@ -5343,22 +5386,24 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
         launch_moe_topk_mask_kernel(weights.raw_data(), rows, num_experts,
                                     eff_top_k);
 
-        // Per-expert load accumulation in GPU memory.  We use a fresh
-        // buffer rather than reusing one across calls so that the
-        // device memset is safe regardless of previous async work.
-        Tensor loads_gpu = Tensor::zeros(
-            std::vector<int>{num_experts}, Device::GPU);
-        launch_moe_load_accumulate_kernel(weights.raw_data(),
-                                          loads_gpu.raw_data(),
-                                          rows, num_experts);
-
-        // Single small D2H copy (num_experts floats).  Required because
-        // expert_loads is observed by audit collectors and Python
-        // bindings on the CPU side.
-        Tensor loads_host = loads_gpu.cpu();
-        const float* loads_ptr = loads_host.data();
-        for (int e = 0; e < num_experts; ++e) {
-            expert_loads[e] = loads_ptr[e];
+        // Per-expert load accumulation: only training consumers read
+        // expert_loads (aux regularization, layer-audit router records) — at
+        // inference the D2H below is a per-token synchronous copy that costs
+        // decode latency and aborts CUDA-graph capture, so skip it and leave
+        // expert_loads zeroed (already reset above).
+        if (gate->training_mode()) {
+            // Fresh buffer rather than one reused across calls so the device
+            // memset is safe regardless of previous async work.
+            Tensor loads_gpu = Tensor::zeros(
+                std::vector<int>{num_experts}, Device::GPU);
+            launch_moe_load_accumulate_kernel(weights.raw_data(),
+                                              loads_gpu.raw_data(),
+                                              rows, num_experts);
+            Tensor loads_host = loads_gpu.cpu();
+            const float* loads_ptr = loads_host.data();
+            for (int e = 0; e < num_experts; ++e) {
+                expert_loads[e] = loads_ptr[e];
+            }
         }
         return {logits, weights};
     }

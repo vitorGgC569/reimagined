@@ -116,6 +116,8 @@ GATE_TESTS = ['test_gradcheck',
               'test_gpu_parity_jamba',
               'test_gpu_parity_mamba_proper',
               'test_gpu_parity_mamba_proper_stream',
+              'test_gpu_parity_mamba_nstate_stream',
+              'test_gpu_parity_moe_router',
               'test_gpu_parity_decode_graph']
 need_build = not CACHE_SO.exists()
 if not need_build:
@@ -180,11 +182,12 @@ print(f"D2H 4 bytes x {res['iters']}: pageable={res['pageable_us']:.2f} us/copia
       f"ganho={res['pageable_us']/max(res['pinned_us'],1e-9):.2f}x")
 """))
 
-cells.append(md("""## 5 — tok/s: decode eager vs CUDA graph (mesmo modelo)
+cells.append(md("""## 5 — tok/s: decode eager vs CUDA graph (ARQUITETURA COMPLETA)
 
-Modelo híbrido pequeno (4L d128, atenção nas camadas 2/4, sem MoE/TTT — o
-graph v1 declina MoE por design, roteamento host-synced).  A seleção do token
-é o MESMO argmax host nos dois braços — o que muda é só o forward por token
+Modelo híbrido GPU-first: Mamba-2 **N-state** (passo device fundido) + atenção
+GQA (camadas 2/4) + **MoE-4 top-2** (caminho denso single-row device — pesos
+top-k mascarados lidos na GPU, zero D2H por token).  A seleção do token é o
+MESMO argmax host nos dois braços — o que muda é só o forward por token
 (cascata de launches vs 1 `cudaGraphLaunch`).  Paridade de tokens é verificada
 in-loco além do gate C++."""))
 cells.append(code("""import os, time
@@ -199,10 +202,12 @@ c = nsos.ModelConfig()
 c.num_layers = 4; c.d_model = 128; c.vocab_size = 512
 c.n_heads = 4; c.n_kv_heads = 2
 c.attention_period = 2; c.attention_slot = 1
-c.use_moe = False; c.use_ttt = False
-# via diagonal proper: o passo GPU fundido cobre ela; o passo N-state e
-# host-side e o graph declina (follow-up documentado)
-c.mamba_state_expansion = False
+# ARQUITETURA COMPLETA sob o graph (GPU-first): N-state Mamba (default do
+# config) via passo device fundido + MoE via caminho denso single-row
+# device-resident (pesos top-k mascarados lidos NA GPU).
+c.use_moe = True; c.num_experts = 4; c.num_experts_per_token = 2
+c.moe_period = 2; c.moe_slot = 0
+c.use_ttt = False
 c.max_context_tokens = 1024; c.use_cuda = True
 model = nsos.JambaModel(c, nsos.Device.GPU); model.to(nsos.Device.GPU)
 model.set_training_mode(False)

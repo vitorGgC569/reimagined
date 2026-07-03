@@ -253,7 +253,29 @@ __global__ void moe_scatter_add_weighted_kernel(
   atomicAdd(&y[dst_row * dim + d], scaled);
 }
 
+// Dense single-row decode accumulation: out[i] += (*scale_dev) * y[i], with
+// the scale read from DEVICE memory (the row's routing weight for one
+// expert).  Host never sees the weights -> no per-token D2H, and the read
+// happens at kernel EXECUTION, so the op is CUDA-graph capturable (the
+// weight changes every replay while the pointer stays fixed).
+__global__ void moe_scale_accum_row_kernel(float *__restrict__ out,
+                                           const float *__restrict__ y,
+                                           const float *__restrict__ scale_dev,
+                                           int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] += (*scale_dev) * y[i];
+}
+
 extern "C" {
+
+void launch_moe_scale_accum_row_kernel(float *out, const float *y,
+                                       const float *scale_dev, int n) {
+  if (n <= 0) return;
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  moe_scale_accum_row_kernel<<<blocks, threads>>>(out, y, scale_dev, n);
+}
 
 void launch_moe_topk_mask_kernel(float *weights, int batch, int num_experts,
                                  int k) {

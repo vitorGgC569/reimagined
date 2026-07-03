@@ -109,6 +109,19 @@ void launch_mamba_proper_step(const float *xv, const float *z,
                               const float *convw, float *ring, float *h,
                               float *gated, int dim, int K);
 
+// Fused single-token incremental decode step for the N-STATE path (full
+// Mamba-2).  xv/z are [dim]; B_in/C_in are [H*N] (per-head N-dim); dt/A are
+// [H] (per-head, A in log-domain); convw is [dim*K]; ring is [(K-1)*dim]
+// (in/out); h is [dim*N] == [H*P*N] (in/out, the carried N-state); gated is
+// [dim] (out).  Mirrors Mamba2SSD::forward_proper_nstate_step's host loop
+// 1:1; device-resident carry -> no per-token host round-trip; CUDA-graph
+// capturable.
+void launch_mamba_nstate_step(const float *xv, const float *z,
+                              const float *B_in, const float *C_in,
+                              const float *dt, const float *A,
+                              const float *convw, float *ring, float *h,
+                              float *gated, int dim, int K, int P, int N);
+
 // =====================================================================
 // Causal depthwise conv1d (proper-path local mixing).
 //   in/out : [Batch, Seq, D]   weight : [D, K]
