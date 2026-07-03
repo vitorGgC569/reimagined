@@ -112,6 +112,13 @@ public:
   // pos_dev must outlive the captured graph.  nullptr (default) keeps the
   // eager path byte-identical.
   void set_decode_graph_pos(const int* pos_dev) { decode_graph_pos_dev_ = pos_dev; }
+  // Detach the KV cache to a uniquely-owned buffer if a session snapshot is
+  // sharing it (use_count > 1).  ensure_kv_cache_capacity() reallocates
+  // copy-on-write when the buffer is shared; calling this BEFORE a CUDA-graph
+  // capture (right after fork_session) moves that realloc + D2D copy OUTSIDE
+  // the capture, so the recorded decode step sees a stable, owned cache and
+  // does not realloc mid-capture (which would corrupt the graph).
+  void make_kv_cache_unique();
   // Host mirror advance for graph REPLAYS: a replay executes the captured
   // kernels (which advance the device-side position) without ever entering
   // Attention::forward, so cached_tokens_ must be bumped externally to keep

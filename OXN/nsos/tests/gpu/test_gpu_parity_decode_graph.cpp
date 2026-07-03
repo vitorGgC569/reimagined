@@ -105,12 +105,18 @@ int main() {
     }
     Tensor eager_last = logits.cpu();
     model.set_streaming_inference(false);
+    // Localize faults precisely across the two failed T4 rounds: prove the
+    // GPU-first eager decode path (N-state step + MoE dense + attention
+    // decode) is clean BEFORE any graph capture.  If this throws, the bug is
+    // in the decode integration, NOT the capture.
+    cuda_sync_or_throw("eager-reference-decode");
 
     // ── Graph decode (warm -> capture -> replays) ───────────────────
     model.reset_session();
     model.set_streaming_inference(true);
     model.reserve_kv_cache(reserve_total, Device::GPU, 1);
     logits = model.forward_ids(prompt, nullptr);
+    cuda_sync_or_throw("graph-prefill");
     std::vector<int> graph_tokens;
     bool graph_engaged = false;
     tok = greedy_from(logits);
@@ -122,6 +128,11 @@ int main() {
       } else {
         logits = model.forward_ids({tok}, nullptr);
       }
+      // s==0 warm (eager), s==1 capture + first replay, s>=2 pure replays —
+      // a labeled sync per step names the exact failing phase.
+      cuda_sync_or_throw(
+          (std::string("graph-step-") + std::to_string(s) + "-" +
+           model.decode_graph_status()).c_str());
       graph_engaged = graph_engaged || model.decode_graph_active();
       tok = greedy_from(logits);
     }

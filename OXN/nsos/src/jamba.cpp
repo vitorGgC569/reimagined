@@ -771,6 +771,20 @@ void Attention::reserve_kv_cache(int total_tokens, Device device, int batch_size
     ensure_kv_cache_capacity(aligned, device, std::max(batch_size, 1));
 }
 
+void Attention::make_kv_cache_unique() {
+    // clone() deep-copies into a fresh buffer (use_count 1), same shape so
+    // cache_capacity_tokens_ is unchanged.  Only fires when a snapshot is
+    // aliasing the buffer; a no-op otherwise.  Must run OUTSIDE any capture.
+    if (key_cache_buffer_.size > 0 &&
+        key_cache_buffer_.data_ptr.use_count() > 1) {
+        key_cache_buffer_ = key_cache_buffer_.clone();
+    }
+    if (value_cache_buffer_.size > 0 &&
+        value_cache_buffer_.data_ptr.use_count() > 1) {
+        value_cache_buffer_ = value_cache_buffer_.clone();
+    }
+}
+
 void JambaModel::reserve_kv_cache(int total_tokens, Device device, int batch_size) {
     // Iterate every JambaBlock that has an attention layer and reserve
     // its KV cache.  Mamba-only blocks have no KV cache to reserve.
@@ -1290,6 +1304,13 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
     // forward (position mirrors advance) without running any device work; a
     // failed capture must undo those host advances before the eager retry.
     JambaSessionSnapshot pre_capture = fork_session();
+    // fork_session shares the KV cache buffer (use_count 2) for batch<=1.  If
+    // left shared, ensure_kv_cache_capacity would reallocate copy-on-write on
+    // the FIRST recorded decode step — a realloc + D2D copy INSIDE the capture
+    // that corrupts the graph (observed as an illegal memory access on the T4).
+    // Detach to a uniquely-owned cache now, before BeginCapture, so recording
+    // sees a stable buffer and never reallocs.
+    attn_layers([](Attention& a) { a.make_kv_cache_unique(); });
     attn_layers([&](Attention& a) { a.set_decode_graph_pos(dg.d_pos); });
     cudaGraph_t graph = nullptr;
     bool capture_open = false;
