@@ -552,9 +552,9 @@ PROFILES["hybrid_medium_v10_gpu"]["batch_size"] = 10
 PROFILES["hybrid_medium_v10_gpu"]["lr"] = 5.2e-4
 PROFILES["hybrid_medium_v10_gpu"]["warmup_steps"] = 200
 PROFILES["hybrid_medium_v10_gpu"]["validation_scope"] = (
-    "hybrid_medium_v10_gpu: GPU-tuned variant of v10 with batch_size=8 "
-    "(batch=10 and 16 both caused PSU shutdown on the GTX 1050 Ti "
-    "host).  LR 4.6e-4 with warmup_steps=200.  Same phase_steps as v10."
+    "hybrid_medium_v10_gpu: GPU-tuned variant of v10 with batch_size=10 "
+    "(batch=16 caused PSU shutdown on the GTX 1050 Ti host).  "
+    "LR 5.2e-4 with warmup_steps=200.  Same phase_steps as v10."
 )
 
 # ── hybrid_v11_colab_t4 ───────────────────────────────────────────────────
@@ -3173,12 +3173,20 @@ def train_rows_direct(trainer, tokenizer, rows: List[Dict], max_steps: int, call
 
         prompt_batch: List[List[int]] = []
         answer_batch: List[List[int]] = []
+        scanned = 0
+        scan_limit = 2 * len(order) + 4 * max(1, batch_size)
         while cursor < len(order) or prompt_batch:
+            if scanned >= scan_limit:
+                # Nothing usable left to fill the batch (e.g. every row
+                # missing an answer) — without this cap the reshuffle
+                # loop below spins forever.
+                break
             if cursor >= len(order):
                 rng.shuffle(order)
                 cursor = 0
             row = rows[order[cursor]]
             cursor += 1
+            scanned += 1
             if not row.get("answer"):
                 continue
             prompt_tokens, answer_tokens = build_supervised_tokens(tokenizer, row, eos_token_id)
@@ -3595,7 +3603,12 @@ def main() -> int:
         elif args.device == "cpu":
             device = nsos.Device.CPU
         else:
-            device = nsos.Device.GPU if os.name == "nt" else nsos.Device.CPU
+            # auto: try GPU on every platform; the fast_gpu_supported()
+            # probe right below downgrades to CPU when the GPU path is
+            # not viable.  (The old rule "GPU only when os.name == 'nt'"
+            # made Colab/Linux runs with --device auto silently train on
+            # CPU even with a T4 attached.)
+            device = nsos.Device.GPU
 
         if device == nsos.Device.GPU and hasattr(nsos, "fast_gpu_supported"):
             print("[boot] probing fast_gpu_supported()...", flush=True)
@@ -3652,8 +3665,12 @@ def main() -> int:
             _taus = []
             for _p in model.parameters():
                 if _p.name.endswith("mamba.A"):
-                    _a = _np.abs(_np.asarray(_p.data.numpy(), dtype=_np.float64))
-                    _taus.append(1.0 / _np.maximum(_a, 1e-3))
+                    # N1: A vive em log-domain (A_eff = exp(A_log)), entao
+                    # rate = exp(A) e tau = 1/rate = exp(-A).  (A formula
+                    # antiga 1/|A| tratava A como rate e imprimia taus
+                    # errados depois da migracao para log-domain.)
+                    _a_log = _np.asarray(_p.data.numpy(), dtype=_np.float64)
+                    _taus.append(_np.exp(-_np.clip(_a_log, -60.0, 60.0)))
             if _taus:
                 _t = _np.concatenate(_taus)
                 _spread = float(_np.log10(_t.max() / max(float(_t.min()), 1e-9)))

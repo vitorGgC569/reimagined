@@ -43,18 +43,35 @@ def _load_dataset(split: str, n_examples: Optional[int]):
     return ds
 
 
+def _preprocess(text: str) -> str:
+    """lm-eval-harness HellaSwag preprocessing, reproduced exactly.
+
+    The raw dataset carries WikiHow artifacts like ``[title]`` and
+    ``[step]`` inside contexts and endings; published numbers strip
+    them.  Skipping this step changes accuracy by a few points and
+    breaks comparability.
+    """
+    import re
+    text = text.strip()
+    text = text.replace(" [title]", ". ")
+    text = re.sub(r"\[.*?\]", "", text)
+    text = text.replace("  ", " ")
+    return text
+
+
 def _format_context(item: dict) -> str:
     """Standard HellaSwag context: activity label + sentence opener.
 
-    Matches the lm-eval-harness `description` field exactly so our
-    numbers are comparable.
+    Matches lm-eval-harness: ``ctx = ctx_a + " " + ctx_b.capitalize()``
+    then ``preprocess(activity_label + ": " + ctx)``.
     """
     label = item.get("activity_label", "").strip()
     ctx_a = item.get("ctx_a", "").strip()
-    ctx_b = item.get("ctx_b", "").strip()
+    ctx_b = item.get("ctx_b", "").strip().capitalize()
+    ctx = f"{ctx_a} {ctx_b}".strip()
     if label:
-        return f"{label}: {ctx_a} {ctx_b}".strip()
-    return f"{ctx_a} {ctx_b}".strip()
+        return _preprocess(f"{label}: {ctx}")
+    return _preprocess(ctx)
 
 
 def run(adapter: ModelAdapter, *, n_examples: Optional[int] = 500,
@@ -82,7 +99,7 @@ def run(adapter: ModelAdapter, *, n_examples: Optional[int] = 500,
     gold: List[int] = []
     for i, item in enumerate(ds):
         context = _format_context(item)
-        endings = list(item["endings"])
+        endings = [_preprocess(e) for e in item["endings"]]
         try:
             scores = score_multiple_choice(adapter, context, endings,
                                             normalization=normalization)

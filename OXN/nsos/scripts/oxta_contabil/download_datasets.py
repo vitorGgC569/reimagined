@@ -318,6 +318,7 @@ def fetch_culturax(name: str, info: Dict[str, Any], dst_root: Path,
     written_bytes = 0
     written_docs = 0
     fiscal_docs = 0
+    generic_seen = 0  # contador de genericos VISTOS (nao escritos) p/ o 10%
     shard_idx = 0
     shard_lines: List[str] = []
     shard_target_bytes = max(64 * 1024 * 1024, target_bytes // max_shards)
@@ -348,9 +349,15 @@ def fetch_culturax(name: str, info: Dict[str, Any], dst_root: Path,
 
             is_fiscal = bool(keywords) and keyword_match(text, keywords)
             # Keep all fiscal docs; sample 10% of generic ones to stay broad.
-            if not is_fiscal and (written_docs % 10) != 0:
-                # tracked but not written
-                continue
+            # BUG FIX: o gate anterior usava written_docs % 10, mas written_docs
+            # so incrementa ao ESCREVER — apos o 1o generico o contador congelava
+            # em valor !=0 (mod 10) e TODOS os genericos eram descartados ate
+            # docs fiscais empurrarem o contador; o corpus saia ~100% fiscal,
+            # quebrando o "stay broad".  O gate correto conta genericos VISTOS.
+            if not is_fiscal:
+                generic_seen += 1
+                if (generic_seen % 10) != 0:
+                    continue
 
             line = json.dumps(
                 {"text": text, "is_fiscal": is_fiscal},

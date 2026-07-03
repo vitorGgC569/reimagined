@@ -149,9 +149,10 @@ def run_scorecard(
             ]
             ok_count = len(primaries)
             agg_metrics = {}
+            primary_name = seed_results[0].primary_metric
             if ok_count >= 1:
-                agg_metrics[r.primary_metric] = statistics.mean(primaries)
-                agg_metrics[f"{r.primary_metric}_stdev"] = (
+                agg_metrics[primary_name] = statistics.mean(primaries)
+                agg_metrics[f"{primary_name}_stdev"] = (
                     statistics.pstdev(primaries) if ok_count > 1 else 0.0
                 )
                 agg_metrics["n_seeds_ok"] = float(ok_count)

@@ -167,15 +167,31 @@ class NsosAdapter(ModelAdapter):
         if not target_ids:
             return 0.0
         full = list(prompt_ids) + list(target_ids)
+        target_ids = list(target_ids)
         if len(full) > self._max_seq_len:
             # Truncate from the LEFT so target_ids stay intact — they're
             # what we score.  Drop oldest prompt tokens.
             drop = len(full) - self._max_seq_len
             full = full[drop:]
-            # Recompute where the target starts within the truncated view
-            prompt_len = self._max_seq_len - len(target_ids)
+            # Recompute where the target starts within the truncated view.
+            # May go NEGATIVE when truncation ate past the prompt into the
+            # target itself — the unclamped value tells us how many target
+            # tokens were dropped from `full`.
+            prompt_len = len(prompt_ids) - drop
         else:
             prompt_len = len(prompt_ids)
+        if prompt_len < 1:
+            # Prompt fully truncated: leading target tokens either fell
+            # out of `full` entirely (prompt_len negative) or have no
+            # predecessor row to score from (prompt_len == 0).  Treat
+            # them as unscored context (lm-eval convention) — otherwise
+            # arr[prompt_len-1] would be arr[-1] and numpy wraps to the
+            # LAST row.
+            skip = 1 - prompt_len
+            target_ids = target_ids[skip:]
+            prompt_len = 1
+            if not target_ids:
+                return 0.0
 
         # Run forward and pull logits as numpy.  forward_ids returns a Tensor
         # of shape (seq_len, vocab_size); the i-th row predicts token i+1.
@@ -205,14 +221,18 @@ class NsosAdapter(ModelAdapter):
         already have a JambaModel ready.  We do our own sampling loop on
         top of forward_ids — slower but always available.
         """
+        import zlib
+
         import numpy as np
 
         ids = self.tokenize(prompt_text)
         generated_ids: List[int] = []
         eos_seen = False
-        stop_check_window = "".join([])
 
-        rng = np.random.default_rng(seed=hash(prompt_text) & 0xFFFFFFFF)
+        # zlib.crc32 is stable across processes; Python's hash() is
+        # randomized per run (PYTHONHASHSEED) and would make eval
+        # generations irreproducible.
+        rng = np.random.default_rng(seed=zlib.crc32(prompt_text.encode("utf-8")))
 
         for _ in range(max_new_tokens):
             ctx = ids + generated_ids
