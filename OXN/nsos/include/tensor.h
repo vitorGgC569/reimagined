@@ -50,6 +50,14 @@ struct PoolStats {
 };
 PoolStats pool_stats();
 void release_cached_memory();  // devolve TODO o cache ao driver (trim)
+// CUDA-graph capture guard (see ManagedPool): begin makes the pool
+// capture-safe (no cudaFree/trim/memGetInfo; capture-time buffers are
+// quarantined on free); end stops tracking new allocations but keeps the
+// quarantine; release (call ONLY after the captured graph is destroyed)
+// returns the quarantined buffers to the driver.
+void gpu_pool_begin_capture();
+void gpu_pool_end_capture();
+void gpu_pool_release_capture();
 
 struct TensorShape {
     std::vector<int> dims;

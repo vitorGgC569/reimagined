@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _OPENMP
@@ -423,6 +424,37 @@ public:
         return ((bytes + k2m - 1) / k2m) * k2m;
     }
 
+    // ── CUDA-graph capture guard ─────────────────────────────────────────
+    // Between begin_capture() and release_capture() the pool is
+    // capture-safe: (1) it NEVER calls cudaFree/trim/cudaMemGetInfo (all
+    // synchronize the device, which is illegal during stream capture), and
+    // (2) every buffer allocated during capture is QUARANTINED on free
+    // instead of returning to the free-list, so no address the captured
+    // graph writes on replay is ever handed to another tensor.  The graph's
+    // decode owner calls release_capture() only after the graph is
+    // destroyed, at which point the quarantine is returned to the driver.
+    void begin_capture() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        capturing_ = true;
+    }
+    void end_capture() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        capturing_ = false;  // captured_ + quarantine_ persist until release
+    }
+    void release_capture() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        capturing_ = false;
+        for (void* p : quarantine_) {
+            auto it = live_.find(p);
+            const size_t sz = (it != live_.end()) ? it->second : 0;
+            cudaFree(p);
+            if (it != live_.end()) live_.erase(it);
+            live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
+        }
+        quarantine_.clear();
+        captured_.clear();
+    }
+
     void* allocate(size_t bytes) {
         if (bytes == 0) return nullptr;
         if (!enabled_) return raw_alloc(bytes);
@@ -434,16 +466,23 @@ public:
             void* p = bin.back();
             bin.pop_back();
             cached_bytes_ -= bytes;
+            if (capturing_) captured_.insert(p);
             return p;
         }
         void* p = raw_alloc(bytes);
-        if (!p) {
+        if (!p && !capturing_) {
             // Out of memory: return every cached free block to the driver and
             // retry once (mirrors a caching allocator's empty-cache-on-OOM).
+            // Skipped during capture — trim_locked calls cudaFree (illegal
+            // mid-capture); a capture-time OOM fails the capture cleanly and
+            // the decode falls back to eager.
             trim_locked();
             p = raw_alloc(bytes);
         }
-        if (p) live_[p] = bytes;
+        if (p) {
+            live_[p] = bytes;
+            if (capturing_) captured_.insert(p);
+        }
         return p;
     }
 
@@ -460,13 +499,26 @@ public:
             return;
         }
         const size_t sz = it->second;
+        // Captured buffer: the graph still references this address on every
+        // replay.  Quarantine it (keep live_[p] so release_capture can size
+        // the free) — never cache/free it until the graph is destroyed.
+        auto cap_it = captured_.find(p);
+        if (cap_it != captured_.end()) {
+            captured_.erase(cap_it);
+            quarantine_.push_back(p);
+            return;
+        }
         if (cap_bytes_ != 0 && cached_bytes_ + sz > cap_bytes_) {
             // Cache is full: return this block to the driver instead of caching
-            // it, so total managed footprint stays bounded.
-            cudaFree(p);
-            live_.erase(it);
-            live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
-            return;
+            // it, so total managed footprint stays bounded.  During capture
+            // cudaFree is illegal, so cache it instead (bounded growth for the
+            // duration of a single capture is acceptable).
+            if (!capturing_) {
+                cudaFree(p);
+                live_.erase(it);
+                live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
+                return;
+            }
         }
         free_[sz].push_back(p);
         cached_bytes_ += sz;
@@ -474,8 +526,9 @@ public:
         // Guarda de oversubscription UM (auditoria #27): checagem barata por
         // cadência — UM não dá OOM, degrada paginando (T4 a 96% custou steps
         // 6->8s antes do binning).  Acima de 88% de uso do device: poda o
-        // cache e avisa uma vez por episódio.
-        if (((++dealloc_probe_) & 511u) == 0) {
+        // cache e avisa uma vez por episódio.  Pulada durante captura
+        // (cudaMemGetInfo/cudaFree sincronizam o device -> ilegal).
+        if (!capturing_ && ((++dealloc_probe_) & 511u) == 0) {
             size_t free_b = 0, total_b = 0;
             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b > 0) {
                 const double used = 1.0 - static_cast<double>(free_b) /
@@ -585,6 +638,9 @@ private:
     std::mutex mtx_;
     std::unordered_map<size_t, std::vector<void*>> free_;  // exact bytes -> free blocks
     std::unordered_map<void*, size_t> live_;               // ptr -> its byte size
+    bool capturing_ = false;                 // inside a CUDA-graph capture
+    std::unordered_set<void*> captured_;     // alive buffers touched by the capture
+    std::vector<void*> quarantine_;          // freed captured buffers, held until release
 };
 
 }  // namespace
@@ -904,6 +960,24 @@ PoolStats pool_stats() {
 void release_cached_memory() {
 #ifdef USE_CUDA
     ManagedPool::instance().trim();
+#endif
+}
+
+void gpu_pool_begin_capture() {
+#ifdef USE_CUDA
+    ManagedPool::instance().begin_capture();
+#endif
+}
+
+void gpu_pool_end_capture() {
+#ifdef USE_CUDA
+    ManagedPool::instance().end_capture();
+#endif
+}
+
+void gpu_pool_release_capture() {
+#ifdef USE_CUDA
+    ManagedPool::instance().release_capture();
 #endif
 }
 

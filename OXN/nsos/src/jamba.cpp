@@ -1089,12 +1089,18 @@ struct JambaDecodeGraph {
                cudaMalloc(&d_pos, sizeof(int)) == cudaSuccess;
     }
     ~JambaDecodeGraph() {
+        // Destroy the exec FIRST (no more replays can reference the pooled
+        // buffers), then drain the capture quarantine back to the driver.
+        // The `logits` Tensor member is destroyed AFTER this body; by then
+        // release_capture() has cleared its captured-tracking, so it returns
+        // to the pool normally (the graph is already dead — safe to reuse).
         if (exec) cudaGraphExecDestroy(exec);
         if (d_token) cudaFree(d_token);
         if (d_pos) cudaFree(d_pos);
         if (h_token) cudaFreeHost(h_token);
         if (h_pos) cudaFreeHost(h_pos);
         (void)cudaGetLastError();
+        gpu_pool_release_capture();
     }
 };
 #endif  // USE_CUDA
@@ -1287,6 +1293,12 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
     attn_layers([&](Attention& a) { a.set_decode_graph_pos(dg.d_pos); });
     cudaGraph_t graph = nullptr;
     bool capture_open = false;
+    // Make the tensor pool capture-safe for the whole recording: no
+    // cudaFree/trim/memGetInfo (all synchronize the device — illegal during
+    // capture), and every buffer allocated here is quarantined on free so no
+    // address the graph writes on replay is ever recycled.  Drained by
+    // ~JambaDecodeGraph::release_capture() when the graph is destroyed.
+    gpu_pool_begin_capture();
     try {
         if (cudaStreamBeginCapture(cudaStreamPerThread,
                                    cudaStreamCaptureModeRelaxed) != cudaSuccess) {
@@ -1316,6 +1328,11 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
         cudaGraphDestroy(graph);
         graph = nullptr;
         dg.logits = lg;
+        // Stop tracking new allocations as captured.  The captured set +
+        // quarantine persist (drained by ~JambaDecodeGraph); `x`/`lg` freed
+        // as this scope unwinds still route to quarantine via the captured
+        // set, independent of the capturing flag.
+        gpu_pool_end_capture();
     } catch (const std::exception& e) {
         if (capture_open) {
             cudaGraph_t partial = nullptr;
@@ -1324,6 +1341,10 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
         }
         if (graph) cudaGraphDestroy(graph);
         (void)cudaGetLastError();
+        // End capture tracking and drain the quarantine now — this graph never
+        // reached Captured, so nothing will replay against those buffers.
+        gpu_pool_end_capture();
+        gpu_pool_release_capture();
         attn_layers([](Attention& a) { a.set_decode_graph_pos(nullptr); });
         restore_session(pre_capture);
         disable(std::string("capture failed: ") + e.what());
