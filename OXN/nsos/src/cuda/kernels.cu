@@ -1366,11 +1366,18 @@ extern "C" void launch_batched_gqa_causal_attention_kernel(const float *q_flat,
 __global__ void gqa_append_kv_cache_kernel(const float *kv_flat, float *key_cache,
                                            float *value_cache, int cache_row,
                                            int n_kv_heads, int head_dim,
-                                           float theta) {
+                                           float theta, const int *pos_dev) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int kv_dim = n_kv_heads * head_dim;
   if (idx >= kv_dim) {
     return;
+  }
+
+  // CUDA-graph decode: the position advances every replay, so it must come
+  // from device memory (host args are frozen at capture).  nullptr keeps the
+  // historical host-arg behaviour byte-for-byte.
+  if (pos_dev != nullptr) {
+    cache_row = *pos_dev;
   }
 
   const int head = idx / head_dim;
@@ -1413,12 +1420,15 @@ extern "C" void launch_gqa_append_kv_cache_kernel(const float *kv_flat,
                                                   int cache_row,
                                                   int n_kv_heads,
                                                   int head_dim,
-                                                  float theta) {
+                                                  float theta,
+                                                  const int *pos_dev) {
   const int kv_dim = n_kv_heads * head_dim;
   const int threads = 256;
   const int blocks = (kv_dim + threads - 1) / threads;
-  gqa_append_kv_cache_kernel<<<blocks, threads>>>(
-      kv_flat, key_cache, value_cache, cache_row, n_kv_heads, head_dim, theta);
+  gqa_append_kv_cache_kernel<<<blocks, threads>>>(kv_flat, key_cache,
+                                                  value_cache, cache_row,
+                                                  n_kv_heads, head_dim, theta,
+                                                  pos_dev);
 }
 
 __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
@@ -1431,13 +1441,21 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
                                                    int n_kv_heads,
                                                    int head_dim,
                                                    int kv_group_size,
-                                                   float theta) {
+                                                   float theta,
+                                                   const int *pos_dev) {
   const int head_index = blockIdx.x;
   const int thread_index = threadIdx.x;
   const int kv_dim = n_kv_heads * head_dim;
   const int kv_head = min(head_index / max(kv_group_size, 1), n_kv_heads - 1);
   const int half_dim = head_dim / 2;
   const float scale = rsqrtf(fmaxf(static_cast<float>(head_dim), 1.0f));
+  // CUDA-graph decode: pos_dev holds the position of the token being decoded
+  // (== cached tokens BEFORE this step), which advances every replay while
+  // host kernel args stay frozen at capture.  nullptr keeps the historical
+  // host-arg behaviour byte-for-byte.
+  if (pos_dev != nullptr) {
+    cached_tokens = *pos_dev + 1;
+  }
   const int query_pos = max(cached_tokens - 1, 0);
 
   extern __shared__ float shared_scores[];
@@ -1535,13 +1553,19 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
 extern "C" void launch_gqa_cached_attention_decode_kernel(
     const float *q_flat, const float *key_cache, const float *value_cache,
     float *out, int cached_tokens, int d_model, int n_heads, int n_kv_heads,
-    int head_dim, int kv_group_size, float theta) {
+    int head_dim, int kv_group_size, float theta, const int *pos_dev,
+    int shared_capacity_tokens) {
   const int threads = 128;
   const dim3 grid(n_heads);
-  const size_t shared_bytes = static_cast<size_t>(cached_tokens) * sizeof(float);
+  // Graph mode (pos_dev set) must size the shared scratch for the WHOLE cache
+  // capacity: the shared size is a launch parameter, frozen inside a captured
+  // graph, while the live token count grows each replay.
+  const int shared_tokens =
+      shared_capacity_tokens > 0 ? shared_capacity_tokens : cached_tokens;
+  const size_t shared_bytes = static_cast<size_t>(shared_tokens) * sizeof(float);
   gqa_cached_attention_decode_kernel<<<grid, threads, shared_bytes>>>(
       q_flat, key_cache, value_cache, out, cached_tokens, d_model, n_heads,
-      n_kv_heads, head_dim, kv_group_size, theta);
+      n_kv_heads, head_dim, kv_group_size, theta, pos_dev);
 }
 
 // =====================================================================
@@ -1749,6 +1773,70 @@ cleanup:
   if (d_buf) cudaFree(d_buf);
   if (d_eager) cudaFree(d_eager);
   if (d_mid) cudaFree(d_mid);
+  (void)cudaGetLastError();
+  return ok;
+}
+
+// =====================================================================
+// D2H per-token copy micro-benchmark: pageable vs pinned staging.
+// The decode loop moves ONE int per token device->host (the sampled token).
+// Pageable host memory forces the driver through an intermediate staging
+// buffer; pinned (cudaMallocHost) memory DMAs directly.  This measures the
+// real per-copy latency of both so the pinned-staging decision in
+// GpuGreedySampler is backed by a number from the target GPU, not theory.
+// =====================================================================
+extern "C" int nsos_bench_d2h_copy(int iters, double *pageable_us,
+                                   double *pinned_us) {
+  if (iters <= 0 || pageable_us == nullptr || pinned_us == nullptr) return 0;
+  int ok = 0;
+  int *d_val = nullptr;
+  int *h_pinned = nullptr;
+  int h_pageable = 0;
+  cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+  if (cudaMalloc(&d_val, sizeof(int)) != cudaSuccess) goto cleanup;
+  if (cudaMallocHost(&h_pinned, sizeof(int)) != cudaSuccess) goto cleanup;
+  if (cudaMemset(d_val, 0x2a, sizeof(int)) != cudaSuccess) goto cleanup;
+  if (cudaEventCreate(&ev_start) != cudaSuccess) goto cleanup;
+  if (cudaEventCreate(&ev_stop) != cudaSuccess) goto cleanup;
+
+  {
+    // Warm both paths once so lazy driver setup is outside the timing.
+    (void)cudaMemcpy(&h_pageable, d_val, sizeof(int), cudaMemcpyDeviceToHost);
+    (void)cudaMemcpy(h_pinned, d_val, sizeof(int), cudaMemcpyDeviceToHost);
+    if (cudaDeviceSynchronize() != cudaSuccess) goto cleanup;
+
+    float ms = 0.0f;
+    if (cudaEventRecord(ev_start) != cudaSuccess) goto cleanup;
+    for (int i = 0; i < iters; ++i) {
+      if (cudaMemcpy(&h_pageable, d_val, sizeof(int),
+                     cudaMemcpyDeviceToHost) != cudaSuccess) {
+        goto cleanup;
+      }
+    }
+    if (cudaEventRecord(ev_stop) != cudaSuccess) goto cleanup;
+    if (cudaEventSynchronize(ev_stop) != cudaSuccess) goto cleanup;
+    if (cudaEventElapsedTime(&ms, ev_start, ev_stop) != cudaSuccess) goto cleanup;
+    *pageable_us = static_cast<double>(ms) * 1000.0 / iters;
+
+    if (cudaEventRecord(ev_start) != cudaSuccess) goto cleanup;
+    for (int i = 0; i < iters; ++i) {
+      if (cudaMemcpy(h_pinned, d_val, sizeof(int), cudaMemcpyDeviceToHost) !=
+          cudaSuccess) {
+        goto cleanup;
+      }
+    }
+    if (cudaEventRecord(ev_stop) != cudaSuccess) goto cleanup;
+    if (cudaEventSynchronize(ev_stop) != cudaSuccess) goto cleanup;
+    if (cudaEventElapsedTime(&ms, ev_start, ev_stop) != cudaSuccess) goto cleanup;
+    *pinned_us = static_cast<double>(ms) * 1000.0 / iters;
+    ok = 1;
+  }
+
+cleanup:
+  if (ev_start) cudaEventDestroy(ev_start);
+  if (ev_stop) cudaEventDestroy(ev_stop);
+  if (h_pinned) cudaFreeHost(h_pinned);
+  if (d_val) cudaFree(d_val);
   (void)cudaGetLastError();
   return ok;
 }

@@ -64,3 +64,24 @@ Caminho host preservado como fallback (CPU) — mesma matemática.
 Do `docs/GPU_OPTIMIZATION_ANALYSIS.md`: MoE top-k via `std::partial_sort` no host;
 ausência de pinned memory para H2D; CUDA Graphs para shapes estáticos weight-tied;
 `persistent_kernel` stub a remover. Rastreados para PRs próprios.
+
+## CUDA-graph decode fim-a-fim — FEITO (opt-in, validação T4)
+
+`JambaModel::forward_ids_decode_graph` (env `NSOS_CUDA_GRAPH_DECODE=1`) captura
+UM forward single-token num CUDA graph e o replay-a por token: a cascata de
+launches por token vira 1 `cudaGraphLaunch`. Peças: (a) build opt-in
+`-DNSOS_CUDA_PTDS=ON` (per-thread default stream — a legacy stream não é
+capturável; muda semântica global, então a suíte inteira de gates roda sob ela
+no notebook); (b) token+posição entram por staging PINNED relido pelos nós
+memcpy capturados a cada replay; (c) kernels de decode da atenção ganharam
+variante device-pos (`pos_dev`) + shared scratch dimensionado pela CAPACIDADE
+do cache (args host congelam na captura); (d) passo Mamba GPU
+(`NSOS_MAMBA_GPU_STEP=1`) já era capture-safe; (e) BitLinear ganhou cache de
+inferência do ternário (a absmean por-forward fazia D2H síncrono — abortaria a
+captura e desperdiçava decode); (f) adoção GUARDADA: warm-up eager → captura
+com snapshot/restore em falha → fallback eager permanente com razão em
+`decode_graph_status()`. MoE/TTT declinam por design (roteamento host-synced;
+device-resident routing é follow-up). Gate: `test_gpu_parity_decode_graph`
+(sequência graph == eager token-a-token). Medição: pinned vs pageable D2H via
+`nsos.bench_d2h_copy` + `NSOS_D2H_TIMING=1` no sampler; notebook
+`colab/bench_decode_graph_t4.ipynb`.

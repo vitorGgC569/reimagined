@@ -39,6 +39,10 @@ public:
   // Output: [Batch, Seq, Dim]
   Tensor forward(const std::vector<int> &indices);
   Tensor forward_batch(const std::vector<std::vector<int>>& indices_batch);
+  // CUDA-graph decode path: gather straight from token ids that ALREADY live
+  // in device memory (no per-call H2D memcpy / staging alloc — both are
+  // illegal inside a graph capture).  GPU weights only; returns [count, dim].
+  Tensor forward_device_ids(const int* device_ids, int count);
 
   // Backward pass
   // Accumulates gradient into grad_weight

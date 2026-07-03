@@ -105,7 +105,23 @@ public:
   int num_query_heads() const { return n_heads; }
   int num_kv_heads() const { return n_kv_heads; }
 
+  // ── CUDA-graph decode hooks (set by JambaModel around graph capture) ──
+  // While pos_dev is non-null, the streaming single-token GPU decode kernels
+  // read the KV position from *pos_dev (device memory) instead of the frozen
+  // host argument, and size their shared scratch for the full cache capacity.
+  // pos_dev must outlive the captured graph.  nullptr (default) keeps the
+  // eager path byte-identical.
+  void set_decode_graph_pos(const int* pos_dev) { decode_graph_pos_dev_ = pos_dev; }
+  // Host mirror advance for graph REPLAYS: a replay executes the captured
+  // kernels (which advance the device-side position) without ever entering
+  // Attention::forward, so cached_tokens_ must be bumped externally to keep
+  // snapshots/session forks truthful.
+  void advance_cached_tokens_external() { ++cached_tokens_; }
+  int cached_tokens() const { return cached_tokens_; }
+  int kv_cache_capacity() const { return cache_capacity_tokens_; }
+
 private:
+  const int* decode_graph_pos_dev_ = nullptr;
   int d_model;
   int n_heads;
   int n_kv_heads;
@@ -443,6 +459,23 @@ public:
   void restore_session(const JambaSessionSnapshot& snapshot);
   void restore_session_batch(const std::vector<JambaSessionSnapshot>& snapshots);
   void reset_session();
+  // ── CUDA-graph decode (opt-in NSOS_CUDA_GRAPH_DECODE=1) ──────────────
+  // Captures ONE streaming single-token forward into a CUDA graph and replays
+  // it per generated token, collapsing the per-token kernel-launch cascade
+  // into a single cudaGraphLaunch.  Requirements: NSOS_CUDA_PTDS build (the
+  // default-stream kernels must run on a capturable per-thread stream), GPU
+  // streaming decode after a prefill, no MoE/TTT layers (their routing is
+  // host-synced), NSOS_CUDA_SYNC unset, pre-reserved KV cache.  Call pattern:
+  // returns the step's logits, or an EMPTY Tensor whenever the graph path is
+  // unavailable/disabled — the caller then falls back to forward_ids({token})
+  // with identical results.  1st call runs eagerly (warm-up: memory pool,
+  // lazy device state, inference weight caches); 2nd call captures, verifies
+  // instantiation and executes; later calls replay.  Any failure restores the
+  // pre-capture session state and permanently disables the path for this
+  // model (reason in decode_graph_status()).
+  Tensor forward_ids_decode_graph(int token);
+  bool decode_graph_active() const;
+  std::string decode_graph_status() const;
   void set_hamiltonian_mode(bool enabled);
   Tensor run_simd_inference(const Tensor &x, int steps);
   void session_adapt(const Tensor &x, const Tensor &y);
@@ -498,6 +531,11 @@ private:
   int num_layers, d_model, vocab_size;
   Device device;
   ModelConfig model_config_;
+  // CUDA-graph decode state (pimpl; defined in jamba.cpp, USE_CUDA only —
+  // stays empty otherwise).  shared_ptr so the incomplete type is fine here.
+  std::shared_ptr<struct JambaDecodeGraph> decode_graph_;
+  bool decode_graph_disabled_ = false;
+  std::string decode_graph_status_ = "not_attempted";
   // N6 (weight tying): when on, value_head (LM head) shares the embedding's
   // weight BUFFER (both are [vocab, d_model]).  apply_weight_tying_() re-points
   // the shared_ptr storage; it is idempotent and re-applied after every to()

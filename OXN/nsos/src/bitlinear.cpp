@@ -96,6 +96,11 @@ BitLinear::BitLinear(int in, int out, bool b, uint64_t seed)
 void BitLinear::invalidate_cached_materialized_weights() {
   cached_gpu_weight_ = Tensor();
   cached_gpu_weight_version = 0;
+  // The QAT inference ternary cache derives from the same weights; every
+  // point that invalidates the materialized-weight cache (load, device move,
+  // repack, release) invalidates it too.
+  qat_inference_cache_valid_ = false;
+  qat_inference_w_eff_ = Tensor();
 }
 
 void BitLinear::repack_weights() {
@@ -384,8 +389,27 @@ Tensor BitLinear::forward(const Tensor &input) {
     if (qat_ternary_path) {
       // Same scale rule as pack_weights()/quantize_weights() so the QAT codes
       // match what packed inference will use.
-      weight_scale = tensor_abs_mean(weight.data) + 1e-8f;  // absmean (BitNet b1.58)
-      Tensor w_eff = qat_fake_quant_ternary(weight.data, weight_scale);       // [out,in]
+      Tensor w_eff;
+      if (training_mode_) {
+        // Weights change every optimizer step: recompute per forward.
+        weight_scale = tensor_abs_mean(weight.data) + 1e-8f;  // absmean (BitNet b1.58)
+        w_eff = qat_fake_quant_ternary(weight.data, weight_scale);  // [out,in]
+      } else {
+        // Inference: the weights are frozen, so the absmean scale (a device
+        // reduction + sync D2H on GPU) and the ternary w_eff materialization
+        // are computed ONCE and reused for every token.  Besides the obvious
+        // decode win, the sync D2H would also abort CUDA-graph capture.
+        if (!qat_inference_cache_valid_ ||
+            qat_inference_w_eff_.size != weight.data.size ||
+            qat_inference_w_eff_.get_device() != weight.data.get_device()) {
+          qat_inference_scale_ = tensor_abs_mean(weight.data) + 1e-8f;
+          qat_inference_w_eff_ =
+              qat_fake_quant_ternary(weight.data, qat_inference_scale_);
+          qat_inference_cache_valid_ = true;
+        }
+        weight_scale = qat_inference_scale_;
+        w_eff = qat_inference_w_eff_;
+      }
       Tensor x_dq = qat_fake_quant_activations(linear_input, precision_bits);  // [M,in]
       Tensor pre = matmul_nt(x_dq, w_eff);                                    // [M,out]
       if (training_mode_) {

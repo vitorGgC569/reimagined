@@ -19,6 +19,13 @@ option(NSOS_BUILD_OXTAMEM "Build the copied OxtaMem engine with Cargo when avail
 option(NSOS_BUILD_PROFILER "Build the standalone inference profiler tool" OFF)
 option(NSOS_ENABLE_TURBOQUANT "Enable external TurboQuant integration when configured" ON)
 option(NSOS_CUDA_ALLOW_UNSUPPORTED_COMPILER "Allow nvcc to compile with an unsupported host MSVC version" OFF)
+# Per-thread default stream: required for CUDA-graph decode (the graph capture
+# needs kernels on a capturable stream; the legacy default stream cannot be
+# captured).  Changes stream semantics globally — kernels/API calls from
+# different threads no longer serialize through the legacy stream — so it is
+# OFF by default; the T4 notebook builds with it ON and runs the full parity/
+# gradcheck gate suite under it before measuring graph decode.
+option(NSOS_CUDA_PTDS "Compile CUDA with per-thread default stream (enables NSOS_CUDA_GRAPH_DECODE)" OFF)
 option(NSOS_ENABLE_NATIVE_OPTIMIZATIONS "Enable host-specific CPU tuning flags such as -march=native" OFF)
 option(NSOS_ENABLE_X86_AVX2_KERNELS "Build runtime-dispatched AVX2 CPU kernels on x86_64" ON)
 set(NSOS_SANITIZERS "" CACHE STRING "Semicolon-separated sanitizers to enable for CPU builds (address;undefined;thread)")
@@ -214,6 +221,22 @@ if (NSOS_ENABLE_CUDA)
         # is defined; tests/CLI/API targets that link nsos_core need to
         # inherit the CUDA include directory to compile that header.
         target_link_libraries(nsos_core PUBLIC CUDA::cudart CUDA::cublas)
+        if (NSOS_CUDA_PTDS)
+            # 1) nvcc: __global__ launches without an explicit stream go to
+            #    cudaStreamPerThread instead of the legacy stream.
+            # 2) Host TUs: CUDA_API_PER_THREAD_DEFAULT_STREAM makes runtime
+            #    API calls (memcpy/memset/sync) use the per-thread stream too.
+            #    PUBLIC so every consumer TU sees the SAME stream view (mixed
+            #    views across TUs is a documented CUDA footgun).
+            # 3) NSOS_CUDA_PTDS gates the code that needs the capturable
+            #    stream (cublasSetStream, decode-graph capture).
+            target_compile_options(nsos_core PRIVATE
+                $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+            target_compile_definitions(nsos_core PUBLIC
+                CUDA_API_PER_THREAD_DEFAULT_STREAM=1
+                NSOS_CUDA_PTDS=1)
+            message(STATUS "NSOS_CUDA_PTDS=ON: per-thread default stream (CUDA-graph decode enabled)")
+        endif()
         message(STATUS "Using CUDA toolkit: ${CUDAToolkit_BIN_DIR}")
         message(STATUS "Using CUDA toolkit version: ${CUDAToolkit_VERSION}")
         message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
@@ -538,6 +561,14 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gpu_parity_mamba_proper_stream PRIVATE nsos_core)
     target_include_directories(test_gpu_parity_mamba_proper_stream PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_mamba_proper_stream COMMAND test_gpu_parity_mamba_proper_stream)
+
+    # CUDA-graph decode: graph token sequence == eager token sequence (the
+    # graph-frozen-argument failure class).  SKIPs on builds without
+    # NSOS_CUDA_PTDS — legacy default stream cannot be captured.
+    add_executable(test_gpu_parity_decode_graph tests/gpu/test_gpu_parity_decode_graph.cpp)
+    target_link_libraries(test_gpu_parity_decode_graph PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_decode_graph PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_decode_graph COMMAND test_gpu_parity_decode_graph)
 
     # Full Mamba-2 SSD with N-state expansion: mamba_nstate_* CUDA kernels
     # (per-head dt/A, N-dim B/C, h in R^{H*P*N}) vs the host reference.

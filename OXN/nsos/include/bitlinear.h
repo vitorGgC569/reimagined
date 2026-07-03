@@ -92,7 +92,16 @@ public:
   // behavior exactly; JambaModel::set_training_mode propagates this so serving
   // never pays for backward bookkeeping it will not use.  The forward OUTPUT is
   // byte-identical either way; only the saved state is elided.
-  void set_training_mode(bool enabled) { training_mode_ = enabled; }
+  void set_training_mode(bool enabled) {
+    // Any mode transition invalidates the QAT inference ternary cache: on
+    // entering training the weights are about to change; on leaving it the
+    // cache (if any) was computed from pre-training weights.
+    if (enabled != training_mode_) {
+      qat_inference_cache_valid_ = false;
+      qat_inference_w_eff_ = Tensor();
+    }
+    training_mode_ = enabled;
+  }
   bool training_mode() const { return training_mode_; }
 
   Tensor forward(const Tensor &input);
@@ -130,6 +139,14 @@ private:
 
   NormStrategy norm_strategy = NormStrategy::RMS_PERI;
   float weight_scale = 1.0f;
+  // Inference-time QAT ternary cache: at inference the weights are frozen, so
+  // the absmean scale (a device reduction + sync D2H when the weights live on
+  // the GPU) and the ternary w_eff materialization are computed once, not per
+  // forward.  Invalidated on training-mode transitions and everywhere
+  // invalidate_cached_materialized_weights() fires (load/move/repack).
+  bool qat_inference_cache_valid_ = false;
+  float qat_inference_scale_ = 0.0f;
+  Tensor qat_inference_w_eff_;
 
 public:
   Parameter weight;

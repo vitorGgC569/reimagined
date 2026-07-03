@@ -16,6 +16,7 @@
 #ifdef USE_CUDA
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include "../include/cuda/kernels.cuh"  // nsos_bench_d2h_copy
 #endif
 
 namespace py = pybind11;
@@ -96,6 +97,35 @@ PYBIND11_MODULE(nsos_ext, m) {
         d["bins"] = st.bins;
         return d;
     });
+    // Per-thread-default-stream build flag (NSOS_CUDA_PTDS) — prerequisite of
+    // the CUDA-graph decode path (NSOS_CUDA_GRAPH_DECODE).
+    m.def("cuda_ptds_build", []() {
+#ifdef NSOS_CUDA_PTDS
+        return true;
+#else
+        return false;
+#endif
+    });
+    // D2H per-token copy micro-benchmark: average microseconds per 4-byte
+    // device->host copy through PAGEABLE vs PINNED host staging.  Returns a
+    // dict; raises on CUDA errors / CPU builds.
+    m.def("bench_d2h_copy", [](int iters) {
+#ifdef USE_CUDA
+        double pageable_us = 0.0;
+        double pinned_us = 0.0;
+        if (nsos_bench_d2h_copy(iters, &pageable_us, &pinned_us) == 0) {
+            throw std::runtime_error("bench_d2h_copy: CUDA error");
+        }
+        py::dict d;
+        d["iters"] = iters;
+        d["pageable_us"] = pageable_us;
+        d["pinned_us"] = pinned_us;
+        return d;
+#else
+        (void)iters;
+        throw std::runtime_error("bench_d2h_copy requires a CUDA build");
+#endif
+    }, py::arg("iters") = 2000);
     m.def("release_cached_memory", []() { release_cached_memory(); });
     m.def("set_seed", [](uint64_t seed) {
         determinism::DeterminismManager::instance().set_global_seed(seed);
@@ -227,6 +257,7 @@ PYBIND11_MODULE(nsos_ext, m) {
              py::arg("fill") = 0.0f)
         .def_property_readonly("shape", [](const Tensor& tensor) { return tensor.shape.dims; })
         .def_property_readonly("device", [](const Tensor& tensor) { return tensor.device; })
+        .def_property_readonly("size", [](const Tensor& tensor) { return tensor.size; })
         .def("to", &Tensor::to)
         .def("cpu", &Tensor::cpu)
         .def("clone", &Tensor::clone)
@@ -428,6 +459,14 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def("forward", py::overload_cast<const Tensor&, Context*>(&JambaModel::forward),
              py::arg("x"), py::arg("ctx") = nullptr,
              py::call_guard<py::gil_scoped_release>())
+        .def("forward_ids_decode_graph", &JambaModel::forward_ids_decode_graph,
+             py::arg("token"),
+             "CUDA-graph decode step (opt-in NSOS_CUDA_GRAPH_DECODE=1 on an "
+             "NSOS_CUDA_PTDS build).  Returns the step logits, or an empty "
+             "Tensor when the graph path is unavailable — fall back to "
+             "forward_ids([token]).")
+        .def("decode_graph_active", &JambaModel::decode_graph_active)
+        .def("decode_graph_status", &JambaModel::decode_graph_status)
         .def("forward_ids", &JambaModel::forward_ids, py::arg("ids"), py::arg("ctx") = nullptr,
              py::call_guard<py::gil_scoped_release>())
         .def("forward_ids_batch", &JambaModel::forward_ids_batch, py::arg("batch_ids"), py::arg("ctx") = nullptr,

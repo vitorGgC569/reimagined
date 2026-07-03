@@ -255,6 +255,27 @@ Tensor Embedding::forward(const std::vector<int> &indices) {
   return batch.reshape({static_cast<int>(indices.size()), embedding_dim});
 }
 
+Tensor Embedding::forward_device_ids(const int* device_ids, int count) {
+#ifdef USE_CUDA
+  if (device_ids == nullptr || count <= 0) {
+    throw std::runtime_error("Embedding::forward_device_ids: null/empty ids");
+  }
+  if (weight.data.get_device() != Device::GPU) {
+    throw std::runtime_error(
+        "Embedding::forward_device_ids requires GPU-resident weights");
+  }
+  Tensor out({count, embedding_dim}, Device::GPU);
+  launch_embedding_gather_kernel(out.raw_data(), weight.data.raw_data(),
+                                 device_ids, count, vocab_size, embedding_dim);
+  return out;
+#else
+  (void)device_ids;
+  (void)count;
+  throw std::runtime_error(
+      "Embedding::forward_device_ids requires a CUDA build");
+#endif
+}
+
 Tensor Embedding::forward_batch(const std::vector<std::vector<int>>& indices_batch) {
   if (indices_batch.empty()) {
     return Tensor({0, 0, embedding_dim}, weight.data.get_device());

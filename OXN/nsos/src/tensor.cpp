@@ -162,6 +162,21 @@ bool gpu_blas_supported() {
         return false;
     }
 
+#ifdef NSOS_CUDA_PTDS
+    // Per-thread-default-stream build: our __global__ launches go to
+    // cudaStreamPerThread (nvcc --default-stream=per-thread), but cuBLAS
+    // interprets a null stream as the LEGACY stream regardless of that flag.
+    // Pin the handle to the per-thread stream explicitly so GEMMs stay
+    // ordered with the surrounding kernels — and get RECORDED when a decode
+    // CUDA graph captures that stream.
+    if (cublasSetStream(handle, cudaStreamPerThread) != CUBLAS_STATUS_SUCCESS) {
+        cublasDestroy(handle);
+        handle = nullptr;
+        state = 0;
+        return false;
+    }
+#endif
+
     state = 1;
     return true;
 }

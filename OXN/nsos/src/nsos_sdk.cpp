@@ -1000,7 +1000,20 @@ bool gpu_greedy_sampler_enabled() {
 // the host path.  Single-threaded decode use (one instance per generation).
 class GpuGreedySampler {
 public:
-    ~GpuGreedySampler() { free_all(); }
+    ~GpuGreedySampler() {
+        // NSOS_D2H_TIMING=1: report the measured per-token D2H latency of
+        // whichever staging path (pinned vs pageable) this generation used —
+        // the empirical counterpart of nsos_bench_d2h_copy().
+        if (d2h_copies_ > 0) {
+            std::fprintf(stderr,
+                         "[nsos] decode token D2H (%s staging): n=%zu "
+                         "avg=%.2f us total=%.2f ms\n",
+                         h_result_ ? "pinned" : "pageable", d2h_copies_,
+                         d2h_us_total_ / static_cast<double>(d2h_copies_),
+                         d2h_us_total_ / 1000.0);
+        }
+        free_all();
+    }
 
     bool select(const float* raw_row_device, int vocab,
                 const GenerationOptions& options,
@@ -1066,9 +1079,23 @@ public:
         // extra por passo (item do estudo CuPy).
         int token = options.eos_token_id;
         int* dst = h_result_ ? h_result_ : &token;
+        static const bool d2h_timing = [] {
+            const char* v = std::getenv("NSOS_D2H_TIMING");
+            return v != nullptr && v[0] == '1';
+        }();
+        std::chrono::steady_clock::time_point d2h_started;
+        if (d2h_timing) d2h_started = std::chrono::steady_clock::now();
         if (cudaMemcpy(dst, d_result_, sizeof(int),
                        cudaMemcpyDeviceToHost) != cudaSuccess) {
             return false;
+        }
+        if (d2h_timing) {
+            d2h_us_total_ += static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - d2h_started)
+                    .count()) /
+                1000.0;
+            ++d2h_copies_;
         }
         if (h_result_) token = *h_result_;
         // -1 sentinel: every candidate was masked.  Fall back to the host greedy
@@ -1137,6 +1164,8 @@ private:
     bool control_built_ = false;
     size_t marked_count_ = 0;
     std::vector<int> banned_;
+    double d2h_us_total_ = 0.0;  // NSOS_D2H_TIMING accumulators
+    size_t d2h_copies_ = 0;
 };
 #endif  // USE_CUDA
 
@@ -1621,6 +1650,12 @@ std::string InferenceEngine::generate_stream(
         }
         decode_started_at = std::chrono::steady_clock::now();
 
+        // CUDA-graph decode (opt-in NSOS_CUDA_GRAPH_DECODE=1 on an
+        // NSOS_CUDA_PTDS build): the model captures one single-token forward
+        // and replays it per token.  An empty return means the graph path is
+        // unavailable/disabled — the SAME token then runs through the eager
+        // forward_ids, so results are identical either way.
+        bool try_decode_graph = true;
         for (int step = 0; step < std::max(options.max_tokens, 0); ++step) {
             const int next_token = sample_next_token(logits);
             output.push_back(next_token);
@@ -1634,6 +1669,14 @@ std::string InferenceEngine::generate_stream(
                 break;
             }
 
+            if (try_decode_graph) {
+                Tensor graphed = this->model->forward_ids_decode_graph(next_token);
+                if (graphed.size > 0) {
+                    logits = std::move(graphed);
+                    continue;
+                }
+                try_decode_graph = false;
+            }
             logits = this->model->forward_ids({next_token}, nullptr);
         }
         decode_finished_at = std::chrono::steady_clock::now();

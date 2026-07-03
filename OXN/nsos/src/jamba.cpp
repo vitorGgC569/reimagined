@@ -649,6 +649,11 @@ Tensor JambaModel::forward(const Tensor& x) {
 
 void JambaModel::to(Device dev) {
     device = dev;
+    // Device moves reallocate every buffer a captured decode graph points at.
+    if (decode_graph_) {
+        decode_graph_.reset();
+        if (!decode_graph_disabled_) decode_graph_status_ = "idle";
+    }
     embedding->to(dev);
     for (auto& layer : layers) {
         layer->to(dev);
@@ -959,6 +964,12 @@ void JambaModel::set_streaming_inference(bool enabled) {
         set_training_mode(false);
     }
     streaming_inference_enabled_ = enabled;
+    // The captured decode graph embeds this session's device buffers; any
+    // streaming-mode transition ends the session it was captured for.
+    if (decode_graph_) {
+        decode_graph_.reset();
+        if (!decode_graph_disabled_) decode_graph_status_ = "idle";
+    }
     for (auto& layer : layers) {
         layer->set_streaming_inference(enabled);
     }
@@ -1039,6 +1050,299 @@ Tensor JambaModel::forward_ids(const std::vector<int>& ids, Context* ctx) {
                                model_config_.max_context_tokens, false);
     Tensor x = embedding->forward(ids);
     return forward(x, ctx);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CUDA-graph decode (opt-in NSOS_CUDA_GRAPH_DECODE=1; requires NSOS_CUDA_PTDS)
+//
+// One streaming single-token forward is captured into a CUDA graph and then
+// replayed per generated token: the whole per-token kernel cascade (embedding
+// gather, per-layer norms/projections/Mamba step/attention decode/FFN, final
+// norm + LM head) becomes ONE cudaGraphLaunch.  The two per-token host inputs
+// (token id, KV position) enter through pinned staging ints that the graph's
+// captured H2D memcpy nodes RE-READ at every replay — the host just rewrites
+// two pinned ints per token.
+//
+// Guarded adoption: any capture problem restores the pre-capture session
+// state and permanently disables the path for this model instance; the caller
+// falls back to the eager forward_ids with identical results.  The parity
+// contract (graph token sequence == eager token sequence) is enforced by
+// tests/gpu/test_gpu_parity_decode_graph.cpp on the target GPU.
+// ═══════════════════════════════════════════════════════════════════════════
+#ifdef USE_CUDA
+struct JambaDecodeGraph {
+    enum class Phase { Warm, Captured };
+    Phase phase = Phase::Warm;
+    cudaGraphExec_t exec = nullptr;
+    int* h_token = nullptr;  // pinned: the captured H2D nodes re-read these at
+    int* h_pos = nullptr;    //   every replay (contents-at-execution semantics)
+    int* d_token = nullptr;
+    int* d_pos = nullptr;
+    int next_pos = 0;        // host mirror of the KV position of the NEXT step
+    size_t replays = 0;
+    Tensor logits;           // captured output buffer; held alive so the pool
+                             // cannot hand it to anyone while the graph lives
+    bool alloc_buffers() {
+        return cudaMallocHost(&h_token, sizeof(int)) == cudaSuccess &&
+               cudaMallocHost(&h_pos, sizeof(int)) == cudaSuccess &&
+               cudaMalloc(&d_token, sizeof(int)) == cudaSuccess &&
+               cudaMalloc(&d_pos, sizeof(int)) == cudaSuccess;
+    }
+    ~JambaDecodeGraph() {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (d_token) cudaFree(d_token);
+        if (d_pos) cudaFree(d_pos);
+        if (h_token) cudaFreeHost(h_token);
+        if (h_pos) cudaFreeHost(h_pos);
+        (void)cudaGetLastError();
+    }
+};
+#endif  // USE_CUDA
+
+bool JambaModel::decode_graph_active() const {
+#ifdef USE_CUDA
+    return decode_graph_ != nullptr &&
+           decode_graph_->phase == JambaDecodeGraph::Phase::Captured;
+#else
+    return false;
+#endif
+}
+
+std::string JambaModel::decode_graph_status() const { return decode_graph_status_; }
+
+Tensor JambaModel::forward_ids_decode_graph(int token) {
+#if !defined(USE_CUDA)
+    (void)token;
+    decode_graph_status_ = "unavailable: CPU build";
+    return Tensor();
+#elif !defined(NSOS_CUDA_PTDS)
+    (void)token;
+    decode_graph_status_ =
+        "unavailable: build without NSOS_CUDA_PTDS (default-stream kernel "
+        "launches go to the legacy stream, which cannot be captured; rebuild "
+        "with -DNSOS_CUDA_PTDS=ON)";
+    return Tensor();
+#else
+    static const bool env_enabled = [] {
+        const char* v = std::getenv("NSOS_CUDA_GRAPH_DECODE");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!env_enabled) {
+        decode_graph_status_ = "disabled: NSOS_CUDA_GRAPH_DECODE unset";
+        return Tensor();
+    }
+    if (decode_graph_disabled_) return Tensor();
+
+    auto attn_layers = [&](auto&& fn) {
+        for (auto& layer : layers) {
+            if (layer && layer->uses_attention() && layer->attn_layer) {
+                fn(*layer->attn_layer);
+            }
+        }
+    };
+    auto disable = [&](const std::string& why) {
+        decode_graph_disabled_ = true;
+        decode_graph_status_ = "disabled: " + why;
+        decode_graph_.reset();
+        std::fprintf(stderr, "[nsos] decode CUDA graph disabled: %s\n",
+                     why.c_str());
+    };
+
+    // ── replay hot path ─────────────────────────────────────────────────
+    if (decode_graph_ &&
+        decode_graph_->phase == JambaDecodeGraph::Phase::Captured) {
+        JambaDecodeGraph& dg = *decode_graph_;
+        *dg.h_token = token;
+        *dg.h_pos = dg.next_pos;
+        if (cudaGraphLaunch(dg.exec, cudaStreamPerThread) != cudaSuccess) {
+            // The failed launch did not advance device state: the caller
+            // re-runs this token eagerly and generation continues.
+            disable("cudaGraphLaunch failed mid-generation");
+            return Tensor();
+        }
+        ++dg.next_pos;
+        ++dg.replays;
+        last_input_ids_.push_back(token);
+        // A replay bypasses Attention::forward, so the host position mirrors
+        // must advance here to keep session forks/snapshots truthful.
+        attn_layers([](Attention& a) { a.advance_cached_tokens_external(); });
+        return dg.logits;
+    }
+
+    // ── one-time preconditions + warm-up step ───────────────────────────
+    if (!decode_graph_) {
+        const char* sync_env = std::getenv("NSOS_CUDA_SYNC");
+        if (sync_env && sync_env[0] == '1') {
+            disable("NSOS_CUDA_SYNC=1 (device-wide syncs are illegal during "
+                    "stream capture)");
+            return Tensor();
+        }
+        if (device != Device::GPU) {
+            disable("model is not on the GPU");
+            return Tensor();
+        }
+        if (!streaming_inference_enabled_) {
+            disable("streaming inference is off");
+            return Tensor();
+        }
+        if (last_input_ids_.empty()) {
+            disable("no prefill ran before decode");
+            return Tensor();
+        }
+        for (auto& layer : layers) {
+            if (layer && layer->uses_moe()) {
+                disable("MoE layer present (routing is host-synced per step; "
+                        "device-resident MoE routing is a documented follow-up)");
+                return Tensor();
+            }
+            if (layer && layer->uses_ttt()) {
+                disable("TTT layer present (host-side per-token adaptation)");
+                return Tensor();
+            }
+        }
+        bool has_mamba = false;
+        for (auto& layer : layers) {
+            if (layer && !layer->uses_attention() && !layer->uses_ttt()) {
+                has_mamba = true;
+            }
+        }
+        const char* step_env = std::getenv("NSOS_MAMBA_GPU_STEP");
+        if (has_mamba && (step_env == nullptr || step_env[0] != '1')) {
+            disable("Mamba layers run the HOST decode step (set "
+                    "NSOS_MAMBA_GPU_STEP=1 so the per-token step is "
+                    "device-resident and capturable)");
+            return Tensor();
+        }
+        if (has_mamba && model_config_.mamba_proper_ssm &&
+            model_config_.mamba_state_expansion) {
+            disable("N-state Mamba decode step is host-side (the fused GPU "
+                    "step covers the diagonal proper path only) — construct "
+                    "with mamba_state_expansion=false for graph decode; the "
+                    "nstate device step is a documented follow-up");
+            return Tensor();
+        }
+        if (cuda_graphs_supported() == 0) {
+            disable("driver/device reports no CUDA graph support");
+            return Tensor();
+        }
+        decode_graph_ = std::make_shared<JambaDecodeGraph>();
+        decode_graph_status_ = "warming";
+        // Warm-up: run THIS token through the normal eager path.  It warms
+        // the tensor pool with decode-shaped buffers, uploads lazy device
+        // state (Mamba stream ring/h), and populates the BitLinear inference
+        // weight caches — everything that would otherwise allocate or sync
+        // INSIDE the capture.
+        return forward_ids({token}, nullptr);
+    }
+
+    // ── capture (second decode token) ───────────────────────────────────
+    JambaDecodeGraph& dg = *decode_graph_;
+    if (!dg.alloc_buffers()) {
+        (void)cudaGetLastError();
+        disable("pinned/device staging allocation failed");
+        return Tensor();
+    }
+    int pos0 = -1;
+    bool lockstep = true;
+    bool reserved = true;
+    bool shared_fits = true;
+    attn_layers([&](Attention& a) {
+        const int p = a.cached_tokens();
+        if (pos0 < 0) pos0 = p;
+        else if (p != pos0) lockstep = false;
+        // The decode kernel's shared scratch is sized once, at capture, for
+        // the WHOLE cache capacity — so the cache must be pre-reserved (the
+        // SDK reserves prompt+max_tokens before the loop) and fit in the
+        // 48KB default shared-memory-per-block budget (12K slots).
+        if (a.kv_cache_capacity() <= p + 1) reserved = false;
+        if (a.kv_cache_capacity() > 12000) shared_fits = false;
+    });
+    if (!lockstep) { disable("attention layers out of position lockstep"); return Tensor(); }
+    if (!reserved) {
+        disable("KV cache not pre-reserved (call reserve_kv_cache for "
+                "prompt+max_tokens before the decode loop)");
+        return Tensor();
+    }
+    if (!shared_fits) {
+        disable("KV capacity exceeds the decode kernel's 48KB shared scratch "
+                "(12K tokens)");
+        return Tensor();
+    }
+    if (pos0 < 0) pos0 = static_cast<int>(last_input_ids_.size());
+    *dg.h_token = token;
+    *dg.h_pos = pos0;
+    dg.next_pos = pos0;
+
+    // Snapshot BEFORE capture: recording executes the HOST side of the
+    // forward (position mirrors advance) without running any device work; a
+    // failed capture must undo those host advances before the eager retry.
+    JambaSessionSnapshot pre_capture = fork_session();
+    attn_layers([&](Attention& a) { a.set_decode_graph_pos(dg.d_pos); });
+    cudaGraph_t graph = nullptr;
+    bool capture_open = false;
+    try {
+        if (cudaStreamBeginCapture(cudaStreamPerThread,
+                                   cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+            throw std::runtime_error("cudaStreamBeginCapture failed");
+        }
+        capture_open = true;
+        if (cudaMemcpyAsync(dg.d_token, dg.h_token, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cudaStreamPerThread) != cudaSuccess ||
+            cudaMemcpyAsync(dg.d_pos, dg.h_pos, sizeof(int),
+                            cudaMemcpyHostToDevice,
+                            cudaStreamPerThread) != cudaSuccess) {
+            throw std::runtime_error("token/pos H2D memcpy node failed");
+        }
+        Tensor x = embedding->forward_device_ids(dg.d_token, 1);
+        Tensor lg = forward(x, nullptr);
+        cudaError_t end_status = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+        capture_open = false;
+        if (end_status != cudaSuccess || graph == nullptr) {
+            throw std::runtime_error(std::string("cudaStreamEndCapture: ") +
+                                     cudaGetErrorString(end_status));
+        }
+        if (cudaGraphInstantiate(&dg.exec, graph, 0) != cudaSuccess) {
+            throw std::runtime_error("cudaGraphInstantiate failed");
+        }
+        (void)cudaGraphUpload(dg.exec, cudaStreamPerThread);
+        cudaGraphDestroy(graph);
+        graph = nullptr;
+        dg.logits = lg;
+    } catch (const std::exception& e) {
+        if (capture_open) {
+            cudaGraph_t partial = nullptr;
+            (void)cudaStreamEndCapture(cudaStreamPerThread, &partial);
+            if (partial) cudaGraphDestroy(partial);
+        }
+        if (graph) cudaGraphDestroy(graph);
+        (void)cudaGetLastError();
+        attn_layers([](Attention& a) { a.set_decode_graph_pos(nullptr); });
+        restore_session(pre_capture);
+        disable(std::string("capture failed: ") + e.what());
+        return Tensor();
+    }
+    // The hooks only influence what gets RECORDED; clear them so any later
+    // eager forward (e.g. after a mid-generation disable) behaves normally.
+    attn_layers([](Attention& a) { a.set_decode_graph_pos(nullptr); });
+
+    // Capture only RECORDS — this launch EXECUTES the captured step.
+    if (cudaGraphLaunch(dg.exec, cudaStreamPerThread) != cudaSuccess) {
+        restore_session(pre_capture);
+        disable("first cudaGraphLaunch failed");
+        return Tensor();
+    }
+    dg.phase = JambaDecodeGraph::Phase::Captured;
+    dg.next_pos = pos0 + 1;
+    dg.replays = 1;
+    last_input_ids_.push_back(token);
+    decode_graph_status_ = "active";
+    std::fprintf(stderr,
+                 "[nsos] decode CUDA graph ACTIVE: captured 1 step at pos=%d; "
+                 "replaying one launch per token\n",
+                 pos0);
+    return dg.logits;
+#endif
 }
 
 Tensor JambaModel::forward_ids_batch(const std::vector<std::vector<int>>& batch_ids, Context* ctx) {
@@ -1354,6 +1658,13 @@ void JambaModel::reset_session() {
     last_input_batch_lengths_.clear();
     saved_final_hidden_ = Tensor();
     saved_final_norm_ = Tensor();
+    // A captured decode graph embeds pointers into THIS session's device
+    // state (KV cache, Mamba ring); replaying it after a reset would write
+    // stale buffers.  Drop it — a new generation re-captures cheaply.
+    if (decode_graph_) {
+        decode_graph_.reset();
+        if (!decode_graph_disabled_) decode_graph_status_ = "idle";
+    }
     for (auto& layer : layers) {
         layer->reset();
     }
@@ -2016,12 +2327,16 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
     // Deterministic mode uses the ordered per-expert path below (its scatter is
     // a sequence of non-overlapping row copies summed in fixed expert order),
     // not the batched scatter-add kernel.
+    // moe_router_grad only matters for BACKWARD (it needs the per-expert
+    // outputs saved by the host path below); at inference there is no
+    // backward, so the router-grad flag must not force decode through the
+    // host loop (which costs a weights D2H + per-row host sort every step).
     if (target_device == Device::GPU &&
         weights.get_device() == Device::GPU &&
         gpu_custom_kernels_supported() && rows > 0 && num_experts > 0 &&
         num_experts <= 1024 && dim > 0 &&
         !determinism::deterministic_reductions_enabled() &&
-        !moe_router_grad_enabled()) {
+        !(moe_router_grad_enabled() && training_mode_)) {
         return forward_moe_gpu_batched(x, weights, rows, dim,
                                         effective_top_k);
     }
@@ -3540,7 +3855,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         cached_tokens_,
                         n_kv_heads,
                         head_dim,
-                        theta);
+                        theta,
+                        nullptr);
                     launch_gqa_cached_attention_decode_kernel(
                         q_flat.raw_data() + static_cast<size_t>(batch) * q_row_stride,
                         key_cache_buffer_.raw_data() + static_cast<size_t>(batch) * cache_row_stride,
@@ -3552,7 +3868,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         n_kv_heads,
                         head_dim,
                         kv_group_size,
-                        theta);
+                        theta,
+                        nullptr,
+                        0);
                 }
                 ++cached_tokens_;
 
@@ -3837,6 +4155,10 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         if (streaming_inference_ && seq_len == 1) {
             ensure_kv_cache_capacity(cached_tokens_ + 1, Device::GPU);
             Tensor output_gpu({seq_len, d_model}, Device::GPU);
+            // decode_graph_pos_dev_: set only while JambaModel records the
+            // decode CUDA graph — the kernels then read the position from
+            // device memory (host args freeze at capture) and the decode
+            // kernel sizes its shared scratch for the full cache capacity.
             launch_gqa_append_kv_cache_kernel(
                 kv_flat.raw_data(),
                 key_cache_buffer_.raw_data(),
@@ -3844,7 +4166,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 cached_tokens_,
                 n_kv_heads,
                 head_dim,
-                theta);
+                theta,
+                decode_graph_pos_dev_);
             launch_gqa_cached_attention_decode_kernel(
                 q_flat.raw_data(),
                 key_cache_buffer_.raw_data(),
@@ -3856,7 +4179,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 n_kv_heads,
                 head_dim,
                 kv_group_size,
-                theta);
+                theta,
+                decode_graph_pos_dev_,
+                decode_graph_pos_dev_ != nullptr ? cache_capacity_tokens_ : 0);
             ++cached_tokens_;
 
             cudaError_t status = cudaGetLastError();
