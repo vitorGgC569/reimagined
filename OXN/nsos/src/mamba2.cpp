@@ -226,18 +226,24 @@ Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
     // timescale HIERARCHY comes from A.  Log-spacing dt over the same index
     // range as A — in the opposite sense — would make the product dt·A_eff
     // (which sets the decay) constant across heads and CANCEL A's hierarchy.
-    // A constant small dt keeps every head slow enough to learn recall while
-    // preserving A's per-head/-channel timescale spread.  Deterministic (no
-    // RNG).  Default ON with dt_init=0.01; NSOS_MAMBA_DT_INIT=0 restores the
-    // flat (bias=0) init for A/B; a numeric value overrides dt_init.
+    //
+    // ⚠ DEFAULT OFF (opt-in).  A local A/B on MQAR (GTX 1050, sm_61) showed the
+    // dt-init ALONE *regresses* recall (n_kv=8: 0.46 -> 0.34; loss 1.53 -> 1.69).
+    // Reason: our recurrence is  h = decay·h + B·x  — the input is NOT scaled by
+    // dt (we lack the reference's  dB = dt·B  ZOH input discretisation).  With a
+    // small dt the decay -> 1 (stops forgetting) BUT the input keeps writing at
+    // full strength every token -> the state SATURATES (loses selectivity).  A
+    // small dt is only correct when COUPLED with dt·B input scaling.  So this
+    // init is now opt-in and should be enabled together with the dt·B change.
+    // Opt-in: NSOS_MAMBA_DT_INIT=1 (dt_init=0.01) or a numeric dt_init value.
     if (dt_proj_ && dt_proj_->bias.data.size > 0) {  // dt_proj_ built with bias
       const char* dtenv = std::getenv("NSOS_MAMBA_DT_INIT");
-      const bool disabled = (dtenv != nullptr && dtenv[0] == '0' && dtenv[1] == '\0');
-      if (!disabled) {
-        float dt_init = 0.01f;  // default: holds state ~100..10000 tokens
-        // A numeric value (anything other than unset / "1") overrides dt_init.
-        if (dtenv != nullptr && dtenv[0] != '\0' &&
-            !(dtenv[0] == '1' && dtenv[1] == '\0')) {
+      const bool enabled = (dtenv != nullptr && dtenv[0] != '\0' &&
+                            !(dtenv[0] == '0' && dtenv[1] == '\0'));
+      if (enabled) {
+        float dt_init = 0.01f;  // NSOS_MAMBA_DT_INIT=1 -> default 0.01
+        // A numeric value (anything other than "1") overrides dt_init.
+        if (!(dtenv[0] == '1' && dtenv[1] == '\0')) {
           const float v = std::strtof(dtenv, nullptr);
           if (v > 1e-6f && v < 1.0f) dt_init = v;
         }
