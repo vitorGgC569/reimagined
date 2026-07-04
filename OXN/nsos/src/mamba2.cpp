@@ -210,6 +210,44 @@ Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
     for (int c = 0; c < d_model; ++c) {
       cw[c * conv_kernel_ + (conv_kernel_ - 1)] = 1.0f; // identity: newest tap
     }
+
+    // dt bias init — THE critical Mamba init (Gu & Dao, mamba-ssm reference).
+    // Without it, dt_proj's bias starts ~0, so softplus(dt)≈softplus(0)=0.693
+    // and the discrete decay exp(-dt·A) forgets ~50% of the SSM state PER
+    // TOKEN at step 0 — the model literally cannot hold a key long enough to
+    // learn associative recall (measured: our recall plateaus ~0.45 while the
+    // reference Mamba-2, which does this init, reaches 1.0 / loss→0).  We set
+    // dt_bias = softplus^{-1}(dt_init) so softplus(dt)≈dt_init at step 0 and
+    // the discrete decay exp(-dt·A_eff) holds state over many tokens; the model
+    // refines selectivity from there.
+    //
+    // dt is CONSTANT across the dt outputs (not per-head-varied): our A_log is
+    // already initialised on a log-spaced grid (A_eff ~ 1 .. a_min), so the
+    // timescale HIERARCHY comes from A.  Log-spacing dt over the same index
+    // range as A — in the opposite sense — would make the product dt·A_eff
+    // (which sets the decay) constant across heads and CANCEL A's hierarchy.
+    // A constant small dt keeps every head slow enough to learn recall while
+    // preserving A's per-head/-channel timescale spread.  Deterministic (no
+    // RNG).  Default ON with dt_init=0.01; NSOS_MAMBA_DT_INIT=0 restores the
+    // flat (bias=0) init for A/B; a numeric value overrides dt_init.
+    if (dt_proj_ && dt_proj_->bias.data.size > 0) {  // dt_proj_ built with bias
+      const char* dtenv = std::getenv("NSOS_MAMBA_DT_INIT");
+      const bool disabled = (dtenv != nullptr && dtenv[0] == '0' && dtenv[1] == '\0');
+      if (!disabled) {
+        float dt_init = 0.01f;  // default: holds state ~100..10000 tokens
+        // A numeric value (anything other than unset / "1") overrides dt_init.
+        if (dtenv != nullptr && dtenv[0] != '\0' &&
+            !(dtenv[0] == '1' && dtenv[1] == '\0')) {
+          const float v = std::strtof(dtenv, nullptr);
+          if (v > 1e-6f && v < 1.0f) dt_init = v;
+        }
+        // softplus^{-1}(y) = log(exp(y) - 1), numerically safe for small y.
+        const float dt_bias = std::log(std::expm1(dt_init) + 1e-12f);
+        float* db = dt_proj_->bias.data.data();
+        const int nb = dt_proj_->bias.data.size;
+        for (int i = 0; i < nb; ++i) db[i] = dt_bias;
+      }
+    }
   }
 }
 
