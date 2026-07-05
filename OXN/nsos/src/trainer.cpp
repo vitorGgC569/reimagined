@@ -702,7 +702,7 @@ void apply_progressive_qat_phase(Trainer& trainer) {
     }
 }
 
-void apply_qat_regularization(Trainer& trainer) {
+void apply_qat_regularization(Trainer& trainer, int accumulation_steps) {
     if (!trainer.model || !trainer.phase_scheduler.progressive_qat_enabled) {
         return;
     }
@@ -718,8 +718,14 @@ void apply_qat_regularization(Trainer& trainer) {
                                       effective.semantic_warmup_steps) /
                        ramp_denom,
                    0.0f, 1.0f);
+    // Task gradients are accumulated as a sum and divided by
+    // accumulation_steps in apply_optimizer_step.  Scale this once-per-step
+    // regularizer by the same count so its effective coefficient is invariant
+    // to batch size / gradient accumulation.
     const float regularization =
-        trainer.phase_scheduler.ternary_regularization * std::max(ramp, 0.0f);
+        trainer.phase_scheduler.ternary_regularization *
+        std::max(ramp, 0.0f) *
+        static_cast<float>(std::max(accumulation_steps, 1));
     if (regularization <= 0.0f) {
         return;
     }
@@ -1871,7 +1877,7 @@ float train_supervised_batch_impl(Trainer& trainer,
         tm_last = _tm_bwd1;
     }
 
-    apply_qat_regularization(trainer);
+    apply_qat_regularization(trainer, std::max(sample_count, 1));
     apply_moe_aux_regularization(trainer);
     float grad_norm = 0.0f;
     const auto _tm_opt0 = tm_now();
@@ -1978,7 +1984,7 @@ float Trainer::accumulate_gradients(const std::vector<int>& tokens,
         grad = grad.add(l2_grad);
     }
     model->backward_external(grad, ctx);
-    apply_qat_regularization(*this);
+    apply_qat_regularization(*this, 1);
     apply_moe_aux_regularization(*this);
     return loss;
 }
@@ -2132,7 +2138,7 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
             const float mean_loss =
                 aggregate_loss / static_cast<float>(std::max(aggregate_samples, 1));
 
-            apply_qat_regularization(*this);
+            apply_qat_regularization(*this, samples);
             apply_moe_aux_regularization(*this);
             float grad_norm = 0.0f;
             apply_optimizer_step(*this, params, samples, &grad_norm);

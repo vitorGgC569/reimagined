@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <vector>
 
 using namespace nsos;
 
@@ -49,7 +50,61 @@ void test_ssd_recurrence() {
   std::cout << "Mamba2 SSD Forward test passed!" << std::endl;
 }
 
+void test_proper_diagonal_batched_streaming_decode() {
+  constexpr int D = 8;
+  MambaConfig config;
+  config.proper_selective_ssm = true;
+  config.proper_state_expansion = false;
+  config.conv_kernel = 3;
+  Mamba2SSD layer(D, 4, 2, config);
+  layer.set_streaming_mode(true);
+
+  std::vector<MambaStreamSnapshot> snapshots;
+  std::vector<Tensor> expected;
+  for (int batch = 0; batch < 2; ++batch) {
+    layer.reset();
+    for (int step = 0; step < 3; ++step) {
+      Tensor token({1, 1, D});
+      for (int c = 0; c < D; ++c) {
+        token.data()[c] =
+            0.03f * static_cast<float>(1 + batch * 17 + step * D + c);
+      }
+      (void)layer.forward(token);
+    }
+    MambaStreamSnapshot snapshot = layer.snapshot_streaming_state();
+    snapshots.push_back(snapshot);
+
+    layer.restore_streaming_state(snapshot);
+    Tensor next({1, 1, D});
+    for (int c = 0; c < D; ++c) {
+      next.data()[c] = -0.04f * static_cast<float>(1 + batch * D + c);
+    }
+    expected.push_back(layer.forward(next).cpu());
+  }
+
+  layer.restore_streaming_state_batch(snapshots);
+  Tensor batch_next({2, 1, D});
+  for (int batch = 0; batch < 2; ++batch) {
+    for (int c = 0; c < D; ++c) {
+      batch_next.data()[batch * D + c] =
+          -0.04f * static_cast<float>(1 + batch * D + c);
+    }
+  }
+  Tensor actual = layer.forward(batch_next).cpu();
+  assert(actual.shape.dims == std::vector<int>({2, 1, D}));
+  for (int batch = 0; batch < 2; ++batch) {
+    for (int c = 0; c < D; ++c) {
+      const float want = expected[static_cast<size_t>(batch)].data()[c];
+      const float got = actual.data()[batch * D + c];
+      assert(std::abs(got - want) < 1e-5f);
+    }
+  }
+
+  std::cout << "Proper diagonal batched streaming test passed!" << std::endl;
+}
+
 int main() {
   test_ssd_recurrence();
+  test_proper_diagonal_batched_streaming_decode();
   return 0;
 }

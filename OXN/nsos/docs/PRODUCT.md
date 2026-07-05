@@ -40,7 +40,7 @@
 3. Determinism + industrial Python (`python OXN/scripts/gatekeeper.py` with `NSOS_BUILD_DIR` set).
 4. Benchmark gate (`python OXN/nsos/scripts/benchmark_gate.py --device cpu --profile mamba_small …`); thresholds: ≥ 1.0 prompt tok/s, ≥ 0.1 decode tok/s.
 5. Fuzz smoke (`python OXN/nsos/scripts/fuzz_surface_smoke.py …`).
-6. OxtaMem integrated lane: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `python -m compileall` over `modules/oxtamem/python`, `oxta_engine/python`, `nn/`.
+6. OxtaMem integrated lane: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `python -m compileall` over `modules/oxtamem/python` and `nn/`. The duplicate legacy SDK under `oxta_engine/python` was removed; the packaged safe serializer is the only supported Python client.
 7. Docker build (`docker build -t nsos-mvp .`).
 8. `git status --short` clean except ignored build artifacts.
 

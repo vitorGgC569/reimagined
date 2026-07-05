@@ -438,6 +438,10 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_lut_cas PRIVATE nsos_core)
     add_test(NAME test_lut_cas COMMAND test_lut_cas)
 
+    add_executable(test_turboquant tests/test_turboquant.cpp)
+    target_link_libraries(test_turboquant PRIVATE nsos_core)
+    add_test(NAME test_turboquant COMMAND test_turboquant)
+
     add_executable(test_bitnet_integrated tests/test_bitnet_integrated.cpp)
     target_link_libraries(test_bitnet_integrated PRIVATE nsos_core)
     add_test(NAME test_bitnet_integrated COMMAND test_bitnet_integrated)
@@ -475,6 +479,10 @@ if (NSOS_BUILD_TESTS)
     add_executable(test_tokenizer tests/test_tokenizer.cpp)
     target_link_libraries(test_tokenizer PRIVATE nsos_core)
     add_test(NAME test_tokenizer COMMAND test_tokenizer)
+
+    add_executable(test_dataloader tests/test_dataloader.cpp)
+    target_link_libraries(test_dataloader PRIVATE nsos_core)
+    add_test(NAME test_dataloader COMMAND test_dataloader)
 
     if (NSOS_BUILD_PYTHON)
         add_test(

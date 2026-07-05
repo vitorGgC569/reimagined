@@ -899,57 +899,62 @@ void JambaModel::load_edge_linear_pack(const std::string& path,
 
     for (uint32_t index = 0; index < expected_layers; ++index) {
         const uint8_t sensitive = read_pod<uint8_t>(in);
+        if (sensitive > 1) {
+            throw std::runtime_error("Edge pack contains an invalid sensitivity flag");
+        }
         BitLinearPackedState state;
         state.in_features = read_pod<int32_t>(in);
         state.out_features = read_pod<int32_t>(in);
         state.use_bias = read_pod<uint8_t>(in) != 0;
         state.weight_scale = read_pod<float>(in);
-        if (state.in_features <= 0 || state.out_features <= 0 ||
-            state.in_features > 1'000'000 || state.out_features > 1'000'000) {
-            throw std::runtime_error("Edge pack layer dimensions are outside configured limits");
+        BitLinear* layer = linear_layers[index];
+        const int expected_in = layer->input_features();
+        const int expected_out = layer->output_features();
+        const bool expected_bias = layer->uses_bias();
+        if (state.in_features != expected_in || state.out_features != expected_out ||
+            state.use_bias != expected_bias) {
+            throw std::runtime_error("Edge pack layer metadata does not match model architecture");
         }
-        const uint64_t max_weight_words =
+        if ((sensitive != 0) != layer->quantization_sensitive()) {
+            throw std::runtime_error("Edge pack sensitivity metadata does not match model architecture");
+        }
+        if (!std::isfinite(state.weight_scale) || state.weight_scale <= 0.0f) {
+            throw std::runtime_error("Edge pack contains an invalid weight scale");
+        }
+        const uint64_t required_weight_words =
             static_cast<uint64_t>(state.out_features) *
             static_cast<uint64_t>((state.in_features + 15) / 16);
-        const uint64_t max_out = static_cast<uint64_t>(state.out_features);
-        const uint64_t max_in_out =
+        const uint64_t required_out = static_cast<uint64_t>(state.out_features);
+        const uint64_t required_in = static_cast<uint64_t>(state.in_features);
+        const uint64_t required_in_out =
             static_cast<uint64_t>(state.in_features) * static_cast<uint64_t>(state.out_features);
-        state.packed_weights = read_vector<uint32_t>(in, max_weight_words, "packed_weights");
-        state.magnitude = read_vector<float>(in, max_out, "magnitude");
-        state.bias = read_vector<float>(in, state.use_bias ? max_out : 0, "bias");
-        state.flat_alpha = read_vector<float>(in, max_in_out, "flat_alpha");
-        state.flat_beta = read_vector<float>(in, max_in_out, "flat_beta");
+        state.packed_weights =
+            read_vector<uint32_t>(in, required_weight_words, "packed_weights");
+        state.magnitude = read_vector<float>(in, required_out, "magnitude");
+        state.bias =
+            read_vector<float>(in, state.use_bias ? required_out : 0, "bias");
+        state.flat_alpha = read_vector<float>(in, required_in, "flat_alpha");
+        state.flat_beta = read_vector<float>(in, required_in, "flat_beta");
 
-        // read_vector only caps the MAXIMUM element count; the consumers
-        // (BitNetAdapter::unpack_weights, from_blob with a fixed shape) read a
-        // FIXED number of elements and would read out of bounds if a truncated
-        // or malformed pack under-fills a vector.  Require each to hold at least
-        // what its consumer reads.  Note import_packed_state consumes
-        // flat_alpha/flat_beta as {in_features} (NOT in*out), unconditionally.
-        auto require_at_least = [](size_t got, uint64_t need, const char* what) {
-            if (static_cast<uint64_t>(got) < need) {
+        auto require_exact = [](size_t got, uint64_t need, const char* what) {
+            if (static_cast<uint64_t>(got) != need) {
                 throw std::runtime_error(
                     std::string("Edge pack ") + what +
-                    " is shorter than required (truncated or malformed)");
+                    " length does not match model architecture");
             }
         };
-        require_at_least(state.packed_weights.size(), max_weight_words, "packed_weights");
-        require_at_least(state.magnitude.size(), max_out, "magnitude");
-        if (state.use_bias) {
-            require_at_least(state.bias.size(), max_out, "bias");
-        }
-        require_at_least(state.flat_alpha.size(),
-                         static_cast<uint64_t>(state.in_features), "flat_alpha");
-        require_at_least(state.flat_beta.size(),
-                         static_cast<uint64_t>(state.in_features), "flat_beta");
+        require_exact(state.packed_weights.size(), required_weight_words, "packed_weights");
+        require_exact(state.magnitude.size(), required_out, "magnitude");
+        require_exact(state.bias.size(), state.use_bias ? required_out : 0, "bias");
+        require_exact(state.flat_alpha.size(), required_in, "flat_alpha");
+        require_exact(state.flat_beta.size(), required_in, "flat_beta");
 
-        BitLinear* layer = linear_layers[index];
         if (sensitive) {
             // Restore the float reference path for the sensitive projection so
             // inference uses the same mixed-precision numerics QAT trained on.
             const std::vector<float> wfloat =
-                read_vector<float>(in, max_in_out, "sensitive_weight");
-            require_at_least(wfloat.size(), max_in_out, "sensitive_weight");
+                read_vector<float>(in, required_in_out, "sensitive_weight");
+            require_exact(wfloat.size(), required_in_out, "sensitive_weight");
             const std::vector<int> wshape = {state.out_features, state.in_features};
             layer->weight.data = Tensor(wshape, device);
             layer->weight.data.copy_from(
@@ -5394,19 +5399,45 @@ void Attention::restore_cache_batch(const std::vector<AttentionCacheSnapshot>& s
         clear_kv_cache();
         return;
     }
-    streaming_inference_ = snapshots.front().enabled;
-    cached_tokens_ = snapshots.front().cached_tokens;
-    cache_page_tokens_ = std::max(snapshots.front().cache_page_tokens, 1);
-    cache_capacity_tokens_ = std::max(snapshots.front().cache_capacity_tokens, 0);
+    const auto& first = snapshots.front();
+    if (first.cached_tokens < 0 ||
+        first.cache_capacity_tokens < first.cached_tokens) {
+        throw std::runtime_error("Invalid attention cache snapshot metadata");
+    }
+    const int token_width = n_kv_heads * head_dim;
+    int target_capacity = first.cache_capacity_tokens;
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.enabled != first.enabled ||
+            snapshot.cached_tokens != first.cached_tokens) {
+            throw std::runtime_error(
+                "Batched attention restore requires equal sequence lengths");
+        }
+        if (snapshot.cached_tokens < 0 ||
+            snapshot.cache_capacity_tokens < snapshot.cached_tokens) {
+            throw std::runtime_error("Invalid attention cache snapshot metadata");
+        }
+        const uint64_t required_elements =
+            static_cast<uint64_t>(snapshot.cache_capacity_tokens) *
+            static_cast<uint64_t>(token_width);
+        if (static_cast<uint64_t>(snapshot.key_cache.size) < required_elements ||
+            static_cast<uint64_t>(snapshot.value_cache.size) < required_elements) {
+            throw std::runtime_error("Attention cache snapshot buffer is truncated");
+        }
+        target_capacity = std::max(target_capacity, snapshot.cache_capacity_tokens);
+    }
+
+    streaming_inference_ = first.enabled;
+    cached_tokens_ = first.cached_tokens;
+    cache_page_tokens_ = std::max(first.cache_page_tokens, 1);
+    cache_capacity_tokens_ = target_capacity;
     cached_batch_size_ = static_cast<int>(snapshots.size());
     const Device cache_device =
-        snapshots.front().key_cache.size > 0 ? snapshots.front().key_cache.get_device() : Device::CPU;
-    const int token_width = n_kv_heads * head_dim;
+        first.key_cache.size > 0 ? first.key_cache.get_device() : Device::CPU;
     key_cache_buffer_ = Tensor({cached_batch_size_, cache_capacity_tokens_, token_width}, cache_device);
     value_cache_buffer_ =
         Tensor({cached_batch_size_, cache_capacity_tokens_, token_width}, cache_device);
-    const size_t bytes = static_cast<size_t>(cache_capacity_tokens_) *
-                         static_cast<size_t>(token_width) * sizeof(float);
+    const size_t live_bytes = static_cast<size_t>(cached_tokens_) *
+                              static_cast<size_t>(token_width) * sizeof(float);
     const size_t batch_stride =
         static_cast<size_t>(cache_capacity_tokens_) * static_cast<size_t>(token_width);
     for (size_t batch = 0; batch < snapshots.size(); ++batch) {
@@ -5414,12 +5445,12 @@ void Attention::restore_cache_batch(const std::vector<AttentionCacheSnapshot>& s
                                      key_cache_buffer_.get_device(),
                                      snapshots[batch].key_cache.data(),
                                      snapshots[batch].key_cache.get_device(),
-                                     bytes);
+                                     live_bytes);
         copy_float_bytes_device_safe(value_cache_buffer_.data() + batch * batch_stride,
                                      value_cache_buffer_.get_device(),
                                      snapshots[batch].value_cache.data(),
                                      snapshots[batch].value_cache.get_device(),
-                                     bytes);
+                                     live_bytes);
     }
 }
 

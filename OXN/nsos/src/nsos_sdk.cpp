@@ -1871,7 +1871,12 @@ std::vector<std::string> InferenceEngine::generate_batch(
     auto prefill_started_at = std::chrono::steady_clock::now();
     auto decode_started_at = prefill_started_at;
     auto decode_finished_at = prefill_started_at;
-    if (can_use_streaming && this->model->supports_batched_streaming_inference()) {
+    const bool equal_stream_lengths =
+        std::all_of(items.begin(), items.end(), [&](const auto& item) {
+            return item.prompt_tokens_used == items.front().prompt_tokens_used;
+        });
+    if (can_use_streaming && this->model->supports_batched_streaming_inference() &&
+        equal_stream_lengths) {
         auto to_host_logits = [](const Tensor& logits) {
             return logits.get_device() == Device::GPU ? logits.cpu() : logits;
         };

@@ -2,6 +2,7 @@
 #include "../include/bitnet_adapter.h"
 #include "../include/cuda/gpu_utils.h"
 #include "../include/trainer.h"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -104,6 +105,81 @@ void test_packed_fused_affine_matches_unfused_release() {
   }
 
   std::cout << "Packed fused affine release test passed!" << std::endl;
+}
+
+void test_packed_loqa_backward_uses_normalized_input() {
+  BitLinear layer(4, 3, true);
+  std::fill_n(layer.weight.data.data(), layer.weight.data.size, 0.0f);
+  std::fill_n(layer.magnitude.data.data(), layer.magnitude.data.size, 1.0f);
+  std::fill_n(layer.bias.data.data(), layer.bias.data.size, 0.0f);
+  layer.repack_weights();
+  layer.set_reference_path(false);
+  layer.set_use_loqa(true);
+
+  std::fill_n(layer.loqa.A.data.data(), layer.loqa.A.data.size, 0.0f);
+  std::fill_n(layer.loqa.B.data.data(), layer.loqa.B.data.size, 0.0f);
+  for (int k = 0; k < 4; ++k) {
+    layer.loqa.A.data.data()[k * 32] = 0.08f * static_cast<float>(k + 1);
+    layer.loqa.A.data.data()[k * 32 + 1] = -0.05f * static_cast<float>(k + 1);
+  }
+  for (int j = 0; j < 3; ++j) {
+    layer.loqa.B.data.data()[j] = 0.12f * static_cast<float>(j + 1);
+    layer.loqa.B.data.data()[32 + j] = -0.07f * static_cast<float>(j + 1);
+  }
+
+  Tensor x({2, 4});
+  Tensor dy({2, 3});
+  for (int i = 0; i < x.size; ++i) {
+    x.data()[i] = 0.2f + 0.11f * static_cast<float>(i);
+  }
+  for (int i = 0; i < dy.size; ++i) {
+    dy.data()[i] = -0.3f + 0.09f * static_cast<float>(i);
+  }
+
+  auto objective = [&]() {
+    Tensor y = layer.forward(x);
+    float value = 0.0f;
+    for (int i = 0; i < y.size; ++i) {
+      value += y.data()[i] * dy.data()[i];
+    }
+    return value;
+  };
+
+  const float eps = 1e-3f;
+  std::vector<float> numerical_dx(static_cast<size_t>(x.size), 0.0f);
+  for (int i = 0; i < x.size; ++i) {
+    const float original = x.data()[i];
+    x.data()[i] = original + eps;
+    const float plus = objective();
+    x.data()[i] = original - eps;
+    const float minus = objective();
+    x.data()[i] = original;
+    numerical_dx[static_cast<size_t>(i)] = (plus - minus) / (2.0f * eps);
+  }
+
+  const int checked_a = 2 * 32;
+  const float original_a = layer.loqa.A.data.data()[checked_a];
+  layer.loqa.A.data.data()[checked_a] = original_a + eps;
+  const float plus_a = objective();
+  layer.loqa.A.data.data()[checked_a] = original_a - eps;
+  const float minus_a = objective();
+  layer.loqa.A.data.data()[checked_a] = original_a;
+  const float numerical_da = (plus_a - minus_a) / (2.0f * eps);
+
+  (void)layer.forward(x);
+  Tensor analytic_dx = layer.backward(dy);
+  for (int i = 0; i < analytic_dx.size; ++i) {
+    assert(std::abs(analytic_dx.data()[i] -
+                    numerical_dx[static_cast<size_t>(i)]) < 3e-3f);
+  }
+  assert(layer.loqa.A.grad.size == layer.loqa.A.data.size);
+  assert(std::abs(layer.loqa.A.grad.data()[checked_a] - numerical_da) < 3e-3f);
+  // FlatQuant is not present in any forward path, so it must not receive a
+  // manufactured gradient from the packed backward.
+  assert(layer.flat_alpha.grad.size == 0);
+  assert(layer.flat_beta.grad.size == 0);
+
+  std::cout << "Packed LoQA normalized backward test passed!" << std::endl;
 }
 
 void test_progressive_qat_scheduler() {
@@ -432,6 +508,7 @@ int main() {
   test_quantization();
   test_forward();
   test_packed_fused_affine_matches_unfused_release();
+  test_packed_loqa_backward_uses_normalized_input();
   test_canonical_ternary_rule_consistency();
   test_reference_path_gradcheck();
   test_quantized_training_updates_latent_weights();

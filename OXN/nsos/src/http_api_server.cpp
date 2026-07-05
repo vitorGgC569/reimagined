@@ -8,6 +8,8 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -727,13 +729,27 @@ bool decode_chunked_body(SOCKET socket,
 
         size_t chunk_size = 0;
         try {
-            chunk_size = static_cast<size_t>(std::stoull(size_text, nullptr, 16));
+            size_t parsed_chars = 0;
+            const unsigned long long parsed =
+                std::stoull(size_text, &parsed_chars, 16);
+            if (parsed_chars != size_text.size() ||
+                parsed > static_cast<unsigned long long>(
+                             (std::numeric_limits<size_t>::max)())) {
+                throw std::out_of_range("invalid chunk size");
+            }
+            chunk_size = static_cast<size_t>(parsed);
         } catch (const std::exception&) {
             error_message = "chunked request contained invalid chunk size";
             return false;
         }
 
         cursor = line_end + 2;
+        if (chunk_size >
+                max_body_bytes - (std::min)(decoded_body.size(), max_body_bytes) ||
+            chunk_size > (std::numeric_limits<size_t>::max)() - cursor - 2) {
+            error_message = "request body exceeded configured limit";
+            return false;
+        }
         const size_t required_size = cursor + chunk_size + 2;
         if (!ensure_available(socket, buffer, pending, required_size, max_body_bytes)) {
             error_message = "chunked request ended before chunk payload";
@@ -1090,7 +1106,14 @@ RequestReadResult read_http_request(SOCKET socket, const HttpApiServerConfig& co
         const auto content_length_it = result.request.headers.find("content-length");
         if (content_length_it != result.request.headers.end()) {
             try {
-                const unsigned long long parsed = std::stoull(content_length_it->second);
+                size_t parsed_chars = 0;
+                const unsigned long long parsed =
+                    std::stoull(content_length_it->second, &parsed_chars, 10);
+                if (parsed_chars != content_length_it->second.size() ||
+                    parsed > static_cast<unsigned long long>(
+                                 (std::numeric_limits<size_t>::max)())) {
+                    throw std::out_of_range("invalid content length");
+                }
                 content_length = static_cast<size_t>(parsed);
             } catch (const std::exception&) {
                 result.error = make_error_response(400, "Bad Request", request_id,
@@ -1739,6 +1762,8 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             const JsonValue payload = parse_json_body_or_throw(request, config_);
             const std::string prompt = json_string(payload, "prompt").value_or("");
             GenerationOptions options;
+            options.max_tokens =
+                (std::min)(options.max_tokens, config_.max_generate_tokens);
             if (const auto value = json_int(payload, "max_tokens")) options.max_tokens = *value;
             if (const auto value = json_float(payload, "temperature")) options.temperature = *value;
             if (const auto value = json_float(payload, "top_p")) options.top_p = *value;
@@ -1770,6 +1795,8 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
         if (request.method == "POST" && request.path == "/generate_batch") {
             const JsonValue payload = parse_json_body_or_throw(request, config_);
             GenerationOptions options;
+            options.max_tokens =
+                (std::min)(options.max_tokens, config_.max_generate_tokens);
             if (const auto value = json_int(payload, "max_tokens")) options.max_tokens = *value;
             if (const auto value = json_float(payload, "temperature")) options.temperature = *value;
             if (const auto value = json_float(payload, "top_p")) options.top_p = *value;
@@ -1818,6 +1845,8 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             const JsonValue payload = parse_json_body_or_throw(request, config_);
             const std::string prompt = json_string(payload, "prompt").value_or("");
             GenerationOptions options;
+            options.max_tokens =
+                (std::min)(options.max_tokens, config_.max_generate_tokens);
             options.stream = true;
             if (const auto value = json_int(payload, "max_tokens")) options.max_tokens = *value;
             if (const auto value = json_float(payload, "temperature")) options.temperature = *value;
@@ -1911,6 +1940,13 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
                 stream_finished = true;
             }
             stream_cv.notify_all();
+            // Drain and join the sender before emitting the terminal event.
+            // Otherwise the main thread can write "done" while the sender is
+            // still writing the final chunk, interleaving bytes on the socket
+            // or placing "done" before a queued chunk.
+            if (sender.joinable()) {
+                sender.join();
+            }
             update_latest_generation_metrics(metrics);
 
             send_all(client_socket,
@@ -2116,8 +2152,12 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
         send_all(client_socket, build_http_response(response));
     } catch (const std::exception& ex) {
         internal_errors_.fetch_add(1);
+        std::cerr << "HTTP request " << request_id
+                  << " failed internally: " << ex.what() << std::endl;
         const HttpResponse response =
-            make_error_response(400, "Bad Request", request_id, "request_failed", ex.what());
+            make_error_response(500, "Internal Server Error", request_id,
+                                "internal_error",
+                                "the request could not be completed");
         send_all(client_socket, build_http_response(response));
     }
 }

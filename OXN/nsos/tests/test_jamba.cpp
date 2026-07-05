@@ -317,6 +317,131 @@ void test_attention_batched_streaming_decode() {
   std::cout << "Attention batched streaming decode test passed!" << std::endl;
 }
 
+void test_attention_batched_cache_growth() {
+  ModelConfig config;
+  config.num_layers = 1;
+  config.d_model = 16;
+  config.vocab_size = 80;
+  config.n_heads = 2;
+  config.n_kv_heads = 1;
+  config.attention_period = 1;
+  config.attention_slot = 0;
+  config.use_moe = false;
+  config.use_ttt = false;
+  config.use_exact_attention_training = false;
+
+  JambaModel model(config, Device::CPU);
+  model.set_streaming_inference(true);
+
+  std::vector<std::vector<int>> prompts(2);
+  for (int row = 0; row < 2; ++row) {
+    for (int i = 0; i < 63; ++i) {
+      prompts[static_cast<size_t>(row)].push_back(1 + ((i + row * 13) % 70));
+    }
+  }
+  const std::vector<std::vector<int>> next = {{71, 72, 73}, {74, 75, 76}};
+  std::vector<JambaSessionSnapshot> snapshots;
+  for (const auto& prompt : prompts) {
+    model.reset_session();
+    model.set_streaming_inference(true);
+    (void)model.forward_ids(prompt, nullptr);
+    snapshots.push_back(model.fork_session());
+  }
+
+  std::vector<std::vector<Tensor>> expected(3, std::vector<Tensor>(2));
+  for (int row = 0; row < 2; ++row) {
+    model.restore_session(snapshots[static_cast<size_t>(row)]);
+    for (int step = 0; step < 3; ++step) {
+      Tensor logits =
+          model.forward_ids({next[static_cast<size_t>(row)][static_cast<size_t>(step)]},
+                            nullptr)
+              .cpu();
+      expected[static_cast<size_t>(step)][static_cast<size_t>(row)] =
+          logits.reshape({1, logits.shape.back()});
+    }
+  }
+
+  model.restore_session_batch(snapshots);
+  for (int step = 0; step < 3; ++step) {
+    Tensor logits =
+        model
+            .forward_ids_batch(
+                {{next[0][static_cast<size_t>(step)]},
+                 {next[1][static_cast<size_t>(step)]}},
+                nullptr)
+            .cpu();
+    const int vocab = logits.shape.back();
+    for (int row = 0; row < 2; ++row) {
+      Tensor actual_row({1, vocab}, Device::CPU);
+      std::memcpy(actual_row.data(),
+                  logits.data() + static_cast<size_t>(row) * vocab,
+                  static_cast<size_t>(vocab) * sizeof(float));
+      assert_tensor_close(
+          actual_row,
+          expected[static_cast<size_t>(step)][static_cast<size_t>(row)],
+          1e-4f);
+    }
+  }
+
+  std::cout << "Attention batched cache-growth test passed!" << std::endl;
+}
+
+void test_dropout_backward_gradcheck() {
+  JambaBlock block(
+      8,      // d_model
+      false,  // mamba core
+      false,  // dense FFN
+      false,  // no TTT
+      0, 1,   // layer index/count
+      2, 1,   // query/KV heads
+      1, 1,   // experts/top-k (unused)
+      false,  // exact attention training
+      0.25f,  // dropout
+      false,  // gradient checkpointing
+      16);    // compact FFN hidden size
+
+  Tensor x({1, 2, 8}, Device::CPU);
+  Tensor dy({1, 2, 8}, Device::CPU);
+  for (int i = 0; i < x.size; ++i) {
+    x.data()[i] = -0.35f + 0.07f * static_cast<float>(i);
+    dy.data()[i] = 0.22f - 0.03f * static_cast<float>(i);
+  }
+
+  auto objective = [&]() {
+    block.reset();
+    Context ctx;
+    Tensor y = block.forward(x, &ctx);
+    float value = 0.0f;
+    for (int i = 0; i < y.size; ++i) {
+      value += y.data()[i] * dy.data()[i];
+    }
+    return value;
+  };
+
+  const float eps = 1e-3f;
+  std::vector<float> numerical(static_cast<size_t>(x.size), 0.0f);
+  for (int i = 0; i < x.size; ++i) {
+    const float original = x.data()[i];
+    x.data()[i] = original + eps;
+    const float plus = objective();
+    x.data()[i] = original - eps;
+    const float minus = objective();
+    x.data()[i] = original;
+    numerical[static_cast<size_t>(i)] = (plus - minus) / (2.0f * eps);
+  }
+
+  block.reset();
+  Context ctx;
+  (void)block.forward(x, &ctx);
+  Tensor analytic = block.backward(dy, &ctx);
+  for (int i = 0; i < analytic.size; ++i) {
+    assert(std::abs(analytic.data()[i] - numerical[static_cast<size_t>(i)]) <
+           2e-2f);
+  }
+
+  std::cout << "Dropout backward gradcheck passed!" << std::endl;
+}
+
 void test_ttt_batched_streaming_decode() {
   ModelConfig config;
   config.num_layers = 4;
@@ -622,6 +747,8 @@ int main() {
   test_mamba_streaming_prefill_matches_incremental();
   test_mamba_batched_streaming_decode();
   test_attention_batched_streaming_decode();
+  test_attention_batched_cache_growth();
+  test_dropout_backward_gradcheck();
   test_ttt_batched_streaming_decode();
   test_jamba_rank3_batch_forward_backward();
   test_attention_rank3_heterogeneous_backward();

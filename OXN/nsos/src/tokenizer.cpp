@@ -138,6 +138,12 @@ void reset_tokenizer_state(Tokenizer& tokenizer) {
 void rebuild_special_cache(Tokenizer& tokenizer) {
   tokenizer.sorted_specials.clear();
   for (const auto& token : tokenizer.special_tokens) {
+    // An empty special token matches every position without advancing the
+    // cursor.  Keep the cache defensive even if a caller mutates the public
+    // set directly.
+    if (token.empty()) {
+      continue;
+    }
     tokenizer.sorted_specials.push_back(token);
   }
   std::sort(tokenizer.sorted_specials.begin(), tokenizer.sorted_specials.end(),
@@ -244,12 +250,18 @@ Tokenizer::Tokenizer() {
 
 void Tokenizer::add_special_tokens(const std::vector<std::string> &tokens) {
   for (const auto &t : tokens) {
+    if (t.empty()) {
+      throw std::invalid_argument("Tokenizer special tokens must not be empty");
+    }
+    if (t.size() > kMaxTokenizerTokenBytes) {
+      throw std::invalid_argument("Tokenizer special token exceeds configured limit");
+    }
     if (token_to_id.find(t) == token_to_id.end()) {
       int id = vocab_size++;
       token_to_id[t] = id;
       id_to_token[id] = t;
-      special_tokens.insert(t);
     }
+    special_tokens.insert(t);
   }
   rebuild_special_cache(*this);
 }
@@ -347,6 +359,12 @@ void Tokenizer::load_pack(const std::string& path) {
       throw std::runtime_error("Tokenizer pack token id is outside configured limit");
     }
     std::string token = hex_decode(token_hex);
+    if (token.empty()) {
+      throw std::runtime_error("Tokenizer pack contains an empty token");
+    }
+    if (special_flag != "0" && special_flag != "1") {
+      throw std::runtime_error("Tokenizer pack contains an invalid special flag");
+    }
     token_to_id[token] = id;
     id_to_token[id] = token;
     if (special_flag == "1") {

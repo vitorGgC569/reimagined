@@ -1,8 +1,11 @@
 #include "../include/causal_memory_store.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace nsos {
 
@@ -31,6 +34,15 @@ CausalMemoryStore::CausalMemoryStore(const std::string& file_path) : file_path_(
 }
 
 void CausalMemoryStore::append(const std::string& key, const std::vector<uint8_t>& payload) {
+    if (key.empty() || key.size() > kMaxKeyBytes) {
+        throw std::invalid_argument("Causal store key must be 1..1024 bytes");
+    }
+    if (payload.size() > kMaxPayloadBytes) {
+        throw std::invalid_argument("Causal store payload exceeds 16 MiB");
+    }
+    const uint64_t record_bytes =
+        kHeaderBytes + static_cast<uint64_t>(key.size()) +
+        static_cast<uint64_t>(payload.size());
     std::lock_guard<std::mutex> lock(mutex_);
 
     std::ofstream output(file_path_, std::ios::binary | std::ios::app);
@@ -39,7 +51,18 @@ void CausalMemoryStore::append(const std::string& key, const std::vector<uint8_t
     }
 
     output.seekp(0, std::ios::end);
-    const int64_t offset = static_cast<int64_t>(output.tellp());
+    const std::streampos end_pos = output.tellp();
+    if (end_pos < 0) {
+        throw std::runtime_error("Failed to determine causal store size");
+    }
+    const uint64_t offset_u64 = static_cast<uint64_t>(end_pos);
+    if (offset_u64 > kMaxStoreBytes ||
+        record_bytes > kMaxStoreBytes - offset_u64 ||
+        offset_u64 >
+            static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
+        throw std::runtime_error("Causal store size limit exceeded");
+    }
+    const int64_t offset = static_cast<int64_t>(offset_u64);
     const int64_t prev_offset =
         heads_.count(key) > 0 ? heads_.at(key) : static_cast<int64_t>(-1);
     const uint32_t key_size = static_cast<uint32_t>(key.size());
@@ -56,12 +79,24 @@ void CausalMemoryStore::append(const std::string& key, const std::vector<uint8_t
         output.write(reinterpret_cast<const char*>(payload.data()),
                      static_cast<std::streamsize>(payload.size()));
     }
+    output.flush();
+    if (!output.good()) {
+        throw std::runtime_error("Failed to flush causal store record");
+    }
 
     heads_[key] = offset;
 }
 
 std::optional<CausalMemoryStore::RecordMeta> CausalMemoryStore::read_record_meta(
-    std::ifstream& input, int64_t offset, std::string* out_key) const {
+    std::ifstream& input, int64_t offset, uint64_t file_size,
+    std::string* out_key) const {
+    if (offset < 0) {
+        return std::nullopt;
+    }
+    const uint64_t offset_u64 = static_cast<uint64_t>(offset);
+    if (offset_u64 > file_size || kHeaderBytes > file_size - offset_u64) {
+        return std::nullopt;
+    }
     input.clear();
     input.seekg(offset);
     if (!input.good()) {
@@ -78,6 +113,19 @@ std::optional<CausalMemoryStore::RecordMeta> CausalMemoryStore::read_record_meta
     if (!input.good() || magic != kMagic) {
         return std::nullopt;
     }
+    if (meta.key_size == 0 || meta.key_size > kMaxKeyBytes ||
+        meta.payload_size > kMaxPayloadBytes) {
+        return std::nullopt;
+    }
+    const uint64_t body_bytes =
+        static_cast<uint64_t>(meta.key_size) + meta.payload_size;
+    if (body_bytes > file_size - offset_u64 - kHeaderBytes) {
+        return std::nullopt;
+    }
+    if (meta.prev_offset < -1 ||
+        (meta.prev_offset >= 0 && meta.prev_offset >= offset)) {
+        return std::nullopt;
+    }
 
     if (out_key) {
         out_key->resize(meta.key_size);
@@ -88,23 +136,37 @@ std::optional<CausalMemoryStore::RecordMeta> CausalMemoryStore::read_record_meta
     } else {
         input.seekg(static_cast<std::streamoff>(meta.key_size), std::ios::cur);
     }
+    if (!input.good()) {
+        return std::nullopt;
+    }
     return meta;
 }
 
-std::vector<uint8_t> CausalMemoryStore::read_payload(std::ifstream& input, int64_t offset,
-                                                     const RecordMeta& meta) const {
+std::optional<std::vector<uint8_t>> CausalMemoryStore::read_payload(
+    std::ifstream& input, int64_t offset, uint64_t file_size,
+    const RecordMeta& meta) const {
+    if (offset < 0 || meta.payload_size > kMaxPayloadBytes) {
+        return std::nullopt;
+    }
+    const uint64_t payload_offset =
+        static_cast<uint64_t>(offset) + kHeaderBytes + meta.key_size;
+    if (payload_offset > file_size ||
+        meta.payload_size > file_size - payload_offset) {
+        return std::nullopt;
+    }
     input.clear();
-    input.seekg(offset + static_cast<int64_t>(sizeof(uint32_t) + sizeof(uint32_t) +
-                                             sizeof(uint64_t) + sizeof(int64_t) +
-                                             sizeof(uint64_t) + meta.key_size));
+    input.seekg(static_cast<std::streamoff>(payload_offset));
     if (!input.good()) {
-        return {};
+        return std::nullopt;
     }
 
     std::vector<uint8_t> payload(static_cast<size_t>(meta.payload_size));
     if (!payload.empty()) {
         input.read(reinterpret_cast<char*>(payload.data()),
                    static_cast<std::streamsize>(payload.size()));
+        if (input.gcount() != static_cast<std::streamsize>(payload.size())) {
+            return std::nullopt;
+        }
     }
     return payload;
 }
@@ -117,24 +179,44 @@ void CausalMemoryStore::rebuild_index() {
     if (!input.is_open()) {
         return;
     }
+    std::error_code size_error;
+    const uint64_t file_size = std::filesystem::file_size(file_path_, size_error);
+    if (size_error) {
+        throw std::runtime_error("Failed to inspect causal store size");
+    }
+    if (file_size > kMaxStoreBytes) {
+        throw std::runtime_error("Causal store exceeds configured size limit");
+    }
 
-    while (true) {
+    uint64_t cursor = 0;
+    while (cursor < file_size) {
+        if (cursor >
+            static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
+            throw std::runtime_error("Causal store offset exceeds supported range");
+        }
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(cursor));
         const int64_t offset = static_cast<int64_t>(input.tellg());
-        if (offset < 0 || input.peek() == EOF) {
-            break;
+        if (offset < 0) {
+            throw std::runtime_error("Failed to seek causal store record");
         }
 
         std::string key;
-        const auto meta = read_record_meta(input, offset, &key);
+        const auto meta = read_record_meta(input, offset, file_size, &key);
         if (!meta.has_value()) {
-            break;
+            throw std::runtime_error("Corrupt causal store record at offset " +
+                                     std::to_string(offset));
+        }
+        const int64_t expected_prev =
+            heads_.count(key) > 0 ? heads_.at(key) : static_cast<int64_t>(-1);
+        if (meta->prev_offset != expected_prev) {
+            throw std::runtime_error("Invalid causal store lineage at offset " +
+                                     std::to_string(offset));
         }
 
         heads_[key] = offset;
-        input.seekg(static_cast<std::streamoff>(meta->payload_size), std::ios::cur);
-        if (!input.good()) {
-            break;
-        }
+        cursor += kHeaderBytes + static_cast<uint64_t>(meta->key_size) +
+                  meta->payload_size;
     }
 }
 
@@ -149,12 +231,18 @@ std::optional<std::vector<uint8_t>> CausalMemoryStore::read_latest(const std::st
     if (!input.is_open()) {
         return std::nullopt;
     }
-
-    const auto meta = read_record_meta(input, it->second);
-    if (!meta.has_value()) {
+    std::error_code size_error;
+    const uint64_t file_size = std::filesystem::file_size(file_path_, size_error);
+    if (size_error || file_size > kMaxStoreBytes) {
         return std::nullopt;
     }
-    return read_payload(input, it->second, *meta);
+
+    std::string stored_key;
+    const auto meta = read_record_meta(input, it->second, file_size, &stored_key);
+    if (!meta.has_value() || stored_key != key) {
+        return std::nullopt;
+    }
+    return read_payload(input, it->second, file_size, *meta);
 }
 
 std::vector<std::vector<uint8_t>> CausalMemoryStore::read_history(const std::string& key,
@@ -170,14 +258,32 @@ std::vector<std::vector<uint8_t>> CausalMemoryStore::read_history(const std::str
     if (!input.is_open()) {
         return history;
     }
+    std::error_code size_error;
+    const uint64_t file_size = std::filesystem::file_size(file_path_, size_error);
+    if (size_error || file_size > kMaxStoreBytes) {
+        return history;
+    }
 
     int64_t cursor = it->second;
-    while (cursor >= 0 && history.size() < depth) {
-        const auto meta = read_record_meta(input, cursor);
-        if (!meta.has_value()) {
+    uint64_t history_bytes = 0;
+    std::unordered_set<int64_t> visited;
+    const size_t bounded_depth = std::min(depth, kMaxHistoryDepth);
+    while (cursor >= 0 && history.size() < bounded_depth) {
+        if (!visited.insert(cursor).second) {
             break;
         }
-        history.push_back(read_payload(input, cursor, *meta));
+        std::string stored_key;
+        const auto meta = read_record_meta(input, cursor, file_size, &stored_key);
+        if (!meta.has_value() || stored_key != key ||
+            meta->payload_size > kMaxHistoryBytes - history_bytes) {
+            break;
+        }
+        auto payload = read_payload(input, cursor, file_size, *meta);
+        if (!payload.has_value()) {
+            break;
+        }
+        history_bytes += meta->payload_size;
+        history.push_back(std::move(*payload));
         cursor = meta->prev_offset;
     }
     return history;

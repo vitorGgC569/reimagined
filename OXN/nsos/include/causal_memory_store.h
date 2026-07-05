@@ -29,12 +29,22 @@ private:
     };
 
     static constexpr uint32_t kMagic = 0x43535452; // CSTR
+    static constexpr uint64_t kHeaderBytes =
+        sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t) +
+        sizeof(int64_t) + sizeof(uint64_t);
+    static constexpr uint32_t kMaxKeyBytes = 1024;
+    static constexpr uint64_t kMaxPayloadBytes = 16ull * 1024ull * 1024ull;
+    static constexpr uint64_t kMaxHistoryBytes = 64ull * 1024ull * 1024ull;
+    static constexpr size_t kMaxHistoryDepth = 1024;
+    static constexpr uint64_t kMaxStoreBytes = 32ull * 1024ull * 1024ull * 1024ull;
 
     void rebuild_index();
     std::optional<RecordMeta> read_record_meta(std::ifstream& input, int64_t offset,
+                                               uint64_t file_size,
                                                std::string* out_key = nullptr) const;
-    std::vector<uint8_t> read_payload(std::ifstream& input, int64_t offset,
-                                      const RecordMeta& meta) const;
+    std::optional<std::vector<uint8_t>> read_payload(
+        std::ifstream& input, int64_t offset, uint64_t file_size,
+        const RecordMeta& meta) const;
 
     std::filesystem::path file_path_;
     mutable std::mutex mutex_;

@@ -96,6 +96,9 @@ BitLinear::BitLinear(int in, int out, bool b, uint64_t seed)
 void BitLinear::invalidate_cached_materialized_weights() {
   cached_gpu_weight_ = Tensor();
   cached_gpu_weight_version = 0;
+  cached_gpu_packed_weights_ = Tensor();
+  cached_gpu_packed_version_ = 0;
+  cached_heat_map_.clear();
   // The QAT inference ternary cache derives from the same weights; every
   // point that invalidates the materialized-weight cache (load, device move,
   // repack, release) invalidates it too.
@@ -812,14 +815,14 @@ Tensor BitLinear::backward(const Tensor &grad) {
   // packed ternary forward.  The real integer kernel ran in the forward; this
   // back-propagates onto the FP32 latent parameters.  The forward computed:
   //   x_norm = rmsnorm(input)                                   [saved_x_norm]
-  //   xt     = flatquant(x_norm)             (if use_flatquant)
-  //   xt     = hadamard(xt)                  (if use_hadamard)
+  //   xt     = hadamard(x_norm)               (if use_hadamard)
   //   x_q    = round(xt / act_scale)         [saved_x_quant], act_scale [saved_act_scales]
   //   w_t    = ternary(W) in {-1,0,+1}       [unpacked_weights_i8], scale = weight_scale
-  //   pre    = (x_q * act_scale) @ (w_t * weight_scale)^T   (+ loqa(input) if active)
+  //   pre    = (x_q * act_scale) @ (w_t * weight_scale)^T
+  //            + loqa(x_norm) if active
   //   out    = pre * magnitude + bias
   // STE treats both quantizers as identity for gradient flow; gradients
-  // accumulate into the latent FP32 weight / magnitude / bias / flat params.
+  // accumulate into the latent FP32 weight / magnitude / bias parameters.
   if (weight.data.size == 0) {
     throw std::runtime_error(
         "BitLinear STE backward requires latent full-precision weights; "
@@ -871,10 +874,13 @@ Tensor BitLinear::backward(const Tensor &grad) {
     }
   }
 
-  // LoQA contributes to the pre-magnitude output (it adds loqa(input)).
+  // LoQA bypasses the packed transforms, but consumes the same normalized
+  // activation as the reference/GPU paths.
+  Tensor loqa_input =
+      saved_x_norm.size > 0 ? saved_x_norm.reshape({M, in_features}) : input_2d;
   Tensor loqa_out;
   if (loqa.active) {
-    loqa_out = input_2d.matmul(loqa.A.data).matmul(loqa.B.data); // [M, out]
+    loqa_out = loqa_input.matmul(loqa.A.data).matmul(loqa.B.data); // [M, out]
   }
 
   // Recover `pre` (gemm output before the magnitude/bias affine) for the exact
@@ -926,20 +932,20 @@ Tensor BitLinear::backward(const Tensor &grad) {
   }
   weight.add_grad(dW);
 
-  // LoQA adapter backward (its input is the raw layer input; its output is
-  // scaled by magnitude in the forward, so it uses grad_pre).
+  // LoQA adapter backward.  Its input is x_norm, and its output is scaled by
+  // magnitude in the forward, so it uses grad_pre.
   Tensor dx_loqa;
   if (loqa.active) {
-    Tensor inputA = input_2d.matmul(loqa.A.data);             // [M, r]
+    Tensor inputA = loqa_input.matmul(loqa.A.data);           // [M, r]
     Tensor dB = inputA.transpose().matmul(grad_pre);          // [r, out]
     loqa.B.add_grad(dB);
     Tensor gradBt = grad_pre.matmul(loqa.B.data.transpose()); // [M, r]
-    Tensor dA = input_2d.transpose().matmul(gradBt);          // [in, r]
+    Tensor dA = loqa_input.transpose().matmul(gradBt);        // [in, r]
     loqa.A.add_grad(dA);
-    dx_loqa = gradBt.matmul(loqa.A.data.transpose());         // [M, in] (wrt raw input)
+    dx_loqa = gradBt.matmul(loqa.A.data.transpose());         // [M, in] (wrt x_norm)
   }
 
-  // Gradient into the (flatquant/hadamard-transformed) activation, STE through
+  // Gradient into the Hadamard-transformed activation, STE through
   // the int8 activation quantizer: uses the effective ternary weight.
   Tensor d_act = grad_pre.matmul(w_eff); // [M, in]
 
@@ -950,25 +956,11 @@ Tensor BitLinear::backward(const Tensor &grad) {
     hadamard_transform(d_act.data(), M, in_features);
   }
 
-  // Reverse FlatQuant: xt = alpha * x_norm + beta, on the pre-flatquant
-  // activation x_norm (= rmsnorm(input), or input itself if no norm).
-  Tensor dx;
-  if (use_flatquant) {
-    Tensor x_norm = (norm_strategy == NormStrategy::RMS_PERI ||
-                     norm_strategy == NormStrategy::RMS_PRE)
-                        ? saved_x_norm
-                        : saved_input;
-    if (x_norm.shape.dims.size() != 2) {
-      x_norm = x_norm.reshape({M, in_features});
-    }
-    flat_alpha.add_grad(d_act.mul(x_norm).sum(0));
-    flat_beta.add_grad(d_act.sum(0));
-    dx = d_act.mul(flat_alpha.data);
-  } else {
-    dx = d_act;
-  }
+  // FlatQuant is deliberately dormant in every forward path (see forward):
+  // do not manufacture gradients for a transform that did not run.
+  Tensor dx = d_act;
 
-  // Add the LoQA input-gradient (it bypasses flatquant; its input is raw).
+  // Add the LoQA gradient in x_norm space before reversing RMSNorm.
   if (loqa.active && dx_loqa.size > 0) {
     dx = dx.add(dx_loqa);
   }

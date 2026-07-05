@@ -90,12 +90,27 @@ void test_dataloader() {
   std::remove(path.c_str());
 }
 
+void test_dataloader_missing_file_terminates() {
+  std::cout << "[Test] DataLoader missing-file fallback termination..." << std::endl;
+  const std::string path = "definitely_missing_nsos_data.bin";
+  std::remove(path.c_str());
+  DataLoader loader(path, 2500, 1, 1);
+  Tensor batch;
+  int count = 0;
+  while (loader.next(batch)) {
+    ++count;
+  }
+  assert(count == 4);
+  std::cout << "  Passed." << std::endl;
+}
+
 int main() {
   std::cout << "=== Running Comprehensive Unit Tests ===" << std::endl;
   test_sprecher();
   test_memory_system();
   test_fabric();
   test_dataloader();
+  test_dataloader_missing_file_terminates();
   std::cout << "=== All Unit Tests Passed ===" << std::endl;
   return 0;
 }

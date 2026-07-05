@@ -237,27 +237,34 @@ void check_mamba2_proper() {
   cfg.proper_selective_ssm = true;
   cfg.conv_kernel = 3;
   Mamba2SSD layer(D, N, H, cfg);
+  auto params = layer.parameters();
+  Parameter *dt_bias = find_param(params, "dt_proj.bias");
+  assert(dt_bias != nullptr && "proper Mamba2SSD must expose dt_proj.bias");
+  std::fill_n(dt_bias->data.data(), dt_bias->data.size, -1.5f);
   Tensor x({L, D});
   fill_smooth(x, 0.6f, 0.41f);
 
   auto loss_fn = [&]() { return sum_sq(layer.forward(x)); };
 
-  zero_all_grads(layer.parameters());
+  zero_all_grads(params);
   Tensor y = layer.forward(x);
   Tensor dy = y.clone();
   Context ctx;
   Tensor dx = layer.backward(dy, ctx);
 
-  Parameter *A = find_param(layer.parameters(), "A");
-  Parameter *conv = find_param(layer.parameters(), "conv1d_weight");
+  Parameter *A = find_param(params, "A");
+  Parameter *conv = find_param(params, "conv1d_weight");
   assert(A != nullptr && conv != nullptr &&
          "proper Mamba2SSD must expose A and conv1d_weight");
   std::vector<float> gA(static_cast<size_t>(A->grad.size));
   std::vector<float> gW(static_cast<size_t>(conv->grad.size));
+  std::vector<float> gDt(static_cast<size_t>(dt_bias->grad.size));
   for (int i = 0; i < A->grad.size; ++i)
     gA[static_cast<size_t>(i)] = A->grad.data()[i];
   for (int i = 0; i < conv->grad.size; ++i)
     gW[static_cast<size_t>(i)] = conv->grad.data()[i];
+  for (int i = 0; i < dt_bias->grad.size; ++i)
+    gDt[static_cast<size_t>(i)] = dt_bias->grad.data()[i];
 
   gradcheck_buffer(x.data(), x.size, dx.data(), loss_fn,
                    "mamba2-proper d/dinput", kTolScan);
@@ -265,6 +272,8 @@ void check_mamba2_proper() {
                    "mamba2-proper d/dA", kTolScan);
   gradcheck_buffer(conv->data.data(), conv->data.size, gW.data(), loss_fn,
                    "mamba2-proper d/dconv1d", kTolScan);
+  gradcheck_buffer(dt_bias->data.data(), dt_bias->data.size, gDt.data(),
+                   loss_fn, "mamba2-proper d/ddt_bias", kTolScan);
 }
 
 // ── Module: full Mamba-2 SSD with N-state expansion (proper_state_expansion) ──
@@ -276,27 +285,34 @@ void check_mamba2_nstate() {
   cfg.proper_state_expansion = true;
   cfg.conv_kernel = 3;
   Mamba2SSD layer(D, N, H, cfg);
+  auto params = layer.parameters();
+  Parameter *dt_bias = find_param(params, "dt_proj.bias");
+  assert(dt_bias != nullptr && "nstate Mamba2SSD must expose dt_proj.bias");
+  std::fill_n(dt_bias->data.data(), dt_bias->data.size, -1.5f);
   Tensor x({L, D});
   fill_smooth(x, 0.6f, 0.39f);
 
   auto loss_fn = [&]() { return sum_sq(layer.forward(x)); };
 
-  zero_all_grads(layer.parameters());
+  zero_all_grads(params);
   Tensor y = layer.forward(x);
   Tensor dy = y.clone();
   Context ctx;
   Tensor dx = layer.backward(dy, ctx);
 
-  Parameter *A = find_param(layer.parameters(), "A");
-  Parameter *conv = find_param(layer.parameters(), "conv1d_weight");
+  Parameter *A = find_param(params, "A");
+  Parameter *conv = find_param(params, "conv1d_weight");
   assert(A != nullptr && conv != nullptr &&
          "nstate Mamba2SSD must expose A and conv1d_weight");
   std::vector<float> gA(static_cast<size_t>(A->grad.size));
   std::vector<float> gW(static_cast<size_t>(conv->grad.size));
+  std::vector<float> gDt(static_cast<size_t>(dt_bias->grad.size));
   for (int i = 0; i < A->grad.size; ++i)
     gA[static_cast<size_t>(i)] = A->grad.data()[i];
   for (int i = 0; i < conv->grad.size; ++i)
     gW[static_cast<size_t>(i)] = conv->grad.data()[i];
+  for (int i = 0; i < dt_bias->grad.size; ++i)
+    gDt[static_cast<size_t>(i)] = dt_bias->grad.data()[i];
 
   gradcheck_buffer(x.data(), x.size, dx.data(), loss_fn,
                    "mamba2-nstate d/dinput", kTolScan);
@@ -304,6 +320,8 @@ void check_mamba2_nstate() {
                    "mamba2-nstate d/dA", kTolScan);
   gradcheck_buffer(conv->data.data(), conv->data.size, gW.data(), loss_fn,
                    "mamba2-nstate d/dconv1d", kTolScan);
+  gradcheck_buffer(dt_bias->data.data(), dt_bias->data.size, gDt.data(),
+                   loss_fn, "mamba2-nstate d/ddt_bias", kTolScan);
 }
 
 // ── Module: proper-path incremental streaming decode ─────────────────────────

@@ -8,6 +8,9 @@ try:
 except ImportError:
     HAS_TORCH = False
 
+MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+MAX_RECALL_DEPTH = 1024
+
 class GeodesicClient:
     """
     High-level Python SDK for Geodesic Memory Engine.
@@ -46,23 +49,40 @@ class GeodesicClient:
         if HAS_TORCH and isinstance(data, torch.Tensor):
             buff = io.BytesIO()
             np.save(buff, data.detach().cpu().numpy(), allow_pickle=False)
-            return b"TORCHTENSOR:" + buff.getvalue()
+            payload = b"TORCHTENSOR:" + buff.getvalue()
+            if len(payload) > MAX_PAYLOAD_BYTES:
+                raise ValueError("serialized payload exceeds the 16 MiB limit")
+            return payload
 
         if isinstance(data, np.ndarray):
             buff = io.BytesIO()
             if data.dtype == object:
                 raise TypeError("object dtype arrays are not supported by the safe serializer")
             np.save(buff, data, allow_pickle=False)
-            return b"NUMPY:" + buff.getvalue()
+            payload = b"NUMPY:" + buff.getvalue()
+            if len(payload) > MAX_PAYLOAD_BYTES:
+                raise ValueError("serialized payload exceeds the 16 MiB limit")
+            return payload
 
         if isinstance(data, bytes):
-            return b"BYTES:" + data
+            payload = b"BYTES:" + data
+            if len(payload) > MAX_PAYLOAD_BYTES:
+                raise ValueError("serialized payload exceeds the 16 MiB limit")
+            return payload
 
         if isinstance(data, str):
-            return b"TEXT:" + data.encode("utf-8")
+            payload = b"TEXT:" + data.encode("utf-8")
+            if len(payload) > MAX_PAYLOAD_BYTES:
+                raise ValueError("serialized payload exceeds the 16 MiB limit")
+            return payload
 
         if data is None or isinstance(data, (bool, int, float, list, dict)):
-            return b"JSON:" + json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            payload = b"JSON:" + json.dumps(
+                data, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            if len(payload) > MAX_PAYLOAD_BYTES:
+                raise ValueError("serialized payload exceeds the 16 MiB limit")
+            return payload
 
         raise TypeError(
             "unsupported value type for safe OxtaMem serialization; use bytes, str, JSON values, "
@@ -71,6 +91,8 @@ class GeodesicClient:
 
     def _deserialize(self, data: bytes):
         """Restores bytes to objects."""
+        if len(data) > MAX_PAYLOAD_BYTES:
+            raise ValueError("stored payload exceeds the 16 MiB limit")
         if data.startswith(b"TORCHTENSOR:"):
             buff = io.BytesIO(data[12:])
             array = np.load(buff, allow_pickle=False)
@@ -114,8 +136,11 @@ class GeodesicClient:
 
     def recall_history(self, key: str, depth: int):
         """Returns a list of states (time travel)."""
+        depth = int(depth)
+        if depth < 0 or depth > MAX_RECALL_DEPTH:
+            raise ValueError("depth must be between 0 and 1024")
         if self.driver_type == "redis":
-            raw_list = self.conn.execute_command("RECALL", key, int(depth))
+            raw_list = self.conn.execute_command("RECALL", key, depth)
         else:
             raw_list = self.conn.recall(key, depth)
         return [self._deserialize(x) for x in raw_list]

@@ -161,9 +161,9 @@ void launch_decode_greedy_argmax(const float *raw, int vocab,
 //   * Renormalize the surviving values so they sum to 1 (within the row).
 //
 // Matches the CPU implementation in jamba.cpp::MoERouter::forward.  k must
-// satisfy 1 <= k <= num_experts.  num_experts is bounded by
-// MOE_TOPK_MASK_MAX_EXPERTS (compile-time constant in mamba_kernels.cu /
-// moe_kernels.cu — currently 64).  Single launch, no internal sync.
+// satisfy 1 <= k <= num_experts.  The implementation has no fixed-size
+// per-thread expert array, so expert counts above 64 are safe.  Single launch,
+// no internal sync.
 // =====================================================================
 void launch_moe_topk_mask_kernel(float *weights, int batch, int num_experts,
                                  int k);

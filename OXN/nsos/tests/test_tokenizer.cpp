@@ -1,5 +1,7 @@
 #include "../include/tokenizer.h"
 #include <cassert>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -54,6 +56,36 @@ void test_special_tokens() {
   assert(ids[ids.size() - 1] == 256);
 
   assert(tok.decode(ids) == text);
+  std::cout << "OK" << std::endl;
+}
+
+void test_empty_special_token_is_rejected() {
+  std::cout << "Testing empty special token rejection..." << std::endl;
+  Tokenizer tok;
+  bool rejected = false;
+  try {
+    tok.add_special_tokens({""});
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+
+  const auto path =
+      std::filesystem::temp_directory_path() / "nsos_empty_special_token.tok";
+  {
+    std::ofstream out(path, std::ios::binary);
+    out << "NSOS_TOKENIZER_V1\t257\n";
+    out << "256\t\t1\n";
+  }
+  rejected = false;
+  try {
+    tok.load_pack(path.string());
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  assert(rejected);
   std::cout << "OK" << std::endl;
 }
 
@@ -172,6 +204,7 @@ int main() {
   try {
     test_basic_encoding();
     test_special_tokens();
+    test_empty_special_token_is_rejected();
     test_decode_sanitizes_invalid_utf8();
     test_utf8_word_merges();
     test_bpe_efficient_matches_naive();

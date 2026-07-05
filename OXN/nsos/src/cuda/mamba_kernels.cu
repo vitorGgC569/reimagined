@@ -58,8 +58,10 @@ __global__ void mamba_single_token_update_kernel(
 
   const int d = channel % D;
   const float a_value = mamba_a_eff_dev(A[d]);
-  const float decay = expf(-softplus_device(dt[channel]) * a_value);
-  const float next_state = x[channel] + state[channel] * decay;
+  const float dt_scale = softplus_device(dt[channel]);
+  const float decay = expf(-dt_scale * a_value);
+  const float next_state =
+      dt_scale * x[channel] + state[channel] * decay;
   state[channel] = next_state;
   y[channel] = tanhf(next_state);
 }
@@ -125,8 +127,9 @@ __global__ void mamba_selective_scan_forward_kernel(
   for (int t = 0; t < Seq; ++t) {
     const int idx = (b * Seq + t) * D + d;
     const float dt_val = dt[idx];
-    const float decay = expf(-softplus_device(dt_val) * a_value);
-    state = state * decay + B_in[idx] * x[idx];
+    const float dt_scale = softplus_device(dt_val);
+    const float decay = expf(-dt_scale * a_value);
+    state = state * decay + dt_scale * B_in[idx] * x[idx];
     if (state_history != nullptr) {
       state_history[idx] = state;
     }
@@ -141,9 +144,9 @@ __global__ void mamba_selective_scan_forward_kernel(
 // src/mamba2.cpp::Mamba2SSD::ssd_backward exactly, including:
 //   * y_t  = tanh(h_t) * C_t   →   dC_t = grad_y_t * tanh(h_t)
 //   * dh_t = grad_y_t * C_t * (1 - tanh(h_t)^2) + dh_next
-//   * h_t  = h_{t-1} * decay + B_t * x_t
-//       dx_t  = dh_t * B_t
-//       dB_t  = dh_t * x_t
+//   * h_t  = h_{t-1} * decay + softplus(dt_t) * B_t * x_t
+//       dx_t  = dh_t * softplus(dt_t) * B_t
+//       dB_t  = dh_t * softplus(dt_t) * x_t
 //       dh_{t-1} (carried) = dh_t * decay
 //       dDecay = dh_t * h_{t-1}
 //       ddt_t  = dDecay * decay * (-A) * sigmoid(dt_t)
@@ -201,20 +204,22 @@ __global__ void mamba_selective_scan_backward_kernel(
     const float grad_candidate = grad_y[idx] * c_value;
     const float grad_state = grad_candidate * dcand + grad_state_next;
 
-    // dx = dh * B  ;  dB = dh * x
-    grad_x[idx] = grad_state * B_in[idx];
-    grad_B[idx] = grad_state * x[idx];
+    // dx = dh * dt_scale * B  ;  dB = dh * dt_scale * x
+    grad_x[idx] = grad_state * dt_sp * B_in[idx];
+    grad_B[idx] = grad_state * dt_sp * x[idx];
 
     // Carry through the recurrence
     const float grad_decay = grad_state * prev_state;
     grad_state_next = grad_state * decay;
 
-    // ddt = dDecay * decay * (-A) * sigmoid(dt)
+    // ddt receives both the discretized input and decay contributions.
     const float decay_pre = grad_decay * decay;
     // Numerically stable sigmoid (CPU path uses a branched form; expf is
     // sufficient here because dt magnitudes are bounded by softplus scale).
     const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_val));
-    grad_dt[idx] = decay_pre * (-a_value) * sigmoid_dt;
+    const float grad_dt_scale =
+        grad_state * B_in[idx] * x[idx] + decay_pre * (-a_value);
+    grad_dt[idx] = grad_dt_scale * sigmoid_dt;
 
     // N1: dA_log += dDecay·decay·(-softplus(dt))·A_eff  (unconditional).
     grad_a_local += decay_pre * (-dt_sp) * a_value;
@@ -226,8 +231,9 @@ __global__ void mamba_selective_scan_backward_kernel(
 }
 
 // ── Parallel-prefix (associative) selective scan ─────────────────────────────
-// The forward recurrence h_t = decay_t * h_{t-1} + (B_t * x_t) is a first-order
-// AFFINE recurrence, i.e. an associative scan with operator
+// The forward recurrence h_t = decay_t * h_{t-1}
+//                              + softplus(dt_t) * B_t * x_t
+// is a first-order AFFINE recurrence, i.e. an associative scan with operator
 //   (a_l,b_l) o (a_r,b_r) = (a_l*a_r,  a_r*b_l + b_r),  identity (1,0),
 // applied to h_{-1}=0 so that h_t is the b-component of the inclusive scan.
 // This kernel does ONE block per (batch,dim) channel and a Hillis-Steele
@@ -261,8 +267,9 @@ __global__ void mamba_selective_scan_forward_parallel_kernel(
 
   const float a_value = mamba_a_eff_dev(A[d]);
   const int idx = (b * Seq + t) * D + d;
-  sa[t] = expf(-softplus_device(dt[idx]) * a_value);  // decay_t
-  sb[t] = B_in[idx] * x[idx];                         // input term
+  const float dt_scale = softplus_device(dt[idx]);
+  sa[t] = expf(-dt_scale * a_value);                   // decay_t
+  sb[t] = dt_scale * B_in[idx] * x[idx];               // input term
   __syncthreads();
 
   // Hillis-Steele inclusive scan with the affine operator.  Double-buffer via
@@ -508,12 +515,14 @@ __global__ void mamba_nstate_forward_kernel(
   const float a_value = mamba_a_eff_dev(A[h]);
   for (int t = 0; t < Seq; ++t) {
     const int row = b * Seq + t;
-    const float decay = expf(-softplus_device(dt[row * H + h]) * a_value);
+    const float dt_scale = softplus_device(dt[row * H + h]);
+    const float decay = expf(-dt_scale * a_value);
     const float xcv = xc[(size_t)row * dim + chan];
     float y_acc = 0.0f;
     for (int n = 0; n < N; ++n) {
       const size_t bcidx = (size_t)row * (H * N) + h * N + n;
-      const float hv = decay * state[n] + B_in[bcidx] * xcv;
+      const float hv =
+          decay * state[n] + dt_scale * B_in[bcidx] * xcv;
       state[n] = hv;
       if (state_history != nullptr) {
         state_history[(size_t)row * HPN + (size_t)chan * N + n] = hv;
@@ -553,6 +562,7 @@ __global__ void mamba_nstate_backward_kernel(
     const float xcv = xc[(size_t)row * dim + chan];
     const float gyv = gy[(size_t)row * dim + chan];
     float ddecay = 0.0f;
+    float dinput_scale = 0.0f;
     float gxc_acc = 0.0f;
     for (int n = 0; n < N; ++n) {
       const size_t bcidx = (size_t)row * (H * N) + h * N + n;
@@ -564,14 +574,16 @@ __global__ void mamba_nstate_backward_kernel(
       const float bval = B_in[bcidx];
       atomicAdd(&gC[bcidx], gyv * h_t);
       const float grad_h = gyv * cval + carry[n];
-      atomicAdd(&gB[bcidx], grad_h * xcv);
-      gxc_acc += grad_h * bval;
+      atomicAdd(&gB[bcidx], grad_h * sp * xcv);
+      gxc_acc += grad_h * sp * bval;
+      dinput_scale += grad_h * bval * xcv;
       ddecay += grad_h * h_prev;
       carry[n] = grad_h * decay;
     }
     gXc[(size_t)row * dim + chan] = gxc_acc;
     const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_val));
-    atomicAdd(&gDt[row * H + h], ddecay * decay * (-a_value) * sigmoid_dt);
+    atomicAdd(&gDt[row * H + h],
+              (dinput_scale + ddecay * decay * (-a_value)) * sigmoid_dt);
     // N1: per-head dA_log += dDecay·decay·(-sp)·A_eff (unconditional).
     atomicAdd(&gA[h], ddecay * decay * (-sp) * a_value);
   }
@@ -620,7 +632,8 @@ void launch_mamba_nstate_backward(const float *gy, const float *xc,
 // One thread per channel.  Mirrors forward_proper_step's host math exactly:
 //   conv_pre = sum_j convw[c,j] * window[j]   (window = [ring taps..., xv])
 //   xc       = silu(conv_pre)
-//   h        = decay*h + B*xc ; decay = exp(-softplus(dt)*exp(A_log))  (N1)
+//   h        = decay*h + softplus(dt)*B*xc
+//              decay = exp(-softplus(dt)*exp(A_log))  (N1)
 //   y        = h*C
 //   gated    = y * silu(z)
 // then advances the conv ring in place (shift left, append xv).  Keeps the SSD
@@ -644,8 +657,9 @@ __global__ void mamba_proper_step_kernel(
   const float xc = conv_pre * (1.0f / (1.0f + expf(-conv_pre)));  // silu
 
   const float a_value = mamba_a_eff_dev(A[c]);
-  const float decay = expf(-softplus_device(dt[c]) * a_value);
-  const float st = decay * h[c] + B_in[c] * xc;
+  const float dt_scale = softplus_device(dt[c]);
+  const float decay = expf(-dt_scale * a_value);
+  const float st = decay * h[c] + dt_scale * B_in[c] * xc;
   h[c] = st;
   const float y = st * C_in[c];
   const float gate = z[c] * (1.0f / (1.0f + expf(-z[c])));  // silu(z)
@@ -695,13 +709,14 @@ __global__ void mamba_nstate_step_kernel(
 
   const int head = c / max(P, 1);
   const float a_value = mamba_a_eff_dev(A[head]);
-  const float decay = expf(-softplus_device(dt[head]) * a_value);
+  const float dt_scale = softplus_device(dt[head]);
+  const float decay = expf(-dt_scale * a_value);
   const float *b_row = B_in + head * N;
   const float *c_row = C_in + head * N;
   float *h_row = h + static_cast<size_t>(c) * N;
   float y_acc = 0.0f;
   for (int n = 0; n < N; ++n) {
-    const float hv = decay * h_row[n] + b_row[n] * xc;
+    const float hv = decay * h_row[n] + dt_scale * b_row[n] * xc;
     h_row[n] = hv;
     y_acc += hv * c_row[n];
   }

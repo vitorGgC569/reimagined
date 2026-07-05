@@ -227,23 +227,21 @@ Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
     // range as A — in the opposite sense — would make the product dt·A_eff
     // (which sets the decay) constant across heads and CANCEL A's hierarchy.
     //
-    // ⚠ DEFAULT OFF (opt-in).  A local A/B on MQAR (GTX 1050, sm_61) showed the
-    // dt-init ALONE *regresses* recall (n_kv=8: 0.46 -> 0.34; loss 1.53 -> 1.69).
-    // Reason: our recurrence is  h = decay·h + B·x  — the input is NOT scaled by
-    // dt (we lack the reference's  dB = dt·B  ZOH input discretisation).  With a
-    // small dt the decay -> 1 (stops forgetting) BUT the input keeps writing at
-    // full strength every token -> the state SATURATES (loses selectivity).  A
-    // small dt is only correct when COUPLED with dt·B input scaling.  So this
-    // init is now opt-in and should be enabled together with the dt·B change.
-    // Opt-in: NSOS_MAMBA_DT_INIT=1 (dt_init=0.01) or a numeric dt_init value.
+    // The input discretisation is coupled to the same dt
+    // (dB = softplus(dt)·B), so a small initial dt slows both forgetting and
+    // writing instead of saturating the state.  Default ON; set
+    // NSOS_MAMBA_DT_INIT=0 only to load/compare a historical checkpoint.
+    // A numeric value in (1e-6, 1) overrides the default 0.01.
     if (dt_proj_ && dt_proj_->bias.data.size > 0) {  // dt_proj_ built with bias
       const char* dtenv = std::getenv("NSOS_MAMBA_DT_INIT");
-      const bool enabled = (dtenv != nullptr && dtenv[0] != '\0' &&
-                            !(dtenv[0] == '0' && dtenv[1] == '\0'));
+      const bool enabled =
+          dtenv == nullptr || dtenv[0] == '\0' ||
+          !(dtenv[0] == '0' && dtenv[1] == '\0');
       if (enabled) {
         float dt_init = 0.01f;  // NSOS_MAMBA_DT_INIT=1 -> default 0.01
         // A numeric value (anything other than "1") overrides dt_init.
-        if (!(dtenv[0] == '1' && dtenv[1] == '\0')) {
+        if (dtenv != nullptr && dtenv[0] != '\0' &&
+            !(dtenv[0] == '1' && dtenv[1] == '\0')) {
           const float v = std::strtof(dtenv, nullptr);
           if (v > 1e-6f && v < 1.0f) dt_init = v;
         }
@@ -404,7 +402,9 @@ Tensor Mamba2SSD::ssd_forward(const Tensor& x, const Tensor& delta,
             for (int d = 0; d < dim; ++d) {
                 const float decay = std::exp(
                     -softplus_stable(dt_t[d]) * mamba_a_eff(a_ptr[d]));
-                state[d] = state[d] * decay + b_t[d] * x_t[d];
+                const float dt_scale = softplus_stable(dt_t[d]);
+                state[d] =
+                    state[d] * decay + dt_scale * b_t[d] * x_t[d];
                 if (s_t) {
                     s_t[d] = state[d];
                 }
@@ -549,16 +549,23 @@ Mamba2SSD::ssd_backward(const Tensor& grad_y, const Tensor& x,
                 const float grad_state =
                     grad_candidate * (1.0f - candidate * candidate) + grad_state_next[d];
 
-                grad_x_ptr[token_index * dim + d] += grad_state * b_value;
+                const float dt_scale =
+                    softplus_stable(dt_ptr[token_index * dim + d]);
+                grad_x_ptr[token_index * dim + d] +=
+                    grad_state * dt_scale * b_value;
                 grad_b_ptr[token_index * dim + d] +=
-                    grad_state * x_ptr[token_index * dim + d];
+                    grad_state * dt_scale * x_ptr[token_index * dim + d];
 
                 const float grad_decay = grad_state * prev_state;
                 grad_state_next[d] = grad_state * decay;
 
                 const float decay_pre = grad_decay * decay;
+                const float grad_dt_scale =
+                    grad_state * b_value * x_ptr[token_index * dim + d] +
+                    decay_pre * (-a_value);
                 grad_delta_ptr[token_index * dim + d] +=
-                    decay_pre * (-a_value) * sigmoid_stable(dt_ptr[token_index * dim + d]);
+                    grad_dt_scale *
+                    sigmoid_stable(dt_ptr[token_index * dim + d]);
 
                 // N1: dL/dA_log = dL/dA_eff · A_eff; gradient flows for every
                 // channel (no 1e-3 gate). a_value = A_eff = exp(A_log).
@@ -669,7 +676,8 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
     // xc = silu(conv_pre) = conv_pre * sigmoid(conv_pre) — device-agnostic.
     Tensor xc = conv_pre.mul(conv_pre.sigmoid());
 
-    // Diagonal selective recurrence: h_t = decay_t*h_{t-1} + B_t*xc_t;
+    // Diagonal selective recurrence:
+    // h_t = decay_t*h_{t-1} + softplus(dt_t)*B_t*xc_t;
     // y_t = h_t * C_t (linear readout, C once).  GPU kernel on device; the
     // sequential recurrence runs as an ordered host loop on CPU.
     Tensor h_hist(std::vector<int>{rows, dim}, dev);
@@ -696,11 +704,11 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
                 for (int c = 0; c < dim; ++c) {
                     const size_t idx = row * dim + c;
                     const float a_value = mamba_a_eff(a_ptr[c]);
-                    const float decay =
-                        std::exp(-softplus_stable(dt_ptr[idx]) * a_value);
+                    const float dt_scale = softplus_stable(dt_ptr[idx]);
+                    const float decay = std::exp(-dt_scale * a_value);
                     state[static_cast<size_t>(c)] =
                         decay * state[static_cast<size_t>(c)] +
-                        b_ptr[idx] * xc_ptr[idx];
+                        dt_scale * b_ptr[idx] * xc_ptr[idx];
                     h_ptr[idx] = state[static_cast<size_t>(c)];
                     y_ptr[idx] = state[static_cast<size_t>(c)] * c_ptr[idx];
                 }
@@ -835,11 +843,13 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
                     gCp[idx] = gy[idx] * h_t;
                     const float grad_h =
                         gy[idx] * c_ptr[idx] + carry[static_cast<size_t>(c)];
-                    gBp[idx] = grad_h * xc_ptr[idx];
-                    gXcp[idx] = grad_h * b_ptr[idx];
+                    gBp[idx] = grad_h * sp * xc_ptr[idx];
+                    gXcp[idx] = grad_h * sp * b_ptr[idx];
                     const float grad_decay = grad_h * h_prev;
-                    gDtp[idx] = grad_decay * decay * (-a_value) *
-                                sigmoid_stable(dt_ptr[idx]);
+                    const float grad_sp =
+                        grad_h * b_ptr[idx] * xc_ptr[idx] +
+                        grad_decay * decay * (-a_value);
+                    gDtp[idx] = grad_sp * sigmoid_stable(dt_ptr[idx]);
                     // N1: gradient to A_log (= dL/dA_eff · A_eff), unconditional.
                     gA[c] += grad_decay * decay * (-sp) * a_value;
                     carry[static_cast<size_t>(c)] = grad_h * decay;
@@ -970,8 +980,8 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
             const int row = b * seq + t;
             for (int h = 0; h < H; ++h) {
                 const float a_value = mamba_a_eff(ap[h]);
-                const float decay =
-                    std::exp(-softplus_stable(dtp[row * H + h]) * a_value);
+                const float dt_scale = softplus_stable(dtp[row * H + h]);
+                const float decay = std::exp(-dt_scale * a_value);
                 for (int p = 0; p < P; ++p) {
                     const int chan = h * P + p;
                     const float xcv = xcp[static_cast<size_t>(row) * dim + chan];
@@ -980,7 +990,8 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
                         const size_t sidx = (static_cast<size_t>(h) * P + p) * N + n;
                         const float bval = bp[static_cast<size_t>(row) * (H * N) + h * N + n];
                         const float cval = cp[static_cast<size_t>(row) * (H * N) + h * N + n];
-                        const float hv = decay * state[sidx] + bval * xcv;
+                        const float hv =
+                            decay * state[sidx] + dt_scale * bval * xcv;
                         state[sidx] = hv;
                         histp[static_cast<size_t>(row) * HPN + sidx] = hv;
                         y_acc += hv * cval;
@@ -1125,6 +1136,7 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
                 const float sp = softplus_stable(dtp[row * H + h]);
                 const float decay = std::exp(-sp * a_value);
                 float ddecay = 0.0f;
+                float dinput_scale = 0.0f;
                 for (int p = 0; p < P; ++p) {
                     const int chan = h * P + p;
                     const float xcv = xcp[static_cast<size_t>(row) * dim + chan];
@@ -1140,14 +1152,17 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
                         const float bval = bp[bcidx];
                         gCp[bcidx] += gyv * h_t;
                         const float grad_h = gyv * cval + carry[sidx];
-                        gBp[bcidx] += grad_h * xcv;
-                        gXcp[static_cast<size_t>(row) * dim + chan] += grad_h * bval;
+                        gBp[bcidx] += grad_h * sp * xcv;
+                        gXcp[static_cast<size_t>(row) * dim + chan] +=
+                            grad_h * sp * bval;
+                        dinput_scale += grad_h * bval * xcv;
                         ddecay += grad_h * h_prev;
                         carry[sidx] = grad_h * decay;
                     }
                 }
                 gDtp[row * H + h] =
-                    ddecay * decay * (-a_value) * sigmoid_stable(dtp[row * H + h]);
+                    (dinput_scale + ddecay * decay * (-a_value)) *
+                    sigmoid_stable(dtp[row * H + h]);
                 // N1: per-head gradient to A_log (= dL/dA_eff · A_eff), unconditional.
                 gAp[h] += ddecay * decay * (-sp) * a_value;
             }
@@ -1389,8 +1404,10 @@ Tensor Mamba2SSD::forward_proper_step(const Tensor& u) {
             // (batched decode), corrupting rows>=1.  Mirrors the nstate step's
             // ap[h] (also shared across rows).
             const float a_value = mamba_a_eff(ap[c]);
-            const float decay = std::exp(-softplus_stable(dtp[base + c]) * a_value);
-            const float st = decay * state_r[c] + bp[base + c] * xc;
+            const float dt_scale = softplus_stable(dtp[base + c]);
+            const float decay = std::exp(-dt_scale * a_value);
+            const float st =
+                decay * state_r[c] + dt_scale * bp[base + c] * xc;
             state_r[c] = st;
             yp[base + c] = st * cp[base + c];
         }
@@ -1530,7 +1547,8 @@ Tensor Mamba2SSD::forward_proper_nstate_step(const Tensor& u) {
         }
         for (int h = 0; h < H; ++h) {
             const float a_value = mamba_a_eff(ap[h]);
-            const float decay = std::exp(-softplus_stable(dtp[dtbase + h]) * a_value);
+            const float dt_scale = softplus_stable(dtp[dtbase + h]);
+            const float decay = std::exp(-dt_scale * a_value);
             for (int p = 0; p < P; ++p) {
                 const int chan = h * P + p;
                 const float xcv = xc[static_cast<size_t>(chan)];
@@ -1539,7 +1557,8 @@ Tensor Mamba2SSD::forward_proper_nstate_step(const Tensor& u) {
                     const size_t sidx = (static_cast<size_t>(h) * P + p) * N + n;
                     const float bval = bp[bcbase + static_cast<size_t>(h) * N + n];
                     const float cval = cp[bcbase + static_cast<size_t>(h) * N + n];
-                    const float hv = decay * state_r[sidx] + bval * xcv;
+                    const float hv =
+                        decay * state_r[sidx] + dt_scale * bval * xcv;
                     state_r[sidx] = hv;
                     y_acc += hv * cval;
                 }
@@ -1673,10 +1692,11 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
                 for (int d = 0; d < d_model; ++d) {
                     const int index = row * d_model + d;
                     const float a_value = mamba_a_eff(a_ptr[d]);
-                    const float decay =
-                        std::exp(-softplus_stable(delta_ptr[index]) * a_value);
+                    const float dt_scale = softplus_stable(delta_ptr[index]);
+                    const float decay = std::exp(-dt_scale * a_value);
                     const float next_state =
-                        state_ptr[index] * decay + b_ptr[index] * x_ptr[index];
+                        state_ptr[index] * decay +
+                        dt_scale * b_ptr[index] * x_ptr[index];
                     state_ptr[index] = next_state;
                     y_ptr[index] = std::tanh(next_state) * c_ptr[index];
                 }

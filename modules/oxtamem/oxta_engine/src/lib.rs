@@ -2,7 +2,7 @@ pub mod engine;
 pub mod server;
 pub mod sharding;
 
-use crate::engine::GeodesicEngine;
+use crate::engine::{GeodesicEngine, MAX_RECALL_BYTES, MAX_VALUE_BYTES};
 use pyo3::prelude::*;
 use std::ffi::{CStr, c_char};
 use std::ptr;
@@ -88,14 +88,25 @@ fn write_allocated_buffer(bytes: Vec<u8>, out_data: *mut *mut u8, out_len: *mut 
     true
 }
 
-fn serialize_nodes(values: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut encoded = Vec::new();
+fn serialize_nodes(values: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+    let mut total = sizeof_u64();
+    for value in &values {
+        total = total.checked_add(sizeof_u64())?.checked_add(value.len())?;
+        if total > MAX_RECALL_BYTES {
+            return None;
+        }
+    }
+    let mut encoded = Vec::with_capacity(total);
     encoded.extend_from_slice(&(values.len() as u64).to_le_bytes());
     for value in values {
         encoded.extend_from_slice(&(value.len() as u64).to_le_bytes());
         encoded.extend_from_slice(&value);
     }
-    encoded
+    Some(encoded)
+}
+
+const fn sizeof_u64() -> usize {
+    std::mem::size_of::<u64>()
 }
 
 fn cstr_to_string(ptr: *const c_char) -> Option<String> {
@@ -147,7 +158,7 @@ pub unsafe extern "C" fn oxtamem_write(
     value: *const u8,
     value_len: usize,
 ) -> bool {
-    if handle.is_null() || value.is_null() {
+    if handle.is_null() || value.is_null() || value_len > MAX_VALUE_BYTES {
         return false;
     }
 
@@ -222,7 +233,10 @@ pub unsafe extern "C" fn oxtamem_recall(
         .into_iter()
         .map(|node| node.value)
         .collect::<Vec<_>>();
-    write_allocated_buffer(serialize_nodes(payloads), out_data, out_len)
+    match serialize_nodes(payloads) {
+        Some(encoded) => write_allocated_buffer(encoded, out_data, out_len),
+        None => false,
+    }
 }
 
 /// # Safety

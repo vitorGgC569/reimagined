@@ -30,6 +30,9 @@ struct Args {
     #[arg(long, default_value_t = 524_288)]
     max_bulk_bytes: usize,
 
+    #[arg(long, default_value_t = 8_388_608)]
+    max_response_bytes: usize,
+
     #[arg(long, default_value_t = 10_000)]
     read_timeout_ms: u64,
 }
@@ -63,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_connections: args.max_connections,
             max_frame_bytes: args.max_frame_bytes,
             max_bulk_bytes: args.max_bulk_bytes,
+            max_response_bytes: args.max_response_bytes,
             read_timeout_ms: args.read_timeout_ms,
             ..RespServerConfig::default()
         })

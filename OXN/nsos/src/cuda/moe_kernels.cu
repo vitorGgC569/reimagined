@@ -19,21 +19,13 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-// Per-row stack-allocated arrays cap the supported expert count.  64 is
-// far above current configurations (8 in stable_jamba, 32 in scaled-up
-// research), but cheap enough to keep without measurable register
-// pressure on Pascal.
-#define MOE_TOPK_MASK_MAX_EXPERTS 64
-
 // =====================================================================
 // Top-k mask + renormalize, one CUDA thread per row.
 //
-// Strategy: each thread reads its row into a 64-element register array,
-// computes a partial sort to find the k-th largest value (used as the
-// threshold), zeros entries below the threshold, sums the survivors,
-// and divides through.  For typical num_experts (8 or 16) the partial
-// sort is essentially free; for 64 it is still O(num_experts * k) which
-// is fine because k itself is tiny (typically 2).
+// Strategy: selection is performed in-place.  A selected non-negative
+// softmax weight v is temporarily marked as -v-1, which cannot collide
+// with an unselected probability.  This keeps O(num_experts*k) behavior
+// without a fixed-size local array.
 // =====================================================================
 __global__ void moe_topk_mask_kernel(float *__restrict__ weights, int batch,
                                      int num_experts, int k) {
@@ -61,56 +53,32 @@ __global__ void moe_topk_mask_kernel(float *__restrict__ weights, int batch,
     return;
   }
 
-  // Local copy of row values + their original indices.  We use a
-  // selection-sort over k iterations to identify the k largest (and
-  // their indices) without a full sort — this is O(num_experts * k)
-  // and avoids dynamic shared memory.
-  float local_vals[MOE_TOPK_MASK_MAX_EXPERTS];
-  int   local_idx[MOE_TOPK_MASK_MAX_EXPERTS];
-  const int N =
-      (num_experts > MOE_TOPK_MASK_MAX_EXPERTS) ? MOE_TOPK_MASK_MAX_EXPERTS
-                                                : num_experts;
-  for (int e = 0; e < N; ++e) {
-    local_vals[e] = row_ptr[e];
-    local_idx[e] = e;
-  }
-
-  // Partial selection sort: bring the top-k to the front.  Stable in
-  // index order on ties, matching std::partial_sort's predicate-only
-  // ordering (CPU code uses ranked indices comparing weights, with no
-  // tie-breaker — both implementations may pick different ties; this
-  // is acceptable because the renormalization absorbs the choice).
-  for (int rank = 0; rank < eff_k; ++rank) {
-    int best = rank;
-    for (int j = rank + 1; j < N; ++j) {
-      if (local_vals[j] > local_vals[best]) {
-        best = j;
-      }
-    }
-    if (best != rank) {
-      float tv = local_vals[rank];
-      local_vals[rank] = local_vals[best];
-      local_vals[best] = tv;
-      int ti = local_idx[rank];
-      local_idx[rank] = local_idx[best];
-      local_idx[best] = ti;
-    }
-  }
-
-  // Sum of the survivors and inverse for renormalization.
   float selected_sum = 0.0f;
   for (int rank = 0; rank < eff_k; ++rank) {
-    selected_sum += local_vals[rank];
+    int best_index = -1;
+    float best_value = -1.0f;
+    for (int e = 0; e < num_experts; ++e) {
+      const float value = row_ptr[e];
+      if (value >= 0.0f &&
+          (best_index < 0 || value > best_value)) {
+        best_index = e;
+        best_value = value;
+      }
+    }
+    if (best_index < 0) {
+      break;
+    }
+    selected_sum += best_value;
+    row_ptr[best_index] = -best_value - 1.0f;
   }
+
   const float inv_selected = 1.0f / fmaxf(selected_sum, 1e-9f);
 
-  // Write back: zero everything, then scatter the renormalized
-  // survivors into their original positions.
+  // Restore marked survivors and zero every unselected probability.
   for (int e = 0; e < num_experts; ++e) {
-    row_ptr[e] = 0.0f;
-  }
-  for (int rank = 0; rank < eff_k; ++rank) {
-    row_ptr[local_idx[rank]] = local_vals[rank] * inv_selected;
+    const float value = row_ptr[e];
+    row_ptr[e] =
+        value < 0.0f ? (-value - 1.0f) * inv_selected : 0.0f;
   }
 }
 

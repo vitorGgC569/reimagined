@@ -1,6 +1,8 @@
 #include "memory_system.h"
 
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 
@@ -49,6 +51,48 @@ int main() {
     require(history[0].content == "world", "latest message mismatch");
     require(history[1].content == "hello\nworld", "oldest message mismatch");
     require(std::filesystem::exists(store_path), "causal store file was not created");
+
+    const auto corrupt_path =
+        std::filesystem::temp_directory_path() / "nsos_memory_causal_corrupt.bin";
+    std::filesystem::remove(corrupt_path);
+    {
+      CausalMemoryStore store(corrupt_path.string());
+      store.append("k", {1});
+      store.append("k", {2});
+    }
+    constexpr int64_t header_bytes =
+        sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t) +
+        sizeof(int64_t) + sizeof(uint64_t);
+    const int64_t second_offset = header_bytes + 1 + 1;
+    {
+      std::fstream file(corrupt_path,
+                        std::ios::binary | std::ios::in | std::ios::out);
+      require(file.is_open(), "failed to open corruption fixture");
+      file.seekp(second_offset + sizeof(uint32_t) + sizeof(uint32_t) +
+                 sizeof(uint64_t));
+      file.write(reinterpret_cast<const char*>(&second_offset),
+                 sizeof(second_offset));
+    }
+    bool rejected_corrupt_lineage = false;
+    try {
+      CausalMemoryStore corrupt(corrupt_path.string());
+      (void)corrupt;
+    } catch (const std::runtime_error&) {
+      rejected_corrupt_lineage = true;
+    }
+    require(rejected_corrupt_lineage,
+            "causal store accepted a self-referential lineage");
+    std::filesystem::remove(corrupt_path);
+
+    bool rejected_empty_key = false;
+    try {
+      CausalMemoryStore store(corrupt_path.string());
+      store.append("", {1});
+    } catch (const std::invalid_argument&) {
+      rejected_empty_key = true;
+    }
+    std::filesystem::remove(corrupt_path);
+    require(rejected_empty_key, "causal store accepted an empty key");
 
     MemorySystem volatile_memory(4);
     volatile_memory.add_message(first);

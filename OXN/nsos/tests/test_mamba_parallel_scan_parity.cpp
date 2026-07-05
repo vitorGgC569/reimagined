@@ -2,7 +2,8 @@
 // channel-parallel sequential selective-scan kernel.
 //
 // Both compute the same recurrence per (batch,dim) channel:
-//   h_t = decay_t * h_{t-1} + B_t * x_t ,  y_t = tanh(h_t) * C_t
+//   h_t = decay_t * h_{t-1} + softplus(dt_t) * B_t * x_t
+//   y_t = tanh(h_t) * C_t
 // The parallel kernel reassociates the floating-point summation (Hillis-Steele
 // scan), so results must agree with the sequential reference within 1e-4.
 //

@@ -150,5 +150,30 @@ int main() {
             " |delta|=" + std::to_string(diff));
       }
     }
+
+    // Regression for the former fixed local arrays[64] in the CUDA top-k
+    // kernel.  65 experts used to let eff_k index beyond those arrays.
+    constexpr int wide_experts = 65;
+    constexpr int wide_top_k = 3;
+    MoERouter wide_cpu(d_model, wide_experts, wide_top_k);
+    MoERouter wide_gpu(d_model, wide_experts, wide_top_k);
+    wide_gpu.to(Device::GPU);
+    mirror_parameters(wide_cpu.parameters(), wide_gpu.parameters());
+    Tensor wide_input = Tensor::random({2, d_model}, Device::CPU);
+    auto [_wide_cpu_logits, wide_cpu_weights] = wide_cpu.forward(wide_input);
+    auto [_wide_gpu_logits, wide_gpu_weights_device] =
+        wide_gpu.forward(wide_input.to(Device::GPU));
+    cuda_sync_or_throw("moe_router/forward_65_experts");
+    Tensor wide_gpu_weights = wide_gpu_weights_device.cpu();
+    assert_close(wide_cpu_weights, wide_gpu_weights, 1e-4f,
+                 "moe_router_weights_65_experts");
+    for (int row = 0; row < 2; ++row) {
+      if (count_nonzero_in_row(
+              wide_gpu_weights.data() + row * wide_experts,
+              wide_experts) != wide_top_k) {
+        throw std::runtime_error(
+            "65-expert CUDA router did not preserve top-k cardinality");
+      }
+    }
   });
 }

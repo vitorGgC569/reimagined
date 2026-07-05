@@ -18,7 +18,8 @@ namespace cuda {
 //
 // Recurrence (per (batch, dim) channel, sequential over time):
 //   decay     = exp(-softplus(dt[t]) * exp(A_log[d]))            (N1)
-//   state[d]  = state[d] * decay + B_in[t,d] * x[t,d]
+//   state[d]  = state[d] * decay
+//               + softplus(dt[t,d]) * B_in[t,d] * x[t,d]
 //   y[t,d]    = tanh(state[d]) * C_in[t,d]
 //
 // Tensors (all device pointers):

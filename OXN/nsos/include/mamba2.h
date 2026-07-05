@@ -28,7 +28,8 @@ struct MambaConfig {
   // depthwise conv1d on x (Mamba's local token mixing), a LINEAR readout
   // y = h * C (C applied exactly once), and a separate SiLU gate y * silu(z):
   //   xc_t   = silu(conv1d_causal(x_proj(u)))
-  //   h_t    = exp(-softplus(dt_t) * A) * h_{t-1} + B_t * xc_t
+  //   h_t    = exp(-softplus(dt_t) * A) * h_{t-1}
+  //            + softplus(dt_t) * B_t * xc_t
   //   y_t    = h_t * C_t
   //   out    = out_proj(y * silu(z)) + u * D
   // This removes the delta==C / double-C degeneracy and gives the time axis its
@@ -44,7 +45,8 @@ struct MambaConfig {
   // (H heads, P=d_head channels/head, N=d_state).  B and C become per-head
   // N-dimensional, dt and A become per-head:
   //   decay_{t,h} = exp(-softplus(dt_{t,h}) * A_h)
-  //   h_{t,h,p,n} = decay_{t,h} * h_{t-1,h,p,n} + B_{t,h,n} * xc_{t,h,p}
+  //   h_{t,h,p,n} = decay_{t,h} * h_{t-1,h,p,n}
+  //                 + softplus(dt_{t,h}) * B_{t,h,n} * xc_{t,h,p}
   //   y_{t,h,p}   = Σ_n h_{t,h,p,n} * C_{t,h,n}
   // This is the state-space duality form (Gu & Dao 2024).  Default false keeps
   // the diagonal proper path (and its parameter set) unchanged.  All gradients

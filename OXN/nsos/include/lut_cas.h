@@ -138,7 +138,9 @@ bool read_from_file(const std::string& path, CasPack& out_pack);
 struct CasMultiPack {
     TileK k;
     std::vector<DictEntry> shared_dictionary;
-    std::vector<CasPack> matrices;   // dictionary inside each is the SAME ref
+    // Per-matrix packs keep dictionary empty; shared_dictionary is the single
+    // source of truth.  This avoids duplicating a large dictionary per matrix.
+    std::vector<CasPack> matrices;
     // Aggregate stats
     size_t total_matrices = 0;
     size_t total_tiles_all = 0;

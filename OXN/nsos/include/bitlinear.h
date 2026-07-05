@@ -111,6 +111,9 @@ public:
   void repack_weights();
   void release_full_precision_weight();
   bool has_full_precision_weight() const { return weight.data.size > 0; }
+  int input_features() const { return in_features; }
+  int output_features() const { return out_features; }
+  bool uses_bias() const { return use_bias; }
   BitLinearPackedState export_packed_state() const;
   void import_packed_state(const BitLinearPackedState& state,
                            Device dev = Device::CPU,

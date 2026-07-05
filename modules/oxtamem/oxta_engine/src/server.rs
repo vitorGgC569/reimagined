@@ -1,4 +1,4 @@
-use crate::engine::GeodesicEngine;
+use crate::engine::{GeodesicEngine, MAX_RECALL_DEPTH};
 use bytes::{Buf, BytesMut};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,9 +9,13 @@ use tokio::time::{Duration, timeout};
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
 const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_BULK_BYTES: usize = 512 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_ARGS: usize = 16;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 10_000;
-const MAX_RECALL_DEPTH: usize = 1024;
+const ABSOLUTE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const ABSOLUTE_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const ABSOLUTE_MAX_ARGS: usize = 1024;
+const ABSOLUTE_MAX_CONNECTIONS: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct RespServerConfig {
@@ -21,6 +25,7 @@ pub struct RespServerConfig {
     pub max_connections: usize,
     pub max_frame_bytes: usize,
     pub max_bulk_bytes: usize,
+    pub max_response_bytes: usize,
     pub max_args: usize,
     pub read_timeout_ms: u64,
 }
@@ -34,6 +39,7 @@ impl Default for RespServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_bulk_bytes: DEFAULT_MAX_BULK_BYTES,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_args: DEFAULT_MAX_ARGS,
             read_timeout_ms: DEFAULT_READ_TIMEOUT_MS,
         }
@@ -50,6 +56,20 @@ impl RespServer {
     }
 
     pub async fn run(&self, config: RespServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+        if config.max_connections == 0
+            || config.max_connections > ABSOLUTE_MAX_CONNECTIONS
+            || config.max_frame_bytes == 0
+            || config.max_frame_bytes > ABSOLUTE_MAX_FRAME_BYTES
+            || config.max_bulk_bytes == 0
+            || config.max_bulk_bytes > config.max_frame_bytes
+            || config.max_response_bytes == 0
+            || config.max_response_bytes > ABSOLUTE_MAX_RESPONSE_BYTES
+            || config.max_args == 0
+            || config.max_args > ABSOLUTE_MAX_ARGS
+            || config.read_timeout_ms == 0
+        {
+            return Err("invalid RESP server resource limits".into());
+        }
         let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
         println!("RESP Server listening on {}:{}", config.host, config.port);
         let connection_limit = Arc::new(Semaphore::new(config.max_connections.max(1)));
@@ -198,21 +218,40 @@ fn parse_resp(buffer: &BytesMut, config: &RespServerConfig) -> RespParse {
     Ok(Some((args, cursor)))
 }
 
-fn bulk_response(bytes: &[u8]) -> Vec<u8> {
-    let mut response = format!("${}\r\n", bytes.len()).into_bytes();
+fn bulk_response(bytes: &[u8], max_response_bytes: usize) -> Option<Vec<u8>> {
+    let header = format!("${}\r\n", bytes.len()).into_bytes();
+    let total = header.len().checked_add(bytes.len())?.checked_add(2)?;
+    if total > max_response_bytes {
+        return None;
+    }
+    let mut response = Vec::with_capacity(total);
+    response.extend_from_slice(&header);
     response.extend_from_slice(bytes);
     response.extend_from_slice(b"\r\n");
-    response
+    Some(response)
 }
 
-fn array_bulk_response(items: &[Vec<u8>]) -> Vec<u8> {
-    let mut response = format!("*{}\r\n", items.len()).into_bytes();
+fn array_bulk_response(items: &[Vec<u8>], max_response_bytes: usize) -> Option<Vec<u8>> {
+    let array_header = format!("*{}\r\n", items.len()).into_bytes();
+    let mut total = array_header.len();
+    for item in items {
+        let item_header_len = format!("${}\r\n", item.len()).len();
+        total = total
+            .checked_add(item_header_len)?
+            .checked_add(item.len())?
+            .checked_add(2)?;
+        if total > max_response_bytes {
+            return None;
+        }
+    }
+    let mut response = Vec::with_capacity(total);
+    response.extend_from_slice(&array_header);
     for item in items {
         response.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
         response.extend_from_slice(item);
         response.extend_from_slice(b"\r\n");
     }
-    response
+    Some(response)
 }
 
 fn handle_command(
@@ -263,11 +302,15 @@ fn handle_command(
                 Ok(value) => value,
                 Err(_) => return b"-ERR key must be utf-8\r\n".to_vec(),
             };
-            let Ok(eng) = engine.lock() else {
-                return b"-ERR engine lock poisoned\r\n".to_vec();
+            let node = {
+                let Ok(eng) = engine.lock() else {
+                    return b"-ERR engine lock poisoned\r\n".to_vec();
+                };
+                eng.read_latest(key)
             };
-            match eng.read_latest(key) {
-                Some(node) => bulk_response(&node.value),
+            match node {
+                Some(node) => bulk_response(&node.value, config.max_response_bytes)
+                    .unwrap_or_else(|| b"-ERR response exceeds configured limit\r\n".to_vec()),
                 None => b"$-1\r\n".to_vec(),
             }
         }
@@ -284,29 +327,50 @@ fn handle_command(
                 None => return b"-ERR depth must be an integer\r\n".to_vec(),
                 Some(_) => return b"-ERR depth exceeds configured limit\r\n".to_vec(),
             };
-            let Ok(eng) = engine.lock() else {
-                return b"-ERR engine lock poisoned\r\n".to_vec();
+            let items: Vec<Vec<u8>> = {
+                let Ok(eng) = engine.lock() else {
+                    return b"-ERR engine lock poisoned\r\n".to_vec();
+                };
+                eng.recall_bounded(key, depth, config.max_response_bytes)
+                    .into_iter()
+                    .map(|node| node.value)
+                    .collect()
             };
-            let items: Vec<Vec<u8>> = eng
-                .recall(key, depth)
-                .into_iter()
-                .map(|node| node.value)
-                .collect();
-            array_bulk_response(&items)
+            array_bulk_response(&items, config.max_response_bytes)
+                .unwrap_or_else(|| b"-ERR response exceeds configured limit\r\n".to_vec())
         }
         "GETRAW" if args.len() >= 2 => {
             let key = match std::str::from_utf8(&args[1]) {
                 Ok(value) => value,
                 Err(_) => return b"-ERR key must be utf-8\r\n".to_vec(),
             };
-            let Ok(eng) = engine.lock() else {
-                return b"-ERR engine lock poisoned\r\n".to_vec();
+            let node = {
+                let Ok(eng) = engine.lock() else {
+                    return b"-ERR engine lock poisoned\r\n".to_vec();
+                };
+                eng.read_latest(key)
             };
-            match eng.read_latest(key) {
-                Some(node) => bulk_response(&node.value),
+            match node {
+                Some(node) => bulk_response(&node.value, config.max_response_bytes)
+                    .unwrap_or_else(|| b"-ERR response exceeds configured limit\r\n".to_vec()),
                 None => b"$-1\r\n".to_vec(),
             }
         }
         _ => b"-ERR unknown command\r\n".to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_builders_enforce_total_limit() {
+        assert!(bulk_response(&[0; 32], 16).is_none());
+        assert!(bulk_response(&[0; 32], 64).is_some());
+        assert!(array_bulk_response(&[vec![0; 20], vec![0; 20]], 32).is_none());
+        let response = array_bulk_response(&[vec![0; 20], vec![0; 20]], 128)
+            .expect("bounded response should fit");
+        assert!(response.len() <= 128);
     }
 }

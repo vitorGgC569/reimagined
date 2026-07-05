@@ -24,6 +24,7 @@ private:
     std::string path;
     int batch_size;
     int d_model;
+    size_t max_queue;
 
     std::thread worker;
     std::atomic<bool> stop_flag;

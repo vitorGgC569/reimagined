@@ -227,6 +227,12 @@ int main() {
         require(generate.find("\"text\":") != std::string::npos,
                 "generate response missing text");
 
+        const std::string generate_with_server_default = send_http_request(
+            "127.0.0.1", port, "POST", "/generate",
+            "{\"prompt\":\"0123\",\"temperature\":0.0}", auth_headers);
+        require(generate_with_server_default.find("200 OK") != std::string::npos,
+                "generate without max_tokens must use the server-side cap");
+
         const std::string unicode_generate = send_http_request(
             "127.0.0.1", port, "POST", "/generate",
             "{\"prompt\":\"ol\\u00E1 \\uD83D\\uDE80\",\"max_tokens\":1}", auth_headers);
@@ -254,7 +260,7 @@ int main() {
 
         const std::string batch = send_http_request(
             "127.0.0.1", port, "POST", "/generate_batch",
-            "{\"prompts\":[\"01\",\"12\"],\"max_tokens\":2}", auth_headers);
+            "{\"prompts\":[\"01\",\"1234\"],\"max_tokens\":2}", auth_headers);
         require(batch.find("200 OK") != std::string::npos, "generate_batch endpoint failed");
         require(batch.find("\"outputs\":") != std::string::npos,
                 "generate_batch missing outputs");
@@ -265,6 +271,22 @@ int main() {
         require(stream.find("200 OK") != std::string::npos, "generate_stream endpoint failed");
         require(stream.find("event: done") != std::string::npos,
                 "generate_stream missing done event");
+        const size_t stream_headers_end = stream.find("\r\n\r\n");
+        require(stream_headers_end != std::string::npos,
+                "generate_stream response missing header terminator");
+        require(stream.substr(0, stream_headers_end).find("Content-Length:") ==
+                    std::string::npos,
+                "generate_stream must not declare a fixed content length");
+        const size_t done_pos = stream.find("event: done");
+        const size_t last_chunk_pos = stream.rfind("event: chunk");
+        require(last_chunk_pos == std::string::npos || last_chunk_pos < done_pos,
+                "generate_stream emitted a chunk after the done event");
+
+        const std::string invalid_content_length = send_http_request(
+            "127.0.0.1", port, "POST", "/generate", {},
+            {"Authorization: Bearer test-secret", "Content-Length: 2x"});
+        require(invalid_content_length.find("400 Bad Request") != std::string::npos,
+                "invalid content-length suffix should be rejected");
 
         std::atomic<int> concurrent_ok{0};
         std::vector<std::thread> clients;
@@ -332,10 +354,11 @@ int main() {
             "127.0.0.1", strict_port, "POST", "/train-corpus",
             "{\"corpus\":\"A\",\"epochs\":1,\"batch_size\":1,\"seq_len\":4}",
             strict_auth_headers);
-        require(strict_train_corpus.find("400 Bad Request") != std::string::npos,
-                "train-corpus should fail on tokenizer/model vocab mismatch");
-        require(strict_train_corpus.find("Tokenizer/model vocabulary mismatch") != std::string::npos,
-                "train-corpus should surface explicit vocab mismatch");
+        require(strict_train_corpus.find("500 Internal Server Error") != std::string::npos,
+                "train-corpus internal model mismatch should return HTTP 500");
+        require(strict_train_corpus.find("Tokenizer/model vocabulary mismatch") ==
+                    std::string::npos,
+                "train-corpus must not leak internal model details");
 
         const std::string info_one =
             send_http_request("127.0.0.1", strict_port, "GET", "/info", {}, strict_auth_headers);
