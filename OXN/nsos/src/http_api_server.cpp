@@ -601,7 +601,8 @@ std::vector<std::string> json_string_array(const JsonValue& object, const std::s
 // The config_ pointer is a file-scope accessor set once on server init.
 static const HttpApiServerConfig* g_response_config = nullptr;
 
-std::string build_http_response(const HttpResponse& response) {
+std::string build_http_response(const HttpResponse& response,
+                                bool omit_content_length = false) {
     std::map<std::string, std::string> headers = response.headers;
     headers.try_emplace("X-Content-Type-Options", "nosniff");
     headers.try_emplace("X-Frame-Options", "DENY");
@@ -623,7 +624,13 @@ std::string build_http_response(const HttpResponse& response) {
     std::ostringstream raw;
     raw << "HTTP/1.1 " << response.status_code << ' ' << response.status_text << "\r\n";
     raw << "Content-Type: " << response.content_type << "\r\n";
-    raw << "Content-Length: " << response.body.size() << "\r\n";
+    // Streaming responses (SSE) must NOT declare a fixed Content-Length: the
+    // body is open-ended and terminated by the connection close.  Emitting
+    // "Content-Length: 0" before the events made the response an invalid SSE
+    // stream (a conforming client stops reading at 0 bytes).
+    if (!omit_content_length) {
+        raw << "Content-Length: " << response.body.size() << "\r\n";
+    }
     raw << "Connection: close\r\n";
     for (const auto& [key, value] : headers) {
         raw << key << ": " << value << "\r\n";
@@ -693,6 +700,13 @@ bool decode_chunked_body(SOCKET socket,
     while (true) {
         size_t line_end = pending.find("\r\n", cursor);
         while (line_end == std::string::npos) {
+            // Bound the buffered bytes while scanning for the chunk-size line's
+            // terminator — otherwise a client that never sends "\r\n" grows
+            // `pending` without limit (pre-handler memory exhaustion).
+            if (pending.size() > max_body_bytes) {
+                error_message = "chunked request chunk header exceeded limit";
+                return false;
+            }
             if (!recv_append(socket, buffer, pending)) {
                 error_message = "chunked request ended before chunk header";
                 return false;
@@ -746,6 +760,13 @@ bool decode_chunked_body(SOCKET socket,
             while (true) {
                 size_t trailer_end = pending.find("\r\n", cursor);
                 while (trailer_end == std::string::npos) {
+                    // Same bound for trailer lines: cap buffered bytes so an
+                    // unterminated / endless trailer section cannot grow
+                    // `pending` without limit before the request is handled.
+                    if (pending.size() > max_body_bytes) {
+                        error_message = "chunked request trailers exceeded limit";
+                        return false;
+                    }
                     if (!recv_append(socket, buffer, pending)) {
                         error_message = "chunked request ended before trailer terminator";
                         return false;
@@ -1813,7 +1834,8 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             head.body = "";
             head.headers["Cache-Control"] = "no-cache";
             head.headers["X-Request-ID"] = std::to_string(request_id);
-            if (!send_all(client_socket, build_http_response(head))) {
+            if (!send_all(client_socket,
+                          build_http_response(head, /*omit_content_length=*/true))) {
                 return;
             }
 
@@ -1855,6 +1877,24 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
                 }
             });
             JoinThreadGuard sender_guard{&sender};
+            // Guarantee the sender is told to finish before sender_guard joins
+            // it — even if generate_stream throws.  Without this, an exception
+            // leaves stream_finished == false, the sender blocks forever on
+            // stream_cv, and JoinThreadGuard::~JoinThreadGuard deadlocks the
+            // worker.  Declared AFTER sender_guard so its destructor runs FIRST
+            // (reverse order): signal + notify, THEN the join wakes and returns.
+            struct FinishSignal {
+                std::mutex& m;
+                std::condition_variable& cv;
+                bool& done;
+                ~FinishSignal() {
+                    {
+                        std::lock_guard<std::mutex> lock(m);
+                        done = true;
+                    }
+                    cv.notify_all();
+                }
+            } finish_signal{stream_mutex, stream_cv, stream_finished};
             with_inference_replica([&](InferenceEngine& engine) {
                 final_text = engine.generate_stream(
                     prompt, options, [&](const std::string& chunk) {

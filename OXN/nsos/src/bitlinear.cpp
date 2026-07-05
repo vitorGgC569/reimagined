@@ -526,18 +526,28 @@ Tensor BitLinear::forward(const Tensor &input) {
     repack_weights();
   }
 
-  if (use_flatquant) {
-    // Clone before modifying because input might be shared
-    x = x.clone();
-    apply_flatquant(x.data(), M, in_features, true);
-  }
-  if (use_hadamard)
+  // LoQA operates on the SAME (rmsnorm'd) activations as the reference/GPU
+  // paths — the reference path feeds it linear_input = x ({M, in_features}).
+  // The old code fed loqa the RAW pre-norm `input` here, so the adapter's
+  // contribution diverged from training and from the GPU path.  Capture the
+  // normalized activations before the packed-only transforms below.
+  const Tensor loqa_input = x.reshape({M, in_features});
+  // FlatQuant is an activation-space transform, but the reference (float) path
+  // used for TRAINING/QAT applies it NOT, pack_weights does not fold it into
+  // the packed weights, and the GPU packed path also skips it.  Applying it
+  // only here made CPU packed inference diverge from both the trained numerics
+  // and the GPU path.  Keep packed inference consistent: do not apply FlatQuant.
+  // (Re-enabling FlatQuant requires wiring it — with its gradient — into the
+  // reference path and every inference path together.)
+  if (use_hadamard) {
+    x = x.clone();  // clone before the in-place transform (input may be shared)
     hadamard_transform(x.data(), M, in_features);
+  }
   saved_x_quant = quantize_activations_bitnet(x, saved_act_scales);
   const bool fuse_output_affine = !loqa.active;
   Tensor output = gemm_158bit_ultra(saved_x_quant, saved_act_scales, fuse_output_affine);
   if (loqa.active) {
-    Tensor loqa_out = loqa.apply(input);
+    Tensor loqa_out = loqa.apply(loqa_input);
     if (loqa_out.shape.numel() > 0)
       output = output.add(loqa_out);
   }

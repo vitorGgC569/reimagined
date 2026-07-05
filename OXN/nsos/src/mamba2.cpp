@@ -1383,7 +1383,12 @@ Tensor Mamba2SSD::forward_proper_step(const Tensor& u) {
                 acc += cwp[static_cast<size_t>(c) * K + j] * tapv;
             }
             const float xc = acc * (1.0f / (1.0f + std::exp(-acc)));
-            const float a_value = mamba_a_eff(ap[base + c]);
+            // A is a per-channel parameter [d_model], SHARED across batch rows —
+            // index by channel only.  dt/B/C/x are [R,dim] so they use base+c,
+            // but ap[base+c] (base=r*dim) read A out of bounds for any row r>0
+            // (batched decode), corrupting rows>=1.  Mirrors the nstate step's
+            // ap[h] (also shared across rows).
+            const float a_value = mamba_a_eff(ap[c]);
             const float decay = std::exp(-softplus_stable(dtp[base + c]) * a_value);
             const float st = decay * state_r[c] + bp[base + c] * xc;
             state_r[c] = st;

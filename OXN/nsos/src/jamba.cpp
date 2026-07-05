@@ -264,9 +264,11 @@ void zero_sequence_suffix_inplace(Tensor& tensor, const std::vector<int>& length
 Tensor apply_training_dropout(const Tensor& input,
                               float dropout_rate,
                               const std::string& scope,
-                              int salt) {
+                              int salt,
+                              Tensor* out_mask = nullptr) {
     const float rate = std::clamp(dropout_rate, 0.0f, 0.95f);
     if (rate <= 1e-6f || input.size == 0) {
+        if (out_mask) *out_mask = Tensor();  // no dropout -> no mask
         return input;
     }
     Tensor mask_host(input.shape.dims, Device::CPU);
@@ -282,6 +284,7 @@ Tensor apply_training_dropout(const Tensor& input,
         mask_ptr[i] = dist(rng) >= rate ? keep_scale : 0.0f;
     }
     Tensor mask = input.get_device() == Device::GPU ? mask_host.to(Device::GPU) : mask_host;
+    if (out_mask) *out_mask = mask;  // carried to backward for a correct STE
     return input.mul(mask);
 }
 
@@ -917,12 +920,36 @@ void JambaModel::load_edge_linear_pack(const std::string& path,
         state.flat_alpha = read_vector<float>(in, max_in_out, "flat_alpha");
         state.flat_beta = read_vector<float>(in, max_in_out, "flat_beta");
 
+        // read_vector only caps the MAXIMUM element count; the consumers
+        // (BitNetAdapter::unpack_weights, from_blob with a fixed shape) read a
+        // FIXED number of elements and would read out of bounds if a truncated
+        // or malformed pack under-fills a vector.  Require each to hold at least
+        // what its consumer reads.  Note import_packed_state consumes
+        // flat_alpha/flat_beta as {in_features} (NOT in*out), unconditionally.
+        auto require_at_least = [](size_t got, uint64_t need, const char* what) {
+            if (static_cast<uint64_t>(got) < need) {
+                throw std::runtime_error(
+                    std::string("Edge pack ") + what +
+                    " is shorter than required (truncated or malformed)");
+            }
+        };
+        require_at_least(state.packed_weights.size(), max_weight_words, "packed_weights");
+        require_at_least(state.magnitude.size(), max_out, "magnitude");
+        if (state.use_bias) {
+            require_at_least(state.bias.size(), max_out, "bias");
+        }
+        require_at_least(state.flat_alpha.size(),
+                         static_cast<uint64_t>(state.in_features), "flat_alpha");
+        require_at_least(state.flat_beta.size(),
+                         static_cast<uint64_t>(state.in_features), "flat_beta");
+
         BitLinear* layer = linear_layers[index];
         if (sensitive) {
             // Restore the float reference path for the sensitive projection so
             // inference uses the same mixed-precision numerics QAT trained on.
             const std::vector<float> wfloat =
                 read_vector<float>(in, max_in_out, "sensitive_weight");
+            require_at_least(wfloat.size(), max_in_out, "sensitive_weight");
             const std::vector<int> wshape = {state.out_features, state.in_features};
             layer->weight.data = Tensor(wshape, device);
             layer->weight.data.copy_from(
@@ -1986,6 +2013,11 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     last_batch_size_ = x.shape.size() == 3 ? x.shape[0] : 0;
     saved_input_ = x;
     saved_core_norm_ = x.rmsnorm();
+    // Clear last forward's dropout masks so backward never reapplies stale ones.
+    saved_drop_core_ = Tensor();
+    saved_drop_moe_ = Tensor();
+    saved_drop_ff_hidden_ = Tensor();
+    saved_drop_ff_out_ = Tensor();
     Tensor core;
     if (is_ttt) {
         core = ttt_layer->forward(saved_core_norm_);
@@ -1997,7 +2029,7 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     if (training_mode_ && dropout_rate_ > 1e-6f) {
         core = apply_training_dropout(core, dropout_rate_,
                                       "jamba_core_" + std::to_string(layer_idx),
-                                      layer_idx * 17 + 1);
+                                      layer_idx * 17 + 1, &saved_drop_core_);
     }
 
     saved_residual_ = x.add(core);
@@ -2008,7 +2040,7 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         if (training_mode_ && dropout_rate_ > 1e-6f) {
             ff = apply_training_dropout(ff, dropout_rate_,
                                         "jamba_moe_" + std::to_string(layer_idx),
-                                        layer_idx * 17 + 2);
+                                        layer_idx * 17 + 2, &saved_drop_moe_);
         }
         // ── CHRASS parallel slot (after FFN dropout, before residual add) ──
         if (chrass_layer && saved_ff_norm_.size > 0) {
@@ -2052,14 +2084,14 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         if (training_mode_ && dropout_rate_ > 1e-6f) {
             ff_hidden = apply_training_dropout(ff_hidden, dropout_rate_ * 0.5f,
                                         "jamba_ff_hidden_" + std::to_string(layer_idx),
-                                        layer_idx * 17 + 3);
+                                        layer_idx * 17 + 3, &saved_drop_ff_hidden_);
         }
         ff = ffn_down->forward(ff_hidden);
     }
     if (training_mode_ && dropout_rate_ > 1e-6f) {
         ff = apply_training_dropout(ff, dropout_rate_,
                                     "jamba_ff_out_" + std::to_string(layer_idx),
-                                    layer_idx * 17 + 4);
+                                    layer_idx * 17 + 4, &saved_drop_ff_out_);
     }
     // ── CHRASS parallel slot (FFN path) ──
     if (chrass_layer && saved_ff_norm_.size > 0) {
@@ -2840,9 +2872,16 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
 
 Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     const auto audit_started = std::chrono::steady_clock::now();
+    // Reapply the forward dropout masks to the gradient (STE): grad flows only
+    // through kept units and carries the same keep_scale the forward applied.
+    // Empty mask (dropout off this forward) -> identity.
+    auto masked = [](const Tensor& g, const Tensor& m) {
+        return m.size > 0 ? g.mul(m) : g;
+    };
     Tensor ff_grad;
     if (is_moe) {
-        ff_grad = backward_moe(dy, ctx, "L" + std::to_string(layer_idx), saved_ff_norm_);
+        ff_grad = backward_moe(masked(dy, saved_drop_moe_), ctx,
+                               "L" + std::to_string(layer_idx), saved_ff_norm_);
         // CHRASS parallel: its grad w.r.t. saved_ff_norm adds to ff_grad
         // before the shared rmsnorm_backward.  Reshape dy + saved_ff_norm
         // to 2D, run chrass.backward, reshape result back.
@@ -2864,7 +2903,7 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
             ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
         }
     } else if (kan_ffn) {
-        ff_grad = kan_ffn->backward(dy);
+        ff_grad = kan_ffn->backward(masked(dy, saved_drop_ff_out_));
         // CHRASS parallel (KAN path) — same injection as the dense FFN.
         if (chrass_layer && saved_ff_norm_.size > 0) {
             const auto& s = saved_ff_norm_.shape;
@@ -2884,7 +2923,10 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
             ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
         }
     } else if (ffn_down && ffn_gate_up) {
-        ff_grad = ffn_down->backward(dy);
+        ff_grad = ffn_down->backward(masked(dy, saved_drop_ff_out_));
+        // Hidden dropout was applied AFTER squared_relu, BEFORE ffn_down, so its
+        // mask multiplies the grad w.r.t. ff_hidden before the squared_relu VJP.
+        ff_grad = masked(ff_grad, saved_drop_ff_hidden_);
         if (saved_ff_hidden_pre_.size > 0) {
             // LEARN S1: squared ReLU backward.  d(max(0,x)^2)/dx is:
             //   2 * max(0, x)   for x > 0
@@ -2922,14 +2964,18 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     // Regra da Cadeia para Conexão Residual Superior: d_residual = dy + d_ff
     Tensor residual_grad = dy.add(ff_grad);
 
+    // The mixer output passed through dropout before the residual add, so the
+    // mixer's input grad carries the core mask; the x-branch of the residual
+    // (used for input_grad below) does NOT — keep residual_grad unmasked there.
+    const Tensor core_in_grad = masked(residual_grad, saved_drop_core_);
     Tensor core_grad;
     if (is_ttt && ttt_layer) {
-        core_grad = ttt_layer->backward(residual_grad);
+        core_grad = ttt_layer->backward(core_in_grad);
     } else if (is_attention && attn_layer) {
-        core_grad = attn_layer->backward(residual_grad, ctx);
+        core_grad = attn_layer->backward(core_in_grad, ctx);
     } else if (mamba_layer) {
         Context local_ctx;
-        core_grad = mamba_layer->backward(residual_grad, ctx ? *ctx : local_ctx);
+        core_grad = mamba_layer->backward(core_in_grad, ctx ? *ctx : local_ctx);
     } else {
         core_grad = make_zero_like(dy);
     }
@@ -5124,19 +5170,33 @@ void Attention::ensure_kv_cache_capacity(int required_tokens, Device device, int
 
     if (cached_tokens_ > 0 && key_cache_buffer_.size > 0 && value_cache_buffer_.size > 0) {
         const int copy_batch = std::min(std::max(cached_batch_size_, 1), normalized_batch);
-        const size_t bytes = static_cast<size_t>(copy_batch) *
-                             static_cast<size_t>(cached_tokens_) *
-                             static_cast<size_t>(token_width) * sizeof(float);
-        copy_float_bytes_device_safe(next_key.data(),
-                                     next_key.get_device(),
-                                     key_cache_buffer_.data(),
-                                     key_cache_buffer_.get_device(),
-                                     bytes);
-        copy_float_bytes_device_safe(next_value.data(),
-                                     next_value.get_device(),
-                                     value_cache_buffer_.data(),
-                                     value_cache_buffer_.get_device(),
-                                     bytes);
+        // The buffers are [batch, capacity, token_width].  The OLD buffer's
+        // per-sequence stride is the OLD capacity (== cache_capacity_tokens_
+        // here, still holding the pre-grow value); the NEW buffer's is
+        // target_capacity.  Because they differ on a grow, a single contiguous
+        // copy of copy_batch*cached_tokens_ scatters rows>=1 into the wrong
+        // region (corrupting every sequence after the first in batched decode).
+        // Copy each sequence's live tokens row-by-row with the correct strides.
+        const size_t old_row_stride =
+            static_cast<size_t>(cache_capacity_tokens_) * token_width;
+        const size_t new_row_stride =
+            static_cast<size_t>(target_capacity) * token_width;
+        const size_t row_bytes = static_cast<size_t>(cached_tokens_) *
+                                 static_cast<size_t>(token_width) * sizeof(float);
+        float* dst_key = next_key.data();
+        float* dst_value = next_value.data();
+        const float* src_key = key_cache_buffer_.data();
+        const float* src_value = value_cache_buffer_.data();
+        for (int b = 0; b < copy_batch; ++b) {
+            const size_t dst_off = static_cast<size_t>(b) * new_row_stride;
+            const size_t src_off = static_cast<size_t>(b) * old_row_stride;
+            copy_float_bytes_device_safe(dst_key + dst_off, next_key.get_device(),
+                                         src_key + src_off, key_cache_buffer_.get_device(),
+                                         row_bytes);
+            copy_float_bytes_device_safe(dst_value + dst_off, next_value.get_device(),
+                                         src_value + src_off, value_cache_buffer_.get_device(),
+                                         row_bytes);
+        }
     }
 
     key_cache_buffer_ = next_key;

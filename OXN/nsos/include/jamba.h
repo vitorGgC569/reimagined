@@ -343,6 +343,14 @@ private:
   Tensor saved_residual_;
   Tensor saved_ff_norm_;
   Tensor saved_ff_hidden_pre_;
+  // Training dropout masks captured in forward and REAPPLIED in backward (the
+  // recurrence has no autograd tape, so the mask must be carried explicitly;
+  // omitting it let gradients flow through dropped/rescaled units).  Empty when
+  // dropout is off for this forward.
+  Tensor saved_drop_core_;
+  Tensor saved_drop_moe_;
+  Tensor saved_drop_ff_hidden_;
+  Tensor saved_drop_ff_out_;
   Tensor saved_moe_weights_;
   std::vector<std::vector<int>> saved_moe_rows_;
   // LEARN S1 (squared ReLU backward): per-expert pre-activation cache.
