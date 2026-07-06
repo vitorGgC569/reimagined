@@ -195,7 +195,8 @@ public:
     Tensor sum(int dim = -1, bool keepdim = false) const;
     float norm() const;
     
-    Tensor rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const;
+    Tensor rmsnorm_backward(const Tensor& grad, const Tensor& x_norm,
+                            float eps = 1e-6f) const;
     std::pair<float, Tensor> cross_entropy(const std::vector<int>& target) const;
     std::pair<float, Tensor> mse_loss(const Tensor& target) const;
     
@@ -223,6 +224,8 @@ public:
     static Tensor ones(const std::vector<int>& s, Device dev = Device::CPU) { return Tensor(s, dev, 1.0f); }
     static Tensor ones(const TensorShape& s, Device dev = Device::CPU) { return Tensor(s.dims, dev, 1.0f); }
     static Tensor random(const std::vector<int>& s, Device dev = Device::CPU);
+    static Tensor uniform(const std::vector<int>& s, float low, float high,
+                          Device dev = Device::CPU);
     static Tensor kaiming_uniform(const std::vector<int>& s, Device dev = Device::CPU);
     // Seeded variant — uses a LOCAL mt19937 (does NOT touch tensor_rng global
     // state).  Required for determinism between instances when constructing

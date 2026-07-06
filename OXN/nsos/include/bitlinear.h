@@ -12,7 +12,7 @@ namespace nsos {
 // BitLinear Ultra SOTA (2025-2026)
 // ============================================================================
 
-enum class NormStrategy { RMS_PRE, RMS_PERI, LN_PRE };
+enum class NormStrategy { NONE, RMS_PRE, RMS_PERI, LN_PRE };
 
 struct TequilaState {
   Tensor deadzone_mask;
@@ -62,6 +62,16 @@ public:
   void set_use_loqa(bool use) { loqa.active = use; }
   void set_reference_path(bool use) { use_reference_path = use; }
   bool reference_path_enabled() const { return use_reference_path; }
+  // Make the float path numerically equivalent to a plain nn.Linear:
+  // no implicit input RMSNorm and no trainable per-output magnitude.  The
+  // magnitude buffer remains fixed at one so existing packed kernels and pack
+  // formats stay compatible.  Weight ternarization remains available.
+  void set_exact_linear_mode(bool enabled) {
+    exact_linear_mode_ = enabled;
+    norm_strategy = enabled ? NormStrategy::NONE : NormStrategy::RMS_PERI;
+    use_flatquant = !enabled;
+  }
+  bool exact_linear_mode() const { return exact_linear_mode_; }
 
   // Quantization-sensitive layers (e.g. Mamba's dt/B/C "sensitive" input
   // projection) are kept on the float reference path during quantization-aware
@@ -139,6 +149,7 @@ private:
   bool use_flatquant = true;
   bool use_reference_path = true;
   bool quantization_sensitive_ = false;
+  bool exact_linear_mode_ = false;
 
   NormStrategy norm_strategy = NormStrategy::RMS_PERI;
   float weight_scale = 1.0f;

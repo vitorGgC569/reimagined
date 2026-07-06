@@ -996,6 +996,20 @@ Tensor Tensor::random(const std::vector<int>& s, Device dev) {
     return t;
 }
 
+Tensor Tensor::uniform(const std::vector<int>& s, float low, float high,
+                       Device dev) {
+    if (!std::isfinite(low) || !std::isfinite(high) || low > high) {
+        throw std::invalid_argument("Tensor::uniform invalid bounds");
+    }
+    Tensor host(s, Device::CPU);
+    std::uniform_real_distribution<float> dist(low, high);
+    float* dst = host.data();
+    for (int64_t i = 0; i < host.size; ++i) {
+        dst[i] = dist(tensor_rng());
+    }
+    return dev == Device::CPU ? host : host.to(dev);
+}
+
 Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev) {
     Tensor t(s, dev);
     float fan_in = s.empty() ? 1.0f : static_cast<float>(s.back());
@@ -1670,8 +1684,7 @@ Tensor Tensor::rmsnorm(float eps) const {
 
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        launch_rmsnorm_kernel(result.raw_data(), raw_data(), outer, inner,
-                              0, 0);
+        launch_rmsnorm_kernel(result.raw_data(), raw_data(), outer, inner, eps);
         sync_cuda();
         return result;
     }
@@ -2073,7 +2086,8 @@ float Tensor::get(const std::vector<int>& indices) const {
     return at(indices);
 }
 
-Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const {
+Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm,
+                                float eps) const {
     Tensor dx(shape.dims, device);
     int inner = shape.back();
     int outer = size / inner;
@@ -2083,7 +2097,7 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const 
         gpu_custom_kernels_supported()) {
         launch_rmsnorm_backward_kernel(dx.raw_data(), grad.raw_data(),
                                         x_norm.raw_data(), raw_data(),
-                                        outer, inner);
+                                        outer, inner, eps);
         sync_cuda();
         return dx;
     }
@@ -2093,7 +2107,6 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm) const 
     const float* y = x_norm.data();
     const float* x = data();  // *this is the original pre-norm input
     float* dx_ptr = dx.data();
-    const float eps = 1e-6f;  // matches the rmsnorm() forward default
 #pragma omp parallel for
     for (int i = 0; i < outer; ++i) {
         float sum_sq = 0.0f;

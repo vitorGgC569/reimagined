@@ -1,4 +1,22 @@
 import json
+import os
+from pathlib import Path
+
+
+_dll_handles = []
+if os.name == "nt" and hasattr(os, "add_dll_directory"):
+    candidates = []
+    for key in ("CUDA_PATH", "CUDA_PATH_V12_9"):
+        if os.environ.get(key):
+            candidates.append(Path(os.environ[key]) / "bin")
+    candidates.extend(
+        Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA").glob(
+            "v*/bin"
+        )
+    )
+    for directory in candidates:
+        if directory.is_dir():
+            _dll_handles.append(os.add_dll_directory(str(directory)))
 
 import nsos_ext
 

@@ -330,6 +330,95 @@ void check_mamba2_nstate() {
 // so the carried state + conv window are byte-faithful — this catches any drift
 // in the streaming bookkeeping (window shift, prime, state carry) on CPU, before
 // it ever burns T4 quota.
+void check_mamba2_faithful() {
+  const int D = 4, N = 3, L = 4;
+  MambaConfig cfg;
+  cfg.faithful_mamba2 = true;
+  cfg.expand = 2;
+  cfg.head_dim = 4;
+  cfg.n_groups = 1;
+  cfg.conv_kernel = 3;
+  Mamba2SSD layer(D, N, /*ignored in faithful mode=*/1, cfg);
+  auto params = layer.parameters();
+  Parameter *A = find_param(params, "A");
+  Parameter *conv = find_param(params, "conv1d_weight");
+  Parameter *norm = find_param(params, "norm.weight");
+  Parameter *dt_bias = find_param(params, "dt_proj.bias");
+  assert(A && conv && norm && dt_bias);
+  fill_smooth(A->data, 0.2f, 0.17f);
+  fill_smooth(conv->data, 0.12f, 0.23f);
+  std::fill_n(norm->data.data(), norm->data.size, 1.0f);
+  std::fill_n(dt_bias->data.data(), dt_bias->data.size, -2.0f);
+  Tensor x({L, D});
+  fill_smooth(x, 0.4f, 0.31f);
+  auto loss_fn = [&]() { return sum_sq(layer.forward(x)); };
+
+  zero_all_grads(params);
+  Tensor y = layer.forward(x);
+  Context ctx;
+  Tensor dx = layer.backward(y.clone(), ctx);
+  auto copy_grad = [](Parameter *p) {
+    return std::vector<float>(p->grad.data(), p->grad.data() + p->grad.size);
+  };
+  const auto gA = copy_grad(A);
+  const auto gConv = copy_grad(conv);
+  const auto gNorm = copy_grad(norm);
+  const auto gDt = copy_grad(dt_bias);
+  gradcheck_buffer(x.data(), x.size, dx.data(), loss_fn,
+                   "mamba2-faithful d/input", kTolScan);
+  gradcheck_buffer(A->data.data(), A->data.size, gA.data(), loss_fn,
+                   "mamba2-faithful d/A_log", kTolScan);
+  gradcheck_buffer(conv->data.data(), conv->data.size, gConv.data(), loss_fn,
+                   "mamba2-faithful d/conv", kTolScan);
+  gradcheck_buffer(norm->data.data(), norm->data.size, gNorm.data(), loss_fn,
+                   "mamba2-faithful d/norm", kTolScan);
+  gradcheck_buffer(dt_bias->data.data(), dt_bias->data.size, gDt.data(),
+                   loss_fn, "mamba2-faithful d/dt_bias", kTolScan);
+}
+
+// ── Faithful model wrapper: learned residual/final RMSNorm scales ───────────
+// Mamba-2's mixer parity is insufficient if the residual wrapper silently uses
+// an unparameterized RMSNorm. Check the two gamma gradients through the complete
+// one-layer stack and LM head.
+void check_mamba2_faithful_wrapper_norms() {
+  ModelConfig cfg;
+  cfg.num_layers = 1;
+  cfg.d_model = 8;
+  cfg.vocab_size = 7;
+  cfg.attention_period = 99;
+  cfg.use_moe = false;
+  cfg.use_kan = false;
+  cfg.use_chrass = false;
+  cfg.mamba2_faithful = true;
+  cfg.tie_word_embeddings = false;
+  cfg.dropout = 0.0f;
+  JambaModel model(cfg, Device::CPU);
+  auto params = model.parameters();
+  Parameter *layer_norm = find_param(params, "layers.0.norm.weight");
+  Parameter *final_norm = find_param(params, "norm_f.weight");
+  assert(layer_norm && final_norm);
+
+  Tensor x({3, cfg.d_model});
+  fill_smooth(x, 0.35f, 0.29f);
+  auto loss_fn = [&]() { return sum_sq(model.forward(x)); };
+
+  zero_all_grads(params);
+  Context ctx;
+  Tensor y = model.forward(x, &ctx);
+  model.backward(y.clone(), ctx);
+  const std::vector<float> g_layer(
+      layer_norm->grad.data(), layer_norm->grad.data() + layer_norm->grad.size);
+  const std::vector<float> g_final(
+      final_norm->grad.data(), final_norm->grad.data() + final_norm->grad.size);
+
+  gradcheck_buffer(layer_norm->data.data(), layer_norm->data.size,
+                   g_layer.data(), loss_fn, "faithful wrapper d/layernorm",
+                   kTolScan);
+  gradcheck_buffer(final_norm->data.data(), final_norm->data.size,
+                   g_final.data(), loss_fn, "faithful wrapper d/finalnorm",
+                   kTolScan);
+}
+
 static void check_proper_streaming_parity(bool nstate) {
   const int H = nstate ? 2 : 1;
   const int P = 4;
@@ -561,6 +650,7 @@ void check_attention() {
 } // namespace
 
 int main() {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   // Deterministic init so the gate is reproducible run-to-run (unseeded
   // tensor_rng falls back to std::random_device, which made module weights —
   // and thus the finite-difference margins — vary between runs).
@@ -573,6 +663,8 @@ int main() {
   check_mamba2();
   check_mamba2_proper();
   check_mamba2_nstate();
+  check_mamba2_faithful();
+  check_mamba2_faithful_wrapper_norms();
   check_proper_streaming_parity(false);
   check_proper_streaming_parity(true);
   check_moe_switch_aux();

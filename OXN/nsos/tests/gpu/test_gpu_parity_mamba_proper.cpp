@@ -16,6 +16,7 @@
 #include "gpu_parity_common.h"
 
 #include "../../include/mamba2.h"
+#include "../../include/nsos/determinism.h"
 
 #include <cmath>
 #include <vector>
@@ -51,5 +52,13 @@ int main() {
 
     assert_close(y_cpu, y_gpu, 1e-3f, "mamba_proper forward y");
     assert_close(gin_cpu, gin_gpu, 1e-3f, "mamba_proper backward d/input");
+
+    determinism::set_deterministic_reductions(true);
+    Tensor y_det = layer.forward(x_gpu);
+    Tensor gin_det = layer.backward(y_det.clone(), ctx);
+    assert_close(y_cpu, y_det, 1e-3f, "mamba_proper deterministic forward");
+    assert_close(gin_cpu, gin_det, 1e-3f,
+                 "mamba_proper deterministic backward d/input");
+    determinism::set_deterministic_reductions(false);
   });
 }

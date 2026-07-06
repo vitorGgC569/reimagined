@@ -160,6 +160,30 @@ void launch_mamba_nstate_backward(const float *gy, const float *xc,
                                   const float *state_history, float *gXc,
                                   float *gDt, float *gA, float *gB, float *gC,
                                   int Batch, int Seq, int H, int P, int N);
+
+// Faithful Mamba-2 SSD.  B/C are [B,Seq,G,N] and shared by the heads in
+// each group; D is [H] and contributes D[h]*x inside the normalized SSM
+// branch.  This matches state-spaces/mamba Mamba2 with D_has_hdim=false.
+void launch_mamba2_faithful_forward(
+    const float *x, const float *dt, const float *A, const float *B_in,
+    const float *C_in, const float *D, float *y, float *state_history,
+    int Batch, int Seq, int H, int P, int N, int G);
+void launch_mamba2_faithful_backward(
+    const float *gy, const float *x, const float *dt, const float *A,
+    const float *B_in, const float *C_in, const float *D,
+    const float *state_history, float *gX, float *gDt, float *gA,
+    float *gB, float *gC, float *gD, int Batch, int Seq, int H, int P,
+    int N, int G);
+
+// Incremental faithful path split in two kernels so all x/B/C convolution
+// channels are materialized before the SSD consumes shared B/C values.
+void launch_mamba2_faithful_conv_step(
+    const float *xv, const float *Bv, const float *Cv,
+    const float *conv_weight, const float *conv_bias, float *ring,
+    float *xBC, int inner, int group_state, int K);
+void launch_mamba2_faithful_step(
+    const float *xBC, const float *dt, const float *A, const float *D,
+    float *state, float *y, int H, int P, int N, int G);
 #endif
 
 }  // namespace cuda

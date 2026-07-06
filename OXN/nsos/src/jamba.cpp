@@ -455,6 +455,16 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
     const bool use_exact_attention_training = model_config_.use_exact_attention_training;
 
     embedding = std::make_unique<Embedding>(vocab_size, d_model);
+    if (model_config_.mamba2_faithful) {
+        // MambaLMHeadModel initializes token embeddings from N(0, 0.02).
+        embedding->weight.data =
+            Tensor::random({vocab_size, d_model}, Device::CPU);
+        embedding->weight.mark_updated();
+    }
+    if (model_config_.mamba2_faithful) {
+        final_norm_weight_ = Parameter(
+            Tensor::ones({d_model}, Device::CPU), "norm_f.weight");
+    }
     // Slender head-to-toe quantization (opt-in, 2026-05-25 wiring).
     // When true, the Embedding uses ternary-quantized lookup via
     // slender_forward_cpu_ instead of the dense float path.
@@ -497,10 +507,24 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             model_config_.mamba_proper_ssm,
             model_config_.mamba_state_expansion,
             model_config_.mamba_conv_kernel,
+            model_config_.mamba2_faithful,
+            model_config_.mamba_expand,
+            model_config_.mamba_head_dim,
+            model_config_.mamba_n_groups,
             model_config_.rope_theta));
     }
 
-    value_head = std::make_unique<BitLinear>(d_model, vocab_size);
+    value_head = std::make_unique<BitLinear>(
+        d_model, vocab_size, !model_config_.mamba2_faithful);
+    if (model_config_.mamba2_faithful) {
+        value_head->set_exact_linear_mode(true);
+        const float bound =
+            1.0f / std::sqrt(static_cast<float>(std::max(d_model, 1)));
+        value_head->weight.data =
+            Tensor::uniform({vocab_size, d_model}, -bound, bound,
+                            Device::CPU);
+        value_head->weight.mark_updated();
+    }
     tie_word_embeddings_ = model_config_.tie_word_embeddings;  // N6
     to(dev);  // to() applies weight tying at the end when enabled
 }
@@ -615,8 +639,15 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
         ++layer_index;
     }
     saved_final_hidden_ = hidden;
-    saved_final_norm_ = hidden.rmsnorm();
+    const float final_norm_eps =
+        model_config_.mamba2_faithful ? 1e-5f : 1e-6f;
+    saved_final_rms_ = hidden.rmsnorm(final_norm_eps);
+    saved_final_norm_ =
+        model_config_.mamba2_faithful
+            ? saved_final_rms_.mul(final_norm_weight_.data)
+            : saved_final_rms_;
     if (saved_final_norm_.shape.size() == 3 && !last_input_batch_lengths_.empty()) {
+        zero_sequence_suffix_inplace(saved_final_rms_, last_input_batch_lengths_);
         zero_sequence_suffix_inplace(saved_final_norm_, last_input_batch_lengths_);
     }
     if (nsos_layer_timing) {
@@ -661,6 +692,9 @@ void JambaModel::to(Device dev) {
     for (auto& layer : layers) {
         layer->to(dev);
     }
+    if (final_norm_weight_.data.size > 0) {
+        final_norm_weight_.data = final_norm_weight_.data.to(dev);
+    }
     value_head->to(dev);
     apply_weight_tying_();  // N6: re-share the buffer after the device move
 }
@@ -679,6 +713,11 @@ std::vector<Parameter*> JambaModel::parameters() {
         auto layer_params = layer->parameters();
         prefix_parameter_names(layer_params, "layers." + std::to_string(index) + ".");
         params.insert(params.end(), layer_params.begin(), layer_params.end());
+    }
+    if (final_norm_weight_.data.size > 0) {
+        final_norm_weight_.base_name = "norm_f.weight";
+        final_norm_weight_.name = "norm_f.weight";
+        params.push_back(&final_norm_weight_);
     }
     auto head_params = value_head->parameters();
     prefix_parameter_names(head_params, "value_head.");
@@ -1724,7 +1763,22 @@ void JambaModel::backward(const Tensor& grad, Context& ctx) {
         audit_collector_->record_backward(-1, "value_head", grad, dy, latency_ms);
     }
     if (saved_final_hidden_.size > 0 && saved_final_norm_.size > 0) {
-        dy = saved_final_hidden_.rmsnorm_backward(dy, saved_final_norm_);
+        const float final_norm_eps =
+            model_config_.mamba2_faithful ? 1e-5f : 1e-6f;
+        if (model_config_.mamba2_faithful &&
+            saved_final_rms_.size > 0 &&
+            final_norm_weight_.data.size > 0) {
+            const int width = saved_final_hidden_.shape.back();
+            const int rows = saved_final_hidden_.size / width;
+            final_norm_weight_.add_grad(
+                dy.mul(saved_final_rms_).reshape({rows, width}).sum(0));
+            dy = dy.mul(final_norm_weight_.data);
+        }
+        dy = saved_final_hidden_.rmsnorm_backward(
+            dy,
+            model_config_.mamba2_faithful ? saved_final_rms_
+                                          : saved_final_norm_,
+            final_norm_eps);
     }
     for (int i = static_cast<int>(layers.size()) - 1; i >= 0; --i) {
         dy = layers[i]->backward(dy, &ctx);
@@ -1745,6 +1799,7 @@ void JambaModel::reset_session() {
     last_input_batches_.clear();
     last_input_batch_lengths_.clear();
     saved_final_hidden_ = Tensor();
+    saved_final_rms_ = Tensor();
     saved_final_norm_ = Tensor();
     // A captured decode graph embeds pointers into THIS session's device
     // state (KV cache, Mamba ring); replaying it after a reset would write
@@ -1808,6 +1863,7 @@ void JambaModel::restore_session(const JambaSessionSnapshot& snapshot) {
     last_input_batches_.clear();
     last_input_batch_lengths_.clear();
     saved_final_hidden_ = Tensor();
+    saved_final_rms_ = Tensor();
     saved_final_norm_ = Tensor();
 
     const size_t shared_layers = std::min(layers.size(), snapshot.blocks.size());
@@ -1833,6 +1889,7 @@ void JambaModel::restore_session_batch(const std::vector<JambaSessionSnapshot>& 
     last_input_batches_.clear();
     last_input_batch_lengths_.clear();
     saved_final_hidden_ = Tensor();
+    saved_final_rms_ = Tensor();
     saved_final_norm_ = Tensor();
 
     for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
@@ -1890,15 +1947,31 @@ JambaBlock::JambaBlock(int dm,
                        bool mamba_proper_ssm,
                        bool mamba_state_expansion,
                        int mamba_conv_kernel,
+                       bool mamba2_faithful,
+                       int mamba_expand,
+                       int mamba_head_dim,
+                       int mamba_n_groups,
                        float rope_theta)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
+      faithful_mamba_core_only_(mamba2_faithful && !is_attn &&
+                                !is_ttt_layer && !is_moe_flag && !use_kan &&
+                                !use_chrass),
+      core_norm_eps_(mamba2_faithful && !is_attn && !is_ttt_layer
+                         ? 1e-5f
+                         : 1e-6f),
       layer_idx(li),
       total_layers(tl),
       d_model(dm),
       num_experts(std::max(configured_experts, 1)),
       dropout_rate_(std::clamp(dropout_rate, 0.0f, 0.95f)) {
+
+    learnable_core_norm_ = mamba2_faithful && !is_attn && !is_ttt_layer;
+    if (learnable_core_norm_) {
+        core_norm_weight_ = Parameter(
+            Tensor::ones({dm}, Device::CPU), "norm.weight");
+    }
 
     // CHRASS slot (parallel with FFN/MoE).  Each layer gets a distinct
     // random adjacency derived from (chrass_seed + layer_idx).  Self-loops
@@ -1953,6 +2026,21 @@ JambaBlock::JambaBlock(int dm,
         config.proper_selective_ssm = mamba_proper_ssm;
         config.proper_state_expansion = mamba_state_expansion && mamba_proper_ssm;
         config.conv_kernel = std::clamp(mamba_conv_kernel, 1, 16);
+        config.faithful_mamba2 = mamba2_faithful;
+        config.expand = std::clamp(mamba_expand, 1, 8);
+        const int inner = config.expand * dm;
+        config.head_dim = std::min(std::max(mamba_head_dim, 1), inner);
+        while (config.head_dim > 1 && inner % config.head_dim != 0) {
+            --config.head_dim;
+        }
+        const int faithful_heads = inner / config.head_dim;
+        config.n_groups = std::min(std::max(mamba_n_groups, 1), faithful_heads);
+        while (config.n_groups > 1 &&
+               faithful_heads % config.n_groups != 0) {
+            --config.n_groups;
+        }
+        config.out_proj_init_scale =
+            1.0f / std::sqrt(static_cast<float>(std::max(tl, 1)));
         if (const char* e = std::getenv("NSOS_MAMBA_PROPER_SSM"); e != nullptr) {
             config.proper_selective_ssm = (e[0] == '1');
             if (!config.proper_selective_ssm) {
@@ -1967,6 +2055,9 @@ JambaBlock::JambaBlock(int dm,
             if (kv >= 1 && kv <= 16) {
                 config.conv_kernel = kv;
             }
+        }
+        if (const char* f = std::getenv("NSOS_MAMBA2_FAITHFUL"); f != nullptr) {
+            config.faithful_mamba2 = f[0] == '1';
         }
         // d_state (N) is capped at the N-state GPU kernel's MAX_N (=64, see
         // src/cuda/mamba_kernels.cu) so the full SSD scan stays on the device
@@ -1992,7 +2083,7 @@ JambaBlock::JambaBlock(int dm,
         // N5: honor the 1.58-bit invariant — the model's KAN FFN uses ternary
         // fake-quant (STE) weights like every other BitLinear.
         kan_ffn->set_quantized(true);
-    } else {
+    } else if (!faithful_mamba_core_only_) {
         ffn_gate_up = std::make_unique<BitLinear>(dm, default_ffn_hidden);
         ffn_down = std::make_unique<BitLinear>(default_ffn_hidden, dm);
     }
@@ -2009,7 +2100,8 @@ std::string JambaBlock::audit_block_type() const {
     } else {
         type = "mamba2";
     }
-    type += is_moe ? "+moe" : "+ffn";
+    type += is_moe ? "+moe"
+                   : (faithful_mamba_core_only_ ? "+core" : "+ffn");
     return type;
 }
 
@@ -2017,7 +2109,11 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     const auto audit_started = std::chrono::steady_clock::now();
     last_batch_size_ = x.shape.size() == 3 ? x.shape[0] : 0;
     saved_input_ = x;
-    saved_core_norm_ = x.rmsnorm();
+    saved_core_rms_ = x.rmsnorm(core_norm_eps_);
+    saved_core_norm_ =
+        learnable_core_norm_
+            ? saved_core_rms_.mul(core_norm_weight_.data)
+            : saved_core_rms_;
     // Clear last forward's dropout masks so backward never reapplies stale ones.
     saved_drop_core_ = Tensor();
     saved_drop_moe_ = Tensor();
@@ -2072,6 +2168,21 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
                                              x, output, latency_ms);
         }
         return output;
+    }
+
+    if (faithful_mamba_core_only_) {
+        if (audit_collector_ && audit_collector_->enabled()) {
+            const double latency_ms =
+                static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - audit_started)
+                        .count()) /
+                1000.0;
+            audit_collector_->record_forward(
+                layer_idx, audit_block_type(), "activation", x,
+                saved_residual_, latency_ms);
+        }
+        return saved_residual_;
     }
 
     Tensor ff;
@@ -2986,7 +3097,18 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     }
 
     if (saved_input_.size > 0 && saved_core_norm_.size > 0) {
-        core_grad = saved_input_.rmsnorm_backward(core_grad, saved_core_norm_);
+        if (learnable_core_norm_ && saved_core_rms_.size > 0) {
+            const int rows = saved_input_.size / d_model;
+            core_norm_weight_.add_grad(
+                core_grad.mul(saved_core_rms_)
+                    .reshape({rows, d_model})
+                    .sum(0));
+            core_grad = core_grad.mul(core_norm_weight_.data);
+        }
+        core_grad = saved_input_.rmsnorm_backward(
+            core_grad,
+            learnable_core_norm_ ? saved_core_rms_ : saved_core_norm_,
+            core_norm_eps_);
     }
 
     // Regra da Cadeia Inferior: d_input = d_residual + d_core
@@ -3005,6 +3127,7 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
 
 void JambaBlock::reset() {
     saved_input_ = Tensor();
+    saved_core_rms_ = Tensor();
     saved_core_norm_ = Tensor();
     saved_residual_ = Tensor();
     saved_ff_norm_ = Tensor();
@@ -3028,6 +3151,9 @@ void JambaBlock::reset() {
 }
 
 void JambaBlock::to(Device dev) {
+    if (core_norm_weight_.data.size > 0) {
+        core_norm_weight_.data = core_norm_weight_.data.to(dev);
+    }
     if (attn_layer) {
         attn_layer->to(dev);
     }
@@ -3059,6 +3185,11 @@ void JambaBlock::to(Device dev) {
 
 std::vector<Parameter*> JambaBlock::parameters() {
     std::vector<Parameter*> params;
+    if (core_norm_weight_.data.size > 0) {
+        core_norm_weight_.base_name = "norm.weight";
+        core_norm_weight_.name = "norm.weight";
+        params.push_back(&core_norm_weight_);
+    }
     if (attn_layer) {
         auto attn = attn_layer->parameters();
         prefix_parameter_names(attn, "attn.");

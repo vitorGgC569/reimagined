@@ -450,6 +450,10 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_mamba2 PRIVATE nsos_core)
     add_test(NAME test_mamba2 COMMAND test_mamba2)
 
+    add_executable(test_mamba2_reference tests/test_mamba2_reference.cpp)
+    target_link_libraries(test_mamba2_reference PRIVATE nsos_core)
+    add_test(NAME test_mamba2_reference COMMAND test_mamba2_reference)
+
     add_executable(test_kan tests/test_kan.cpp)
     target_link_libraries(test_kan PRIVATE nsos_core)
     add_test(NAME test_kan COMMAND test_kan)
@@ -591,6 +595,11 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gpu_parity_mamba_nstate PRIVATE nsos_core)
     target_include_directories(test_gpu_parity_mamba_nstate PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_mamba_nstate COMMAND test_gpu_parity_mamba_nstate)
+
+    add_executable(test_gpu_parity_mamba_faithful tests/gpu/test_gpu_parity_mamba_faithful.cpp)
+    target_link_libraries(test_gpu_parity_mamba_faithful PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_mamba_faithful PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_mamba_faithful COMMAND test_gpu_parity_mamba_faithful)
 
     add_executable(test_gpu_parity_jamba tests/gpu/test_gpu_parity_jamba.cpp)
     target_link_libraries(test_gpu_parity_jamba PRIVATE nsos_core)

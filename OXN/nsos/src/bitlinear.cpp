@@ -708,7 +708,8 @@ void BitLinear::to(Device dev) {
 std::vector<Parameter *> BitLinear::parameters() {
   std::vector<Parameter *> res;
   res.push_back(&weight);
-  res.push_back(&magnitude);
+  if (!exact_linear_mode_)
+    res.push_back(&magnitude);
   if (use_bias)
     res.push_back(&bias);
   if (use_flatquant) {

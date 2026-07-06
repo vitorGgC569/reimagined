@@ -33,7 +33,7 @@ void launch_bitnet_gemm(const int8_t *A, const uint32_t *W, float *C, int M,
 
 // Standard Math Kernels
 void launch_rmsnorm_kernel(float *out, const float *in, int n_rows, int n_cols,
-                           int stride_unused, int block_dim);
+                           float eps);
 void launch_layernorm_kernel(float *out, const float *in, int n_rows,
                              int n_cols);
 void launch_matmul_kernel(const float *A, const float *B, float *C, int M,
@@ -46,7 +46,7 @@ void launch_cross_entropy_kernel(float *d_loss, float *grad,
                                  int block_dim);
 void launch_rmsnorm_backward_kernel(float *dx, const float *grad,
                                     const float *x_norm, const float *x,
-                                    int outer, int inner);
+                                    int outer, int inner, float eps);
 void launch_adamw_update_kernel(float *weights, const float *grad, float *m,
                                 float *v, int n, float beta1, float beta2,
                                 float bc1, float bc2, float lr, float eps,

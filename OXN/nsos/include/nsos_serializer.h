@@ -24,6 +24,7 @@ public:
         if (cfg.mamba_proper_ssm) fp |= NSOS_FP_MAMBA_PROPER;
         if (cfg.mamba_state_expansion) fp |= NSOS_FP_STATE_EXPANSION;
         if (cfg.tie_word_embeddings) fp |= NSOS_FP_TIE_EMBEDDINGS;
+        if (cfg.mamba2_faithful) fp |= NSOS_FP_MAMBA2_FAITHFUL;
         return fp;
     }
 
@@ -124,6 +125,7 @@ public:
             flag_mismatch(NSOS_FP_MAMBA_PROPER, "mamba_proper_ssm");
             flag_mismatch(NSOS_FP_STATE_EXPANSION, "mamba_state_expansion");
             flag_mismatch(NSOS_FP_TIE_EMBEDDINGS, "tie_word_embeddings");
+            flag_mismatch(NSOS_FP_MAMBA2_FAITHFUL, "mamba2_faithful");
             checkpoint_a_is_rate = (ckpt_fp & NSOS_FP_A_LOG_DOMAIN) == 0;
         } else {
             // v1 predates the fingerprint AND the A log-domain reparameterization

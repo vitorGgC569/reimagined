@@ -627,6 +627,216 @@ void launch_mamba_nstate_backward(const float *gy, const float *xc,
       H, P, N);
 }
 
+// ── Faithful Mamba-2: grouped B/C + per-head D skip ────────────────────────
+__global__ void mamba2_faithful_forward_kernel(
+    const float *__restrict__ x, const float *__restrict__ dt,
+    const float *__restrict__ A, const float *__restrict__ B_in,
+    const float *__restrict__ C_in, const float *__restrict__ D,
+    float *__restrict__ y, float *__restrict__ state_history, int Batch,
+    int Seq, int H, int P, int N, int G) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = Batch * H * P;
+  if (tid >= total) return;
+  const int p = tid % P;
+  const int h = (tid / P) % H;
+  const int b = tid / (H * P);
+  const int group = (h * G) / H;
+  const int inner = H * P;
+  const int chan = h * P + p;
+  const size_t state_row = static_cast<size_t>(inner) * N;
+  float state[MAX_N];
+  for (int n = 0; n < N; ++n) state[n] = 0.0f;
+  const float a_value = mamba_a_eff_dev(A[h]);
+  for (int t = 0; t < Seq; ++t) {
+    const int row = b * Seq + t;
+    const float delta = softplus_device(dt[row * H + h]);
+    const float decay = expf(-delta * a_value);
+    const float xv = x[static_cast<size_t>(row) * inner + chan];
+    float out = D[h] * xv;
+    for (int n = 0; n < N; ++n) {
+      const size_t bc = static_cast<size_t>(row) * G * N + group * N + n;
+      const float hv = decay * state[n] + delta * B_in[bc] * xv;
+      state[n] = hv;
+      state_history[static_cast<size_t>(row) * state_row +
+                    static_cast<size_t>(chan) * N + n] = hv;
+      out += hv * C_in[bc];
+    }
+    y[static_cast<size_t>(row) * inner + chan] = out;
+  }
+}
+
+__global__ void mamba2_faithful_backward_kernel(
+    const float *__restrict__ gy, const float *__restrict__ x,
+    const float *__restrict__ dt, const float *__restrict__ A,
+    const float *__restrict__ B_in, const float *__restrict__ C_in,
+    const float *__restrict__ D, const float *__restrict__ state_history,
+    float *__restrict__ gX, float *__restrict__ gDt, float *__restrict__ gA,
+    float *__restrict__ gB, float *__restrict__ gC, float *__restrict__ gD,
+    int Batch, int Seq, int H, int P, int N, int G) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = Batch * H * P;
+  if (tid >= total) return;
+  const int p = tid % P;
+  const int h = (tid / P) % H;
+  const int b = tid / (H * P);
+  const int group = (h * G) / H;
+  const int inner = H * P;
+  const int chan = h * P + p;
+  const size_t state_row = static_cast<size_t>(inner) * N;
+  float carry[MAX_N];
+  for (int n = 0; n < N; ++n) carry[n] = 0.0f;
+  const float a_value = mamba_a_eff_dev(A[h]);
+  for (int t = Seq - 1; t >= 0; --t) {
+    const int row = b * Seq + t;
+    const float dt_raw = dt[row * H + h];
+    const float delta = softplus_device(dt_raw);
+    const float decay = expf(-delta * a_value);
+    const float xv = x[static_cast<size_t>(row) * inner + chan];
+    const float go = gy[static_cast<size_t>(row) * inner + chan];
+    float gx = go * D[h];
+    float ddecay = 0.0f;
+    float dinput_scale = 0.0f;
+    atomicAdd(&gD[h], go * xv);
+    for (int n = 0; n < N; ++n) {
+      const size_t bc = static_cast<size_t>(row) * G * N + group * N + n;
+      const size_t state_idx =
+          static_cast<size_t>(row) * state_row +
+          static_cast<size_t>(chan) * N + n;
+      const float ht = state_history[state_idx];
+      const float hprev =
+          t == 0
+              ? 0.0f
+              : state_history[static_cast<size_t>(row - 1) * state_row +
+                              static_cast<size_t>(chan) * N + n];
+      atomicAdd(&gC[bc], go * ht);
+      const float gh = go * C_in[bc] + carry[n];
+      atomicAdd(&gB[bc], gh * delta * xv);
+      gx += gh * delta * B_in[bc];
+      dinput_scale += gh * B_in[bc] * xv;
+      ddecay += gh * hprev;
+      carry[n] = gh * decay;
+    }
+    gX[static_cast<size_t>(row) * inner + chan] = gx;
+    const float sigmoid_dt = 1.0f / (1.0f + expf(-dt_raw));
+    atomicAdd(&gDt[row * H + h],
+              (dinput_scale - ddecay * decay * a_value) * sigmoid_dt);
+    atomicAdd(&gA[h], -ddecay * decay * delta * a_value);
+  }
+}
+
+void launch_mamba2_faithful_forward(
+    const float *x, const float *dt, const float *A, const float *B_in,
+    const float *C_in, const float *D, float *y, float *state_history,
+    int Batch, int Seq, int H, int P, int N, int G) {
+  const int total = Batch * H * P;
+  if (total <= 0 || Seq <= 0 || N <= 0 || N > MAX_N || G <= 0 ||
+      H % G != 0) {
+    return;
+  }
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  mamba2_faithful_forward_kernel<<<blocks, threads>>>(
+      x, dt, A, B_in, C_in, D, y, state_history, Batch, Seq, H, P, N, G);
+}
+
+void launch_mamba2_faithful_backward(
+    const float *gy, const float *x, const float *dt, const float *A,
+    const float *B_in, const float *C_in, const float *D,
+    const float *state_history, float *gX, float *gDt, float *gA,
+    float *gB, float *gC, float *gD, int Batch, int Seq, int H, int P,
+    int N, int G) {
+  const int total = Batch * H * P;
+  if (total <= 0 || Seq <= 0 || N <= 0 || N > MAX_N || G <= 0 ||
+      H % G != 0) {
+    return;
+  }
+  cudaMemsetAsync(gDt, 0, static_cast<size_t>(Batch) * Seq * H * sizeof(float));
+  cudaMemsetAsync(gA, 0, static_cast<size_t>(H) * sizeof(float));
+  cudaMemsetAsync(gB, 0,
+                  static_cast<size_t>(Batch) * Seq * G * N * sizeof(float));
+  cudaMemsetAsync(gC, 0,
+                  static_cast<size_t>(Batch) * Seq * G * N * sizeof(float));
+  cudaMemsetAsync(gD, 0, static_cast<size_t>(H) * sizeof(float));
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  mamba2_faithful_backward_kernel<<<blocks, threads>>>(
+      gy, x, dt, A, B_in, C_in, D, state_history, gX, gDt, gA, gB, gC,
+      gD, Batch, Seq, H, P, N, G);
+}
+
+__global__ void mamba2_faithful_conv_step_kernel(
+    const float *__restrict__ xv, const float *__restrict__ Bv,
+    const float *__restrict__ Cv, const float *__restrict__ weight,
+    const float *__restrict__ bias, float *__restrict__ ring,
+    float *__restrict__ xBC, int inner, int group_state, int convdim, int K) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= convdim) return;
+  const float current =
+      c < inner ? xv[c] : (c < inner + group_state
+                               ? Bv[c - inner]
+                               : Cv[c - inner - group_state]);
+  float acc = bias[c];
+  for (int j = 0; j < K; ++j) {
+    const float src = j < K - 1 ? ring[j * convdim + c] : current;
+    acc += weight[c * K + j] * src;
+  }
+  xBC[c] = acc * (1.0f / (1.0f + expf(-acc)));
+  for (int s = 0; s + 1 < K - 1; ++s) {
+    ring[s * convdim + c] = ring[(s + 1) * convdim + c];
+  }
+  if (K > 1) ring[(K - 2) * convdim + c] = current;
+}
+
+void launch_mamba2_faithful_conv_step(
+    const float *xv, const float *Bv, const float *Cv,
+    const float *conv_weight, const float *conv_bias, float *ring,
+    float *xBC, int inner, int group_state, int K) {
+  const int convdim = inner + 2 * group_state;
+  if (convdim <= 0 || K <= 0) return;
+  const int threads = 256;
+  const int blocks = (convdim + threads - 1) / threads;
+  mamba2_faithful_conv_step_kernel<<<blocks, threads>>>(
+      xv, Bv, Cv, conv_weight, conv_bias, ring, xBC, inner, group_state,
+      convdim, K);
+}
+
+__global__ void mamba2_faithful_step_kernel(
+    const float *__restrict__ xBC, const float *__restrict__ dt,
+    const float *__restrict__ A, const float *__restrict__ D,
+    float *__restrict__ state, float *__restrict__ y, int H, int P, int N,
+    int G) {
+  const int chan = blockIdx.x * blockDim.x + threadIdx.x;
+  const int inner = H * P;
+  if (chan >= inner) return;
+  const int h = chan / P;
+  const int group = (h * G) / H;
+  const int group_state = G * N;
+  const float xv = xBC[chan];
+  const float *B = xBC + inner + group * N;
+  const float *C = xBC + inner + group_state + group * N;
+  const float delta = softplus_device(dt[h]);
+  const float decay = expf(-delta * mamba_a_eff_dev(A[h]));
+  float *state_row = state + static_cast<size_t>(chan) * N;
+  float out = D[h] * xv;
+  for (int n = 0; n < N; ++n) {
+    const float hv = decay * state_row[n] + delta * B[n] * xv;
+    state_row[n] = hv;
+    out += hv * C[n];
+  }
+  y[chan] = out;
+}
+
+void launch_mamba2_faithful_step(
+    const float *xBC, const float *dt, const float *A, const float *D,
+    float *state, float *y, int H, int P, int N, int G) {
+  const int inner = H * P;
+  if (inner <= 0 || N <= 0 || N > MAX_N || G <= 0 || H % G != 0) return;
+  const int threads = 256;
+  const int blocks = (inner + threads - 1) / threads;
+  mamba2_faithful_step_kernel<<<blocks, threads>>>(
+      xBC, dt, A, D, state, y, H, P, N, G);
+}
+
 // =====================================================================
 // Fused single-token incremental decode step (proper diagonal path).
 // One thread per channel.  Mirrors forward_proper_step's host math exactly:

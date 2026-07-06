@@ -418,6 +418,10 @@ void write_model_config(const std::filesystem::path& path, const ModelConfig& co
             {"mamba_proper_ssm", config.mamba_proper_ssm ? "true" : "false"},
             {"mamba_state_expansion", config.mamba_state_expansion ? "true" : "false"},
             {"mamba_conv_kernel", std::to_string(config.mamba_conv_kernel)},
+            {"mamba2_faithful", config.mamba2_faithful ? "true" : "false"},
+            {"mamba_expand", std::to_string(config.mamba_expand)},
+            {"mamba_head_dim", std::to_string(config.mamba_head_dim)},
+            {"mamba_n_groups", std::to_string(config.mamba_n_groups)},
             {"tie_word_embeddings", config.tie_word_embeddings ? "true" : "false"},
             {"rope_theta", std::to_string(config.rope_theta)},
         });
@@ -492,6 +496,16 @@ ModelConfig read_model_config(const std::filesystem::path& path) {
     config.mamba_state_expansion =
         get_bool("mamba_state_expansion", config.mamba_state_expansion);
     config.mamba_conv_kernel = get_int("mamba_conv_kernel", config.mamba_conv_kernel);
+    // Packs written before the faithful block existed must keep the old
+    // parameter layout even though new ModelConfig instances default to it.
+    config.mamba2_faithful =
+        get_bool("mamba2_faithful",
+                 values.count("mamba2_faithful") != 0
+                     ? config.mamba2_faithful
+                     : false);
+    config.mamba_expand = get_int("mamba_expand", config.mamba_expand);
+    config.mamba_head_dim = get_int("mamba_head_dim", config.mamba_head_dim);
+    config.mamba_n_groups = get_int("mamba_n_groups", config.mamba_n_groups);
     config.tie_word_embeddings =
         get_bool("tie_word_embeddings", config.tie_word_embeddings);
     config.rope_theta = get_float("rope_theta", config.rope_theta);
@@ -514,6 +528,9 @@ void validate_model_config_for_pack(const ModelConfig& config) {
     require_range(config.sliding_window, 1, NSOS_MAX_SEQ_LEN, "sliding_window");
     require_range(config.max_context_tokens, 1, NSOS_MAX_SEQ_LEN, "max_context_tokens");
     require_range(config.default_batch_size, 1, 4096, "default_batch_size");
+    require_range(config.mamba_expand, 1, 8, "mamba_expand");
+    require_range(config.mamba_head_dim, 1, 4096, "mamba_head_dim");
+    require_range(config.mamba_n_groups, 1, 4096, "mamba_n_groups");
     if (config.dropout < 0.0f || config.dropout >= 1.0f || !std::isfinite(config.dropout)) {
         throw std::runtime_error("Model pack config field 'dropout' must be finite and in [0, 1)");
     }
@@ -590,6 +607,18 @@ void apply_model_config_overrides(ModelConfig& base, const ModelConfig& override
     }
     if (overrides.mamba_conv_kernel != defaults.mamba_conv_kernel) {
         base.mamba_conv_kernel = overrides.mamba_conv_kernel;
+    }
+    if (overrides.mamba2_faithful != defaults.mamba2_faithful) {
+        base.mamba2_faithful = overrides.mamba2_faithful;
+    }
+    if (overrides.mamba_expand != defaults.mamba_expand) {
+        base.mamba_expand = overrides.mamba_expand;
+    }
+    if (overrides.mamba_head_dim != defaults.mamba_head_dim) {
+        base.mamba_head_dim = overrides.mamba_head_dim;
+    }
+    if (overrides.mamba_n_groups != defaults.mamba_n_groups) {
+        base.mamba_n_groups = overrides.mamba_n_groups;
     }
     if (overrides.tie_word_embeddings != defaults.tie_word_embeddings) {
         base.tie_word_embeddings = overrides.tie_word_embeddings;

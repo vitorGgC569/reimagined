@@ -52,6 +52,16 @@ struct MambaConfig {
   // the diagonal proper path (and its parameter set) unchanged.  All gradients
   // hand-derived and covered by tests/test_gradcheck.cpp (check_mamba2_nstate).
   bool proper_state_expansion = false;
+
+  // Versioned, shape-changing architecture mode matching the official
+  // state-spaces/mamba Mamba2 block.  Keeping it explicit lets older
+  // checkpoints continue to select the historical/proper layouts.
+  bool faithful_mamba2 = false;
+  int expand = 2;
+  int head_dim = 64;
+  int n_groups = 1;
+  float rms_norm_eps = 1e-5f;
+  float out_proj_init_scale = 1.0f;
 };
 
 struct MambaStreamSnapshot {
@@ -81,7 +91,7 @@ public:
   // fork/restore streaming (that path snapshots only the legacy [1,d_model]
   // state, not the proper SSD state + conv window).
   bool proper_selective_ssm_enabled() const {
-    return config_.proper_selective_ssm;
+    return config_.proper_selective_ssm || config_.faithful_mamba2;
   }
   MambaStreamSnapshot snapshot_streaming_state() const;
   void restore_streaming_state(const MambaStreamSnapshot& snapshot);
@@ -122,12 +132,15 @@ private:
   // (GPU kernels wired in Phase B); projections/gate via device-agnostic ops.
   Tensor forward_proper_nstate(const Tensor &u);
   Tensor backward_proper_nstate(const Tensor &grad_output);
+  Tensor forward_faithful(const Tensor &u);
+  Tensor backward_faithful(const Tensor &grad_output);
   // Single-token incremental decode for the proper path.  Carries the SSD state
   // and a (K-1)-tap conv window (pp_stream_*) across calls so each generated
   // token is O(1) instead of re-scanning the whole prefix.  Numerically mirrors
   // the corresponding forward_proper* one step at a time.
   Tensor forward_proper_step(const Tensor &u);
   Tensor forward_proper_nstate_step(const Tensor &u);
+  Tensor forward_faithful_step(const Tensor &u);
   // Shared conv step: xv_host [1,dim] -> xc=silu(causal_conv) [1,dim] using the
   // carried window, then advances the window.  Host math (parity with the scan).
   Tensor proper_stream_conv_(const Tensor &xv_host);
@@ -157,12 +170,15 @@ private:
   int d_state;
   int n_heads;
   int d_head;
+  int d_inner;
+  int conv_dim;
+  int n_groups;
 
   MambaConfig config_;
 
   // Mixed Precision Components
-  BitLinear in_proj_robust;    // 1.58-bit (z, x)
-  BitLinear in_proj_sensitive; // FP32 (dt, B, C)
+  std::unique_ptr<BitLinear> in_proj_robust;    // legacy path only
+  std::unique_ptr<BitLinear> in_proj_sensitive; // legacy path only
   BitLinear out_proj;          // 1.58-bit (y)
 
   Parameter A;
@@ -176,7 +192,9 @@ private:
   std::unique_ptr<BitLinear> B_proj_;  // selective B
   std::unique_ptr<BitLinear> C_proj_;  // selective C
   std::unique_ptr<BitLinear> dt_proj_; // timestep stream
-  Parameter conv_weight_;              // [d_model, conv_kernel] depthwise causal
+  Parameter conv_weight_;              // [conv_dim, conv_kernel] depthwise causal
+  Parameter conv_bias_;                // [conv_dim], faithful path only
+  Parameter norm_weight_;              // [d_inner], RMSNormGated gamma
   int conv_kernel_ = 0;                // 0 until proper path constructed
 
   std::string layer_name = "mamba";
@@ -193,7 +211,11 @@ private:
   bool proper_active_ = false; // true after a forward_proper ran
   Tensor pp_u_;                // layer input [rows, dim]
   Tensor pp_xv_;              // x_proj output (pre-conv)
+  Tensor pp_Bv_;              // faithful B projection (pre-conv)
+  Tensor pp_Cv_;              // faithful C projection (pre-conv)
   Tensor pp_conv_pre_;       // conv output (pre-silu)
+  Tensor pp_B_conv_pre_;     // faithful B conv output (pre-silu)
+  Tensor pp_C_conv_pre_;     // faithful C conv output (pre-silu)
   Tensor pp_xc_;             // silu(conv) — the SSM input
   Tensor pp_z_;              // gate projection raw
   Tensor pp_B_;              // B projection
@@ -201,6 +223,8 @@ private:
   Tensor pp_dt_;             // dt projection raw
   Tensor pp_h_hist_;         // diagonal state history h_t [rows, dim]
   Tensor pp_y_ssd_;          // h_t * C_t (pre-gate)
+  Tensor pp_gated_input_;    // (SSD + D*x) * SiLU(z)
+  Tensor pp_gated_norm_;     // RMS-normalized gated input
   Tensor pp_state_hist_;     // N-state SSD history [rows, H, P, N] (BPTT)
   int pp_batch_ = 0;
   int pp_seq_ = 0;

@@ -284,6 +284,10 @@ public:
              bool mamba_proper_ssm = true,
              bool mamba_state_expansion = true,
              int mamba_conv_kernel = 4,
+             bool mamba2_faithful = true,
+             int mamba_expand = 2,
+             int mamba_head_dim = 64,
+             int mamba_n_groups = 1,
              // RoPE base (theta) for the attention layers; larger = more
              // position-invariant (content-recall) dims.  Env NSOS_ROPE_THETA
              // still overrides per construction.
@@ -333,12 +337,17 @@ private:
   // [rows, dim] in the same device as dy.
   Tensor backward_moe_gpu_batched(const Tensor &dy, const Tensor &x);
   bool is_attention, is_moe, is_ttt;
+  bool faithful_mamba_core_only_ = false;
+  bool learnable_core_norm_ = false;
+  float core_norm_eps_ = 1e-6f;
+  Parameter core_norm_weight_;
   int layer_idx, total_layers, d_model, num_experts;
   float dropout_rate_;
   bool training_mode_ = true;
   int inference_top_k_override_ = 0;  // Pacote A.1; 0 = no override
   int last_batch_size_ = 0;
   Tensor saved_input_;
+  Tensor saved_core_rms_;
   Tensor saved_core_norm_;
   Tensor saved_residual_;
   Tensor saved_ff_norm_;
@@ -552,6 +561,7 @@ private:
   // at the end of backward().
   bool tie_word_embeddings_ = false;
   bool weight_tied_ = false;
+  Parameter final_norm_weight_;
   void apply_weight_tying_();
   bool streaming_inference_enabled_ = false;
   bool training_mode_ = true;
@@ -559,6 +569,7 @@ private:
   std::vector<std::vector<int>> last_input_batches_;
   std::vector<int> last_input_batch_lengths_;
   Tensor saved_final_hidden_;
+  Tensor saved_final_rms_;
   Tensor saved_final_norm_;
   LayerAuditCollector* audit_collector_ = nullptr;
   // Opt-in profiler state.  All three default to null; production

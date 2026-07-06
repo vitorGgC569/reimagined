@@ -19,6 +19,7 @@ constexpr uint32_t NSOS_FP_MAMBA_PROPER    = 1u << 0;
 constexpr uint32_t NSOS_FP_STATE_EXPANSION = 1u << 1;
 constexpr uint32_t NSOS_FP_TIE_EMBEDDINGS  = 1u << 2;
 constexpr uint32_t NSOS_FP_A_LOG_DOMAIN    = 1u << 3;  // always set by v2 saves
+constexpr uint32_t NSOS_FP_MAMBA2_FAITHFUL = 1u << 4;
 
 constexpr float NSOS_DEFAULT_EPSILON = 1e-6f;
 constexpr float NSOS_ROPE_THETA = 10000.0f;
@@ -125,6 +126,12 @@ struct ModelConfig {
     bool mamba_proper_ssm = true;
     bool mamba_state_expansion = true;
     int  mamba_conv_kernel = 4;
+    // Exact state-spaces/mamba Mamba2 graph.  Pure Mamba layers omit the
+    // historical dense FFN; set false to load/use the pre-faithful layout.
+    bool mamba2_faithful = true;
+    int  mamba_expand = 2;
+    int  mamba_head_dim = 64;
+    int  mamba_n_groups = 1;
 
     // ── Weight tying (N6) — DEFAULT ON ──────────────────────────────────────
     // Tie the LM head (value_head) to the token embedding matrix (both are
