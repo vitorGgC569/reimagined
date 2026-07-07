@@ -151,6 +151,24 @@ __global__ void fake_quant_ternary_kernel(float *__restrict__ out,
   out[i] = t * scale;
 }
 
+// Same rule, but the absmean scale is computed from a device-resident
+// reduction result.  This keeps QAT on the GPU hot path free of D2H syncs.
+__global__ void fake_quant_ternary_absmean_kernel(
+    float *__restrict__ out, float *__restrict__ scale_out,
+    const float *__restrict__ w, const float *__restrict__ abs_sum, int n) {
+  if (n <= 0) return;
+  const float scale = abs_sum[0] / static_cast<float>(n) + 1e-8f;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    scale_out[0] = scale;
+  }
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float inv = 1.0f / (scale + 1e-8f);
+  const float v = w[i] * inv;
+  const float t = (v > 0.5f) ? 1.0f : ((v < -0.5f) ? -1.0f : 0.0f);
+  out[i] = t * scale;
+}
+
 // Per-row activation fake-quant (quant→dequant fused): one block per row.
 __global__ void fake_quant_activations_kernel(float *__restrict__ out,
                                               const float *__restrict__ x,
@@ -207,6 +225,16 @@ __global__ void ste_clip_weight_grad_kernel(float *__restrict__ dW,
   if (fabsf(w[i] * inv) > 1.0f) dW[i] = 0.0f;
 }
 
+__global__ void ste_clip_weight_grad_device_scale_kernel(
+    float *__restrict__ dW, const float *__restrict__ w,
+    const float *__restrict__ scale_dev, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float scale = scale_dev[0];
+  const float inv = 1.0f / (scale + 1e-8f);
+  if (fabsf(w[i] * inv) > 1.0f) dW[i] = 0.0f;
+}
+
 extern "C" {
 
 void launch_fake_quant_ternary_kernel(float *out, const float *w, float scale,
@@ -215,6 +243,16 @@ void launch_fake_quant_ternary_kernel(float *out, const float *w, float scale,
   const int threads = 256;
   const int blocks = (n + threads - 1) / threads;
   fake_quant_ternary_kernel<<<blocks, threads>>>(out, w, scale, n);
+}
+
+void launch_fake_quant_ternary_absmean_kernel(float *out, float *scale_out,
+                                              const float *w,
+                                              const float *abs_sum, int n) {
+  if (n <= 0) return;
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  fake_quant_ternary_absmean_kernel<<<blocks, threads>>>(out, scale_out, w,
+                                                         abs_sum, n);
 }
 
 void launch_fake_quant_activations_kernel(float *out, const float *x, int M,
@@ -232,6 +270,16 @@ void launch_ste_clip_weight_grad_kernel(float *dW, const float *w, float scale,
   const int threads = 256;
   const int blocks = (n + threads - 1) / threads;
   ste_clip_weight_grad_kernel<<<blocks, threads>>>(dW, w, scale, n);
+}
+
+void launch_ste_clip_weight_grad_device_scale_kernel(float *dW, const float *w,
+                                                     const float *scale,
+                                                     int n) {
+  if (n <= 0) return;
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  ste_clip_weight_grad_device_scale_kernel<<<blocks, threads>>>(dW, w, scale,
+                                                                n);
 }
 
 void launch_quantize_activations_bitnet_kernel(const float *x, int8_t *x_q,

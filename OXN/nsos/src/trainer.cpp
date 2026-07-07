@@ -741,17 +741,11 @@ void apply_qat_regularization(Trainer& trainer, int accumulation_steps) {
             continue;
         }
         // Pull the latent weight toward its ACTUAL fake-quantized value,
-        // scale * code, NOT the bare code {-1,0,+1}.  quantize_weights returns
-        // the unscaled code; scale is the same absmean rule the QAT forward /
-        // pack_weights use (weight_scale = absmean(W) + 1e-8).  Without the
-        // scale the penalty drags weights of magnitude ~1/sqrt(fan_in) toward
-        // magnitude 1, inflating the branch gain instead of nudging toward the
-        // quantization centroids.
-        const float scale = tensor_abs_mean(layer->weight.data) + 1e-8f;
-        Tensor ternary_target =
-            layer->quantize_weights(layer->weight.data).mul(scale);
-        Tensor penalty_grad = layer->weight.data.sub(ternary_target).mul(regularization);
-        layer->weight.add_grad(penalty_grad);
+        // scale * code, NOT the bare code {-1,0,+1}.  The BitLinear helper
+        // reuses the QAT forward's GPU-resident scaled ternary tensor when
+        // available; the old trainer-side quantize_weights() call was a CPU
+        // loop over GPU managed memory and made ternary training unusably slow.
+        layer->add_qat_regularization_grad(regularization);
     }
 }
 

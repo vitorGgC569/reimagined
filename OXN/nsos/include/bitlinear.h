@@ -109,6 +109,9 @@ public:
     if (enabled != training_mode_) {
       qat_inference_cache_valid_ = false;
       qat_inference_w_eff_ = Tensor();
+      saved_qat_w_eff_ = Tensor();
+      saved_qat_scale_ = Tensor();
+      saved_qat_weight_version_ = 0;
     }
     training_mode_ = enabled;
   }
@@ -129,6 +132,7 @@ public:
                            Device dev = Device::CPU,
                            bool release_full_precision = false);
   Tensor quantize_weights(const Tensor &w_float); // SOTA for benchmarks/tests
+  void add_qat_regularization_grad(float regularization);
 
 private:
   Tensor quantize_activations_bitnet(const Tensor &x,
@@ -194,6 +198,9 @@ private:
   bool qat_gpu_active_ = false;
   Tensor saved_qat_x_dq_;   // dequantized activations actually multiplied
   Tensor saved_qat_pre_;    // pre-(magnitude/bias) output, for the magnitude grad
+  Tensor saved_qat_w_eff_;  // scaled ternary weights used by the QAT forward
+  Tensor saved_qat_scale_;  // device scalar scale used by saved_qat_w_eff_
+  uint64_t saved_qat_weight_version_ = 0;
 
   std::vector<uint32_t> packed_weights;
   std::vector<int8_t> unpacked_weights_i8;

@@ -60,6 +60,8 @@ Tensor bitnet_gemm_158bit_gpu(const Tensor& x_gpu,
 // Ternary weight fake-quant: returns clamp(round(w/scale), -1, +1) * scale
 // (same rule as BitLinear::quantize_weights, scaled).  Same shape/device as w.
 Tensor qat_fake_quant_ternary(const Tensor& w, float scale);
+Tensor qat_fake_quant_ternary_absmean(const Tensor& w,
+                                      Tensor* scale_out = nullptr);
 
 // Per-row activation fake-quant (quant→dequant): returns the dequantized
 // float activations the matmul should multiply.  precision_bits selects q_max
@@ -69,6 +71,8 @@ Tensor qat_fake_quant_activations(const Tensor& x, int precision_bits);
 // STE clip applied in place to the weight gradient: zeros entries whose latent
 // weight already saturated past the ternary band (|w/scale| > 1).
 void qat_ste_clip_weight_grad(Tensor& dW, const Tensor& w, float scale);
+void qat_ste_clip_weight_grad_device_scale(Tensor& dW, const Tensor& w,
+                                           const Tensor& scale);
 
 }  // namespace nsos
 

@@ -270,6 +270,11 @@ void launch_abs_sum_kernel(float *d_abs_sum, const float *in, int n);
 // BitLinear::quantize_weights * weight_scale).
 void launch_fake_quant_ternary_kernel(float *out, const float *w, float scale,
                                       int n);
+// Same ternary fake-quant, but `scale_out[0] = abs_sum[0] / n + 1e-8` is
+// computed/read on device.  Avoids per-layer D2H sync during GPU QAT.
+void launch_fake_quant_ternary_absmean_kernel(float *out, float *scale_out,
+                                              const float *w,
+                                              const float *abs_sum, int n);
 // Per-row activation fake-quant (quant→dequant in one pass), returns the
 // DEQUANTIZED float activations the matmul should use:
 //   s_row = (max_j|x|+1e-8)/q_max ; out[r,j] = clip(round(x/s_row),±q_max)*s_row
@@ -281,6 +286,10 @@ void launch_fake_quant_activations_kernel(float *out, const float *x, int M,
 // ternary band:  dW[i] = (|w[i]/scale| > 1) ? 0 : dW[i].
 void launch_ste_clip_weight_grad_kernel(float *dW, const float *w, float scale,
                                         int n);
+// Same STE clip, with the scale read from device memory.
+void launch_ste_clip_weight_grad_device_scale_kernel(float *dW, const float *w,
+                                                     const float *scale,
+                                                     int n);
 
 // HPC Fused Cross-Entropy: softmax + log + NLL in single kernel
 void launch_fused_cross_entropy(float *d_loss, float *grad, const float *logits,

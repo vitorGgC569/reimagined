@@ -158,6 +158,42 @@ Tensor qat_fake_quant_ternary(const Tensor& w, float scale) {
   return out;
 }
 
+Tensor qat_fake_quant_ternary_absmean(const Tensor& w, Tensor* scale_out) {
+  Tensor out(w.shape.dims, w.get_device());
+  const int n = static_cast<int>(w.size);
+  if (n <= 0) return out;
+#ifdef USE_CUDA
+  if (w.get_device() == Device::GPU) {
+    Tensor abs_sum({1}, Device::GPU);
+    Tensor scale({1}, Device::GPU);
+    const cudaError_t memset_status =
+        cudaMemsetAsync(abs_sum.raw_data(), 0, sizeof(float), 0);
+    if (memset_status != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("CUDA error before qat_fake_quant_ternary_absmean: ") +
+          cudaGetErrorString(memset_status));
+    }
+    launch_abs_sum_kernel(abs_sum.raw_data(), w.raw_data(), n);
+    check_cuda_or_throw("qat_fake_quant_ternary_absmean_abs_sum");
+    launch_fake_quant_ternary_absmean_kernel(out.raw_data(), scale.raw_data(),
+                                             w.raw_data(), abs_sum.raw_data(),
+                                             n);
+    check_cuda_or_throw("qat_fake_quant_ternary_absmean");
+    if (scale_out) {
+      *scale_out = scale;
+    }
+    return out;
+  }
+#endif
+  const float scale = tensor_abs_mean(w) + 1e-8f;
+  if (scale_out) {
+    Tensor scale_tensor({1}, w.get_device());
+    scale_tensor.data()[0] = scale;
+    *scale_out = scale_tensor;
+  }
+  return qat_fake_quant_ternary(w, scale);
+}
+
 Tensor qat_fake_quant_activations(const Tensor& x, int precision_bits) {
   Tensor out(x.shape.dims, x.get_device());
   const int K = x.shape.size() > 0 ? x.shape.back() : 0;
@@ -209,6 +245,23 @@ void qat_ste_clip_weight_grad(Tensor& dW, const Tensor& w, float scale) {
   for (int i = 0; i < n; ++i) {
     if (std::fabs(wp[i] * inv) > 1.0f) g[i] = 0.0f;
   }
+}
+
+void qat_ste_clip_weight_grad_device_scale(Tensor& dW, const Tensor& w,
+                                           const Tensor& scale) {
+  const int n = static_cast<int>(dW.size);
+  if (n <= 0 || w.size != dW.size || scale.size <= 0) return;
+#ifdef USE_CUDA
+  if (dW.get_device() == Device::GPU && w.get_device() == Device::GPU &&
+      scale.get_device() == Device::GPU) {
+    launch_ste_clip_weight_grad_device_scale_kernel(
+        dW.raw_data(), w.raw_data(), scale.raw_data(), n);
+    check_cuda_or_throw("qat_ste_clip_weight_grad_device_scale");
+    return;
+  }
+#endif
+  const float* sp = scale.data();
+  qat_ste_clip_weight_grad(dW, w, sp[0]);
 }
 
 }  // namespace nsos

@@ -104,6 +104,9 @@ void BitLinear::invalidate_cached_materialized_weights() {
   // repack, release) invalidates it too.
   qat_inference_cache_valid_ = false;
   qat_inference_w_eff_ = Tensor();
+  saved_qat_w_eff_ = Tensor();
+  saved_qat_scale_ = Tensor();
+  saved_qat_weight_version_ = 0;
 }
 
 void BitLinear::repack_weights() {
@@ -305,6 +308,9 @@ Tensor BitLinear::forward(const Tensor &input) {
   // clone-heavy saves entirely — this is pure per-token, per-layer overhead
   // on the decode hot path.
   qat_gpu_active_ = false;  // K3: only the GPU QAT branch below sets this true
+  saved_qat_w_eff_ = Tensor();
+  saved_qat_scale_ = Tensor();
+  saved_qat_weight_version_ = 0;
   if (training_mode_) saved_input = input.clone();
   int M = input.shape.numel() / in_features;
   Tensor x = input;
@@ -393,10 +399,15 @@ Tensor BitLinear::forward(const Tensor &input) {
       // Same scale rule as pack_weights()/quantize_weights() so the QAT codes
       // match what packed inference will use.
       Tensor w_eff;
+      Tensor qat_scale;
       if (training_mode_) {
-        // Weights change every optimizer step: recompute per forward.
-        weight_scale = tensor_abs_mean(weight.data) + 1e-8f;  // absmean (BitNet b1.58)
-        w_eff = qat_fake_quant_ternary(weight.data, weight_scale);  // [out,in]
+        // Weights change every optimizer step: recompute per forward, but keep
+        // the absmean scale on device for GPU QAT to avoid a D2H sync per
+        // quantized layer.
+        w_eff = qat_fake_quant_ternary_absmean(weight.data, &qat_scale);  // [out,in]
+        if (qat_scale.size > 0 && qat_scale.get_device() == Device::CPU) {
+          weight_scale = qat_scale.data()[0];
+        }
       } else {
         // Inference: the weights are frozen, so the absmean scale (a device
         // reduction + sync D2H on GPU) and the ternary w_eff materialization
@@ -420,6 +431,9 @@ Tensor BitLinear::forward(const Tensor &input) {
         qat_gpu_active_ = true;
         saved_qat_x_dq_ = x_dq;
         saved_qat_pre_ = pre;
+        saved_qat_w_eff_ = w_eff;
+        saved_qat_scale_ = qat_scale;
+        saved_qat_weight_version_ = weight.version;
       }
       Tensor out_q = pre.mul(magnitude.data);
       if (use_bias) {
@@ -757,11 +771,23 @@ Tensor BitLinear::backward(const Tensor &grad) {
     // activations actually multiplied).
     Tensor dW = grad_pre.transpose().matmul(saved_qat_x_dq_);
     // STE clip: zero grad for latent weights already saturated past |W/scale|>1.
-    qat_ste_clip_weight_grad(dW, weight.data, weight_scale);
+    if (saved_qat_scale_.size == 1 &&
+        saved_qat_scale_.get_device() == weight.data.get_device() &&
+        saved_qat_weight_version_ == weight.version) {
+      qat_ste_clip_weight_grad_device_scale(dW, weight.data, saved_qat_scale_);
+    } else {
+      weight_scale = tensor_abs_mean(weight.data) + 1e-8f;
+      qat_ste_clip_weight_grad(dW, weight.data, weight_scale);
+    }
     weight.add_grad(dW);
     // Input grad (STE through the int8 activation quantizer): dx = grad_pre @
     // w_eff, using the effective (fake-quantized) weight that the forward used.
-    Tensor w_eff = qat_fake_quant_ternary(weight.data, weight_scale);
+    Tensor w_eff =
+        (saved_qat_w_eff_.size == weight.data.size &&
+         saved_qat_w_eff_.get_device() == weight.data.get_device() &&
+         saved_qat_weight_version_ == weight.version)
+            ? saved_qat_w_eff_
+            : qat_fake_quant_ternary(weight.data, weight_scale);
     Tensor dx = grad_pre.matmul(w_eff);
     if (norm_strategy == NormStrategy::RMS_PERI ||
         norm_strategy == NormStrategy::RMS_PRE) {
@@ -992,6 +1018,30 @@ Tensor BitLinear::quantize_weights(const Tensor &w_float) {
       dst[i] = 0.0f;
   }
   return res;
+}
+
+void BitLinear::add_qat_regularization_grad(float regularization) {
+  if (regularization <= 0.0f || quantization_sensitive_ ||
+      weight.data.size == 0) {
+    return;
+  }
+
+  Tensor ternary_target;
+  if (saved_qat_w_eff_.size == weight.data.size &&
+      saved_qat_w_eff_.get_device() == weight.data.get_device() &&
+      saved_qat_weight_version_ == weight.version) {
+    // Training GPU QAT already materialized the scaled ternary weight
+    // (scale * code) in forward.  Reuse it for the regularizer instead of
+    // calling quantize_weights(), which is host-loop based and forces GPU
+    // managed-memory migration.
+    ternary_target = saved_qat_w_eff_;
+  } else {
+    const float scale = tensor_abs_mean(weight.data) + 1e-8f;
+    ternary_target = qat_fake_quant_ternary(weight.data, scale);
+  }
+
+  Tensor penalty_grad = weight.data.sub(ternary_target).mul(regularization);
+  weight.add_grad(penalty_grad);
 }
 
 } // namespace nsos
