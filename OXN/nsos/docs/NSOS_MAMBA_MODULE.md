@@ -7,8 +7,8 @@ standardizes small supervised datasets.
 
 ## Goals
 
-- expose only the Mamba path, without Attention, MoE, KAN, TTT, CHRASS, MCTS or
-  OxtaMem;
+- expose Mamba by default, with Attention as the only optional hybrid component;
+- keep MoE, KAN, TTT, CHRASS, MCTS and OxtaMem out of this public wrapper;
 - use faithful Mamba-2 mode (`mamba2_faithful=true`);
 - make streaming incremental decoding the default;
 - select GPU automatically when available and fall back to CPU;
@@ -61,6 +61,41 @@ Behavior:
   the model on CPU;
 - `streaming=True` calls `model.set_streaming_inference(True)` and generation
   uses one prefill plus one-token incremental steps.
+
+## Mamba-only, Mamba+Attention and ternary
+
+Default is Mamba-only:
+
+```python
+cfg = MambaModuleConfig(vocab_size=128, use_attention=False)
+```
+
+Enable Attention, without enabling any other NSOS hybrid subsystem:
+
+```python
+cfg = MambaModuleConfig(
+    vocab_size=128,
+    use_attention=True,
+    attention_period=2,
+    attention_slot=1,
+)
+```
+
+Enable ternary/QAT training:
+
+```python
+cfg = MambaModuleConfig(
+    vocab_size=128,
+    ternary=True,
+    ternary_warmup_steps=100,
+    ternary_start_step=300,
+    ternary_regularization=1e-3,
+)
+```
+
+QAT ternary is a training/deployment mode, not a promise of faster training. On
+small local GPUs it can train slower than float because fake-quantization and
+STE add work to every training step.
 
 ## Minimal synthetic example
 
@@ -204,6 +239,8 @@ pairs = load_text_pairs_jsonl("dataset.jsonl")
   tokenizer pack.
 - The wrapper uses greedy decoding.  Sampling can be added later without
   changing the Mamba architecture.
+- The wrapper can expose Mamba+Attention, but it intentionally does not expose
+  MoE, KAN, TTT, CHRASS, MCTS or external memory.
 - Streaming incremental is the default because edge latency depends on avoiding
   full-context recomputation per generated token.
 - This module is a productization layer.  It should not be used to make new

@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nsos-mamba"
-version = "0.1.0"
-description = "Wrapper Python isolado para o módulo Mamba do NSOS com streaming incremental padrão."
+version = "0.1.1"
+description = "Wrapper Python isolado para Mamba/Attention do NSOS com streaming incremental padrao."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
   { name = "Oxta" }
 ]
-keywords = ["mamba", "ssm", "nsos", "edge-ai", "streaming"]
+keywords = ["mamba", "attention", "ssm", "nsos", "edge-ai", "streaming"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -19,8 +19,8 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Operating System :: Microsoft :: Windows",
 ]
 dependencies = [
   "numpy>=1.23",
@@ -33,3 +33,7 @@ Source = "https://github.com/vitorGgC569/reimagined"
 
 [tool.setuptools]
 packages = ["nsos_mamba"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+nsos_mamba = ["*.pyd"]

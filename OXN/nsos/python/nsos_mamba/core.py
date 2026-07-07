@@ -4,6 +4,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -12,11 +13,46 @@ from .datasets import CharTokenizer, TextPair, pairs_to_token_ids
 
 
 def _load_nsos_ext():
+    import importlib.util
+    import sys
+
+    def _load_extension_from_path(path: Path):
+        spec = importlib.util.spec_from_file_location("nsos_ext", str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot create import spec for {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["nsos_ext"] = module
+        spec.loader.exec_module(module)
+        return module
+
     ext_path = os.environ.get("NSOS_EXT_PATH")
     if ext_path:
-        import sys
-
+        ext_path = os.path.abspath(ext_path)
         sys.path.insert(0, ext_path)
+        if hasattr(os, "add_dll_directory") and os.path.isdir(ext_path):
+            os.add_dll_directory(ext_path)
+    if hasattr(os, "add_dll_directory"):
+        for env_name in ("CUDA_PATH", "CUDA_PATH_V12_9", "CUDA_HOME"):
+            cuda_root = os.environ.get(env_name)
+            if not cuda_root:
+                continue
+            cuda_bin = os.path.join(cuda_root, "bin")
+            if os.path.isdir(cuda_bin):
+                os.add_dll_directory(cuda_bin)
+    package_dir = Path(__file__).resolve().parent
+    bundled_mode = os.environ.get("NSOS_MAMBA_RUNTIME", "auto").strip().lower()
+    bundled_candidates: List[Path] = []
+    if bundled_mode in ("auto", "cuda", "gpu"):
+        bundled_candidates.extend(sorted(package_dir.glob("nsos_ext_cuda*.pyd")))
+    if bundled_mode in ("auto", "cpu"):
+        bundled_candidates.extend(sorted(package_dir.glob("nsos_ext_cpu*.pyd")))
+    for candidate in bundled_candidates:
+        try:
+            return _load_extension_from_path(candidate)
+        except Exception:
+            sys.modules.pop("nsos_ext", None)
+            if bundled_mode not in ("auto", ""):
+                raise
     try:
         import nsos_ext as nsos  # type: ignore
     except ImportError as exc:
@@ -84,7 +120,14 @@ class MambaModuleConfig:
     mamba_expand: int = 2
     mamba_head_dim: int = 64
     mamba_n_groups: int = 1
+    use_attention: bool = False
+    attention_period: int = 2
+    attention_slot: int = 1
     tie_word_embeddings: bool = False
+    ternary: bool = False
+    ternary_warmup_steps: int = 100
+    ternary_start_step: int = 300
+    ternary_regularization: float = 1e-3
     seed: Optional[int] = 42
     device: str = "auto"
     streaming: bool = True
@@ -98,6 +141,13 @@ class MambaModuleConfig:
             d_model=int(os.environ.get("NSOS_MAMBA_DMODEL", "128")),
             d_state=int(os.environ.get("NSOS_MAMBA_DSTATE", "64")),
             max_context_tokens=int(os.environ.get("NSOS_MAMBA_CONTEXT", "4096")),
+            use_attention=_env_bool("NSOS_MAMBA_ATTENTION", False),
+            attention_period=int(os.environ.get("NSOS_MAMBA_ATTENTION_PERIOD", "2")),
+            attention_slot=int(os.environ.get("NSOS_MAMBA_ATTENTION_SLOT", "1")),
+            ternary=_env_bool("NSOS_MAMBA_TERNARY", False),
+            ternary_warmup_steps=int(os.environ.get("NSOS_MAMBA_TERNARY_WARMUP", "100")),
+            ternary_start_step=int(os.environ.get("NSOS_MAMBA_TERNARY_START", "300")),
+            ternary_regularization=float(os.environ.get("NSOS_MAMBA_TERNARY_REG", "1e-3")),
             device=os.environ.get("NSOS_MAMBA_DEVICE", "auto"),
             streaming=_env_bool("NSOS_MAMBA_STREAMING", True),
         )
@@ -201,9 +251,13 @@ class NSOSMamba:
         _safe_set(cfg, "mamba_state_expansion", int(self.config.d_state))
         _safe_set(cfg, "mamba_n_groups", int(self.config.mamba_n_groups))
 
-        # Disable attention by putting the slot outside any real layer schedule.
-        cfg.attention_period = 1_000_000
-        cfg.attention_slot = 0
+        if self.config.use_attention:
+            cfg.attention_period = max(1, int(self.config.attention_period))
+            cfg.attention_slot = max(0, int(self.config.attention_slot))
+        else:
+            # Disable attention by putting the slot outside any real layer schedule.
+            cfg.attention_period = 1_000_000
+            cfg.attention_slot = 0
         return cfg
 
     @property
@@ -230,7 +284,7 @@ class NSOSMamba:
         steps: int = 1200,
         batch_size: int = 16,
         learning_rate: float = 3e-3,
-        qat: bool = False,
+        qat: Optional[bool] = None,
         seed: int = 123,
         progress_every: Optional[int] = None,
         callback: Optional[Callable[[int, float], None]] = None,
@@ -243,7 +297,11 @@ class NSOSMamba:
         trainer.total_training_steps = int(steps)
         trainer.first_token_loss_scale = 1.0
         trainer.eos_loss_scale = 1.0
-        trainer.phase_scheduler.progressive_qat_enabled = bool(qat)
+        use_qat = self.config.ternary if qat is None else bool(qat)
+        trainer.phase_scheduler.progressive_qat_enabled = bool(use_qat)
+        trainer.phase_scheduler.semantic_warmup_steps = int(self.config.ternary_warmup_steps)
+        trainer.phase_scheduler.qat_start_step = int(self.config.ternary_start_step)
+        trainer.phase_scheduler.ternary_regularization = float(self.config.ternary_regularization)
 
         rng = random.Random(seed)
         self.model.set_training_mode(True)

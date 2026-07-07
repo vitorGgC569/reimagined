@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -23,7 +24,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.ext_dir:
-        sys.path.insert(0, args.ext_dir)
+        ext_dir = str(Path(args.ext_dir).resolve())
+        sys.path.insert(0, ext_dir)
+        os.environ["NSOS_EXT_PATH"] = ext_dir
     _ensure_repo_python_path()
 
     from nsos_mamba import CharTokenizer, MambaModuleConfig, NSOSMamba, TextPair
