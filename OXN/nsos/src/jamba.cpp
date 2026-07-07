@@ -2142,8 +2142,28 @@ std::string JambaBlock::audit_block_type() const {
     return type;
 }
 
+// ROOT-FIX PROBE (attn residual scale / LayerScale-lite).  The attn audit
+// isolated: faithful hybrid stalls when attention layers dominate the residual
+// (instrumentation: attention blocks add ~1.4 to the stream while faithful
+// Mamba blocks add ~0.01 — attention is "loud", Mamba near-identity).  A small
+// fixed residual scale on the attention block's contributions (both the mixer
+// output and the FFN output) makes attention start near-identity, harmonising
+// the stack.  Env NSOS_ATTN_RES_SCALE in (0,1]; default 1.0 = exact no-op.  If
+// a small scale rescues terminal attention, the learnable-per-channel LayerScale
+// is the production fix; this fixed knob confirms the mechanism first.
+static float jamba_attn_res_scale() {
+    static const float s = []() {
+        const char* e = std::getenv("NSOS_ATTN_RES_SCALE");
+        if (e == nullptr) return 1.0f;
+        const float v = std::strtof(e, nullptr);
+        return (v > 0.0f && v <= 1.0f) ? v : 1.0f;
+    }();
+    return s;
+}
+
 Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     const auto audit_started = std::chrono::steady_clock::now();
+    const float attn_res_scale = is_attention ? jamba_attn_res_scale() : 1.0f;
     last_batch_size_ = x.shape.size() == 3 ? x.shape[0] : 0;
     saved_input_ = x;
     saved_core_rms_ = x.rmsnorm(core_norm_eps_);
@@ -2170,7 +2190,7 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
                                       layer_idx * 17 + 1, &saved_drop_core_);
     }
 
-    saved_residual_ = x.add(core);
+    saved_residual_ = x.add(attn_res_scale != 1.0f ? core.mul(attn_res_scale) : core);
     saved_ff_norm_ = saved_residual_.rmsnorm();
 
     if (is_moe) {
@@ -2194,7 +2214,7 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
             Tensor c_unflat = c_out.reshape(orig_shape);
             ff = ff.add(c_unflat);
         }
-        Tensor output = saved_residual_.add(ff);
+        Tensor output = saved_residual_.add(attn_res_scale != 1.0f ? ff.mul(attn_res_scale) : ff);
         if (audit_collector_ && audit_collector_->enabled()) {
             const double latency_ms =
                 static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2260,7 +2280,7 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         Tensor c_unflat = c_out.reshape(orig_shape);
         ff = ff.add(c_unflat);
     }
-    Tensor output = saved_residual_.add(ff);
+    Tensor output = saved_residual_.add(attn_res_scale != 1.0f ? ff.mul(attn_res_scale) : ff);
     if (audit_collector_ && audit_collector_->enabled()) {
         const double latency_ms =
             static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3031,9 +3051,16 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     auto masked = [](const Tensor& g, const Tensor& m) {
         return m.size > 0 ? g.mul(m) : g;
     };
+    // Attn residual scale (LayerScale-lite, see jamba_attn_res_scale): the
+    // forward scaled the attention block's core AND ff contributions by s, so
+    // the grad ENTERING the FFN (dy_ff) and the grad ENTERING the mixer
+    // (residual_grad*s below) both carry the same factor.  The residual SKIPs
+    // (dy into residual_grad, residual_grad into input_grad) stay unscaled.
+    const float attn_res_scale = is_attention ? jamba_attn_res_scale() : 1.0f;
+    const Tensor dy_ff = attn_res_scale != 1.0f ? dy.mul(attn_res_scale) : dy;
     Tensor ff_grad;
     if (is_moe) {
-        ff_grad = backward_moe(masked(dy, saved_drop_moe_), ctx,
+        ff_grad = backward_moe(masked(dy_ff, saved_drop_moe_), ctx,
                                "L" + std::to_string(layer_idx), saved_ff_norm_);
         // CHRASS parallel: its grad w.r.t. saved_ff_norm adds to ff_grad
         // before the shared rmsnorm_backward.  Reshape dy + saved_ff_norm
@@ -3056,7 +3083,7 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
             ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
         }
     } else if (kan_ffn) {
-        ff_grad = kan_ffn->backward(masked(dy, saved_drop_ff_out_));
+        ff_grad = kan_ffn->backward(masked(dy_ff, saved_drop_ff_out_));
         // CHRASS parallel (KAN path) — same injection as the dense FFN.
         if (chrass_layer && saved_ff_norm_.size > 0) {
             const auto& s = saved_ff_norm_.shape;
@@ -3076,7 +3103,7 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
             ff_grad = saved_residual_.rmsnorm_backward(ff_grad, saved_ff_norm_);
         }
     } else if (ffn_down && ffn_gate_up) {
-        ff_grad = ffn_down->backward(masked(dy, saved_drop_ff_out_));
+        ff_grad = ffn_down->backward(masked(dy_ff, saved_drop_ff_out_));
         // Hidden dropout was applied AFTER squared_relu, BEFORE ffn_down, so its
         // mask multiplies the grad w.r.t. ff_hidden before the squared_relu VJP.
         ff_grad = masked(ff_grad, saved_drop_ff_hidden_);
@@ -3120,7 +3147,9 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     // The mixer output passed through dropout before the residual add, so the
     // mixer's input grad carries the core mask; the x-branch of the residual
     // (used for input_grad below) does NOT — keep residual_grad unmasked there.
-    const Tensor core_in_grad = masked(residual_grad, saved_drop_core_);
+    const Tensor core_in_grad = masked(
+        attn_res_scale != 1.0f ? residual_grad.mul(attn_res_scale) : residual_grad,
+        saved_drop_core_);
     Tensor core_grad;
     if (is_ttt && ttt_layer) {
         core_grad = ttt_layer->backward(core_in_grad);
