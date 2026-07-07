@@ -341,6 +341,13 @@ private:
   bool learnable_core_norm_ = false;
   float core_norm_eps_ = 1e-6f;
   Parameter core_norm_weight_;
+  // Learnable LayerScale (per-channel gamma) on attention blocks — root fix for
+  // the faithful hybrid stall (attention dominates the residual; validated a
+  // 0.1 residual scale rescues terminal attention).  Init 0.1 so attention
+  // starts near-identity and GROWS as needed (does not cap it).  Only on
+  // faithful attention layers.
+  bool use_attn_layerscale_ = false;
+  Parameter attn_layerscale_;
   int layer_idx, total_layers, d_model, num_experts;
   float dropout_rate_;
   bool training_mode_ = true;
@@ -352,6 +359,9 @@ private:
   Tensor saved_residual_;
   Tensor saved_ff_norm_;
   Tensor saved_ff_hidden_pre_;
+  // Pre-scale attention core/ff outputs saved for the LayerScale gamma grad.
+  Tensor saved_ls_core_;
+  Tensor saved_ls_ff_;
   // Training dropout masks captured in forward and REAPPLIED in backward (the
   // recurrence has no autograd tape, so the mask must be carried explicitly;
   // omitting it let gradients flow through dropped/rescaled units).  Empty when

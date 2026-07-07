@@ -2010,6 +2010,23 @@ JambaBlock::JambaBlock(int dm,
             Tensor::ones({dm}, Device::CPU), "norm.weight");
     }
 
+    // Learnable LayerScale on faithful attention blocks (root fix — see header).
+    // Default ON for faithful attention; NSOS_ATTN_LAYERSCALE=0 disables (A/B).
+    {
+        const char* e = std::getenv("NSOS_ATTN_LAYERSCALE");
+        use_attn_layerscale_ =
+            mamba2_faithful && is_attn && (e == nullptr || e[0] != '0');
+    }
+    if (use_attn_layerscale_) {
+        float ls_init = 0.1f;  // validated: 0.1 residual scale rescues terminal attn
+        if (const char* v = std::getenv("NSOS_ATTN_LAYERSCALE_INIT")) {
+            const float p = std::strtof(v, nullptr);
+            if (p > 0.0f && p <= 1.0f) ls_init = p;
+        }
+        attn_layerscale_ = Parameter(
+            Tensor::ones({dm}, Device::CPU).mul(ls_init), "attn.layerscale");
+    }
+
     // CHRASS slot (parallel with FFN/MoE).  Each layer gets a distinct
     // random adjacency derived from (chrass_seed + layer_idx).  Self-loops
     // excluded; weights uniform [-1,1]; row-normalized inside ctor.
@@ -2163,7 +2180,18 @@ static float jamba_attn_res_scale() {
 
 Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     const auto audit_started = std::chrono::steady_clock::now();
-    const float attn_res_scale = is_attention ? jamba_attn_res_scale() : 1.0f;
+    // Attention residual scaling.  LayerScale (learnable per-channel gamma) is
+    // the production path for faithful attention; the fixed NSOS_ATTN_RES_SCALE
+    // is the legacy A/B knob (skipped when LayerScale is active).
+    const float attn_res_scale =
+        (is_attention && !use_attn_layerscale_) ? jamba_attn_res_scale() : 1.0f;
+    auto scale_ff = [&](const Tensor& ff_in) -> Tensor {
+        if (use_attn_layerscale_) {
+            saved_ls_ff_ = ff_in;  // pre-scale, for gamma grad
+            return ff_in.mul(attn_layerscale_.data);
+        }
+        return attn_res_scale != 1.0f ? ff_in.mul(attn_res_scale) : ff_in;
+    };
     last_batch_size_ = x.shape.size() == 3 ? x.shape[0] : 0;
     saved_input_ = x;
     saved_core_rms_ = x.rmsnorm(core_norm_eps_);
@@ -2190,7 +2218,14 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
                                       layer_idx * 17 + 1, &saved_drop_core_);
     }
 
-    saved_residual_ = x.add(attn_res_scale != 1.0f ? core.mul(attn_res_scale) : core);
+    Tensor core_contrib = core;
+    if (use_attn_layerscale_) {
+        saved_ls_core_ = core;  // pre-scale, for gamma grad
+        core_contrib = core.mul(attn_layerscale_.data);
+    } else if (attn_res_scale != 1.0f) {
+        core_contrib = core.mul(attn_res_scale);
+    }
+    saved_residual_ = x.add(core_contrib);
     saved_ff_norm_ = saved_residual_.rmsnorm();
 
     if (is_moe) {
@@ -2214,7 +2249,7 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
             Tensor c_unflat = c_out.reshape(orig_shape);
             ff = ff.add(c_unflat);
         }
-        Tensor output = saved_residual_.add(attn_res_scale != 1.0f ? ff.mul(attn_res_scale) : ff);
+        Tensor output = saved_residual_.add(scale_ff(ff));
         if (audit_collector_ && audit_collector_->enabled()) {
             const double latency_ms =
                 static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2280,7 +2315,7 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         Tensor c_unflat = c_out.reshape(orig_shape);
         ff = ff.add(c_unflat);
     }
-    Tensor output = saved_residual_.add(attn_res_scale != 1.0f ? ff.mul(attn_res_scale) : ff);
+    Tensor output = saved_residual_.add(scale_ff(ff));
     if (audit_collector_ && audit_collector_->enabled()) {
         const double latency_ms =
             static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3056,8 +3091,12 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     // the grad ENTERING the FFN (dy_ff) and the grad ENTERING the mixer
     // (residual_grad*s below) both carry the same factor.  The residual SKIPs
     // (dy into residual_grad, residual_grad into input_grad) stay unscaled.
-    const float attn_res_scale = is_attention ? jamba_attn_res_scale() : 1.0f;
-    const Tensor dy_ff = attn_res_scale != 1.0f ? dy.mul(attn_res_scale) : dy;
+    const float attn_res_scale =
+        (is_attention && !use_attn_layerscale_) ? jamba_attn_res_scale() : 1.0f;
+    const Tensor dy_ff =
+        use_attn_layerscale_
+            ? dy.mul(attn_layerscale_.data)
+            : (attn_res_scale != 1.0f ? dy.mul(attn_res_scale) : dy);
     Tensor ff_grad;
     if (is_moe) {
         ff_grad = backward_moe(masked(dy_ff, saved_drop_moe_), ctx,
@@ -3147,9 +3186,30 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
     // The mixer output passed through dropout before the residual add, so the
     // mixer's input grad carries the core mask; the x-branch of the residual
     // (used for input_grad below) does NOT — keep residual_grad unmasked there.
-    const Tensor core_in_grad = masked(
-        attn_res_scale != 1.0f ? residual_grad.mul(attn_res_scale) : residual_grad,
-        saved_drop_core_);
+    // LayerScale gamma grad: d/dgamma of (gamma*ff) and (gamma*core) summed over
+    // rows = sum(dy .* ff_pre) + sum(residual_grad .* core_pre).  Computed here,
+    // where residual_grad still holds the unscaled skip grad (the mixer grad
+    // below multiplies a COPY by gamma; the residual skip stays unscaled).
+    if (use_attn_layerscale_ && attn_layerscale_.data.size > 0) {
+        const int width = attn_layerscale_.data.size;
+        Tensor g = Tensor::zeros({width}, dy.get_device());
+        if (saved_ls_ff_.size > 0) {
+            const int rows = static_cast<int>(dy.size / width);
+            g = g.add(dy.mul(saved_ls_ff_).reshape({rows, width}).sum(0));
+        }
+        if (saved_ls_core_.size > 0) {
+            const int rows = static_cast<int>(residual_grad.size / width);
+            g = g.add(
+                residual_grad.mul(saved_ls_core_).reshape({rows, width}).sum(0));
+        }
+        attn_layerscale_.add_grad(g);
+    }
+    const Tensor core_scaled_grad =
+        use_attn_layerscale_
+            ? residual_grad.mul(attn_layerscale_.data)
+            : (attn_res_scale != 1.0f ? residual_grad.mul(attn_res_scale)
+                                      : residual_grad);
+    const Tensor core_in_grad = masked(core_scaled_grad, saved_drop_core_);
     Tensor core_grad;
     if (is_ttt && ttt_layer) {
         core_grad = ttt_layer->backward(core_in_grad);
@@ -3220,6 +3280,9 @@ void JambaBlock::to(Device dev) {
     if (core_norm_weight_.data.size > 0) {
         core_norm_weight_.data = core_norm_weight_.data.to(dev);
     }
+    if (attn_layerscale_.data.size > 0) {
+        attn_layerscale_.data = attn_layerscale_.data.to(dev);
+    }
     if (attn_layer) {
         attn_layer->to(dev);
     }
@@ -3255,6 +3318,11 @@ std::vector<Parameter*> JambaBlock::parameters() {
         core_norm_weight_.base_name = "norm.weight";
         core_norm_weight_.name = "norm.weight";
         params.push_back(&core_norm_weight_);
+    }
+    if (attn_layerscale_.data.size > 0) {
+        attn_layerscale_.base_name = "attn.layerscale";
+        attn_layerscale_.name = "attn.layerscale";
+        params.push_back(&attn_layerscale_);
     }
     if (attn_layer) {
         auto attn = attn_layer->parameters();
