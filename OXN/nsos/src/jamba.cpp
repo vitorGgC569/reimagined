@@ -474,10 +474,23 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
 
     for (int i = 0; i < num_layers; ++i) {
         const int layer_one_based = i + 1;
-        const bool use_attention =
+        bool use_attention =
             num_layers >= std::max(model_config_.attention_period, 1) &&
             layer_matches_schedule(layer_one_based, model_config_.attention_period,
                                    model_config_.attention_slot);
+        // GUARD (last-layer-Mamba): empirically isolated (attn audit, 3 rounds)
+        // — in the faithful config, an attention layer as the FINAL layer of the
+        // stack STALLS training (loss stuck at ~chance), while a Mamba final
+        // layer learns; the trigger is the last-layer TYPE, not the attention
+        // count, and non-faithful is immune.  Force the last layer to be Mamba.
+        // Env override for A/B: NSOS_ATTN_LAST_GUARD=0 disables the guard.
+        if (use_attention && model_config_.mamba2_faithful &&
+            layer_one_based == num_layers) {
+            const char* g = std::getenv("NSOS_ATTN_LAST_GUARD");
+            if (g == nullptr || g[0] != '0') {
+                use_attention = false;
+            }
+        }
         const bool use_moe =
             model_config_.use_moe &&
             num_layers >= std::max(model_config_.moe_period, 1) &&
@@ -621,6 +634,17 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
             lt0 = std::chrono::steady_clock::now();
         }
         hidden = layer->forward(hidden, ctx);
+        {
+            static const bool attn_dbg = []() {
+                const char* e = std::getenv("NSOS_ATTN_DEBUG");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (attn_dbg) {
+                std::fprintf(stderr, "[fwd L%d %-14s] out_absmean=%.5g\n",
+                             layer_index, layer->audit_block_type().c_str(),
+                             tensor_abs_mean(hidden));
+            }
+        }
         if (nsos_layer_timing) {
 #ifdef USE_CUDA
             cudaDeviceSynchronize();
@@ -1780,8 +1804,21 @@ void JambaModel::backward(const Tensor& grad, Context& ctx) {
                                           : saved_final_norm_,
             final_norm_eps);
     }
+    static const bool attn_dbg_bwd = []() {
+        const char* e = std::getenv("NSOS_ATTN_DEBUG");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (attn_dbg_bwd) {
+        std::fprintf(stderr, "[bwd final-norm] dy_absmean=%.5g\n",
+                     tensor_abs_mean(dy));
+    }
     for (int i = static_cast<int>(layers.size()) - 1; i >= 0; --i) {
         dy = layers[i]->backward(dy, &ctx);
+        if (attn_dbg_bwd) {
+            std::fprintf(stderr, "[bwd L%d %-14s] dy_in_absmean=%.5g\n", i,
+                         layers[i]->audit_block_type().c_str(),
+                         tensor_abs_mean(dy));
+        }
     }
     backward_embedding(dy, ctx);
 
