@@ -2018,7 +2018,11 @@ JambaBlock::JambaBlock(int dm,
             mamba2_faithful && is_attn && (e == nullptr || e[0] != '0');
     }
     if (use_attn_layerscale_) {
-        float ls_init = 0.1f;  // validated: 0.1 residual scale rescues terminal attn
+        // Validated default: gamma init 0.01 makes terminal attention SOLVE MQAR
+        // n_kv=8 (acc 0.97, loss->0.10 on the 1050 A/B), vs 0.35 at init 0.1 —
+        // starting attention very quiet lets Mamba establish recall while gamma
+        // grows slowly (standard small-LayerScale-init wisdom).
+        float ls_init = 0.01f;
         if (const char* v = std::getenv("NSOS_ATTN_LAYERSCALE_INIT")) {
             const float p = std::strtof(v, nullptr);
             if (p > 0.0f && p <= 1.0f) ls_init = p;
