@@ -21,11 +21,19 @@ pip install nsos-mamba
 
 O pacote precisa do runtime nativo `nsos_ext`.
 
-Na versão Windows/Python 3.11 publicada como wheel binária, o pacote já pode
-vir com runtimes embutidos:
+As wheels binárias para Windows já vêm com os runtimes embutidos, escolhidos
+automaticamente em tempo de execução:
 
 - `nsos_ext_cuda...pyd`, quando CUDA está disponível;
 - `nsos_ext_cpu...pyd`, como fallback CPU.
+
+Wheels publicadas:
+
+- `cp311` (Python 3.11, x86-64 Windows);
+- `cp312` (Python 3.12.x, x86-64 Windows) — recomendada.
+
+As wheels são específicas da versão de Python (ABI CPython) e da plataforma.
+Para outra versão/OS, aponte para um `nsos_ext` próprio (veja abaixo).
 
 Se você tiver um `nsos_ext` próprio, aponte para ele assim:
 
