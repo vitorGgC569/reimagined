@@ -59,6 +59,10 @@ pub struct GeodesicEngine {
     vector_index: Option<Index>,
     vector_records: HashMap<u64, Vec<f32>>,
     max_size_bytes: u64,
+    // When false, per-write metadata persistence is deferred until flush()/Drop.
+    sync_on_write: bool,
+    // Set on every append, cleared on persist; lets Drop skip a no-op fsync.
+    dirty: bool,
 }
 
 impl GeodesicEngine {
@@ -130,6 +134,8 @@ impl GeodesicEngine {
             // Hard ceiling for arena growth; ensure_capacity doubles the mmap up
             // to this limit instead of pinning the arena to its initial size_mb.
             max_size_bytes: absolute_max_bytes,
+            sync_on_write: true,
+            dirty: false,
         };
 
         engine.restore_metadata()?;
@@ -245,6 +251,7 @@ impl GeodesicEngine {
             tmp.sync_all()?;
         }
         std::fs::rename(&tmp_path, &self.meta_path)?;
+        self.dirty = false;
         Ok(())
     }
 
@@ -278,14 +285,24 @@ impl GeodesicEngine {
         Ok(())
     }
 
-    pub fn write(&mut self, token_id: &str, value: Vec<u8>) -> Result<u64, String> {
-        // Hybrid Search Check: If value looks like a vector (float32 bytes), index it.
-        // For prototype, we don't parse the bytes here, we assume separate method or manual handling.
-        // But let's assume if the user provides a "vector" argument (API change needed), we index it.
-        // For this function, we stick to the core log.
+    /// When `false`, `write`/`write_with_vector` skip the per-write metadata
+    /// fsync; call `flush()` (or drop the engine) to persist.  Trades recent-write
+    /// crash durability for throughput — the node bytes are already durably in the
+    /// arena, only the metadata pointer that references them is deferred.
+    pub fn set_sync_on_write(&mut self, sync_on_write: bool) {
+        self.sync_on_write = sync_on_write;
+    }
 
+    /// Durably persist the metadata snapshot (heads + vector records) to disk.
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.persist_metadata().map_err(|e| e.to_string())
+    }
+
+    pub fn write(&mut self, token_id: &str, value: Vec<u8>) -> Result<u64, String> {
         let addr = self.write_internal(token_id, value)?;
-        self.persist_metadata().map_err(|e| e.to_string())?;
+        if self.sync_on_write {
+            self.persist_metadata().map_err(|e| e.to_string())?;
+        }
         Ok(addr)
     }
 
@@ -325,7 +342,9 @@ impl GeodesicEngine {
         }
 
         self.vector_records.insert(addr, vector);
-        self.persist_metadata().map_err(|e| e.to_string())?;
+        if self.sync_on_write {
+            self.persist_metadata().map_err(|e| e.to_string())?;
+        }
 
         Ok(addr)
     }
@@ -375,6 +394,7 @@ impl GeodesicEngine {
             .ok_or_else(|| "arena offset overflow".to_string())?;
 
         self.heads.insert(token_id.to_string(), node_addr);
+        self.dirty = true;
 
         Ok(node_addr)
     }
@@ -458,6 +478,16 @@ impl GeodesicEngine {
     }
 
     pub fn search_similar(&self, vector: Vec<f32>, k: usize) -> Vec<Node> {
+        self.search_similar_scored(vector, k)
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect()
+    }
+
+    /// Like `search_similar` but returns the cosine distance next to each node
+    /// (smaller = closer; ~0 means near-identical direction).  Lets callers
+    /// threshold on relevance instead of blindly trusting the top-k ordering.
+    pub fn search_similar_scored(&self, vector: Vec<f32>, k: usize) -> Vec<(f32, Node)> {
         let mut results = Vec::new();
         if vector.len() != DEFAULT_VECTOR_DIMENSIONS
             || vector.iter().any(|value| !value.is_finite())
@@ -468,20 +498,28 @@ impl GeodesicEngine {
         }
 
         if let Some(idx) = &self.vector_index {
-            // USearch `search` returns `Result<Matches, Error>`.
-            // `Matches` stores keys and distances in internal vectors.
+            // usearch returns keys (our store addresses) and distances, ordered
+            // closest-first; pair them so callers get a relevance score.
             if let Ok(matches) = idx.search(&vector, k) {
-                // We need to iterate over the keys. Matches struct exposes .keys field.
-                for key in matches.keys {
-                    // key is the address in our store (u64)
-                    if let Some(node) = self.read_node_at(key) {
-                        results.push(node);
+                for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
+                    if let Some(node) = self.read_node_at(*key) {
+                        results.push((*distance, node));
                     }
                 }
             }
         }
 
         results
+    }
+}
+
+impl Drop for GeodesicEngine {
+    fn drop(&mut self) {
+        // Safety net for deferred (sync_on_write = false) writes: persist on a
+        // clean shutdown.  Best-effort — a failure here cannot be surfaced.
+        if self.dirty {
+            let _ = self.persist_metadata();
+        }
     }
 }
 
@@ -674,6 +712,106 @@ mod tests {
         drop(engine);
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(meta);
+    }
+
+    // Deferred durability keeps writes in-memory until flush(); a clean drop
+    // still persists them (the Drop safety net).  A crash before flush would lose
+    // the deferred writes but must never corrupt the store.
+    #[test]
+    fn deferred_durability_persists_on_flush_and_drop() {
+        let (db, meta) = test_paths("deferred");
+        {
+            let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+            engine.set_sync_on_write(false);
+            engine.write("k", vec![1, 2, 3]).unwrap();
+            engine.write("k", vec![4, 5, 6]).unwrap();
+            engine.flush().unwrap();
+            // written after the flush -> only persisted by the Drop safety net
+            engine.write("k", vec![7, 8, 9]).unwrap();
+        }
+        {
+            let engine = GeodesicEngine::new(&db, 2).unwrap();
+            assert_eq!(
+                engine.recall("k", 10).len(),
+                3,
+                "flushed + drop-persisted writes all survive restart"
+            );
+        }
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    // Scored search exposes cosine distance: closest first, exact match ~0.
+    #[test]
+    fn scored_search_orders_by_distance() {
+        let (db, meta) = test_paths("scored");
+        let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+        let a = unit_vector(DEFAULT_VECTOR_DIMENSIONS, 0);
+        let b = unit_vector(DEFAULT_VECTOR_DIMENSIONS, 1); // orthogonal to a
+        engine
+            .write_with_vector("a", b"A".to_vec(), a.clone())
+            .unwrap();
+        engine
+            .write_with_vector("b", b"B".to_vec(), b.clone())
+            .unwrap();
+
+        let scored = engine.search_similar_scored(a.clone(), 2);
+        assert_eq!(scored.len(), 2);
+        assert_eq!(scored[0].1.value, b"A", "exact match ranked first");
+        assert!(
+            scored[0].0 <= scored[1].0,
+            "distances ascending (closest first)"
+        );
+        assert!(
+            scored[0].0 < 1e-3,
+            "exact-match cosine distance ~0, got {}",
+            scored[0].0
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    // Quantifies the per-write fsync ceiling vs deferred durability.  Run with:
+    //   cargo test -p oxta_mem --release -- --ignored --nocapture write_throughput
+    #[test]
+    #[ignore = "write-throughput benchmark; run explicitly with --ignored --nocapture"]
+    fn write_throughput_sync_vs_deferred() {
+        let n = 2000usize;
+        let value = vec![0u8; 64];
+
+        let (db1, m1) = test_paths("thr_sync");
+        let mut sync_engine = GeodesicEngine::new(&db1, 32).unwrap();
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            sync_engine.write(&format!("k{i}"), value.clone()).unwrap();
+        }
+        let sync_ms = t.elapsed().as_secs_f64() * 1000.0;
+        drop(sync_engine);
+        let _ = std::fs::remove_file(&db1);
+        let _ = std::fs::remove_file(&m1);
+
+        let (db2, m2) = test_paths("thr_deferred");
+        let mut def_engine = GeodesicEngine::new(&db2, 32).unwrap();
+        def_engine.set_sync_on_write(false);
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            def_engine.write(&format!("k{i}"), value.clone()).unwrap();
+        }
+        def_engine.flush().unwrap();
+        let def_ms = t.elapsed().as_secs_f64() * 1000.0;
+        drop(def_engine);
+        let _ = std::fs::remove_file(&db2);
+        let _ = std::fs::remove_file(&m2);
+
+        println!(
+            "\n[write throughput N={n}] sync={sync_ms:.0}ms ({:.0}/s)  \
+             deferred+flush={def_ms:.0}ms ({:.0}/s)  speedup {:.1}x",
+            n as f64 / (sync_ms / 1000.0),
+            n as f64 / (def_ms / 1000.0).max(1e-9),
+            sync_ms / def_ms.max(1e-9)
+        );
     }
 
     // Deterministic splitmix64 PRNG so the benchmark is reproducible without
