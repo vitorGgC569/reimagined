@@ -19,6 +19,20 @@ const MAX_METADATA_HEADS: usize = 1_000_000;
 const MAX_VECTOR_RECORDS: usize = 100_000;
 const MAX_ARCHIVED_NODE_BYTES: u64 = MAX_VALUE_BYTES as u64 + 1024 * 1024;
 
+/// usearch needs capacity reserved before `add`; inserting into a zero-capacity
+/// index dereferences uninitialised internals and crashes the process (this path
+/// was never exercised by a successful write, so the crash shipped latent).  Grow
+/// geometrically (double, min 1024) so bulk ingestion amortizes to O(1) reserves
+/// instead of reallocating the HNSW graph on every single insert.
+fn ensure_index_capacity(idx: &Index, wanted: usize) -> Result<(), String> {
+    if wanted > idx.capacity() {
+        let target = wanted.max(idx.capacity().saturating_mul(2)).max(1024);
+        idx.reserve(target)
+            .map_err(|e| format!("Vector index reserve error: {e}"))?;
+    }
+    Ok(())
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 // rkyv 0.8 compatibility
 pub struct Node {
@@ -191,6 +205,7 @@ impl GeodesicEngine {
         }
 
         if let Some(idx) = &mut self.vector_index {
+            ensure_index_capacity(idx, self.vector_records.len()).map_err(io::Error::other)?;
             for (address, vector) in &self.vector_records {
                 idx.add(*address, vector)
                     .map_err(|e| io::Error::other(format!("Vector index restore error: {}", e)))?;
@@ -295,6 +310,8 @@ impl GeodesicEngine {
         if let Some(idx) = &mut self.vector_index {
             // Use the address as the Key in the vector index
             // Note: usearch keys are u64, perfect for our address/offset
+            let wanted = idx.size() + 1;
+            ensure_index_capacity(idx, wanted)?;
             idx.add(addr, &vector)
                 .map_err(|e| format!("Vector index error: {}", e))?;
         }
@@ -520,5 +537,155 @@ mod tests {
 
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(meta);
+    }
+
+    // Deterministic splitmix64 PRNG so the benchmark is reproducible without
+    // pulling an external `rand` dependency into the engine crate.
+    struct SplitMix(u64);
+    impl SplitMix {
+        fn u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn unit(&mut self) -> f32 {
+            // 24 random mantissa bits -> [0, 1)
+            (self.u64() >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn sym(&mut self) -> f32 {
+            self.unit() * 2.0 - 1.0
+        }
+    }
+
+    fn l2_normalize(v: &mut [f32]) {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+        for x in v.iter_mut() {
+            *x /= n;
+        }
+    }
+
+    // OxtaMem Camada 0: isolated retrieval-primitive quality.
+    // Stores N synthetic 128-dim unit vectors (value = item index), then queries
+    // with clean and noisy versions of stored vectors and measures recall@k over
+    // the cosine/usearch(HNSW) index. No model involved — this validates the
+    // memory primitive alone: "given a store + a query embedding, does it return
+    // the right item?".  Run with:
+    //   cargo test -p oxta_mem --release -- --ignored --nocapture recall_at_k
+    // Scales overridable via OXTA_RECALL_SCALES="500,2000,10000".
+    #[test]
+    #[ignore = "recall@k benchmark; run explicitly with --ignored --nocapture"]
+    fn recall_at_k_benchmark() {
+        let dim = DEFAULT_VECTOR_DIMENSIONS;
+        let scales: Vec<usize> = std::env::var("OXTA_RECALL_SCALES")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![500, 2000]);
+        let noise_levels = [0.0f32, 0.25, 0.5, 1.0, 2.0];
+        let n_queries = 300usize;
+        let k = 10usize;
+
+        println!(
+            "\n===== OxtaMem Camada 0: recall@k  (dim={}, metric=cosine, usearch HNSW) =====",
+            dim
+        );
+        println!(
+            "queries/level={}  k={}  | recall@1 = exact top-1 hit, recall@{} = target within top-{}",
+            n_queries, k, k, k
+        );
+
+        for &n in &scales {
+            let (db, meta) = test_paths(&format!("recall_{n}"));
+            // 64 MiB backing file is plenty for N up to ~100k tiny values.
+            let mut engine = GeodesicEngine::new(&db, 64).unwrap();
+
+            // ---- populate: N random unit vectors, value = index as u32 LE ----
+            let mut rng = SplitMix(0xDEAD_BEEF ^ n as u64);
+            let mut bases: Vec<Vec<f32>> = Vec::with_capacity(n);
+            let t_w = std::time::Instant::now();
+            for i in 0..n {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.sym()).collect();
+                l2_normalize(&mut v);
+                engine
+                    .write_with_vector(
+                        &format!("it{i}"),
+                        (i as u32).to_le_bytes().to_vec(),
+                        v.clone(),
+                    )
+                    .unwrap();
+                bases.push(v);
+            }
+            let w_ms = t_w.elapsed().as_secs_f64() * 1000.0;
+            let per = w_ms / n as f64;
+            println!(
+                "\n[N={}] write {:.0} ms total | {:.3} ms/op | {:.0} writes/s",
+                n,
+                w_ms,
+                per,
+                1000.0 / per.max(1e-9)
+            );
+
+            // ---- query: clean + noisy versions of stored vectors ----
+            let mut qrng = SplitMix(0x1234_5678 ^ n as u64);
+            let mut exact_recall_k = 0.0f64;
+            for &eps in &noise_levels {
+                let mut hit1 = 0usize;
+                let mut hitk = 0usize;
+                let mut lat_us = 0.0f64;
+                for _ in 0..n_queries {
+                    let j = (qrng.u64() as usize) % n;
+                    let mut q = bases[j].clone();
+                    if eps > 0.0 {
+                        for x in q.iter_mut() {
+                            *x += eps * qrng.sym();
+                        }
+                        l2_normalize(&mut q);
+                    }
+                    let t = std::time::Instant::now();
+                    let res = engine.search_similar(q, k);
+                    lat_us += t.elapsed().as_secs_f64() * 1e6;
+                    let got: Vec<u32> = res
+                        .iter()
+                        .filter(|nd| nd.value.len() >= 4)
+                        .map(|nd| {
+                            u32::from_le_bytes([nd.value[0], nd.value[1], nd.value[2], nd.value[3]])
+                        })
+                        .collect();
+                    if got.first() == Some(&(j as u32)) {
+                        hit1 += 1;
+                    }
+                    if got.contains(&(j as u32)) {
+                        hitk += 1;
+                    }
+                }
+                let r1 = hit1 as f64 / n_queries as f64;
+                let rk = hitk as f64 / n_queries as f64;
+                if eps == 0.0 {
+                    exact_recall_k = rk;
+                }
+                println!(
+                    "  eps={:.2}  recall@1={:.3}  recall@{}={:.3}  | {:.1} us/query",
+                    eps,
+                    r1,
+                    k,
+                    rk,
+                    lat_us / n_queries as f64
+                );
+            }
+
+            // Sanity guard: clean (eps=0) queries must find the exact stored item
+            // in the top-k — otherwise the primitive is broken, not just approximate.
+            assert!(
+                exact_recall_k >= 0.90,
+                "exact-query recall@{k} collapsed at N={n}: {exact_recall_k:.3} (< 0.90)"
+            );
+
+            drop(engine);
+            let _ = std::fs::remove_file(&db);
+            let _ = std::fs::remove_file(&meta);
+        }
+        println!("=====================================================================\n");
     }
 }
