@@ -1,6 +1,7 @@
 from .core import GeodesicMemoryCore, CausalAugmentedNet
 from .sdk import GeodesicClient
 from .langchain import GeodesicCausalRetriever
+from .selective import SelectiveWriter
 
 try:
     from .native import PyGeodesicEngine
@@ -13,5 +14,6 @@ __all__ = [
     "CausalAugmentedNet",
     "GeodesicClient",
     "GeodesicCausalRetriever",
+    "SelectiveWriter",
     "PyGeodesicEngine"
 ]
