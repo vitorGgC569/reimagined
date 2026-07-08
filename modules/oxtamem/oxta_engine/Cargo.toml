@@ -19,4 +19,7 @@ memmap2 = "0.9.9"
 pyo3 = { version = "0.27.2", features = ["extension-module"] }
 rkyv = "0.8.14"
 tokio = { version = "1.49.0", features = ["full"] }
-usearch = "2.23.0"
+# default-features=false drops the vendored `simsimd` C code, whose AVX-512-FP16
+# intrinsics fail to compile on some toolchains (e.g. Colab's gcc). usearch falls
+# back to its portable distance path — identical results, just without SIMD accel.
+usearch = { version = "2.23.0", default-features = false, features = ["fp16lib"] }
