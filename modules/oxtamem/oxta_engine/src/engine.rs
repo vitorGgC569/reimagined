@@ -99,7 +99,6 @@ impl GeodesicEngine {
                 "existing arena exceeds configured maximum",
             ));
         }
-        let size_bytes = current_len.max(requested_size_bytes);
         if current_len < requested_size_bytes {
             file.set_len(requested_size_bytes)?;
         }
@@ -128,7 +127,9 @@ impl GeodesicEngine {
             meta_path: db_path.with_extension("meta"),
             vector_index: Some(index),
             vector_records: HashMap::new(),
-            max_size_bytes: size_bytes,
+            // Hard ceiling for arena growth; ensure_capacity doubles the mmap up
+            // to this limit instead of pinning the arena to its initial size_mb.
+            max_size_bytes: absolute_max_bytes,
         };
 
         engine.restore_metadata()?;
@@ -304,6 +305,13 @@ impl GeodesicEngine {
         }
         if vector.iter().any(|value| !value.is_finite()) {
             return Err("Vector contains non-finite values".to_string());
+        }
+        // Enforce the same cap the restore path checks, atomically before writing
+        // anything — otherwise a store can accept vectors it can never reopen with.
+        if self.vector_records.len() >= MAX_VECTOR_RECORDS {
+            return Err(format!(
+                "vector index is full: {MAX_VECTOR_RECORDS} records is the maximum the store can reopen with"
+            ));
         }
         let addr = self.write_internal(token_id, value)?;
 
@@ -535,6 +543,135 @@ mod tests {
         assert!(engine.read_node_at(address).is_none());
         drop(engine);
 
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    fn unit_vector(dim: usize, hot: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; dim];
+        v[hot % dim] = 1.0;
+        v
+    }
+
+    // Causal recall must return a key's history newest-first, honour the depth
+    // bound, isolate keys from each other, and yield nothing for unknown keys.
+    #[test]
+    fn causal_recall_orders_and_isolates_keys() {
+        let (db, meta) = test_paths("causal");
+        let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+        for i in 1..=5u8 {
+            engine.write("x", vec![i]).unwrap();
+        }
+        engine.write("y", vec![99]).unwrap();
+
+        let rx = engine.recall("x", 10);
+        assert_eq!(rx.len(), 5, "should recall the full chain");
+        assert_eq!(rx[0].value[0], 5, "newest first");
+        assert_eq!(rx[4].value[0], 1, "oldest last");
+        assert!(
+            rx.windows(2).all(|w| w[0].timestamp >= w[1].timestamp),
+            "timestamps must be non-increasing walking back the chain"
+        );
+
+        assert_eq!(engine.recall("x", 2).len(), 2, "depth bound respected");
+
+        let ry = engine.recall("y", 10);
+        assert_eq!(ry.len(), 1, "keys are isolated");
+        assert_eq!(ry[0].value[0], 99);
+
+        assert!(
+            engine.recall("missing", 10).is_empty(),
+            "unknown key -> empty"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    // A store must survive a restart: causal chains AND the vector index have to
+    // come back.  This exercises the restore replay path that re-adds every
+    // persisted vector to a fresh usearch index (regression guard for the
+    // missing-`reserve` crash — restore adds without a live write in between).
+    #[test]
+    fn persistence_roundtrip_recovers_chains_and_vectors() {
+        let (db, meta) = test_paths("roundtrip");
+        let v_a = unit_vector(DEFAULT_VECTOR_DIMENSIONS, 0);
+        let v_b = unit_vector(DEFAULT_VECTOR_DIMENSIONS, 1);
+        {
+            let mut engine = GeodesicEngine::new(&db, 4).unwrap();
+            engine.write("k", vec![1; 8]).unwrap();
+            engine.write("k", vec![2; 8]).unwrap();
+            engine
+                .write_with_vector("a", b"AAA".to_vec(), v_a.clone())
+                .unwrap();
+            engine
+                .write_with_vector("b", b"BBB".to_vec(), v_b.clone())
+                .unwrap();
+            let hit = engine.search_similar(v_a.clone(), 1);
+            assert_eq!(hit.len(), 1);
+            assert_eq!(hit[0].value, b"AAA", "search works before restart");
+        }
+        {
+            let engine = GeodesicEngine::new(&db, 4).unwrap();
+            assert_eq!(engine.recall("k", 10).len(), 2, "chain survived restart");
+            let hit = engine.search_similar(v_a.clone(), 1);
+            assert_eq!(hit.len(), 1, "vector index rebuilt on restart");
+            assert_eq!(hit[0].value, b"AAA", "search works after restart");
+        }
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    // Writing more than the initial `size_mb` must grow the arena (the doubling
+    // logic in `ensure_capacity`), not fail with OutOfMemory.  Guards against the
+    // arena being silently pinned to its initial size.
+    #[test]
+    fn arena_grows_beyond_initial_size() {
+        let (db, meta) = test_paths("grow");
+        let mut engine = GeodesicEngine::new(&db, 1).unwrap(); // 1 MiB arena
+        let value = vec![7u8; 8 * 1024]; // 8 KiB payload
+        let count = 300; // ~2.4 MiB of payload -> must grow past 1 MiB
+        for i in 0..count {
+            engine
+                .write(&format!("k{i}"), value.clone())
+                .unwrap_or_else(|e| panic!("write {i} should grow the arena, got: {e}"));
+        }
+        let last = engine.read_latest(&format!("k{}", count - 1)).unwrap();
+        assert_eq!(last.value.len(), 8 * 1024, "late write must be readable");
+
+        drop(engine);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    // search_similar must degrade gracefully at the edges instead of crashing or
+    // returning garbage.
+    #[test]
+    fn search_similar_handles_edges() {
+        let (db, meta) = test_paths("edges");
+        let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+        let v = unit_vector(DEFAULT_VECTOR_DIMENSIONS, 3);
+
+        assert!(
+            engine.search_similar(v.clone(), 5).is_empty(),
+            "empty index -> no results"
+        );
+
+        engine
+            .write_with_vector("a", b"A".to_vec(), v.clone())
+            .unwrap();
+
+        let over_k = engine.search_similar(v.clone(), 100);
+        assert_eq!(over_k.len(), 1, "k larger than size returns what exists");
+
+        assert!(
+            engine.search_similar(vec![0.0; 10], 5).is_empty(),
+            "wrong dimension is rejected, not searched"
+        );
+        assert!(engine.search_similar(v, 0).is_empty(), "k=0 -> empty");
+
+        drop(engine);
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(meta);
     }
