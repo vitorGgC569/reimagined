@@ -373,4 +373,55 @@ mod tests {
             .expect("bounded response should fit");
         assert!(response.len() <= 128);
     }
+
+    // The RESP parser reads untrusted network bytes; it must never panic (index
+    // out of bounds, slice overflow, ...) on any input — only ever return
+    // Ok(None) (need more), Ok(Some) (frame), or Err (reject).
+    #[test]
+    fn parse_resp_never_panics_on_arbitrary_input() {
+        let config = RespServerConfig::default();
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (rng() % 96) as usize;
+            let mut buf = BytesMut::with_capacity(len);
+            for _ in 0..len {
+                // bias toward RESP-significant bytes so we explore real code paths
+                let byte = match rng() % 8 {
+                    0 => b'*',
+                    1 => b'$',
+                    2 => b'\r',
+                    3 => b'\n',
+                    4 => b'0' + (rng() % 10) as u8,
+                    _ => (rng() % 256) as u8,
+                };
+                buf.extend_from_slice(&[byte]);
+            }
+            // A panic here fails the test; any Ok/Err is acceptable.
+            let _ = parse_resp(&buf, &config);
+        }
+
+        // Crafted malformed / truncated frames.
+        let cases: [&[u8]; 9] = [
+            b"*",
+            b"*1\r\n",
+            b"*1\r\n$",
+            b"*-1\r\n",
+            b"*99999999\r\n",
+            b"*2\r\n$3\r\nfoo\r\n$",
+            b"*1\r\n$3\r\nfo\r\n",
+            b"$3\r\nfoo\r\n",
+            b"*1\r\n*1\r\n",
+        ];
+        for case in cases {
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(case);
+            let _ = parse_resp(&buf, &config);
+        }
+    }
 }

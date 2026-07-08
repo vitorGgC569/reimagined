@@ -773,6 +773,80 @@ mod tests {
         let _ = std::fs::remove_file(meta);
     }
 
+    // A torn or corrupt metadata file must be rejected on open — never a panic
+    // and never a half-valid store.
+    #[test]
+    fn torn_metadata_is_rejected_on_open() {
+        let (db, meta) = test_paths("torn");
+        {
+            let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+            engine.write("k", vec![1, 2, 3]).unwrap();
+        }
+        // Truncate the persisted metadata to half its bytes (simulates a crash
+        // mid-write); rkyv stores its root at the tail, so a truncated buffer can
+        // no longer be resolved.
+        let data = std::fs::read(&meta).unwrap();
+        assert!(data.len() > 8);
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&meta)
+                .unwrap();
+            file.write_all(&data[..data.len() / 2]).unwrap();
+        }
+        assert!(
+            GeodesicEngine::new(&db, 2).is_err(),
+            "torn metadata must fail to open, not load a corrupt store"
+        );
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    // The engine behind an Arc<Mutex<...>> (how the server shares it) must stay
+    // consistent under many concurrent writers: every write lands, none corrupt.
+    #[test]
+    fn concurrent_writers_stay_consistent() {
+        use std::sync::{Arc, Mutex};
+        let (db, meta) = test_paths("concurrent");
+        let engine = Arc::new(Mutex::new(GeodesicEngine::new(&db, 16).unwrap()));
+        engine.lock().unwrap().set_sync_on_write(false); // keep the test fast
+        let threads = 8usize;
+        let per_thread = 50usize;
+
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let eng = engine.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        eng.lock()
+                            .unwrap()
+                            .write(&format!("t{t}_{i}"), vec![t as u8; 4])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let guard = engine.lock().unwrap();
+        for t in 0..threads {
+            for i in 0..per_thread {
+                let node = guard
+                    .read_latest(&format!("t{t}_{i}"))
+                    .expect("every concurrent write must be readable");
+                assert_eq!(node.value, vec![t as u8; 4]);
+            }
+        }
+        drop(guard);
+        drop(engine);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
     // Quantifies the per-write fsync ceiling vs deferred durability.  Run with:
     //   cargo test -p oxta_mem --release -- --ignored --nocapture write_throughput
     #[test]
