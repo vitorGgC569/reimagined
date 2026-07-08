@@ -65,6 +65,29 @@ impl PyGeodesicEngine {
         let nodes = self.inner.search_similar(vector, k);
         Ok(nodes.into_iter().map(|n| n.value).collect())
     }
+
+    // Similarity search that also returns the cosine distance per hit
+    // (smaller = closer) so callers can threshold on relevance.
+    fn search_similar_scored(&self, vector: Vec<f32>, k: usize) -> PyResult<Vec<(f32, Vec<u8>)>> {
+        Ok(self
+            .inner
+            .search_similar_scored(vector, k)
+            .into_iter()
+            .map(|(distance, node)| (distance, node.value))
+            .collect())
+    }
+
+    // Defer per-write metadata fsync (huge throughput win for bulk ingestion);
+    // call flush() to persist. See GeodesicEngine::set_sync_on_write.
+    fn set_sync_on_write(&mut self, sync_on_write: bool) {
+        self.inner.set_sync_on_write(sync_on_write);
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        self.inner
+            .flush()
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
+    }
 }
 
 pub struct OxtaMemHandle {
