@@ -34,8 +34,11 @@ public sealed class WebBridge
             case "session": return Session();
             case "logout": _auth.Logout(); return Ok(new { });
             case "password.change": return PasswordChange(payload);
+            case "license.info": return LicenseInfo();
 
             case "clients.list": return ClientsList();
+            case "clients.create": return ClientsCreate(payload);
+            case "clients.update": return ClientsUpdate(payload);
 
             case "documents.list": return DocumentsList(payload);
             case "documents.upload": return DocumentsUpload(payload);
@@ -67,6 +70,11 @@ public sealed class WebBridge
     // ── Auth ──
     private object Login(JsonElement p)
     {
+        // Gate de licença de avaliação: sem license.ocl válida (assinatura ECDSA +
+        // prazo), ninguém entra. Fica no lado C# — a UI web não consegue contornar.
+        var lic = LicenseService.Check();
+        if (!lic.Valida) return Err(lic.Motivo ?? "Licença inválida.");
+
         var user = Str(p, "user");
         var pass = Str(p, "pass");
         if (string.IsNullOrWhiteSpace(user) || string.IsNullOrEmpty(pass))
@@ -110,6 +118,13 @@ public sealed class WebBridge
         return Ok(new { changed = true });
     }
 
+    // Situação da licença de avaliação (para a UI exibir prazo restante).
+    private object LicenseInfo()
+    {
+        var l = LicenseService.Check();
+        return Ok(new { valida = l.Valida, motivo = l.Motivo, nome = l.Nome, expiraUtc = l.ExpiraUtc, diasRestantes = l.DiasRestantes });
+    }
+
     private static object UserDto(Models.User u) => new
     {
         id = u.Id,
@@ -134,6 +149,69 @@ public sealed class WebBridge
             volume = c.DocumentCount,
         }).ToList();
         return Ok(rows);
+    }
+
+    // Cadastro real de cliente (a UI antiga era mock: "salvava" e evaporava).
+    private object ClientsCreate(JsonElement p)
+    {
+        if (!_auth.IsLoggedIn || _auth.CurrentUser == null) return Err("Sessão expirada. Faça login novamente.");
+        if (!_auth.CanEdit) return Err("Sem permissão para cadastrar clientes.");
+
+        var nome = Str(p, "nome").Trim();
+        var cnpj = CanonicalCnpj(Str(p, "cnpj"));
+        var regime = Str(p, "regime").Trim();
+        if (string.IsNullOrWhiteSpace(nome)) return Err("Informe a razão social.");
+        if (cnpj == null) return Err("CNPJ inválido — confira os dígitos.");
+
+        using var db = new AppDbContext();
+        if (db.Clients.Any(c => c.Cnpj == cnpj)) return Err("Já existe um cliente com esse CNPJ.");
+
+        var cli = new Client
+        {
+            Name = nome,
+            Cnpj = cnpj,
+            TaxRegime = string.IsNullOrWhiteSpace(regime) ? "Simples Nacional" : regime,
+            Email = Str(p, "email").Trim(),
+            IsActive = true,
+            CreatedAt = DateTime.Now,
+        };
+        db.Clients.Add(cli);
+        db.SaveChanges();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "client.create", "Clients", cli.Id, cnpj);
+        return Ok(new { id = cli.Id });
+    }
+
+    // Edição parcial: só altera o que veio preenchido. CNPJ é identidade — imutável.
+    private object ClientsUpdate(JsonElement p)
+    {
+        if (!_auth.IsLoggedIn || _auth.CurrentUser == null) return Err("Sessão expirada. Faça login novamente.");
+        if (!_auth.CanEdit) return Err("Sem permissão para editar clientes.");
+
+        int id = Int(p, "id");
+        using var db = new AppDbContext();
+        var cli = db.Clients.Find(id);
+        if (cli == null) return Err("Cliente não encontrado.");
+
+        var nome = Str(p, "nome").Trim();
+        var regime = Str(p, "regime").Trim();
+        if (!string.IsNullOrWhiteSpace(nome)) cli.Name = nome;
+        if (!string.IsNullOrWhiteSpace(regime)) cli.TaxRegime = regime;
+        if (p.ValueKind == JsonValueKind.Object && p.TryGetProperty("ativo", out var at) &&
+            at.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            cli.IsActive = at.GetBoolean();
+
+        db.SaveChanges();
+        AuditLogger.Write(db, _auth.CurrentUser?.Id, "client.update", "Clients", cli.Id,
+            $"ativo={cli.IsActive}");
+        return Ok(new { id = cli.Id });
+    }
+
+    // Valida os dígitos verificadores e devolve no formato canônico XX.XXX.XXX/XXXX-XX.
+    private static string? CanonicalCnpj(string raw)
+    {
+        var d = Regex.Replace(raw ?? "", @"[^\d]", "");
+        if (d.Length != 14 || !Validators.ValidateCnpj(d)) return null;
+        return $"{d[..2]}.{d[2..5]}.{d[5..8]}/{d[8..12]}-{d[12..14]}";
     }
 
     // ── Documents (list / upload / reprocess / status) ──

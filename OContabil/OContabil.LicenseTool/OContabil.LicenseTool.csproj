@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>OContabil.LicenseTool</AssemblyName>
+    <Description>Gera chaves e emite licencas de avaliacao do OContabil (offline, assinadas)</Description>
+  </PropertyGroup>
+</Project>
