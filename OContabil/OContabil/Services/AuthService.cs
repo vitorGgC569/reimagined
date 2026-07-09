@@ -77,8 +77,16 @@ public class AuthService
         if (!PasswordHasher.Verify(currentPassword, user.PasswordHash)) return false;
 
         user.PasswordHash = PasswordHasher.Hash(newPassword);
+        user.MustChangePassword = false;   // troca concluída → não exigir de novo
         db.SaveChanges();
         AuditLogger.Write(db, userId, "auth.password.changed", "Users", userId, "Senha alterada pelo proprio usuario");
+
+        // Mantém a sessão em memória coerente com o banco.
+        if (CurrentUser != null && CurrentUser.Id == userId)
+        {
+            CurrentUser.PasswordHash = user.PasswordHash;
+            CurrentUser.MustChangePassword = false;
+        }
         return true;
     }
 

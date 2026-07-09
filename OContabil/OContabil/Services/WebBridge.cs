@@ -33,6 +33,7 @@ public sealed class WebBridge
             case "login": return Login(payload);
             case "session": return Session();
             case "logout": _auth.Logout(); return Ok(new { });
+            case "password.change": return PasswordChange(payload);
 
             case "clients.list": return ClientsList();
 
@@ -89,6 +90,26 @@ public sealed class WebBridge
     private object Session() =>
         _auth.IsLoggedIn && _auth.CurrentUser != null ? Ok(UserDto(_auth.CurrentUser)) : Err("sem sessão");
 
+    // Troca de senha do próprio usuário (usada pelo fluxo obrigatório de primeiro
+    // acesso e pela tela de conta). Exige sessão + senha atual correta.
+    private object PasswordChange(JsonElement p)
+    {
+        if (!_auth.IsLoggedIn || _auth.CurrentUser == null)
+            return Err("Sessão expirada. Faça login novamente.");
+
+        var atual = Str(p, "atual");
+        var nova = Str(p, "nova");
+        if (string.IsNullOrWhiteSpace(nova) || nova.Length < 8)
+            return Err("A nova senha deve ter ao menos 8 caracteres.");
+        if (nova == atual)
+            return Err("A nova senha deve ser diferente da atual.");
+
+        if (!_auth.ChangePassword(_auth.CurrentUser.Id, atual, nova))
+            return Err("Senha atual incorreta.");
+
+        return Ok(new { changed = true });
+    }
+
     private static object UserDto(Models.User u) => new
     {
         id = u.Id,
@@ -96,6 +117,7 @@ public sealed class WebBridge
         usuario = u.Username,
         papel = u.Role.ToString(),
         canManageUsers = u.Role == Models.UserRole.Admin,
+        mustChangePassword = u.MustChangePassword,
     };
 
     // ── Clients ──
@@ -286,64 +308,67 @@ public sealed class WebBridge
         return Ok(new { id, status = WebStatus(doc.Status) });
     }
 
-    // ── Exports (real CSV/TXT of the extracted data, saved via native dialog) ──
+    // ── Exports — despacha para os geradores reais (SPED/Domínio/Excel/CSV/PDF) ──
+    // via ExportManager. Salva pelo diálogo nativo; nada trafega para a nuvem.
     private object ExportsRun(JsonElement p)
     {
-        string fmt = Str(p, "format");
-        int clientId = Int(p, "clienteId");
         string tipo = Str(p, "tipo");
         string status = Str(p, "status");
-
-        using var db = new AppDbContext();
-        var q = db.Documents.Include(d => d.Client).AsQueryable();
+        int clientId = Int(p, "clienteId");
         var ids = IntArray(p, "ids");
-        if (ids.Length > 0) q = q.Where(d => ids.Contains(d.Id));
-        if (clientId > 0) q = q.Where(d => d.ClientId == clientId);
-        if (!string.IsNullOrEmpty(tipo) && tipo != "todos") q = q.Where(d => d.DocumentType == tipo);
-        if (status == "aprovado") q = q.Where(d => d.Status == DocumentStatus.Validated);
+        var fmt = ParseExportFormat(Str(p, "format"));
 
-        var docs = q.OrderByDescending(d => d.Id).ToList();
-        if (docs.Count == 0) return Err("Nenhum documento corresponde ao filtro selecionado.");
+        var request = new Exports.ExportRequest
+        {
+            ClientId = clientId > 0 ? clientId : (int?)null,
+            DocumentType = (!string.IsNullOrEmpty(tipo) && tipo != "todos") ? tipo : null,
+            // Seleção explícita (export em massa) ignora o filtro de "somente aprovados":
+            // exporta exatamente o que o usuário marcou. Caso contrário, respeita o status.
+            OnlyValidated = ids.Length == 0 && status == "aprovado",
+            DocumentIds = ids.Length > 0 ? ids : null,
+        };
 
-        // Honest scope: official SPED/Domínio binary layouts are not implemented;
-        // every format exports the real extracted data as UTF-8 CSV (opens in Excel).
-        bool official = fmt is "sped" or "dominio";
+        // Pré-consulta só para contar (early-return amigável antes de abrir o diálogo).
+        int count;
+        using (var db = new AppDbContext())
+            count = Exports.ExportRepository.Query(db, request).Count;
+        if (count == 0) return Err("Nenhum documento corresponde ao filtro selecionado.");
+
+        var manager = new Exports.ExportManager();
         var sfd = new Microsoft.Win32.SaveFileDialog
         {
-            FileName = $"export_{(string.IsNullOrEmpty(fmt) ? "csv" : fmt)}_{DateTime.Now:yyyyMM}.csv",
-            Filter = "CSV UTF-8 (*.csv)|*.csv|Todos os arquivos (*.*)|*.*",
+            FileName = $"OContabil_{fmt}_{DateTime.Now:yyyyMMdd_HHmmss}.{manager.DefaultExtension(fmt)}",
+            Filter = manager.DefaultFilter(fmt),
             Title = "Salvar exportação",
         };
         if (sfd.ShowDialog() != true) return Ok(new { canceled = true });
+        request.OutputPath = sfd.FileName;
 
-        var sb = new StringBuilder();
-        sb.AppendLine("id;arquivo;tipo;cliente;cnpj;status;confianca;data_upload;valor;json_extraido");
-        foreach (var d in docs)
+        string path;
+        try { path = manager.Export(fmt, request); }
+        catch (Exception ex)
         {
-            var valor = ParseBrl(FindField(d.ExtractedJson, "valor_total", "valor_total_nota", "valor_principal", "valor"));
-            sb.Append(d.Id).Append(';')
-              .Append(Csv(d.Filename)).Append(';')
-              .Append(Csv(d.DocumentType)).Append(';')
-              .Append(Csv(d.Client?.Name)).Append(';')
-              .Append(Csv(d.Client?.Cnpj)).Append(';')
-              .Append(Csv(d.StatusDisplay)).Append(';')
-              .Append((d.ConfidenceScore ?? 0).ToString("0.00", CultureInfo.InvariantCulture)).Append(';')
-              .Append(d.UploadedAt.ToString("yyyy-MM-dd")).Append(';')
-              .Append(valor.ToString("0.00", CultureInfo.InvariantCulture)).Append(';')
-              .Append(Csv(d.ExtractedJson))
-              .AppendLine();
+            SafeLog.Error("export.run", ex);
+            return Err("Não foi possível gerar o arquivo de exportação.");
         }
-        File.WriteAllText(sfd.FileName, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-        AuditLogger.Write(db, _auth.CurrentUser?.Id, "export.run", "Documents", null,
-            $"format={fmt}; count={docs.Count}; file={Path.GetFileName(sfd.FileName)}");
+        if (string.IsNullOrEmpty(path))
+            return Err("Nenhum documento corresponde ao filtro selecionado.");
 
-        return Ok(new
-        {
-            path = sfd.FileName,
-            count = docs.Count,
-            note = official ? $"Layout oficial {fmt.ToUpperInvariant()} ainda não implementado — dados exportados em CSV." : (string?)null,
-        });
+        using (var db = new AppDbContext())
+            AuditLogger.Write(db, _auth.CurrentUser?.Id, "export.run", "Documents", null,
+                $"format={fmt}; count={count}; file={Path.GetFileName(path)}");
+
+        return Ok(new { path, count, format = fmt.ToString() });
     }
+
+    private static Exports.ExportFormat ParseExportFormat(string fmt) => (fmt ?? "").ToLowerInvariant() switch
+    {
+        "sped" => Exports.ExportFormat.Sped,
+        "dominio" => Exports.ExportFormat.Dominio,
+        "excel" or "xlsx" => Exports.ExportFormat.Excel,
+        "pdf" => Exports.ExportFormat.Pdf,
+        _ => Exports.ExportFormat.Csv,
+    };
 
     // ── Backup / Recuperação (cifrado por SENHA, independente do db.key/DPAPI) ──
     private object BackupExport(JsonElement p)
@@ -723,8 +748,6 @@ public sealed class WebBridge
         if (t.Contains(',')) t = t.Replace(".", "").Replace(",", ".");
         return double.TryParse(t, NumberStyles.Any, CultureInfo.InvariantCulture, out var v) ? v : 0;
     }
-
-    private static string Csv(string? s) => SecureCsv.Cell(s);
 
     private static string Str(JsonElement p, string key) =>
         p.ValueKind == JsonValueKind.Object && p.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String

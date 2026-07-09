@@ -68,6 +68,55 @@ public sealed class DocumentProcessingQueue
             ToastService.ShowInfo($"Documento enfileirado para processamento ({_queue.Count} na fila)."));
     }
 
+    /// <summary>
+    /// Recuperação pós-crash. A fila vive só em memória, então documentos deixados em
+    /// Pending/Processing (app fechado ou travado no meio do processamento) ficariam
+    /// presos para sempre. No arranque, re-enfileira os que ainda têm arquivo em disco
+    /// e marca como Erro os órfãos (arquivo original sumiu). Chamado uma vez no startup.
+    /// </summary>
+    public void RecoverInterrupted()
+    {
+        try
+        {
+            using var db = new AppDbContext();
+            var stuck = db.Documents
+                .Where(d => d.Status == DocumentStatus.Pending || d.Status == DocumentStatus.Processing)
+                .ToList();
+            if (stuck.Count == 0) return;
+
+            int requeued = 0, orphaned = 0;
+            var toRequeue = new List<QueueItem>();
+            foreach (var doc in stuck)
+            {
+                if (!string.IsNullOrEmpty(doc.FilePath) && System.IO.File.Exists(doc.FilePath))
+                {
+                    doc.Status = DocumentStatus.Processing;
+                    toRequeue.Add(new QueueItem(doc.Id, doc.FilePath, doc.DocumentType));
+                    requeued++;
+                }
+                else
+                {
+                    doc.Status = DocumentStatus.Error;
+                    doc.OcrText = "Arquivo original não encontrado após reinício — reenvie o documento.";
+                    doc.ProcessedAt = DateTime.Now;
+                    orphaned++;
+                }
+            }
+
+            // Commit ANTES de liberar ao consumidor: garante que o status já está no banco
+            // quando a thread de processamento (contexto próprio) tocar o documento — sem
+            // corrida de "lost update" sobrescrevendo o resultado da reanálise.
+            db.SaveChanges();
+            foreach (var item in toRequeue) { _queue.Enqueue(item); _signal.Release(); }
+
+            SafeLog.Info("queue.recover", $"reenfileirados={requeued}; orfaos={orphaned}");
+        }
+        catch (Exception ex)
+        {
+            SafeLog.Error("queue.recover", ex);
+        }
+    }
+
     private void StartConsumer()
     {
         if (_isRunning) return;

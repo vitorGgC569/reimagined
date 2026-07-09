@@ -34,10 +34,11 @@ public class PasswordHasherTests
     [Fact]
     public void Verify_LegacySha256_ReturnsTrueAndNeedsUpgrade()
     {
-        // SHA256("admin") em base64 / hex puro (compatibilidade reversa)
+        // Formato legado real: SHA256(senha) em HEX minúsculo de 64 chars (o que a
+        // versão original gravava; VerifyLegacySha256 compara em hex).
         using var sha = System.Security.Cryptography.SHA256.Create();
         var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes("admin"));
-        var legacy = Convert.ToBase64String(bytes);
+        var legacy = Convert.ToHexString(bytes).ToLowerInvariant();
 
         PasswordHasher.Verify("admin", legacy).Should().BeTrue();
         PasswordHasher.NeedsUpgrade(legacy).Should().BeTrue();

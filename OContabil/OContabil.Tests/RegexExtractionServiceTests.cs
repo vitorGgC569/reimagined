@@ -21,9 +21,10 @@ public class RegexExtractionServiceTests
         result.Success.Should().BeTrue();
         result.Extraction.Should().NotBeNull();
 
-        var root = (JsonElement)result.Extraction!;
-        root.GetProperty("numero_nota").GetString().Should().Be("123456");
-        root.GetProperty("data_emissao").GetString().Should().Contain("15/03/2024");
+        // Contrato de extração: { "<grupo>": { "<campo>": { text, confidence } } }.
+        var group = ((JsonElement)result.Extraction!).GetProperty("nota_fiscal");
+        group.GetProperty("numero_nota").GetProperty("text").GetString().Should().Be("123456");
+        group.GetProperty("data_emissao").GetProperty("text").GetString().Should().Contain("15/03/2024");
     }
 
     [Fact]

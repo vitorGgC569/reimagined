@@ -22,6 +22,9 @@ public partial class WebShellWindow : Window
     {
         InitializeComponent();
         using (var db = new AppDbContext()) DbInitializer.Initialize(db);
+        // A fila é em memória: recupera documentos presos em Pending/Processing de uma
+        // sessão anterior (crash/fechamento). Acessar .Instance também inicia o consumidor.
+        DocumentProcessingQueue.Instance.RecoverInterrupted();
         _bridge = new WebBridge(_auth);
         Loaded += async (_, _) => await InitAsync();
     }

@@ -14,6 +14,10 @@ internal static class ExportRepository
             .Include(d => d.ValidatedBy)
             .Include(d => d.UploadedBy);
 
+        // Seleção explícita tem precedência: exporta exatamente os IDs marcados.
+        if (request.DocumentIds is { Count: > 0 } ids)
+            q = q.Where(d => ids.Contains(d.Id));
+
         if (request.OnlyValidated)
             q = q.Where(d => d.Status == DocumentStatus.Validated);
 
