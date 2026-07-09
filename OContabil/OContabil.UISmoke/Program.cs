@@ -18,7 +18,7 @@ using FlaUI.UIA3;
 class Program
 {
     static readonly string Exe = Environment.GetEnvironmentVariable("OCONTABIL_EXE")
-        ?? @"C:\Users\Oxta\Desktop\reimagined-main\.claude\worktrees\clever-roentgen-ba007c\OContabil\OContabil\bin\Debug\net8.0-windows\OContabil.exe";
+        ?? @"C:\Users\Oxta\Desktop\reimagined-main\.claude\worktrees\ocontabil-gaps\OContabil\OContabil\bin\Debug\net8.0-windows\OContabil.exe";
     static readonly string ShotDir = @"C:\Users\Oxta\AppData\Local\Temp\ocontabil_shots";
     const StringComparison OIC = StringComparison.OrdinalIgnoreCase;
 
@@ -49,14 +49,53 @@ class Program
 
     static void Login(Window win)
     {
+        // Seed novo (seguro): DB fresco gera senha temporaria aleatoria gravada em
+        // FIRST_ACCESS.txt + MustChangePassword. Le a temporaria de la; "admin" e so
+        // fallback para DBs antigos. Override manual: OCONTABIL_PASS.
+        var pass = Environment.GetEnvironmentVariable("OCONTABIL_PASS") ?? ReadTempPassword() ?? "admin";
+        Console.WriteLine("senha usada: " + (pass == "admin" ? "admin (fallback)" : "FIRST_ACCESS.txt"));
+
         var edits = Retry(() => { var l = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Edit)).ToList(); return l.Count >= 2 ? l : null; }, 14);
         if (edits == null) { Console.WriteLine("inputs login nao encontrados"); return; }
         TypeInto(edits[0], "admin");
-        TypeInto(edits[1], "admin");
+        TypeInto(edits[1], pass);
         var btn = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button)).FirstOrDefault(el => (el.Name ?? "").Trim().Equals("Entrar", OIC));
         if (btn != null) { try { btn.AsButton().Invoke(); } catch { try { btn.Click(); } catch { } } }
         Console.WriteLine("login enviado");
         Thread.Sleep(7000);
+
+        // Gate de primeiro acesso ("Defina uma nova senha"): preenche nova+confirmacao
+        // e salva. Valida em runtime o fluxo MustChangePassword -> password.change.
+        var salvar = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button))
+            .FirstOrDefault(b => (b.Name ?? "").Trim().StartsWith("Salvar e entrar", OIC));
+        if (salvar != null)
+        {
+            const string nova = "Smoke#2026!Ui";
+            var pwEdits = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Edit)).ToList();
+            if (pwEdits.Count >= 2)
+            {
+                TypeInto(pwEdits[0], nova);
+                TypeInto(pwEdits[1], nova);
+                try { salvar.AsButton().Invoke(); } catch { try { salvar.Click(); } catch { } }
+                Console.WriteLine("primeiro acesso: senha temporaria trocada");
+                Thread.Sleep(6000);
+            }
+            else Console.WriteLine("gate de troca detectado mas inputs nao encontrados");
+        }
+    }
+
+    static string ReadTempPassword()
+    {
+        try
+        {
+            var p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "OContabil", "FIRST_ACCESS.txt");
+            if (!File.Exists(p)) return null;
+            var line = File.ReadAllLines(p).FirstOrDefault(l => l.StartsWith("Senha temporaria:", OIC));
+            var pw = line?.Substring("Senha temporaria:".Length).Trim();
+            return string.IsNullOrEmpty(pw) ? null : pw;
+        }
+        catch { return null; }
     }
 
     static void NavFlow(Window win)

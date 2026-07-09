@@ -27,14 +27,37 @@ function LoginScreen({ onLogin }) {
   const [loading, setLoading] = useState(false);
   const [showPass, setShowPass] = useState(false);
   const [err, setErr] = useState('');
+  // Troca de senha obrigatória (primeiro acesso / MustChangePassword).
+  const [pending, setPending] = useState(null);
+  const [nova, setNova] = useState('');
+  const [conf, setConf] = useState('');
+  const [chgErr, setChgErr] = useState('');
+  const [chgBusy, setChgBusy] = useState(false);
 
   const submit = (e) => {
     e.preventDefault();
     setLoading(true); setErr('');
     window.OContabilBridge.call('login', { user: user, pass: pass }).then(function (r) {
       setLoading(false);
-      if (r && r.ok) { onLogin(r.data); }
+      if (r && r.ok) {
+        if (r.data && r.data.mustChangePassword) { setPending(r.data); }
+        else { onLogin(r.data); }
+      }
       else { setErr((r && r.error) || 'Falha no login'); }
+    });
+  };
+
+  const submitChange = (e) => {
+    e.preventDefault();
+    setChgErr('');
+    if (nova.length < 8) { setChgErr('A nova senha deve ter ao menos 8 caracteres.'); return; }
+    if (nova !== conf) { setChgErr('A confirmação não confere.'); return; }
+    if (nova === pass) { setChgErr('A nova senha deve ser diferente da temporária.'); return; }
+    setChgBusy(true);
+    window.OContabilBridge.call('password.change', { atual: pass, nova: nova }).then(function (r) {
+      setChgBusy(false);
+      if (r && r.ok) { const u = pending; setPending(null); onLogin(u); }
+      else { setChgErr((r && r.error) || 'Não foi possível alterar a senha.'); }
     });
   };
 
@@ -43,6 +66,36 @@ function LoginScreen({ onLogin }) {
     background: 'var(--surface)', border: '1px solid var(--hairline)', borderRadius: 'var(--r-md)',
     color: 'var(--text)', outline: 'none', fontFamily: 'var(--font-sans)', transition: 'border-color .14s',
   };
+
+  // Gate obrigatório: primeiro acesso / senha temporária → troca antes de entrar.
+  if (pending) {
+    return (
+      <div style={{ minHeight: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--paper)', padding: 32 }}>
+        <form onSubmit={submitChange} style={{ width: '100%', maxWidth: 400 }}>
+          <Logo size={30} />
+          <h1 style={{ fontSize: 22, fontWeight: 600, letterSpacing: '-0.02em', margin: '22px 0 6px', color: 'var(--text)' }}>Defina uma nova senha</h1>
+          <p style={{ fontSize: 13.5, color: 'var(--text-2)', margin: '0 0 26px' }}>
+            Primeiro acesso: por segurança, troque a senha temporária antes de continuar.
+          </p>
+
+          <label style={{ display: 'block', fontSize: 12.5, fontWeight: 500, color: 'var(--text-2)', marginBottom: 7 }}>Nova senha (mín. 8)</label>
+          <input type="password" value={nova} onChange={e => setNova(e.target.value)} style={inputStyle}
+            onFocus={e => e.target.style.borderColor = 'var(--accent)'} onBlur={e => e.target.style.borderColor = 'var(--hairline)'} />
+
+          <label style={{ display: 'block', fontSize: 12.5, fontWeight: 500, color: 'var(--text-2)', margin: '18px 0 7px' }}>Confirmar nova senha</label>
+          <input type="password" value={conf} onChange={e => setConf(e.target.value)} style={inputStyle}
+            onFocus={e => e.target.style.borderColor = 'var(--accent)'} onBlur={e => e.target.style.borderColor = 'var(--hairline)'} />
+
+          {chgErr && <div style={{ margin: '16px 0 0', fontSize: 12.5, color: 'var(--st-rejected)', background: 'var(--st-rejected-bg)', padding: '9px 12px', borderRadius: 'var(--r-md)', border: '1px solid var(--hairline)' }}>{chgErr}</div>}
+          <div style={{ marginTop: 22 }}>
+            <Button type="submit" variant="primary" size="lg" full disabled={chgBusy}>
+              {chgBusy ? 'Salvando…' : 'Salvar e entrar'}
+            </Button>
+          </div>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: '100%', display: 'flex', background: 'var(--paper)' }}>

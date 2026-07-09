@@ -47,7 +47,7 @@ function ExportScreen({ toast }) {
       if (r && r.ok && r.data && r.data.canceled) return;
       if (r && r.ok && r.data) {
         setExportPath(r.data.path || ''); setDone(true);
-        toast(r.data.note ? r.data.note : (r.data.count + ' documento(s) exportado(s) para CSV'));
+        toast(r.data.count + ' documento(s) exportado(s) — ' + fObj.nome);
       } else {
         toast((r && r.error) || 'Falha na exportação');
       }

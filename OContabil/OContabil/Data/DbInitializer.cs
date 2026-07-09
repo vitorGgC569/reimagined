@@ -1,3 +1,5 @@
+using System.IO;
+using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using OContabil.Models;
 using OContabil.Services;
@@ -58,10 +60,15 @@ public static class DbInitializer
     {
         if (db.Users.Any()) return;
 
+        // Segurança: NUNCA embarcar uma credencial fixa (admin/admin). Gera uma
+        // senha temporária aleatória forte e a grava em FIRST_ACCESS.txt no perfil
+        // local — só quem tem acesso à máquina a lê. MustChangePassword força a
+        // troca no primeiro login.
+        var temporaryPassword = GenerateTemporaryPassword();
         db.Users.Add(new User
         {
             Username = "admin",
-            PasswordHash = PasswordHasher.Hash("admin"),
+            PasswordHash = PasswordHasher.Hash(temporaryPassword),
             FullName = "Administrador",
             Role = UserRole.Admin,
             IsActive = true,
@@ -69,6 +76,35 @@ public static class DbInitializer
             CreatedAt = DateTime.UtcNow
         });
         db.SaveChanges();
+
+        PersistFirstAccessInfo(temporaryPassword);
+    }
+
+    private static string GenerateTemporaryPassword()
+    {
+        const string alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%";
+        var buffer = RandomNumberGenerator.GetBytes(16);
+        return new string(buffer.Select(b => alphabet[b % alphabet.Length]).ToArray());
+    }
+
+    private static void PersistFirstAccessInfo(string temporaryPassword)
+    {
+        try
+        {
+            var root = Path.GetDirectoryName(AppDbContext.DatabasePath)!;
+            Directory.CreateDirectory(root);
+            var content = string.Join(Environment.NewLine,
+                "OContabil - Primeiro acesso",
+                $"Gerado em: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+                "Usuario: admin",
+                $"Senha temporaria: {temporaryPassword}",
+                "Altere essa credencial logo apos o primeiro login (o app vai exigir).");
+            File.WriteAllText(Path.Combine(root, "FIRST_ACCESS.txt"), content, System.Text.Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            SafeLog.Error("firstaccess.write", ex);
+        }
     }
 
     private static void SeedDocumentSchemas(AppDbContext db)

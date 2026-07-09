@@ -49,11 +49,8 @@ public sealed class CsvExportService
         return request.OutputPath;
     }
 
-    private static string Escape(string value)
-    {
-        if (string.IsNullOrEmpty(value)) return "";
-        if (value.Contains(';') || value.Contains('"') || value.Contains('\n'))
-            return "\"" + value.Replace("\"", "\"\"") + "\"";
-        return value;
-    }
+    // Delega ao SecureCsv: além do quoting RFC-4180, previne CSV/Formula Injection
+    // (CWE-1236) — células que começam com '=', '+', '-', '@' ou tab são neutralizadas
+    // para não executarem como fórmula ao abrir no Excel/LibreOffice.
+    private static string Escape(string value) => OContabil.Services.SecureCsv.Cell(value);
 }

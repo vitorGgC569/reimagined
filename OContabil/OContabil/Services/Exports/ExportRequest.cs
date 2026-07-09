@@ -14,6 +14,10 @@ public sealed class ExportRequest
     public bool OnlyValidated { get; set; } = true;
     public string OutputPath { get; set; } = "";
 
+    /// <summary>Seleção explícita de documentos (ex.: itens marcados na tela). Quando
+    /// preenchida, restringe o lote a esses IDs — usada pela exportação em massa.</summary>
+    public IReadOnlyList<int>? DocumentIds { get; set; }
+
     public static ExportRequest ForFile(string path) =>
         new() { OutputPath = path };
 }
