@@ -26,6 +26,8 @@ class Program
     {
         bool io = args.Any(a => a.Equals("io", OIC));
         bool org = args.Any(a => a.Equals("org", OIC));
+        bool gate = args.Any(a => a.Equals("gate", OIC)); // licenca ausente/vencida -> login bloqueado
+        bool cli = args.Any(a => a.Equals("cli", OIC));   // cadastro real de cliente
         Directory.CreateDirectory(ShotDir);
         var auto = new UIA3Automation();
         var app = Application.Launch(Exe);
@@ -37,7 +39,9 @@ class Program
         try { win.Focus(); } catch { }
 
         Login(win);
-        if (org) OrganizeFlow(win);
+        if (gate) { Thread.Sleep(1500); Shot("gate0_login"); }
+        else if (cli) ClientsFlow(win);
+        else if (org) OrganizeFlow(win);
         else if (io) UploadExportFlow(win);
         else NavFlow(win);
 
@@ -161,6 +165,33 @@ class Program
         Thread.Sleep(3500);
         Shot("io2_export");
         Console.WriteLine("CSV existe? " + File.Exists(csvOut) + (File.Exists(csvOut) ? " (" + new FileInfo(csvOut).Length + " bytes)" : ""));
+    }
+
+    static void ClientsFlow(Window win)
+    {
+        Nav(win, "Clientes"); Thread.Sleep(2200);
+        Shot("cli0_lista");
+
+        var novo = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button))
+            .FirstOrDefault(b => (b.Name ?? "").Trim().Equals("Novo cliente", OIC));
+        if (novo == null) { Console.WriteLine("botao Novo cliente NAO encontrado"); return; }
+        try { novo.AsButton().Invoke(); } catch { try { novo.Click(); } catch { } }
+        Thread.Sleep(1800);
+
+        // Edits no modal (a busca da lista fica atras): [0]=busca, [1]=razao, [2]=fantasia, [3]=cnpj
+        var edits = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Edit)).ToList();
+        Console.WriteLine("edits no modal: " + edits.Count);
+        if (edits.Count >= 4)
+        {
+            TypeInto(edits[1], "Escritorio Teste Piloto Ltda");
+            TypeInto(edits[3], "11.222.333/0001-81");
+        }
+        var cad = win.FindAllDescendants(cf => cf.ByControlType(ControlType.Button))
+            .FirstOrDefault(b => (b.Name ?? "").Trim().Equals("Cadastrar", OIC));
+        if (cad != null) { try { cad.AsButton().Invoke(); } catch { try { cad.Click(); } catch { } } Console.WriteLine("Cadastrar clicado"); }
+        else Console.WriteLine("botao Cadastrar NAO encontrado");
+        Thread.Sleep(4000);        // clients.create + __refreshData
+        Shot("cli1_pos_cadastro");
     }
 
     static void Nav(Window win, string alvo)

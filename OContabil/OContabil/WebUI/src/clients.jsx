@@ -78,9 +78,38 @@ function ClientEditModal({ open, onClose, client, toast }) {
   const DB = window.DB;
   const isNew = !client;
   const [form, setForm] = useState({ nome: '', fantasia: '', cnpj: '', uf: 'SP', regime: 'Simples Nacional' });
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
   useEffect(() => {
-    if (open) setForm(client ? { nome: client.nome, fantasia: client.fantasia, cnpj: client.cnpj, uf: client.uf, regime: client.regime } : { nome: '', fantasia: '', cnpj: '', uf: 'SP', regime: 'Simples Nacional' });
+    if (open) { setErr(''); setBusy(false); setForm(client ? { nome: client.nome, fantasia: client.fantasia, cnpj: client.cnpj, uf: client.uf, regime: client.regime } : { nome: '', fantasia: '', cnpj: '', uf: 'SP', regime: 'Simples Nacional' }); }
   }, [open, client]);
+
+  // Persistência real via ponte C# (clients.create/update). Fora do WebView2
+  // (preview no navegador) mantém o comportamento antigo de protótipo.
+  const save = () => {
+    const b = window.OContabilBridge;
+    if (!b || !b.available) { onClose(); toast(isNew ? 'Cliente cadastrado (protótipo)' : 'Cliente atualizado (protótipo)'); return; }
+    setErr(''); setBusy(true);
+    const call = isNew
+      ? b.call('clients.create', { nome: form.nome, cnpj: form.cnpj, regime: form.regime })
+      : b.call('clients.update', { id: client.id, nome: form.nome, regime: form.regime });
+    call.then(function (r) {
+      setBusy(false);
+      if (r && r.ok) { onClose(); toast(isNew ? 'Cliente cadastrado' : 'Cliente atualizado'); if (window.__refreshData) window.__refreshData(); }
+      else setErr((r && r.error) || 'Não foi possível salvar o cliente.');
+    });
+  };
+
+  const deactivate = () => {
+    const b = window.OContabilBridge;
+    if (!b || !b.available) { onClose(); toast('Cliente desativado (protótipo)'); return; }
+    setErr(''); setBusy(true);
+    b.call('clients.update', { id: client.id, ativo: !client.ativo }).then(function (r) {
+      setBusy(false);
+      if (r && r.ok) { onClose(); toast(client.ativo ? 'Cliente desativado' : 'Cliente reativado'); if (window.__refreshData) window.__refreshData(); }
+      else setErr((r && r.error) || 'Não foi possível alterar o status.');
+    });
+  };
 
   const fld = { width: '100%', height: 40, padding: '0 12px', fontSize: 13.5, background: 'var(--surface)', border: '1px solid var(--hairline)', borderRadius: 'var(--r-md)', color: 'var(--text)', outline: 'none', fontFamily: 'var(--font-sans)' };
   const lbl = { display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-2)', marginBottom: 7 };
@@ -127,11 +156,12 @@ function ClientEditModal({ open, onClose, client, toast }) {
           </div>
         )}
       </div>
+      {err && <div style={{ margin: '0 22px 14px', fontSize: 12.5, color: 'var(--st-rejected)', background: 'var(--st-rejected-bg)', padding: '9px 12px', borderRadius: 'var(--r-md)', border: '1px solid var(--hairline)' }}>{err}</div>}
       <div style={{ padding: '14px 22px', borderTop: '1px solid var(--hairline)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--surface-2)' }}>
-        {!isNew ? <button style={{ fontSize: 13, color: 'var(--st-rejected)', background: 'none', border: 'none', fontWeight: 500 }}>Desativar cliente</button> : <span />}
+        {!isNew ? <button onClick={deactivate} disabled={busy} style={{ fontSize: 13, color: 'var(--st-rejected)', background: 'none', border: 'none', fontWeight: 500, cursor: 'pointer' }}>{client && client.ativo === false ? 'Reativar cliente' : 'Desativar cliente'}</button> : <span />}
         <div style={{ display: 'flex', gap: 10 }}>
-          <Button variant="default" onClick={onClose}>Cancelar</Button>
-          <Button variant="primary" icon="check" onClick={() => { onClose(); toast(isNew ? 'Cliente cadastrado' : 'Cliente atualizado'); }}>{isNew ? 'Cadastrar' : 'Salvar alterações'}</Button>
+          <Button variant="default" onClick={onClose} disabled={busy}>Cancelar</Button>
+          <Button variant="primary" icon="check" onClick={save} disabled={busy}>{busy ? 'Salvando…' : (isNew ? 'Cadastrar' : 'Salvar alterações')}</Button>
         </div>
       </div>
     </Modal>
