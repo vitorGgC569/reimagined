@@ -740,3 +740,8 @@ if (NSOS_BUILD_TESTS)
             PROPERTIES ENVIRONMENT "NSOS_CUDA_SYNC=1")
     endif()
 endif()
+
+# Standalone repro for the TTT-in-model construction crash (debug diagnosis).
+# Built unconditionally so it can be produced with a minimal CPU-only config.
+add_executable(repro_ttt tests/repro_ttt.cpp)
+target_link_libraries(repro_ttt PRIVATE nsos_core)
