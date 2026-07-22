@@ -613,8 +613,9 @@ extern "C" void launch_softmax_kernel(float *out, const float *in, int outer,
 
 __global__ void fused_cross_entropy_kernel(float *total_loss, float *grad,
                                            const float *logits,
-                                           const int *target, int batch,
-                                           int vocab) {
+                                           const int *target,
+                                           const float *row_weights,
+                                           int batch, int vocab) {
   int b = blockIdx.x;
   if (b >= batch)
     return;
@@ -625,6 +626,7 @@ __global__ void fused_cross_entropy_kernel(float *total_loss, float *grad,
 
   const float *row_logits = logits + b * vocab;
   float *row_grad = grad + b * vocab;
+  const float row_weight = row_weights != nullptr ? row_weights[b] : 1.0f;
 
   // Phase 1: Find max logit via block-wide reduction
   float partial_max = -1e30f;
@@ -653,16 +655,19 @@ __global__ void fused_cross_entropy_kernel(float *total_loss, float *grad,
     s_sum = total_sum;
     // Compute loss for this batch element
     float log_sum_exp = max_val + logf(total_sum);
-    atomicAdd(total_loss, log_sum_exp - row_logits[t]);
+    atomicAdd(total_loss, row_weight * (log_sum_exp - row_logits[t]));
   }
   __syncthreads();
 
-  float inv_sum = 1.0f / (s_sum + 1e-9f);
+  // max-subtraction guarantees at least one exp(0)=1 term, so s_sum is
+  // strictly positive.  Adding epsilon here would make the returned gradient
+  // no longer the exact derivative of the log-sum-exp loss above.
+  float inv_sum = 1.0f / s_sum;
 
   // Phase 3: Compute gradient = softmax(logits) - one_hot(target)
   for (int v = threadIdx.x; v < vocab; v += blockDim.x) {
     float prob = expf(row_logits[v] - max_val) * inv_sum;
-    row_grad[v] = prob - (v == t ? 1.0f : 0.0f);
+    row_grad[v] = row_weight * (prob - (v == t ? 1.0f : 0.0f));
   }
 }
 
@@ -673,7 +678,16 @@ extern "C" void launch_fused_cross_entropy(float *d_loss, float *grad,
   int threads_per_block = min(
       256, max(WARP_SIZE, ((vocab + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE));
   fused_cross_entropy_kernel<<<batch, threads_per_block>>>(
-      d_loss, grad, logits, target, batch, vocab);
+      d_loss, grad, logits, target, nullptr, batch, vocab);
+}
+
+extern "C" void launch_fused_cross_entropy_weighted(
+    float *d_loss, float *grad, const float *logits, const int *target,
+    const float *row_weights, int batch, int vocab) {
+  int threads_per_block = min(
+      256, max(WARP_SIZE, ((vocab + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE));
+  fused_cross_entropy_kernel<<<batch, threads_per_block>>>(
+      d_loss, grad, logits, target, row_weights, batch, vocab);
 }
 
 // Legacy cross-entropy launcher (preserved for backward compatibility)
@@ -997,7 +1011,8 @@ extern "C" void launch_abs_sum_kernel(float *d_abs_sum, const float *in, int n) 
 // each factor back at its negative-token column.  Net result is identical to the
 // host's per-negative subtract+scatter (the subtracts are linear and sum).
 __global__ void repetition_unlikelihood_kernel(
-    float *__restrict__ grad, const float *__restrict__ probs,
+    float *__restrict__ total_loss, float *__restrict__ grad,
+    const float *__restrict__ probs,
     const int *__restrict__ answer_tokens, int rows, int vocab, float scale,
     int eos_token_id) {
   const int row = blockIdx.x + 1;  // rows 1..rows-1
@@ -1031,6 +1046,7 @@ __global__ void repetition_unlikelihood_kernel(
       if (p_neg <= 1e-6f || p_neg >= 1.0f - 1e-6f) continue;
       const float denom = fmaxf(1.0f - p_neg, 1e-6f);
       const float factor = scale * p_neg / denom;
+      atomicAdd(total_loss, -scale * log1pf(-p_neg));
       s_neg[kept] = neg;
       s_factor[kept] = factor;
       total += factor;
@@ -1058,13 +1074,14 @@ __global__ void repetition_unlikelihood_kernel(
 }
 
 extern "C" void launch_repetition_unlikelihood_kernel(
-    float *grad, const float *probs, const int *answer_tokens, int rows,
-    int vocab, float scale, int eos_token_id) {
+    float *d_loss, float *grad, const float *probs,
+    const int *answer_tokens, int rows, int vocab, float scale,
+    int eos_token_id) {
   if (rows <= 1 || vocab <= 0) return;
   const int threads = 256;
   const int blocks = rows - 1;  // one block per row 1..rows-1
   repetition_unlikelihood_kernel<<<blocks, threads>>>(
-      grad, probs, answer_tokens, rows, vocab, scale, eos_token_id);
+      d_loss, grad, probs, answer_tokens, rows, vocab, scale, eos_token_id);
 }
 
 __global__ void check_stability_kernel(int *d_found, const float *in,
@@ -1093,7 +1110,8 @@ __global__ void gqa_causal_attention_kernel(const float *q_flat,
                                             float *out, int seq_len,
                                             int d_model, int n_heads,
                                             int n_kv_heads, int head_dim,
-                                            int kv_group_size, float theta) {
+                                            int kv_group_size, float theta,
+                                            int sliding_window) {
   const int token_index = blockIdx.x;
   const int head_index = blockIdx.y;
   const int thread_index = threadIdx.x;
@@ -1101,10 +1119,12 @@ __global__ void gqa_causal_attention_kernel(const float *q_flat,
   const int kv_head = min(head_index / max(kv_group_size, 1), n_kv_heads - 1);
   const int half_dim = head_dim / 2;
   const float scale = rsqrtf(fmaxf(static_cast<float>(head_dim), 1.0f));
+  const int first_key = max(0, token_index - sliding_window + 1);
 
   extern __shared__ float shared_scores[];
 
-  for (int source_index = thread_index; source_index <= token_index;
+  for (int source_index = first_key + thread_index;
+       source_index <= token_index;
        source_index += blockDim.x) {
     float dot = 0.0f;
 
@@ -1159,7 +1179,7 @@ __global__ void gqa_causal_attention_kernel(const float *q_flat,
   const int n_keys = token_index + 1;
 
   float local_max = -1e30f;
-  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+  for (int s = first_key + thread_index; s < n_keys; s += blockDim.x) {
     local_max = fmaxf(local_max, shared_scores[s]);
   }
   redbuf[thread_index] = local_max;
@@ -1175,7 +1195,7 @@ __global__ void gqa_causal_attention_kernel(const float *q_flat,
   __syncthreads();
 
   float local_sum = 0.0f;
-  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+  for (int s = first_key + thread_index; s < n_keys; s += blockDim.x) {
     const float stabilized = expf(shared_scores[s] - max_score);
     shared_scores[s] = stabilized;
     local_sum += stabilized;
@@ -1193,7 +1213,7 @@ __global__ void gqa_causal_attention_kernel(const float *q_flat,
 
   for (int dim = thread_index; dim < head_dim; dim += blockDim.x) {
     float acc = 0.0f;
-    for (int source_index = 0; source_index < n_keys; ++source_index) {
+    for (int source_index = first_key; source_index < n_keys; ++source_index) {
       const int value_base =
           source_index * 2 * kv_dim + kv_dim + kv_head * head_dim;
       acc += (shared_scores[source_index] / denom) * kv_flat[value_base + dim];
@@ -1209,13 +1229,14 @@ extern "C" void launch_gqa_causal_attention_kernel(const float *q_flat,
                                                    int n_kv_heads,
                                                    int head_dim,
                                                    int kv_group_size,
-                                                   float theta) {
+                                                   float theta,
+                                                   int sliding_window) {
   const int threads = 128;
   const dim3 grid(seq_len, n_heads);
   const size_t shared_bytes = static_cast<size_t>(seq_len) * sizeof(float);
   gqa_causal_attention_kernel<<<grid, threads, shared_bytes>>>(
       q_flat, kv_flat, out, seq_len, d_model, n_heads, n_kv_heads, head_dim,
-      kv_group_size, theta);
+      kv_group_size, theta, sliding_window);
 }
 
 __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
@@ -1228,6 +1249,7 @@ __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
                                                     int head_dim,
                                                     int kv_group_size,
                                                     float theta,
+                                                    int sliding_window,
                                                     size_t q_batch_stride,
                                                     size_t kv_batch_stride) {
   const int batch_index = blockIdx.z;
@@ -1238,6 +1260,7 @@ __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
   const int kv_head = min(head_index / max(kv_group_size, 1), n_kv_heads - 1);
   const int half_dim = head_dim / 2;
   const float scale = rsqrtf(fmaxf(static_cast<float>(head_dim), 1.0f));
+  const int first_key = max(0, token_index - sliding_window + 1);
 
   const float *q_batch = q_flat + static_cast<size_t>(batch_index) * q_batch_stride;
   const float *kv_batch = kv_flat + static_cast<size_t>(batch_index) * kv_batch_stride;
@@ -1245,7 +1268,8 @@ __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
 
   extern __shared__ float shared_scores[];
 
-  for (int source_index = thread_index; source_index <= token_index;
+  for (int source_index = first_key + thread_index;
+       source_index <= token_index;
        source_index += blockDim.x) {
     float dot = 0.0f;
 
@@ -1296,7 +1320,7 @@ __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
   const int n_keys = token_index + 1;
 
   float local_max = -1e30f;
-  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+  for (int s = first_key + thread_index; s < n_keys; s += blockDim.x) {
     local_max = fmaxf(local_max, shared_scores[s]);
   }
   redbuf[thread_index] = local_max;
@@ -1312,7 +1336,7 @@ __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
   __syncthreads();
 
   float local_sum = 0.0f;
-  for (int s = thread_index; s < n_keys; s += blockDim.x) {
+  for (int s = first_key + thread_index; s < n_keys; s += blockDim.x) {
     const float stabilized = expf(shared_scores[s] - max_score);
     shared_scores[s] = stabilized;
     local_sum += stabilized;
@@ -1330,7 +1354,7 @@ __global__ void batched_gqa_causal_attention_kernel(const float *q_flat,
 
   for (int dim = thread_index; dim < head_dim; dim += blockDim.x) {
     float acc = 0.0f;
-    for (int source_index = 0; source_index < n_keys; ++source_index) {
+    for (int source_index = first_key; source_index < n_keys; ++source_index) {
       const int value_base =
           source_index * 2 * kv_dim + kv_dim + kv_head * head_dim;
       acc += (shared_scores[source_index] / denom) * kv_batch[value_base + dim];
@@ -1349,7 +1373,8 @@ extern "C" void launch_batched_gqa_causal_attention_kernel(const float *q_flat,
                                                            int n_kv_heads,
                                                            int head_dim,
                                                            int kv_group_size,
-                                                           float theta) {
+                                                           float theta,
+                                                           int sliding_window) {
   const int threads = 128;
   const dim3 grid(seq_len, n_heads, batch_size);
   const size_t shared_bytes = static_cast<size_t>(seq_len) * sizeof(float);
@@ -1359,7 +1384,7 @@ extern "C" void launch_batched_gqa_causal_attention_kernel(const float *q_flat,
       static_cast<size_t>(seq_len) * static_cast<size_t>(2 * n_kv_heads * head_dim);
   batched_gqa_causal_attention_kernel<<<grid, threads, shared_bytes>>>(
       q_flat, kv_flat, out, seq_len, d_model, n_heads, n_kv_heads, head_dim,
-      kv_group_size, theta, q_batch_stride, kv_batch_stride);
+      kv_group_size, theta, sliding_window, q_batch_stride, kv_batch_stride);
 }
 
 __global__ void gqa_append_kv_cache_kernel(const float *kv_flat, float *key_cache,
@@ -1430,7 +1455,8 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
                                                    int n_kv_heads,
                                                    int head_dim,
                                                    int kv_group_size,
-                                                   float theta) {
+                                                   float theta,
+                                                   int sliding_window) {
   const int head_index = blockIdx.x;
   const int thread_index = threadIdx.x;
   const int kv_dim = n_kv_heads * head_dim;
@@ -1438,10 +1464,12 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
   const int half_dim = head_dim / 2;
   const float scale = rsqrtf(fmaxf(static_cast<float>(head_dim), 1.0f));
   const int query_pos = max(cached_tokens - 1, 0);
+  const int first_key = max(0, cached_tokens - sliding_window);
 
   extern __shared__ float shared_scores[];
 
-  for (int source_index = thread_index; source_index < cached_tokens;
+  for (int source_index = first_key + thread_index;
+       source_index < cached_tokens;
        source_index += blockDim.x) {
     float dot = 0.0f;
     for (int pair = 0; pair < half_dim; ++pair) {
@@ -1484,7 +1512,8 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
   __shared__ float s_denom;
 
   float local_max = -1e30f;
-  for (int source_index = thread_index; source_index < cached_tokens;
+  for (int source_index = first_key + thread_index;
+       source_index < cached_tokens;
        source_index += blockDim.x) {
     local_max = fmaxf(local_max, shared_scores[source_index]);
   }
@@ -1502,7 +1531,8 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
   const float max_score = s_max;
 
   float local_sum = 0.0f;
-  for (int source_index = thread_index; source_index < cached_tokens;
+  for (int source_index = first_key + thread_index;
+       source_index < cached_tokens;
        source_index += blockDim.x) {
     const float stabilized = expf(shared_scores[source_index] - max_score);
     shared_scores[source_index] = stabilized;
@@ -1522,7 +1552,7 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
 
   for (int dim = thread_index; dim < head_dim; dim += blockDim.x) {
     float acc = 0.0f;
-    for (int source_index = 0; source_index < cached_tokens; ++source_index) {
+    for (int source_index = first_key; source_index < cached_tokens; ++source_index) {
       const int value_base = source_index * kv_dim + kv_head * head_dim;
       acc +=
           (shared_scores[source_index] / denom) * value_cache[value_base + dim];
@@ -1534,13 +1564,13 @@ __global__ void gqa_cached_attention_decode_kernel(const float *q_flat,
 extern "C" void launch_gqa_cached_attention_decode_kernel(
     const float *q_flat, const float *key_cache, const float *value_cache,
     float *out, int cached_tokens, int d_model, int n_heads, int n_kv_heads,
-    int head_dim, int kv_group_size, float theta) {
+    int head_dim, int kv_group_size, float theta, int sliding_window) {
   const int threads = 128;
   const dim3 grid(n_heads);
   const size_t shared_bytes = static_cast<size_t>(cached_tokens) * sizeof(float);
   gqa_cached_attention_decode_kernel<<<grid, threads, shared_bytes>>>(
       q_flat, key_cache, value_cache, out, cached_tokens, d_model, n_heads,
-      n_kv_heads, head_dim, kv_group_size, theta);
+      n_kv_heads, head_dim, kv_group_size, theta, sliding_window);
 }
 
 // =====================================================================

@@ -15,6 +15,10 @@ struct Args {
     #[arg(long, env = "OXTAMEM_AUTH_TOKEN")]
     auth_token: Option<String>,
 
+    /// Explicitly permit clear-text RESP outside loopback. Prefer a TLS tunnel.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_remote: bool,
+
     #[arg(short, long, default_value = "geodesic.db")]
     db_path: String,
 
@@ -44,9 +48,12 @@ fn is_loopback_host(host: &str) -> bool {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    if !is_loopback_host(&args.host) && args.auth_token.is_none() {
+    if !is_loopback_host(&args.host)
+        && (!args.allow_insecure_remote
+            || args.auth_token.as_ref().map_or(true, |token| token.len() < 16))
+    {
         return Err(
-            "refusing to bind OxtaMem outside loopback without --auth-token/OXTAMEM_AUTH_TOKEN"
+            "refusing remote clear-text RESP without --allow-insecure-remote and a >=16-byte auth token"
                 .into(),
         );
     }
@@ -68,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_bulk_bytes: args.max_bulk_bytes,
             max_response_bytes: args.max_response_bytes,
             read_timeout_ms: args.read_timeout_ms,
+            allow_insecure_remote: args.allow_insecure_remote,
             ..RespServerConfig::default()
         })
         .await?;

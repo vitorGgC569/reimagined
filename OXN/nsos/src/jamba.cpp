@@ -7,6 +7,7 @@
 #include "../include/mcts_reasoning.h"
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
+#include "../include/cuda/sparse_attention_kernels.cuh"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -23,6 +24,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -49,6 +55,30 @@ constexpr int kStableMoEExperts = 8;
 constexpr int kStableTopKExperts = 2;
 constexpr uint32_t kEdgePackMagic = 0x31454744; // DGE1
 constexpr uint32_t kEdgePackVersion = 2;  // v2: per-layer sensitivity byte + float weights for quantization-sensitive layers
+
+void replace_checkpoint_file(const std::filesystem::path& temporary,
+                             const std::filesystem::path& destination) {
+#ifdef _WIN32
+    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        std::filesystem::remove(temporary);
+        throw std::runtime_error(
+            "Could not atomically replace checkpoint '" +
+            destination.string() + "' (Win32 error " +
+            std::to_string(error) + ")");
+    }
+#else
+    std::error_code error;
+    std::filesystem::rename(temporary, destination, error);
+    if (error) {
+        std::filesystem::remove(temporary);
+        throw std::runtime_error(
+            "Could not atomically replace checkpoint '" +
+            destination.string() + "': " + error.message());
+    }
+#endif
+}
 
 #ifdef USE_CUDA
 // RAII wrapper for a contiguous GPU device buffer of typed elements.
@@ -261,10 +291,33 @@ void zero_sequence_suffix_inplace(Tensor& tensor, const std::vector<int>& length
     }
 }
 
+std::vector<uint8_t> flattened_valid_row_mask(
+    const Tensor& tensor, const std::vector<int>& lengths) {
+    if (tensor.shape.size() != 3 || lengths.empty()) {
+        return {};
+    }
+    const int batch_size = tensor.shape[0];
+    const int seq_len = tensor.shape[1];
+    if (static_cast<int>(lengths.size()) != batch_size) {
+        throw std::invalid_argument(
+            "batched valid-length count does not match tensor batch dimension");
+    }
+    std::vector<uint8_t> mask(
+        static_cast<size_t>(batch_size) * static_cast<size_t>(seq_len), 0U);
+    for (int batch = 0; batch < batch_size; ++batch) {
+        const int valid =
+            std::clamp(lengths[static_cast<size_t>(batch)], 0, seq_len);
+        std::fill_n(mask.begin() + static_cast<size_t>(batch) * seq_len,
+                    valid, static_cast<uint8_t>(1U));
+    }
+    return mask;
+}
+
 Tensor apply_training_dropout(const Tensor& input,
                               float dropout_rate,
                               const std::string& scope,
                               int salt,
+                              uint64_t forward_sequence,
                               Tensor* out_mask = nullptr) {
     const float rate = std::clamp(dropout_rate, 0.0f, 0.95f);
     if (rate <= 1e-6f || input.size == 0) {
@@ -275,7 +328,9 @@ Tensor apply_training_dropout(const Tensor& input,
     auto rng =
         determinism::DeterminismManager::instance().get_rng_for_operation(
             "jamba_dropout", scope,
-            static_cast<uint64_t>(std::max(salt, 0)) ^
+            forward_sequence ^
+                (static_cast<uint64_t>(static_cast<uint32_t>(std::max(salt, 0)))
+                 << 32U) ^
                 static_cast<uint64_t>(input.shape.numel()));
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     const float keep_scale = 1.0f / std::max(1.0f - rate, 1e-6f);
@@ -430,28 +485,39 @@ JambaModel::JambaModel(int nl, int dm, int vs, Device dev)
           cfg.num_layers = nl;
           cfg.d_model = dm;
           cfg.vocab_size = vs;
+          cfg.n_heads = sanitize_head_count(dm, cfg.n_heads);
+          while (cfg.n_heads > 1 &&
+                 (dm % cfg.n_heads != 0 || ((dm / cfg.n_heads) & 1) != 0)) {
+              --cfg.n_heads;
+          }
+          cfg.n_kv_heads = select_kv_heads(cfg.n_heads, cfg.n_kv_heads);
+          const int inner = cfg.mamba_expand * dm;
+          cfg.mamba_head_dim = std::min(cfg.mamba_head_dim, inner);
+          while (cfg.mamba_head_dim > 1 && inner % cfg.mamba_head_dim != 0) {
+              --cfg.mamba_head_dim;
+          }
+          const int mamba_heads = inner / cfg.mamba_head_dim;
+          cfg.mamba_n_groups = std::min(cfg.mamba_n_groups, mamba_heads);
           cfg.use_cuda = (dev == Device::GPU);
           return cfg;
       }(),
       dev) {}
 
 JambaModel::JambaModel(const ModelConfig& config, Device dev)
-    : num_layers(std::max(config.num_layers, 1)),
-      d_model(std::max(config.d_model, 8)),
-      vocab_size(std::max(config.vocab_size, 2)),
+    : num_layers(config.num_layers),
+      d_model(config.d_model),
+      vocab_size(config.vocab_size),
       device(dev),
       model_config_(config) {
+    validate_model_config(config);
+    if (dev == Device::GPU &&
+        std::getenv("NSOS_GPU_ALLOW_HOST_FALLBACK") == nullptr) {
+        set_strict_gpu_execution(true);
+    }
     model_config_.num_layers = num_layers;
     model_config_.d_model = d_model;
     model_config_.vocab_size = vocab_size;
     model_config_.use_cuda = (dev == Device::GPU);
-    model_config_.n_heads = sanitize_head_count(d_model, model_config_.n_heads);
-    model_config_.n_kv_heads =
-        select_kv_heads(model_config_.n_heads,
-                        sanitize_head_count(d_model, std::max(model_config_.n_kv_heads, 1)));
-    model_config_.num_experts = std::max(model_config_.num_experts, 1);
-    model_config_.num_experts_per_token =
-        std::clamp(model_config_.num_experts_per_token, 1, model_config_.num_experts);
     const bool use_exact_attention_training = model_config_.use_exact_attention_training;
 
     embedding = std::make_unique<Embedding>(vocab_size, d_model);
@@ -478,19 +544,7 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             num_layers >= std::max(model_config_.attention_period, 1) &&
             layer_matches_schedule(layer_one_based, model_config_.attention_period,
                                    model_config_.attention_slot);
-        // GUARD (last-layer-Mamba): empirically isolated (attn audit, 3 rounds)
         // — in the faithful config, an attention layer as the FINAL layer of the
-        // stack STALLS training (loss stuck at ~chance), while a Mamba final
-        // layer learns; the trigger is the last-layer TYPE, not the attention
-        // count, and non-faithful is immune.  Force the last layer to be Mamba.
-        // Env override for A/B: NSOS_ATTN_LAST_GUARD=0 disables the guard.
-        if (use_attention && model_config_.mamba2_faithful &&
-            layer_one_based == num_layers) {
-            const char* g = std::getenv("NSOS_ATTN_LAST_GUARD");
-            if (g == nullptr || g[0] != '0') {
-                use_attention = false;
-            }
-        }
         const bool use_moe =
             model_config_.use_moe &&
             num_layers >= std::max(model_config_.moe_period, 1) &&
@@ -524,7 +578,8 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             model_config_.mamba_expand,
             model_config_.mamba_head_dim,
             model_config_.mamba_n_groups,
-            model_config_.rope_theta));
+            model_config_.rope_theta,
+            model_config_.sliding_window));
     }
 
     value_head = std::make_unique<BitLinear>(
@@ -573,7 +628,23 @@ void JambaModel::apply_weight_tying_() {
 }
 
 void JambaModel::save(const std::string& filename) {
-    ModelSerializer::save(this, filename);
+    const std::filesystem::path destination(filename);
+    if (!destination.parent_path().empty()) {
+        std::filesystem::create_directories(destination.parent_path());
+    }
+    const std::filesystem::path temporary =
+        destination.parent_path() /
+        (destination.filename().string() + ".tmp." +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    try {
+        ModelSerializer::save(this, temporary.string());
+        replace_checkpoint_file(temporary, destination);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
+    }
 }
 
 void JambaModel::load(const std::string& filename, bool strict) {
@@ -586,6 +657,8 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
         throw AbortException();
     }
     Tensor hidden = x;
+    const uint64_t stochastic_sequence =
+        training_mode_ ? training_rng_sequence_++ : 0;
     if (hidden.shape.size() == 3 && !last_input_batch_lengths_.empty()) {
         zero_sequence_suffix_inplace(hidden, last_input_batch_lengths_);
     }
@@ -623,6 +696,7 @@ Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
             throw AbortException();
         }
         layer->set_batch_valid_lengths(last_input_batch_lengths_);
+        layer->set_dropout_sequence(stochastic_sequence);
         if (profiler_begin_layer) {
             profiler_begin_layer(profiler_, layer_index);
         }
@@ -795,11 +869,12 @@ void JambaModel::set_sparse_attention(bool enabled, int block_size,
     }
 }
 
-float JambaModel::accumulate_sparse_selector_grads() {
+float JambaModel::accumulate_sparse_selector_grads(float gradient_weight) {
     float total = 0.0f;
     for (auto& block : layers) {
         if (block && block->attn_layer) {
-            total += block->attn_layer->accumulate_selector_distill_grad();
+            total += block->attn_layer->accumulate_selector_distill_grad(
+                gradient_weight);
         }
     }
     return total;
@@ -1988,7 +2063,8 @@ JambaBlock::JambaBlock(int dm,
                        int mamba_expand,
                        int mamba_head_dim,
                        int mamba_n_groups,
-                       float rope_theta)
+                       float rope_theta,
+                       int sliding_window)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
@@ -2065,8 +2141,9 @@ JambaBlock::JambaBlock(int dm,
     if (is_ttt) {
         ttt_layer = std::make_unique<TTTLayer>(dm, default_ffn_hidden);
     } else if (is_attention) {
-        attn_layer = std::make_unique<Attention>(dm, std::max(query_heads, 1), 512,
-                                                 std::max(kv_heads, 1), rope_theta);
+        attn_layer = std::make_unique<Attention>(dm, query_heads, 512,
+                                                 kv_heads, rope_theta,
+                                                 sliding_window);
         attn_layer->set_exact_training_path(exact_attention_training);
     } else {
         MambaConfig config;
@@ -2083,40 +2160,14 @@ JambaBlock::JambaBlock(int dm,
         // process (set "1" to force on, "0" to force off).
         config.proper_selective_ssm = mamba_proper_ssm;
         config.proper_state_expansion = mamba_state_expansion && mamba_proper_ssm;
-        config.conv_kernel = std::clamp(mamba_conv_kernel, 1, 16);
+        config.conv_kernel = mamba_conv_kernel;
         config.faithful_mamba2 = mamba2_faithful;
-        config.expand = std::clamp(mamba_expand, 1, 8);
+        config.expand = mamba_expand;
         const int inner = config.expand * dm;
-        config.head_dim = std::min(std::max(mamba_head_dim, 1), inner);
-        while (config.head_dim > 1 && inner % config.head_dim != 0) {
-            --config.head_dim;
-        }
-        const int faithful_heads = inner / config.head_dim;
-        config.n_groups = std::min(std::max(mamba_n_groups, 1), faithful_heads);
-        while (config.n_groups > 1 &&
-               faithful_heads % config.n_groups != 0) {
-            --config.n_groups;
-        }
+        config.head_dim = mamba_head_dim;
+        config.n_groups = mamba_n_groups;
         config.out_proj_init_scale =
             1.0f / std::sqrt(static_cast<float>(std::max(tl, 1)));
-        if (const char* e = std::getenv("NSOS_MAMBA_PROPER_SSM"); e != nullptr) {
-            config.proper_selective_ssm = (e[0] == '1');
-            if (!config.proper_selective_ssm) {
-                config.proper_state_expansion = false;
-            }
-        }
-        if (const char* se = std::getenv("NSOS_MAMBA_STATE_EXPANSION"); se != nullptr) {
-            config.proper_state_expansion = (se[0] == '1') && config.proper_selective_ssm;
-        }
-        if (const char* k = std::getenv("NSOS_MAMBA_CONV_K"); k != nullptr) {
-            const int kv = std::atoi(k);
-            if (kv >= 1 && kv <= 16) {
-                config.conv_kernel = kv;
-            }
-        }
-        if (const char* f = std::getenv("NSOS_MAMBA2_FAITHFUL"); f != nullptr) {
-            config.faithful_mamba2 = f[0] == '1';
-        }
         // d_state (N) is capped at the N-state GPU kernel's MAX_N (=64, see
         // src/cuda/mamba_kernels.cu) so the full SSD scan stays on the device
         // fast path instead of the host fallback — critical now that the N-state
@@ -2129,7 +2180,7 @@ JambaBlock::JambaBlock(int dm,
 
     if (is_moe) {
         router = std::make_unique<MoERouter>(
-            dm, num_experts, std::clamp(configured_top_k, 1, num_experts));
+            dm, num_experts, configured_top_k);
         for (int j = 0; j < num_experts; ++j) {
             expert_gate_up.push_back(std::make_unique<BitLinear>(dm, moe_expert_hidden));
             expert_down.push_back(std::make_unique<BitLinear>(moe_expert_hidden, dm));
@@ -2219,7 +2270,8 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     if (training_mode_ && dropout_rate_ > 1e-6f) {
         core = apply_training_dropout(core, dropout_rate_,
                                       "jamba_core_" + std::to_string(layer_idx),
-                                      layer_idx * 17 + 1, &saved_drop_core_);
+                                      layer_idx * 17 + 1, dropout_sequence_,
+                                      &saved_drop_core_);
     }
 
     Tensor core_contrib = core;
@@ -2237,7 +2289,8 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         if (training_mode_ && dropout_rate_ > 1e-6f) {
             ff = apply_training_dropout(ff, dropout_rate_,
                                         "jamba_moe_" + std::to_string(layer_idx),
-                                        layer_idx * 17 + 2, &saved_drop_moe_);
+                                        layer_idx * 17 + 2, dropout_sequence_,
+                                        &saved_drop_moe_);
         }
         // ── CHRASS parallel slot (after FFN dropout, before residual add) ──
         if (chrass_layer && saved_ff_norm_.size > 0) {
@@ -2295,15 +2348,17 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
         Tensor ff_hidden = saved_ff_hidden_pre_.squared_relu();
         if (training_mode_ && dropout_rate_ > 1e-6f) {
             ff_hidden = apply_training_dropout(ff_hidden, dropout_rate_ * 0.5f,
-                                        "jamba_ff_hidden_" + std::to_string(layer_idx),
-                                        layer_idx * 17 + 3, &saved_drop_ff_hidden_);
+                                               "jamba_ff_hidden_" + std::to_string(layer_idx),
+                                               layer_idx * 17 + 3, dropout_sequence_,
+                                               &saved_drop_ff_hidden_);
         }
         ff = ffn_down->forward(ff_hidden);
     }
     if (training_mode_ && dropout_rate_ > 1e-6f) {
         ff = apply_training_dropout(ff, dropout_rate_,
                                     "jamba_ff_out_" + std::to_string(layer_idx),
-                                    layer_idx * 17 + 4, &saved_drop_ff_out_);
+                                    layer_idx * 17 + 4, dropout_sequence_,
+                                    &saved_drop_ff_out_);
     }
     // ── CHRASS parallel slot (FFN path) ──
     if (chrass_layer && saved_ff_norm_.size > 0) {
@@ -2331,6 +2386,8 @@ Tensor JambaBlock::forward(const Tensor& x, Context* ctx) {
     }
     return output;
 }
+
+static bool moe_router_grad_enabled();
 
 #ifdef USE_CUDA
 Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
@@ -2410,12 +2467,12 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     saved_moe_n_active_ = N_active;
     saved_moe_counts_host_ = counts_host;
     saved_moe_offsets_host_ = offsets_host;
-    saved_moe_permutation_host_.assign(static_cast<size_t>(N_active), 0);
+    saved_moe_rows_.clear();
+    saved_moe_scale_device_ = Tensor();
+    saved_moe_permuted_output_ = Tensor();
     // The permutation buffer is populated later by
     // launch_moe_compute_assignments_kernel.  We defer the D2H of
     // permutation until AFTER that kernel runs — see below.
-    saved_moe_rows_.assign(static_cast<size_t>(num_experts),
-                           std::vector<int>{});
 
     if (audit_collector_ && audit_collector_->enabled()) {
         std::vector<int> topk_counts(static_cast<size_t>(num_experts), 0);
@@ -2450,6 +2507,41 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
         permutation_ptr, assignment_ptr, scale_ptr, rows,
         num_experts);
 
+    // Retain per-token routing state per block on the device. The persistent
+    // integer allocation grows geometrically; scales use the Tensor pool.
+    if (!saved_moe_permutation_device_ ||
+        saved_moe_permutation_capacity_ < N_active) {
+        const int new_capacity = std::max(
+            N_active, std::max(saved_moe_permutation_capacity_ * 2, 1));
+        void* allocation = nullptr;
+        const cudaError_t allocation_status = cudaMalloc(
+            &allocation, static_cast<size_t>(new_capacity) * sizeof(int));
+        if (allocation_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("MoE saved permutation allocation failed: ") +
+                cudaGetErrorString(allocation_status));
+        }
+        saved_moe_permutation_device_ = std::shared_ptr<void>(
+            allocation, [](void* pointer) {
+                if (pointer != nullptr) (void)cudaFree(pointer);
+            });
+        saved_moe_permutation_capacity_ = new_capacity;
+    }
+    int* saved_permutation =
+        static_cast<int*>(saved_moe_permutation_device_.get());
+    const cudaError_t permutation_copy_status = cudaMemcpy(
+        saved_permutation, permutation_ptr,
+        static_cast<size_t>(N_active) * sizeof(int), cudaMemcpyDeviceToDevice);
+    if (permutation_copy_status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("MoE saved permutation copy failed: ") +
+            cudaGetErrorString(permutation_copy_status));
+    }
+    saved_moe_scale_device_ = Tensor({N_active}, Device::GPU);
+    copy_tensor_bytes(saved_moe_scale_device_.raw_data(), Device::GPU,
+                      scale_ptr, Device::GPU,
+                      static_cast<size_t>(N_active) * sizeof(float));
+
     // Permuted input: contiguous by expert.
     Tensor permuted_input({N_active, dim}, Device::GPU);
     launch_moe_gather_rows_kernel(x.raw_data(), permutation_ptr,
@@ -2458,31 +2550,6 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     // AUDIT #4+#5: single D2H of permutation_buf, then O(N_active)
     // population of saved_moe_rows_.  This replaces the old O(rows ×
     // num_experts × log num_experts) host-side partial_sort.
-    cudaMemcpy(saved_moe_permutation_host_.data(), permutation_ptr,
-               static_cast<size_t>(N_active) * sizeof(int),
-               cudaMemcpyDeviceToHost);
-    // Reserve per-expert capacity to avoid push_back reallocations.
-    for (int e = 0; e < num_experts; ++e) {
-        const int count = counts_host[static_cast<size_t>(e)];
-        if (count > 0) {
-            saved_moe_rows_[static_cast<size_t>(e)].reserve(
-                static_cast<size_t>(count));
-        }
-    }
-    for (int e = 0; e < num_experts; ++e) {
-        const int count = counts_host[static_cast<size_t>(e)];
-        if (count <= 0) continue;
-        const int offset = offsets_host[static_cast<size_t>(e)];
-        // permutation[offset:offset+count] are the source row ids
-        // routed to expert e, in the same per-expert contiguous order
-        // the assignment kernel produced.
-        for (int slot = 0; slot < count; ++slot) {
-            const int source_row = saved_moe_permutation_host_[
-                static_cast<size_t>(offset + slot)];
-            saved_moe_rows_[static_cast<size_t>(e)].push_back(source_row);
-        }
-    }
-
     // Per-expert forward into a permuted_output buffer.  Slices of
     // permuted_input are computed cheaply (Tensor::slice is a view in
     // the current API) and the BitLinear forwards already use the GPU
@@ -2521,6 +2588,9 @@ Tensor JambaBlock::forward_moe_gpu_batched(const Tensor& x,
     launch_moe_scatter_add_weighted_kernel(
         permuted_output.raw_data(), permutation_ptr, scale_ptr,
         output_accum.raw_data(), N_active, dim);
+    if (training_mode_ && moe_router_grad_enabled()) {
+        saved_moe_permuted_output_ = permuted_output;
+    }
 
     return output_accum.reshape(x.shape.dims);
 }
@@ -2544,7 +2614,9 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
         return make_zero_like(x);
     }
 
-    auto [unused_logits, weights] = router->forward(x);
+    const std::vector<uint8_t> valid_rows =
+        flattened_valid_row_mask(x, active_batch_valid_lengths_);
+    auto [unused_logits, weights] = router->forward(x, valid_rows);
     (void)unused_logits;
 
     const int rows = x.size / x.shape.back();
@@ -2664,8 +2736,7 @@ Tensor JambaBlock::forward_moe(const Tensor& x, Context* ctx, const std::string&
         weights.get_device() == Device::GPU &&
         gpu_custom_kernels_supported() && rows > 0 && num_experts > 0 &&
         num_experts <= 1024 && dim > 0 &&
-        !determinism::deterministic_reductions_enabled() &&
-        !(moe_router_grad_enabled() && training_mode_)) {
+        !determinism::deterministic_reductions_enabled()) {
         return forward_moe_gpu_batched(x, weights, rows, dim,
                                         effective_top_k);
     }
@@ -2782,11 +2853,11 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
     // Pre-condition: caller verified eligibility (dy on GPU,
     // saved_moe_weights_ populated, gpu_custom_kernels_supported).
     //
-    // Pipeline mirrors forward_moe_gpu_batched:
-    //   1. Upload saved_moe_weights_ (host) -> weights_gpu
-    //   2. count + scan + assignments rebuild the same permutation
-    //      that forward used (deterministic given the same weights).
-    //   3. gather dy into permuted_dy [N_active, dim]
+    // Pipeline mirrors forward_moe_gpu_batched using the exact permutation
+    // produced by that forward.  Re-launching the atomic assignment kernel can
+    // change within-expert order and pair dY with another row's cached state.
+    //   1. Upload saved permutation + scales.
+    //   2. gather dy into permuted_dy [N_active, dim]
     //   4. scale rows of permuted_dy by the stored router weights
     //   5. for each expert: down.backward + gate_up.backward on the
     //      contiguous slice of permuted_dy
@@ -2796,50 +2867,52 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
     const int rows = static_cast<int>(saved_moe_weights_.size) /
                      std::max(num_experts, 1);
 
-    // Upload the host-side saved router weights to GPU so the kernels
-    // can drive the same routing the forward pass used.
-    Tensor weights_gpu = saved_moe_weights_.to(Device::GPU);
-
     // Reuse the persistent MoE workspace — same struct as forward.
     // Most allocations are no-ops because forward already grew the
     // buffers to peak size in this step; backward typically hits the
     // workspace at the same N_active that forward set up.
     MoeWorkspace& moe_ws = moe_workspace();
-    int* counts_ptr  = moe_ws.counts(num_experts);
-    int* offsets_ptr = moe_ws.offsets(num_experts);
-    cudaMemset(counts_ptr, 0, static_cast<size_t>(num_experts) * sizeof(int));
-    launch_moe_count_per_expert_kernel(weights_gpu.raw_data(), counts_ptr,
-                                        rows, num_experts);
-    launch_moe_exclusive_scan_small_kernel(counts_ptr, offsets_ptr,
-                                            num_experts);
-
-    std::vector<int> counts_host(static_cast<size_t>(num_experts), 0);
-    std::vector<int> offsets_host(static_cast<size_t>(num_experts + 1), 0);
-    cudaMemcpy(counts_host.data(), counts_ptr,
-               static_cast<size_t>(num_experts) * sizeof(int),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(offsets_host.data(), offsets_ptr,
-               static_cast<size_t>(num_experts + 1) * sizeof(int),
-               cudaMemcpyDeviceToHost);
-    const int N_active = offsets_host[static_cast<size_t>(num_experts)];
+    const std::vector<int>& counts_host = saved_moe_counts_host_;
+    const std::vector<int>& offsets_host = saved_moe_offsets_host_;
+    const int N_active = saved_moe_n_active_;
 
     Tensor grad_accum = Tensor::zeros(dy.shape.dims, Device::GPU);
-    if (N_active <= 0) {
+    if (N_active <= 0 ||
+        counts_host.size() != static_cast<size_t>(num_experts) ||
+        offsets_host.size() != static_cast<size_t>(num_experts + 1) ||
+        !saved_moe_permutation_device_ ||
+        saved_moe_scale_device_.size != N_active) {
         return grad_accum;
     }
 
-    int* workspace_counters_ptr = moe_ws.workspace_counters(num_experts);
-    cudaMemset(workspace_counters_ptr, 0,
-               static_cast<size_t>(num_experts) * sizeof(int));
+    int* permutation_ptr =
+        static_cast<int*>(saved_moe_permutation_device_.get());
+    float* scale_ptr = saved_moe_scale_device_.raw_data();
+    int* offsets_ptr = moe_ws.offsets(num_experts);
+    const cudaError_t offsets_copy_status = cudaMemcpy(
+        offsets_ptr, offsets_host.data(),
+        static_cast<size_t>(num_experts + 1) * sizeof(int),
+        cudaMemcpyHostToDevice);
+    if (offsets_copy_status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("MoE backward offsets upload failed: ") +
+            cudaGetErrorString(offsets_copy_status));
+    }
 
-    int*   permutation_ptr = moe_ws.permutation(N_active);
-    int*   assignment_ptr  = moe_ws.assignment(N_active);
-    float* scale_ptr       = moe_ws.scale(N_active);
-
-    launch_moe_compute_assignments_kernel(
-        weights_gpu.raw_data(), offsets_ptr, workspace_counters_ptr,
-        permutation_ptr, assignment_ptr, scale_ptr, rows,
-        num_experts);
+    Tensor router_grad_weights;
+    if (moe_router_grad_enabled() && router) {
+        if (saved_moe_permuted_output_.size != N_active * dim ||
+            saved_moe_permuted_output_.get_device() != Device::GPU) {
+            throw std::runtime_error(
+                "MoE batched router gradient is missing unscaled expert outputs");
+        }
+        router_grad_weights =
+            Tensor::zeros({rows, num_experts}, Device::GPU);
+        launch_moe_router_weight_grad_kernel(
+            dy.raw_data(), saved_moe_permuted_output_.raw_data(),
+            permutation_ptr, offsets_ptr, router_grad_weights.raw_data(),
+            N_active, dim, num_experts);
+    }
 
     // Gather dy into permuted layout (contiguous by expert).
     Tensor permuted_dy({N_active, dim}, Device::GPU);
@@ -2851,7 +2924,7 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
     // we treat permuted_dy as [N_active, dim] and multiply each row by
     // scale_buf[row].  Done with the existing mul_vector_broadcast kernel.
     {
-        Tensor scaled({N_active, dim}, Device::GPU);
+        Tensor scaled;
         // scale_buf is the per-row vector; reuse mul_vector_broadcast
         // semantics via a direct kernel launch.  We emit a small
         // strided-mul through the existing infrastructure to keep
@@ -2881,16 +2954,10 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
         // scale_buf[offset:offset+count] contains the router weights
         // for these slots — copy them to a small CPU vector then to
         // a device tensor for mul.
-        std::vector<float> slot_scales(static_cast<size_t>(count), 0.0f);
-        cudaMemcpy(slot_scales.data(),
-                   scale_ptr + static_cast<size_t>(offset),
-                   static_cast<size_t>(count) * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-        Tensor scale_col_host({count, 1}, Device::CPU);
-        std::memcpy(scale_col_host.data(), slot_scales.data(),
-                    static_cast<size_t>(count) * sizeof(float));
-        Tensor scale_col_gpu = scale_col_host.to(Device::GPU);
-        Tensor scaled_dy = expert_dy.mul(scale_col_gpu);
+        Tensor scaled_dy({count, dim}, Device::GPU);
+        launch_moe_scale_rows_kernel(
+            expert_dy.raw_data(), scale_ptr + static_cast<size_t>(offset),
+            scaled_dy.raw_data(), count, dim);
 
         Tensor expert_grad = expert_down[e]->backward(scaled_dy);
         // LEARN S1: apply squared_relu_backward between the two
@@ -2928,6 +2995,31 @@ Tensor JambaBlock::backward_moe_gpu_batched(const Tensor& dy, const Tensor& x) {
         permuted_grad_input.raw_data(), permutation_ptr,
         unit_scale_ptr, grad_accum.raw_data(), N_active, dim);
 
+    if (router_grad_weights.size > 0) {
+        Tensor router_input_grad =
+            router->accumulate_task_router_grad(router_grad_weights);
+        if (router_input_grad.size > 0) {
+            if (router_input_grad.shape != grad_accum.shape &&
+                router_input_grad.size == grad_accum.size) {
+                router_input_grad =
+                    router_input_grad.reshape(grad_accum.shape.dims);
+            }
+            if (router_input_grad.shape != grad_accum.shape ||
+                router_input_grad.get_device() != Device::GPU) {
+                throw std::runtime_error(
+                    "MoE batched router input-gradient contract mismatch");
+            }
+            grad_accum = grad_accum.add(router_input_grad);
+        }
+    }
+
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("MoE batched backward kernel failed: ") +
+            cudaGetErrorString(launch_status));
+    }
+
     return grad_accum;
 }
 #endif  // USE_CUDA
@@ -2942,16 +3034,15 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
     // Deterministic mode: the batched backward scatters grads via atomicAdd;
     // use the ordered per-expert host-side accumulation below instead.
     if (target_device == Device::GPU && gpu_custom_kernels_supported() &&
-        !saved_moe_rows_.empty() && saved_moe_weights_.size > 0 &&
+        saved_moe_permutation_device_ && saved_moe_weights_.size > 0 &&
         num_experts > 0 && num_experts <= 1024 && x.shape.back() > 0 &&
-        !determinism::deterministic_reductions_enabled() &&
+        !determinism::deterministic_reductions_enabled()) {
         // N4 (parity): the batched GPU backward does NOT compute the task→router
         // gradient (that path lives only in the ordered host backward below).
         // forward_moe already bypasses the batched FORWARD when this flag is on
         // (line ~1896); mirror that here so accumulate_task_router_grad always
         // runs when NSOS_MOE_ROUTER_GRAD=1 — otherwise the router's task grad is
         // silently dropped on GPU.
-        !moe_router_grad_enabled()) {
         return backward_moe_gpu_batched(dy, x);
     }
 #endif
@@ -3076,7 +3167,21 @@ Tensor JambaBlock::backward_moe(const Tensor& dy, Context* ctx, const std::strin
                 gw[static_cast<size_t>(r) * num_experts + e] = static_cast<float>(acc);
             }
         }
-        router->accumulate_task_router_grad(g_w);
+        Tensor router_input_grad = router->accumulate_task_router_grad(g_w);
+        if (router_input_grad.size > 0) {
+            if (router_input_grad.shape != grad_accum.shape &&
+                router_input_grad.size == grad_accum.size) {
+                router_input_grad = router_input_grad.reshape(grad_accum.shape.dims);
+            }
+            if (router_input_grad.shape != grad_accum.shape) {
+                throw std::runtime_error(
+                    "MoE router input-gradient shape mismatch");
+            }
+            if (router_input_grad.get_device() != grad_accum.get_device()) {
+                router_input_grad = router_input_grad.to(grad_accum.get_device());
+            }
+            grad_accum = grad_accum.add(router_input_grad);
+        }
     }
 
     return grad_accum;
@@ -3116,7 +3221,7 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
                 orig_shape.push_back(s[i]);
                 if (i + 1 < s.size()) total_lead *= s[i];
             }
-            Tensor dy_flat = dy.reshape({total_lead, orig_shape.back()});
+            Tensor dy_flat = dy_ff.reshape({total_lead, orig_shape.back()});
             Tensor x_flat  = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
             Tensor c_grad_flat = chrass_layer->backward(dy_flat, x_flat);
             Tensor c_grad = c_grad_flat.reshape(orig_shape);
@@ -3136,7 +3241,7 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
                 orig_shape.push_back(s[i]);
                 if (i + 1 < s.size()) total_lead *= s[i];
             }
-            Tensor dy_flat = dy.reshape({total_lead, orig_shape.back()});
+            Tensor dy_flat = dy_ff.reshape({total_lead, orig_shape.back()});
             Tensor x_flat  = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
             Tensor c_grad_flat = chrass_layer->backward(dy_flat, x_flat);
             Tensor c_grad = c_grad_flat.reshape(orig_shape);
@@ -3171,7 +3276,7 @@ Tensor JambaBlock::backward(const Tensor& dy, Context* ctx) {
                 orig_shape.push_back(s[i]);
                 if (i + 1 < s.size()) total_lead *= s[i];
             }
-            Tensor dy_flat = dy.reshape({total_lead, orig_shape.back()});
+            Tensor dy_flat = dy_ff.reshape({total_lead, orig_shape.back()});
             Tensor x_flat  = saved_ff_norm_.reshape({total_lead, orig_shape.back()});
             Tensor c_grad_flat = chrass_layer->backward(dy_flat, x_flat);
             Tensor c_grad = c_grad_flat.reshape(orig_shape);
@@ -3264,6 +3369,12 @@ void JambaBlock::reset() {
     saved_ff_hidden_pre_ = Tensor();
     saved_moe_weights_ = Tensor();
     saved_moe_rows_.clear();
+    saved_moe_scale_device_ = Tensor();
+    saved_moe_permuted_output_ = Tensor();
+    saved_moe_offsets_host_.clear();
+    saved_moe_counts_host_.clear();
+    saved_moe_n_active_ = 0;
+    saved_moe_expert_out_.clear();
     // LEARN S1: clear per-expert pre-activations.  Default-construct
     // each Tensor releases its backing storage (unique_ptr in
     // Tensor::data_ptr); the vector itself stays sized at num_experts
@@ -3421,6 +3532,9 @@ void JambaBlock::set_streaming_inference(bool enabled) {
 
 void JambaBlock::set_training_mode(bool enabled) {
     training_mode_ = enabled;
+    if (mamba_layer) {
+        mamba_layer->set_training_mode(enabled);
+    }
     if (attn_layer) {
         attn_layer->set_training_mode(enabled);
     }
@@ -3430,6 +3544,7 @@ void JambaBlock::set_training_mode(bool enabled) {
 }
 
 void JambaBlock::set_batch_valid_lengths(const std::vector<int>& lengths) {
+    active_batch_valid_lengths_ = lengths;
     if (attn_layer) {
         attn_layer->set_batch_valid_lengths(lengths);
     }
@@ -3546,31 +3661,35 @@ void JambaBlock::restore_session_state_batch(const std::vector<JambaBlockSession
     reset();
 }
 
-Attention::Attention(int d, int n, int l, int n_kv, float rope_theta)
+Attention::Attention(int d, int n, int l, int n_kv, float rope_theta,
+                     int sliding_window)
     : d_model(d),
-      n_heads(std::max(n, 1)),
-      n_kv_heads(select_kv_heads(std::max(n, 1), n_kv)),
-      kv_group_size(std::max(std::max(n, 1) /
-                                 std::max(select_kv_heads(std::max(n, 1), n_kv), 1),
-                             1)),
-      head_dim(std::max(d / std::max(n, 1), 1)),
+      n_heads(n),
+      n_kv_heads(n_kv),
+      kv_group_size(n_kv > 0 ? n / n_kv : 0),
+      head_dim(n > 0 ? d / n : 0),
       n_latents(l),
       q_down_proj(std::make_unique<BitLinear>(d, d)),
       kv_down_proj(
           std::make_unique<BitLinear>(d, 2 * n_kv_heads * head_dim)),
       out_proj(std::make_unique<BitLinear>(d, d)),
       max_seq_len(4096),
-      theta(rope_theta > 0.0f ? rope_theta : 10000.0f) {
+      sliding_window_(sliding_window),
+      theta(rope_theta) {
+    if (d <= 0 || n <= 0 || n_kv <= 0 || l <= 0 || d % n != 0 ||
+        n_kv > n || n % n_kv != 0 || ((d / n) & 1) != 0 ||
+        !std::isfinite(rope_theta) || rope_theta <= 0.0f ||
+        sliding_window <= 0) {
+        throw std::invalid_argument(
+            "Attention requires positive dimensions, d_model divisible by "
+            "n_heads, an even head dimension, n_heads divisible by "
+            "n_kv_heads, finite positive rope_theta, and a positive "
+            "sliding_window");
+    }
     // Env override (A/B harness), per-construction: NSOS_ROPE_THETA.  RoPE with
     // any theta is still exact — the kernels already take theta as a parameter,
     // so nothing else changes.  Larger theta -> more position-invariant dims
     // (content recall); theta -> inf approaches NoPE.
-    if (const char* e = std::getenv("NSOS_ROPE_THETA")) {
-        const float parsed = std::strtof(e, nullptr);
-        if (parsed > 0.0f) {
-            theta = parsed;
-        }
-    }
     precompute_freqs_cis();
     // Learned block-selection routing, initialised to identity so SSA
     // selection starts as the mean-key heuristic and is then trained.
@@ -3809,6 +3928,110 @@ Tensor Attention::sparse_forward(const Tensor& input, Context* ctx) {
     Tensor q_flat = q_down_proj->forward(project_input);
     Tensor kv_flat = kv_down_proj->forward(project_input);
 
+#ifdef USE_CUDA
+    if (original_device == Device::GPU && gpu_custom_kernels_supported() &&
+        head_dim <= 256 && ssa_top_k_blocks_ >= 0 &&
+        ssa_top_k_blocks_ <= 64) {
+        Tensor k_flat_gpu = Tensor::uninitialized(
+            {batch_size, seq_len, kv_dim}, Device::GPU);
+        Tensor v_flat_gpu = Tensor::uninitialized(
+            {batch_size, seq_len, kv_dim}, Device::GPU);
+        launch_kv_split(k_flat_gpu.raw_data(), v_flat_gpu.raw_data(),
+                        kv_flat.raw_data(),
+                        static_cast<long long>(batch_size) * seq_len, kv_dim);
+        Tensor q_rot_gpu = q_flat.clone();
+        Tensor k_rot_gpu = k_flat_gpu.clone();
+        ensure_rope_gpu_cache();
+        launch_rope_apply(q_rot_gpu.raw_data(), rope_cos_gpu_.raw_data(),
+                          rope_sin_gpu_.raw_data(), batch_size, seq_len,
+                          n_heads, head_dim, 0, max_seq_len, +1);
+        launch_rope_apply(k_rot_gpu.raw_data(), rope_cos_gpu_.raw_data(),
+                          rope_sin_gpu_.raw_data(), batch_size, seq_len,
+                          n_kv_heads, head_dim, 0, max_seq_len, +1);
+        attn_train_check_cuda("SSA split/RoPE forward");
+
+        saved_q_rot_ = q_rot_gpu.reshape(
+            {batch_size, seq_len, n_heads, head_dim});
+        saved_k_rot_ = k_rot_gpu.reshape(
+            {batch_size, seq_len, n_kv_heads, head_dim});
+        saved_v_heads_ = v_flat_gpu.reshape(
+            {batch_size, seq_len, n_kv_heads, head_dim});
+        saved_attn_probs_ = Tensor();
+
+        const int BH = batch_size * n_heads;
+        Tensor q_permuted = Tensor::uninitialized(
+            {BH, seq_len, head_dim}, Device::GPU);
+        Tensor k_permuted = Tensor::uninitialized(
+            {BH, seq_len, head_dim}, Device::GPU);
+        Tensor v_permuted = Tensor::uninitialized(
+            {BH, seq_len, head_dim}, Device::GPU);
+        launch_attn_gather_heads(
+            q_permuted.raw_data(), saved_q_rot_.raw_data(), batch_size,
+            seq_len, n_heads, head_dim, n_heads, 1, 0);
+        launch_attn_gather_heads(
+            k_permuted.raw_data(), saved_k_rot_.raw_data(), batch_size,
+            seq_len, n_heads, head_dim, n_kv_heads, kv_group_size, 0);
+        launch_attn_gather_heads(
+            v_permuted.raw_data(), saved_v_heads_.raw_data(), batch_size,
+            seq_len, n_heads, head_dim, n_kv_heads, kv_group_size, 0);
+
+        Tensor route_permuted = q_permuted;
+        if (ssa_wsel_.data.size > 0) {
+            if (ssa_wsel_.data.get_device() != Device::GPU) {
+                throw std::runtime_error(
+                    "SSA selector parameter must share the GPU compute device");
+            }
+            route_permuted =
+                q_permuted.matmul(ssa_wsel_.data.transpose());
+        }
+        Tensor output_permuted =
+            Tensor::zeros({BH, seq_len, head_dim}, Device::GPU);
+        const int block_size = std::max(ssa_block_size_, 1);
+        for (int batch = 0; batch < batch_size; ++batch) {
+            const int valid_len = std::clamp(
+                saved_valid_lengths_[static_cast<size_t>(batch)], 0, seq_len);
+            if (valid_len <= 0) continue;
+            const int block_count =
+                (valid_len + block_size - 1) / block_size;
+            for (int head = 0; head < n_heads; ++head) {
+                const int bh = batch * n_heads + head;
+                const size_t offset =
+                    static_cast<size_t>(bh) * seq_len * head_dim;
+                Tensor block_means(
+                    {block_count, head_dim}, Device::GPU);
+                cuda::launch_sparse_block_means(
+                    k_permuted.raw_data() + offset,
+                    block_means.raw_data(), valid_len, head_dim, block_size);
+                cuda::launch_sparse_selective_attention(
+                    q_permuted.raw_data() + offset,
+                    k_permuted.raw_data() + offset,
+                    v_permuted.raw_data() + offset,
+                    route_permuted.raw_data() + offset,
+                    block_means.raw_data(), output_permuted.raw_data() + offset,
+                    valid_len, head_dim, block_size, ssa_top_k_blocks_,
+                    ssa_local_blocks_, ssa_sink_blocks_, scale);
+            }
+        }
+        Tensor output_heads = Tensor::uninitialized(
+            {batch_size, seq_len, n_heads, head_dim}, Device::GPU);
+        launch_attn_unpermute_heads(
+            output_heads.raw_data(), output_permuted.raw_data(), batch_size,
+            n_heads, seq_len, head_dim);
+        attn_train_check_cuda("SSA selective forward");
+        Tensor projected = out_proj->forward(
+            output_heads.reshape({batch_size, seq_len, d_model}));
+        if (saved_input_rank_ == 1) return projected.reshape({d_model});
+        if (saved_input_rank_ == 2) return projected.reshape({seq_len, d_model});
+        return projected;
+    }
+#endif
+
+    if (original_device == Device::GPU && strict_gpu_execution()) {
+        throw std::runtime_error(
+            "Strict GPU SSA requires custom kernels, head_dim <= 256 and "
+            "top_k_blocks <= 64");
+    }
+
     // Sparse attention math (block selection + softmax) runs on host pointers;
     // bring projections to CPU for the per-head extraction and for backward
     // (Attention::backward consumes saved_*_ as CPU tensors).
@@ -4012,7 +4235,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                                                        n_kv_heads,
                                                        head_dim,
                                                        kv_group_size,
-                                                       theta);
+                                                       theta,
+                                                       sliding_window_);
             cudaError_t status = cudaGetLastError();
             if (status != cudaSuccess) {
                 throw std::runtime_error(
@@ -4141,6 +4365,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 for (int head = 0; head < n_heads; ++head) {
                     const int kv_head = std::min(head / kv_group_size, n_kv_heads - 1);
                     for (int i = 0; i < seq_len; ++i) {
+                        const int first_key = std::max(0, i - sliding_window_ + 1);
                         const size_t out_row_offset =
                             (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
                             static_cast<size_t>(head_dim);
@@ -4152,7 +4377,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         float max_s = -1e30f;
                         for (int j = 0; j < seq_len; ++j) {
                             float score = -1e9f;
-                            if (j < valid_len && j <= i) {
+                            if (j >= first_key && j < valid_len && j <= i) {
                                 float dot = 0.0f;
                                 const size_t q_offset =
                                     (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
@@ -4173,8 +4398,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         float sum_exp = 0.0f;
                         for (int j = 0; j < seq_len; ++j) {
                             float value =
-                                (j < valid_len && j <= i) ? std::exp(scores[static_cast<size_t>(j)] - max_s)
-                                                          : 0.0f;
+                                (j >= first_key && j < valid_len && j <= i)
+                                    ? std::exp(scores[static_cast<size_t>(j)] - max_s)
+                                    : 0.0f;
                             probs[static_cast<size_t>(j)] = value;
                             sum_exp += value;
                         }
@@ -4242,8 +4468,100 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
 #ifdef USE_CUDA
             if (original_device == Device::GPU &&
                 q_flat.get_device() == Device::GPU &&
+                kv_flat.get_device() == Device::GPU && batch_size > 0 &&
+                sparse_enabled_ && gpu_custom_kernels_supported() &&
+                head_dim <= 256 && ssa_top_k_blocks_ >= 0 &&
+                ssa_top_k_blocks_ <= 64) {
+                ensure_kv_cache_capacity(
+                    cached_tokens_ + 1, Device::GPU, batch_size);
+                const size_t kv_row_stride =
+                    static_cast<size_t>(2 * kv_dim);
+                const size_t cache_row_stride =
+                    static_cast<size_t>(cache_capacity_tokens_) * kv_dim;
+                for (int batch = 0; batch < batch_size; ++batch) {
+                    launch_gqa_append_kv_cache_kernel(
+                        kv_flat.raw_data() +
+                            static_cast<size_t>(batch) * kv_row_stride,
+                        key_cache_buffer_.raw_data() +
+                            static_cast<size_t>(batch) * cache_row_stride,
+                        value_cache_buffer_.raw_data() +
+                            static_cast<size_t>(batch) * cache_row_stride,
+                        cached_tokens_, n_kv_heads, head_dim, theta);
+                }
+                Tensor q_rot_gpu = q_flat.clone();
+                ensure_rope_gpu_cache();
+                launch_rope_apply(
+                    q_rot_gpu.raw_data(), rope_cos_gpu_.raw_data(),
+                    rope_sin_gpu_.raw_data(), batch_size, 1, n_heads,
+                    head_dim, cached_tokens_, max_seq_len, +1);
+                Tensor q_heads = q_rot_gpu.reshape(
+                    {batch_size, n_heads, 1, head_dim});
+                Tensor route_heads = q_heads;
+                if (ssa_wsel_.data.size > 0) {
+                    if (ssa_wsel_.data.get_device() != Device::GPU) {
+                        throw std::runtime_error(
+                            "SSA selector parameter must share the GPU compute device");
+                    }
+                    route_heads =
+                        q_heads.matmul(ssa_wsel_.data.transpose());
+                }
+                const int total_tokens = cached_tokens_ + 1;
+                const int block_size = std::max(ssa_block_size_, 1);
+                const int block_count =
+                    (total_tokens + block_size - 1) / block_size;
+                Tensor output_heads = Tensor::zeros(
+                    {batch_size, 1, n_heads, head_dim}, Device::GPU);
+                for (int batch = 0; batch < batch_size; ++batch) {
+                    Tensor k_permuted = Tensor::uninitialized(
+                        {n_heads, total_tokens, head_dim}, Device::GPU);
+                    Tensor v_permuted = Tensor::uninitialized(
+                        {n_heads, total_tokens, head_dim}, Device::GPU);
+                    launch_attn_gather_heads(
+                        k_permuted.raw_data(),
+                        key_cache_buffer_.raw_data() +
+                            static_cast<size_t>(batch) * cache_row_stride,
+                        1, total_tokens, n_heads, head_dim, n_kv_heads,
+                        kv_group_size, 0);
+                    launch_attn_gather_heads(
+                        v_permuted.raw_data(),
+                        value_cache_buffer_.raw_data() +
+                            static_cast<size_t>(batch) * cache_row_stride,
+                        1, total_tokens, n_heads, head_dim, n_kv_heads,
+                        kv_group_size, 0);
+                    for (int head = 0; head < n_heads; ++head) {
+                        const size_t cache_offset =
+                            static_cast<size_t>(head) * total_tokens * head_dim;
+                        const size_t head_offset =
+                            (static_cast<size_t>(batch) * n_heads + head) *
+                            head_dim;
+                        Tensor block_means(
+                            {block_count, head_dim}, Device::GPU);
+                        cuda::launch_sparse_block_means(
+                            k_permuted.raw_data() + cache_offset,
+                            block_means.raw_data(), total_tokens, head_dim,
+                            block_size);
+                        cuda::launch_sparse_selective_attention_decode(
+                            q_heads.raw_data() + head_offset,
+                            k_permuted.raw_data() + cache_offset,
+                            v_permuted.raw_data() + cache_offset,
+                            route_heads.raw_data() + head_offset,
+                            block_means.raw_data(),
+                            output_heads.raw_data() + head_offset,
+                            total_tokens, head_dim, block_size,
+                            ssa_top_k_blocks_, ssa_local_blocks_,
+                            ssa_sink_blocks_, scale);
+                    }
+                }
+                ++cached_tokens_;
+                attn_train_check_cuda("batched SSA streaming decode");
+                return out_proj->forward(
+                    output_heads.reshape({batch_size, 1, d_model}));
+            }
+            if (original_device == Device::GPU &&
+                q_flat.get_device() == Device::GPU &&
                 kv_flat.get_device() == Device::GPU &&
                 batch_size > 0 &&
+                !sparse_enabled_ &&
                 gpu_custom_kernels_supported()) {
                 ensure_kv_cache_capacity(cached_tokens_ + 1, Device::GPU, batch_size);
                 Tensor output_gpu({batch_size, 1, d_model}, Device::GPU);
@@ -4272,7 +4590,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         n_kv_heads,
                         head_dim,
                         kv_group_size,
-                        theta);
+                        theta,
+                        sliding_window_);
                 }
                 ++cached_tokens_;
 
@@ -4296,6 +4615,12 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 return out_proj->forward(output_gpu);
             }
 #endif
+
+            if (sparse_enabled_) {
+                throw std::runtime_error(
+                    "Batched streaming SSA is unsupported; use single-sequence "
+                    "decode or disable sparse attention");
+            }
 
             Tensor q_cpu = (q_flat.get_device() == Device::GPU) ? q_flat.cpu() : q_flat;
             Tensor kv_cpu = (kv_flat.get_device() == Device::GPU) ? kv_flat.cpu() : kv_flat;
@@ -4331,10 +4656,11 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             const float* q_ptr = q_rot.data();
             for (int batch = 0; batch < batch_size; ++batch) {
                 std::vector<float> token_scores(static_cast<size_t>(cached_tokens_), 0.0f);
+                const int first_token = std::max(0, cached_tokens_ - sliding_window_);
                 for (int head = 0; head < n_heads; ++head) {
                     const int kv_head = std::min(head / kv_group_size, n_kv_heads - 1);
                     float max_s = -1e30f;
-                    for (int t = 0; t < cached_tokens_; ++t) {
+                    for (int t = first_token; t < cached_tokens_; ++t) {
                         float dot = 0.0f;
                         const float* cached_key_token =
                             kv_cache_token_ptr(key_cache_buffer_, batch, t);
@@ -4351,13 +4677,14 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                         max_s = std::max(max_s, token_scores[static_cast<size_t>(t)]);
                     }
                     float sum_exp = 0.0f;
-                    for (float& score_value : token_scores) {
+                    for (int t = first_token; t < cached_tokens_; ++t) {
+                        float& score_value = token_scores[static_cast<size_t>(t)];
                         score_value = std::exp(score_value - max_s);
                         sum_exp += score_value;
                     }
                     const float inv_sum = 1.0f / std::max(sum_exp, 1e-9f);
-                    for (float& score_value : token_scores) {
-                        score_value *= inv_sum;
+                    for (int t = first_token; t < cached_tokens_; ++t) {
+                        token_scores[static_cast<size_t>(t)] *= inv_sum;
                     }
                     const size_t out_offset =
                         (((static_cast<size_t>(batch) * 1) * n_heads) + head) *
@@ -4366,7 +4693,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                     std::fill_n(out_head, head_dim, 0.0f);
                     const size_t kv_offset =
                         static_cast<size_t>(kv_head) * static_cast<size_t>(head_dim);
-                    for (int t = 0; t < cached_tokens_; ++t) {
+                    for (int t = first_token; t < cached_tokens_; ++t) {
                         const float* cached_value_token =
                             kv_cache_token_ptr(value_cache_buffer_, batch, t) + kv_offset;
                         const float score = token_scores[static_cast<size_t>(t)];
@@ -4406,7 +4733,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                                                        n_kv_heads,
                                                        head_dim,
                                                        kv_group_size,
-                                                       theta);
+                                                       theta,
+                                                       sliding_window_);
 
             cudaError_t status = cudaGetLastError();
             if (status != cudaSuccess) {
@@ -4477,10 +4805,11 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 std::fill(scores.begin(), scores.end(), 0.0f);
 
                 for (int i = 0; i < seq_len; ++i) {
+                    const int first_key = std::max(0, i - sliding_window_ + 1);
                     float max_s = -1e30f;
                     for (int j = 0; j < seq_len; ++j) {
                         float score = -1e9f;
-                        if (j <= i) {
+                        if (j >= first_key && j <= i) {
                             float dot = 0.0f;
                             const size_t q_offset =
                                 (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
@@ -4500,7 +4829,10 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
 
                     float sum_exp = 0.0f;
                     for (int j = 0; j < seq_len; ++j) {
-                        float value = std::exp(scores[static_cast<size_t>(i) * seq_len + j] - max_s);
+                        const float value =
+                            (j >= first_key && j <= i)
+                                ? std::exp(scores[static_cast<size_t>(i) * seq_len + j] - max_s)
+                                : 0.0f;
                         scores[static_cast<size_t>(i) * seq_len + j] = value;
                         sum_exp += value;
                     }
@@ -4554,7 +4886,74 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         seq_len > 0 &&
         seq_len <= 4096 &&
         gpu_custom_kernels_supported()) {
-        if (streaming_inference_ && seq_len == 1) {
+        if (streaming_inference_ && seq_len == 1 && sparse_enabled_ &&
+            head_dim <= 256 && ssa_top_k_blocks_ >= 0 &&
+            ssa_top_k_blocks_ <= 64) {
+            ensure_kv_cache_capacity(cached_tokens_ + 1, Device::GPU);
+            launch_gqa_append_kv_cache_kernel(
+                kv_flat.raw_data(), key_cache_buffer_.raw_data(),
+                value_cache_buffer_.raw_data(), cached_tokens_, n_kv_heads,
+                head_dim, theta);
+            Tensor q_rot_gpu = q_flat.clone();
+            ensure_rope_gpu_cache();
+            launch_rope_apply(
+                q_rot_gpu.raw_data(), rope_cos_gpu_.raw_data(),
+                rope_sin_gpu_.raw_data(), 1, 1, n_heads, head_dim,
+                cached_tokens_, max_seq_len, +1);
+            const int total_tokens = cached_tokens_ + 1;
+            Tensor k_permuted = Tensor::uninitialized(
+                {n_heads, total_tokens, head_dim}, Device::GPU);
+            Tensor v_permuted = Tensor::uninitialized(
+                {n_heads, total_tokens, head_dim}, Device::GPU);
+            launch_attn_gather_heads(
+                k_permuted.raw_data(), key_cache_buffer_.raw_data(), 1,
+                total_tokens, n_heads, head_dim, n_kv_heads, kv_group_size, 0);
+            launch_attn_gather_heads(
+                v_permuted.raw_data(), value_cache_buffer_.raw_data(), 1,
+                total_tokens, n_heads, head_dim, n_kv_heads, kv_group_size, 0);
+            Tensor q_heads = q_rot_gpu.reshape({n_heads, 1, head_dim});
+            Tensor route_heads = q_heads;
+            if (ssa_wsel_.data.size > 0) {
+                if (ssa_wsel_.data.get_device() != Device::GPU) {
+                    throw std::runtime_error(
+                        "SSA selector parameter must share the GPU compute device");
+                }
+                route_heads = q_heads.matmul(ssa_wsel_.data.transpose());
+            }
+            Tensor output_heads =
+                Tensor::zeros({1, 1, n_heads, head_dim}, Device::GPU);
+            const int block_size = std::max(ssa_block_size_, 1);
+            const int block_count =
+                (total_tokens + block_size - 1) / block_size;
+            for (int head = 0; head < n_heads; ++head) {
+                const size_t cache_offset =
+                    static_cast<size_t>(head) * total_tokens * head_dim;
+                const size_t head_offset =
+                    static_cast<size_t>(head) * head_dim;
+                Tensor block_means(
+                    {block_count, head_dim}, Device::GPU);
+                cuda::launch_sparse_block_means(
+                    k_permuted.raw_data() + cache_offset,
+                    block_means.raw_data(), total_tokens, head_dim, block_size);
+                cuda::launch_sparse_selective_attention_decode(
+                    q_heads.raw_data() + head_offset,
+                    k_permuted.raw_data() + cache_offset,
+                    v_permuted.raw_data() + cache_offset,
+                    route_heads.raw_data() + head_offset,
+                    block_means.raw_data(),
+                    output_heads.raw_data() + head_offset, total_tokens,
+                    head_dim, block_size, ssa_top_k_blocks_, ssa_local_blocks_,
+                    ssa_sink_blocks_, scale);
+            }
+            ++cached_tokens_;
+            attn_train_check_cuda("SSA streaming decode");
+            Tensor projected = out_proj->forward(
+                output_heads.reshape({1, d_model}));
+            return input.shape.size() == 1
+                       ? projected.reshape({d_model})
+                       : projected;
+        }
+        if (streaming_inference_ && seq_len == 1 && !sparse_enabled_) {
             ensure_kv_cache_capacity(cached_tokens_ + 1, Device::GPU);
             Tensor output_gpu({seq_len, d_model}, Device::GPU);
             launch_gqa_append_kv_cache_kernel(
@@ -4576,7 +4975,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 n_kv_heads,
                 head_dim,
                 kv_group_size,
-                theta);
+                theta,
+                sliding_window_);
             ++cached_tokens_;
 
             cudaError_t status = cudaGetLastError();
@@ -4612,7 +5012,8 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             n_kv_heads,
             head_dim,
             kv_group_size,
-            theta);
+            theta,
+            sliding_window_);
 
         cudaError_t status = cudaGetLastError();
         if (status != cudaSuccess) {
@@ -4636,6 +5037,12 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         }
     }
 #endif
+    if (original_device == Device::GPU && streaming_inference_ &&
+        sparse_enabled_ && strict_gpu_execution()) {
+        throw std::runtime_error(
+            "GPU streaming SSA has no validated device kernel; strict GPU "
+            "execution refuses a host fallback");
+    }
     Tensor q_cpu = (q_flat.get_device() == Device::GPU) ? q_flat.cpu() : q_flat;
     Tensor kv_cpu = (kv_flat.get_device() == Device::GPU) ? kv_flat.cpu() : kv_flat;
 
@@ -4677,6 +5084,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         append_kv_cache_token(k_rot_ptr, Device::CPU, v_ptr, Device::CPU);
 
         std::vector<float> token_scores(static_cast<size_t>(cached_tokens_), 0.0f);
+        const int first_token = std::max(0, cached_tokens_ - sliding_window_);
         for (int h = 0; h < n_heads; ++h) {
             const int kv_head = std::min(h / kv_group_size, n_kv_heads - 1);
             // SSA (opt-in, default OFF): select top-k content blocks + local
@@ -4734,7 +5142,7 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                             ssa_active[static_cast<size_t>(t)] = 1;
             }
             float max_s = -1e30f;
-            for (int t = 0; t < cached_tokens_; ++t) {
+            for (int t = first_token; t < cached_tokens_; ++t) {
                 if (!ssa_active.empty() && !ssa_active[static_cast<size_t>(t)]) {
                     token_scores[static_cast<size_t>(t)] = -1e30f;
                     continue;
@@ -4750,19 +5158,20 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
                 max_s = std::max(max_s, token_scores[static_cast<size_t>(t)]);
             }
             float sum_exp = 0.0f;
-            for (float& score_value : token_scores) {
+            for (int t = first_token; t < cached_tokens_; ++t) {
+                float& score_value = token_scores[static_cast<size_t>(t)];
                 score_value = std::exp(score_value - max_s);
                 sum_exp += score_value;
             }
             const float inv_sum = 1.0f / std::max(sum_exp, 1e-9f);
-            for (float& score_value : token_scores) {
-                score_value *= inv_sum;
+            for (int t = first_token; t < cached_tokens_; ++t) {
+                token_scores[static_cast<size_t>(t)] *= inv_sum;
             }
             float* out_head = out_ptr + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
             std::fill_n(out_head, head_dim, 0.0f);
             const size_t kv_offset =
                 static_cast<size_t>(kv_head) * static_cast<size_t>(head_dim);
-            for (int t = 0; t < cached_tokens_; ++t) {
+            for (int t = first_token; t < cached_tokens_; ++t) {
                 const float* cached_value_token =
                     kv_cache_token_ptr(value_cache_buffer_, t) + kv_offset;
                 const float score = token_scores[static_cast<size_t>(t)];
@@ -4828,8 +5237,9 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
         const float* qh = q_rot.data() + h * head_dim;   // offset na dim de cabeça
 
         for (int i = 0; i < seq_len; ++i) {
+            const int first_key = std::max(0, i - sliding_window_ + 1);
             for (int j = 0; j < seq_len; ++j) {
-                if (j > i) {
+                if (j < first_key || j > i) {
                     // Máscara causal: tokens futuros recebem -inf
                     scores[i * seq_len + j] = -1e9f;
                     continue;
@@ -4888,6 +5298,130 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
 // Derivation per (b,h,i):  P = softmax(mask(scale·Q·Kᵀ))
 //   dP = dO·Vᵀ ; dS = scale·P⊙(dP − Σⱼ P·dP) ; dQ = dS·K ; dK = dSᵀ·Q ;
 //   dV = Pᵀ·dO ; GQA: dK/dV reduzidos por grupo de query-heads.
+Tensor Attention::backward_sparse_gpu(const Tensor& dy, int batch_size,
+                                      int seq_len, int kv_dim, float scale) {
+#ifdef USE_CUDA
+    Tensor grad_out = out_proj->backward(dy);
+    Tensor grad_heads =
+        grad_out.reshape({batch_size, seq_len, n_heads, head_dim});
+    const int BH = batch_size * n_heads;
+    Tensor q_permuted = Tensor::uninitialized(
+        {BH, seq_len, head_dim}, Device::GPU);
+    Tensor k_permuted = Tensor::uninitialized(
+        {BH, seq_len, head_dim}, Device::GPU);
+    Tensor v_permuted = Tensor::uninitialized(
+        {BH, seq_len, head_dim}, Device::GPU);
+    Tensor go_permuted = Tensor::uninitialized(
+        {BH, seq_len, head_dim}, Device::GPU);
+    launch_attn_gather_heads(
+        q_permuted.raw_data(), saved_q_rot_.raw_data(), batch_size, seq_len,
+        n_heads, head_dim, n_heads, 1, 0);
+    launch_attn_gather_heads(
+        k_permuted.raw_data(), saved_k_rot_.raw_data(), batch_size, seq_len,
+        n_heads, head_dim, n_kv_heads, kv_group_size, 0);
+    launch_attn_gather_heads(
+        v_permuted.raw_data(), saved_v_heads_.raw_data(), batch_size, seq_len,
+        n_heads, head_dim, n_kv_heads, kv_group_size, 0);
+    launch_attn_gather_heads(
+        go_permuted.raw_data(), grad_heads.raw_data(), batch_size, seq_len,
+        n_heads, head_dim, n_heads, 1, 0);
+
+    Tensor route_permuted = q_permuted;
+    if (ssa_wsel_.data.size > 0) {
+        if (ssa_wsel_.data.get_device() != Device::GPU) {
+            throw std::runtime_error(
+                "SSA selector parameter must share the GPU compute device");
+        }
+        route_permuted = q_permuted.matmul(ssa_wsel_.data.transpose());
+    }
+    Tensor dq_permuted =
+        Tensor::zeros({BH, seq_len, head_dim}, Device::GPU);
+    Tensor dk_permuted =
+        Tensor::zeros({BH, seq_len, head_dim}, Device::GPU);
+    Tensor dv_permuted =
+        Tensor::zeros({BH, seq_len, head_dim}, Device::GPU);
+    const int block_size = std::max(ssa_block_size_, 1);
+    const bool deterministic =
+        determinism::deterministic_reductions_enabled();
+    for (int batch = 0; batch < batch_size; ++batch) {
+        const int valid_len = std::clamp(
+            saved_valid_lengths_[static_cast<size_t>(batch)], 0, seq_len);
+        if (valid_len <= 0) continue;
+        const int block_count =
+            (valid_len + block_size - 1) / block_size;
+        for (int head = 0; head < n_heads; ++head) {
+            const int bh = batch * n_heads + head;
+            const size_t offset =
+                static_cast<size_t>(bh) * seq_len * head_dim;
+            Tensor block_means(
+                {block_count, head_dim}, Device::GPU);
+            cuda::launch_sparse_block_means(
+                k_permuted.raw_data() + offset, block_means.raw_data(),
+                valid_len, head_dim, block_size);
+            cuda::launch_sparse_selective_attention_backward(
+                q_permuted.raw_data() + offset,
+                k_permuted.raw_data() + offset,
+                v_permuted.raw_data() + offset,
+                route_permuted.raw_data() + offset,
+                block_means.raw_data(), go_permuted.raw_data() + offset,
+                dq_permuted.raw_data() + offset,
+                dk_permuted.raw_data() + offset,
+                dv_permuted.raw_data() + offset, valid_len, head_dim,
+                block_size, ssa_top_k_blocks_, ssa_local_blocks_,
+                ssa_sink_blocks_, scale, deterministic);
+        }
+    }
+
+    Tensor grad_q_rot = Tensor::uninitialized(
+        {batch_size, seq_len, n_heads, head_dim}, Device::GPU);
+    Tensor grad_k_rot = Tensor::uninitialized(
+        {batch_size, seq_len, n_kv_heads, head_dim}, Device::GPU);
+    Tensor grad_v = Tensor::uninitialized(
+        {batch_size, seq_len, n_kv_heads, head_dim}, Device::GPU);
+    launch_attn_unpermute_heads(
+        grad_q_rot.raw_data(), dq_permuted.raw_data(), batch_size, n_heads,
+        seq_len, head_dim);
+    launch_attn_reduce_group(
+        grad_k_rot.raw_data(), dk_permuted.raw_data(), batch_size, seq_len,
+        n_kv_heads, head_dim, n_heads, kv_group_size);
+    launch_attn_reduce_group(
+        grad_v.raw_data(), dv_permuted.raw_data(), batch_size, seq_len,
+        n_kv_heads, head_dim, n_heads, kv_group_size);
+
+    ensure_rope_gpu_cache();
+    launch_rope_apply(
+        grad_q_rot.raw_data(), rope_cos_gpu_.raw_data(),
+        rope_sin_gpu_.raw_data(), batch_size, seq_len, n_heads, head_dim, 0,
+        max_seq_len, -1);
+    launch_rope_apply(
+        grad_k_rot.raw_data(), rope_cos_gpu_.raw_data(),
+        rope_sin_gpu_.raw_data(), batch_size, seq_len, n_kv_heads, head_dim, 0,
+        max_seq_len, -1);
+    Tensor grad_q_input =
+        grad_q_rot.reshape({batch_size, seq_len, d_model});
+    Tensor grad_kv_input = Tensor::uninitialized(
+        {batch_size, seq_len, 2 * kv_dim}, Device::GPU);
+    launch_kv_concat(
+        grad_kv_input.raw_data(), grad_k_rot.raw_data(), grad_v.raw_data(),
+        static_cast<long long>(batch_size) * seq_len, kv_dim);
+    attn_train_check_cuda("SSA selective backward");
+
+    Tensor grad_q = q_down_proj->backward(grad_q_input);
+    Tensor grad_kv = kv_down_proj->backward(grad_kv_input);
+    Tensor grad_total = grad_q.add(grad_kv);
+    if (saved_input_rank_ == 1) return grad_total.reshape({d_model});
+    if (saved_input_rank_ == 2) return grad_total.reshape({seq_len, d_model});
+    return grad_total;
+#else
+    (void)dy;
+    (void)batch_size;
+    (void)seq_len;
+    (void)kv_dim;
+    (void)scale;
+    throw std::runtime_error("GPU SSA backward requires a CUDA build");
+#endif
+}
+
 Tensor Attention::backward_exact_gpu(const Tensor& dy, int batch_size,
                                      int seq_len, int kv_dim, float scale) {
     const int B = batch_size;
@@ -4931,7 +5465,8 @@ Tensor Attention::backward_exact_gpu(const Tensor& dy, int batch_size,
 
     // P = masked_softmax(scale * Q Kᵀ)   (in place over the scores buffer)
     Tensor scores = Qp.reshape({BH, S, hd}).matmul(KpT.reshape({BH, hd, S}));
-    launch_attn_masked_softmax(scores.raw_data(), dvalid, B, H, S, scale);
+    launch_attn_masked_softmax(scores.raw_data(), dvalid, B, H, S, scale,
+                               sliding_window_);
     // dP = dO Vᵀ ; dS = scale * P ⊙ (dP − rowdot)
     Tensor dP = Op.reshape({BH, S, hd}).matmul(VpT.reshape({BH, hd, S}));
     Tensor dS = Tensor::uninitialized({BH, S, S}, Device::GPU);
@@ -5004,7 +5539,18 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
         // GPU exact-cache backward: keeps the whole attention backward
         // device-resident.  The host loop below remains as the reference
         // implementation and the NSOS_ATTN_BWD_HOST=1 parity arm.
-        if (!attn_bwd_force_host() && gpu_custom_kernels_supported() &&
+        if (sparse_enabled_ && !attn_bwd_force_host() &&
+            gpu_custom_kernels_supported() &&
+            saved_q_rot_.get_device() == Device::GPU &&
+            saved_k_rot_.get_device() == Device::GPU &&
+            saved_v_heads_.get_device() == Device::GPU &&
+            head_dim <= 256 && ssa_top_k_blocks_ >= 0 &&
+            ssa_top_k_blocks_ <= 64 && head_dim % 2 == 0) {
+            return backward_sparse_gpu(
+                dy, batch_size, seq_len, kv_dim, scale);
+        }
+        if (!sparse_enabled_ && !attn_bwd_force_host() &&
+            gpu_custom_kernels_supported() &&
             saved_q_rot_.get_device() == Device::GPU &&
             saved_k_rot_.get_device() == Device::GPU &&
             saved_v_heads_.get_device() == Device::GPU &&
@@ -5012,6 +5558,13 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
             return backward_exact_gpu(dy, batch_size, seq_len, kv_dim, scale);
         }
 #endif
+
+        if (saved_q_rot_.get_device() == Device::GPU &&
+            strict_gpu_execution()) {
+            throw std::runtime_error(
+                "Strict GPU attention backward has no eligible device path for "
+                "the active configuration");
+        }
 
         Tensor grad_out = out_proj->backward(dy);
         Tensor grad_out_host = (grad_out.get_device() == Device::GPU) ? grad_out.cpu() : grad_out;
@@ -5038,12 +5591,77 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
         std::vector<float> scores(static_cast<size_t>(seq_len), 0.0f);
         std::vector<float> probs(static_cast<size_t>(seq_len), 0.0f);
 
+        if (sparse_enabled_) {
+            SparseAttentionConfig sparse_cfg;
+            sparse_cfg.block_size = ssa_block_size_;
+            sparse_cfg.top_k_blocks = ssa_top_k_blocks_;
+            sparse_cfg.local_blocks = ssa_local_blocks_;
+            sparse_cfg.sink_blocks = ssa_sink_blocks_;
+            sparse_cfg.scale = scale;
+
+            for (int batch = 0; batch < batch_size; ++batch) {
+                const int valid_len = std::clamp(
+                    saved_valid_lengths_[static_cast<size_t>(batch)], 0, seq_len);
+                if (valid_len <= 0) continue;
+                for (int head = 0; head < n_heads; ++head) {
+                    const int kv_head =
+                        std::min(head / kv_group_size, n_kv_heads - 1);
+                    Tensor Qh({valid_len, head_dim}, Device::CPU);
+                    Tensor Kh({valid_len, head_dim}, Device::CPU);
+                    Tensor Vh({valid_len, head_dim}, Device::CPU);
+                    Tensor dOh({valid_len, head_dim}, Device::CPU);
+                    for (int token = 0; token < valid_len; ++token) {
+                        const size_t q_offset =
+                            (((static_cast<size_t>(batch) * seq_len + token) *
+                              n_heads) + head) * head_dim;
+                        const size_t kv_offset =
+                            (((static_cast<size_t>(batch) * seq_len + token) *
+                              n_kv_heads) + kv_head) * head_dim;
+                        std::memcpy(Qh.data() + static_cast<size_t>(token) * head_dim,
+                                    q_ptr + q_offset,
+                                    static_cast<size_t>(head_dim) * sizeof(float));
+                        std::memcpy(Kh.data() + static_cast<size_t>(token) * head_dim,
+                                    k_ptr + kv_offset,
+                                    static_cast<size_t>(head_dim) * sizeof(float));
+                        std::memcpy(Vh.data() + static_cast<size_t>(token) * head_dim,
+                                    v_ptr + kv_offset,
+                                    static_cast<size_t>(head_dim) * sizeof(float));
+                        std::memcpy(dOh.data() + static_cast<size_t>(token) * head_dim,
+                                    grad_head_ptr + q_offset,
+                                    static_cast<size_t>(head_dim) * sizeof(float));
+                    }
+
+                    SparseAttentionBackwardResult sparse_grad =
+                        sparse_selective_attention_backward(
+                            Qh, Kh, Vh, sparse_cfg, dOh, &ssa_wsel_.data);
+                    const float* dq_sparse = sparse_grad.dQ.data();
+                    const float* dk_sparse = sparse_grad.dK.data();
+                    const float* dv_sparse = sparse_grad.dV.data();
+                    for (int token = 0; token < valid_len; ++token) {
+                        const size_t q_offset =
+                            (((static_cast<size_t>(batch) * seq_len + token) *
+                              n_heads) + head) * head_dim;
+                        const size_t kv_offset =
+                            (((static_cast<size_t>(batch) * seq_len + token) *
+                              n_kv_heads) + kv_head) * head_dim;
+                        for (int dim = 0; dim < head_dim; ++dim) {
+                            const size_t local =
+                                static_cast<size_t>(token) * head_dim + dim;
+                            grad_q_ptr[q_offset + dim] = dq_sparse[local];
+                            grad_k_ptr[kv_offset + dim] += dk_sparse[local];
+                            grad_v_ptr[kv_offset + dim] += dv_sparse[local];
+                        }
+                    }
+                }
+            }
+        } else {
         for (int batch = 0; batch < batch_size; ++batch) {
             const int valid_len =
                 std::clamp(saved_valid_lengths_[static_cast<size_t>(batch)], 0, seq_len);
             for (int head = 0; head < n_heads; ++head) {
                 const int kv_head = std::min(head / kv_group_size, n_kv_heads - 1);
                 for (int i = 0; i < valid_len; ++i) {
+                    const int first_key = std::max(0, i - sliding_window_ + 1);
                     const size_t q_offset =
                         (((static_cast<size_t>(batch) * seq_len + i) * n_heads) + head) *
                         static_cast<size_t>(head_dim);
@@ -5054,7 +5672,7 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
                     float max_s = -1e30f;
                     for (int j = 0; j < seq_len; ++j) {
                         float score = -1e9f;
-                        if (j < valid_len && j <= i) {
+                        if (j >= first_key && j < valid_len && j <= i) {
                             float dot = 0.0f;
                             const size_t k_offset =
                                 (((static_cast<size_t>(batch) * seq_len + j) * n_kv_heads) +
@@ -5073,7 +5691,7 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
                     float sum_exp = 0.0f;
                     for (int j = 0; j < seq_len; ++j) {
                         const float value =
-                            (j < valid_len && j <= i)
+                            (j >= first_key && j < valid_len && j <= i)
                                 ? std::exp(scores[static_cast<size_t>(j)] - max_s)
                                 : 0.0f;
                         probs[static_cast<size_t>(j)] = value;
@@ -5085,7 +5703,7 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
                     }
 
                     float row_dot = 0.0f;
-                    for (int j = 0; j < valid_len; ++j) {
+                    for (int j = first_key; j < valid_len; ++j) {
                         const size_t v_offset =
                             (((static_cast<size_t>(batch) * seq_len + j) * n_kv_heads) + kv_head) *
                             static_cast<size_t>(head_dim);
@@ -5098,7 +5716,7 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
                         row_dot += dot * probs[static_cast<size_t>(j)];
                     }
 
-                    for (int j = 0; j < valid_len; ++j) {
+                    for (int j = first_key; j < valid_len; ++j) {
                         const float prob = probs[static_cast<size_t>(j)];
                         const float d_score = prob * (d_probs[static_cast<size_t>(j)] - row_dot);
                         const size_t k_offset =
@@ -5116,6 +5734,7 @@ Tensor Attention::backward(const Tensor& dy, Context* ctx) {
                     }
                 }
             }
+        }
         }
 
         auto [grad_q_pre_rope, grad_k_pre_rope] = apply_rope_backward(grad_q_rot, grad_k_rot, 0);
@@ -5253,6 +5872,13 @@ void Attention::to(Device dev) {
     if (out_proj) {
         out_proj->to(dev);
     }
+    if (ssa_wsel_.data.get_device() != dev) {
+        ssa_wsel_.data = ssa_wsel_.data.to(dev);
+        ssa_wsel_.mark_updated();
+    }
+    if (ssa_wsel_.grad.size > 0 && ssa_wsel_.grad.get_device() != dev) {
+        ssa_wsel_.grad = ssa_wsel_.grad.to(dev);
+    }
 }
 
 std::vector<Parameter*> Attention::parameters() {
@@ -5272,10 +5898,13 @@ std::vector<Parameter*> Attention::parameters() {
         prefix_parameter_names(out, "out_proj.");
         params.insert(params.end(), out.begin(), out.end());
     }
+    // Learned routing state is a first-class parameter: the Trainer owns its
+    // update and serializers must preserve it with the rest of the attention.
+    params.push_back(&ssa_wsel_);
     return params;
 }
 
-float Attention::accumulate_selector_distill_grad() {
+float Attention::accumulate_selector_distill_grad(float gradient_weight) {
     // Learned block selection trained by distilling the DENSE attention's
     // per-block MASS into the scorer: the selector learns to predict which
     // blocks dense attention attends to, so hard top-k by (Wsel @ q).block_mean
@@ -5294,6 +5923,7 @@ float Attention::accumulate_selector_distill_grad() {
     if (qs.size() != 4 || ks.size() != 4) {
         return 0.0f;
     }
+    const int batch_size = qs[0];
     const int S = qs[1];
     const int nH = qs[2];
     const int d = qs[3];
@@ -5307,9 +5937,101 @@ float Attention::accumulate_selector_distill_grad() {
         return 0.0f;  // selection only meaningful with >= 2 blocks
     }
 
-    const float* qp = saved_q_rot_.data();
-    const float* kp = saved_k_rot_.data();
-    const float* W = ssa_wsel_.data.data();
+#ifdef USE_CUDA
+    if (saved_q_rot_.get_device() == Device::GPU &&
+        saved_k_rot_.get_device() == Device::GPU &&
+        ssa_wsel_.data.get_device() == Device::GPU &&
+        gpu_custom_kernels_supported() && d <= 256 && nb <= 512) {
+        const int BH = batch_size * nH;
+        Tensor q_permuted = Tensor::uninitialized(
+            {BH, S, d}, Device::GPU);
+        Tensor k_permuted = Tensor::uninitialized(
+            {BH, S, d}, Device::GPU);
+        launch_attn_gather_heads(
+            q_permuted.raw_data(), saved_q_rot_.raw_data(), batch_size, S,
+            nH, d, nH, 1, 0);
+        launch_attn_gather_heads(
+            k_permuted.raw_data(), saved_k_rot_.raw_data(), batch_size, S,
+            nH, d, nKV, std::max(kv_group_size, 1), 0);
+        Tensor selector_grad = Tensor::zeros({d, d}, Device::GPU);
+        Tensor statistics = Tensor::zeros({2}, Device::GPU);
+        const float selector_scale =
+            1.0f / std::sqrt(static_cast<float>(d));
+        const bool deterministic =
+            determinism::deterministic_reductions_enabled();
+        for (int batch = 0; batch < batch_size; ++batch) {
+            const int valid_len = saved_valid_lengths_.empty()
+                                      ? S
+                                      : std::clamp(
+                                            saved_valid_lengths_[static_cast<size_t>(batch)],
+                                            0, S);
+            const int valid_blocks =
+                (valid_len + Bsz - 1) / Bsz;
+            if (valid_blocks < 2) continue;
+            for (int head = 0; head < nH; ++head) {
+                const int bh = batch * nH + head;
+                const size_t offset = static_cast<size_t>(bh) * S * d;
+                Tensor block_means(
+                    {valid_blocks, d}, Device::GPU);
+                cuda::launch_sparse_block_means(
+                    k_permuted.raw_data() + offset,
+                    block_means.raw_data(), valid_len, d, Bsz);
+                cuda::launch_sparse_selector_distill(
+                    q_permuted.raw_data() + offset,
+                    k_permuted.raw_data() + offset,
+                    block_means.raw_data(), ssa_wsel_.data.raw_data(),
+                    selector_grad.raw_data(), statistics.raw_data(),
+                    statistics.raw_data() + 1, valid_len, d, Bsz,
+                    selector_scale, deterministic);
+            }
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("SSA selector distillation kernel failed: ") +
+                cudaGetErrorString(launch_status));
+        }
+        Tensor statistics_host = statistics.cpu();
+        const float loss_sum = statistics_host.data()[0];
+        const float count = statistics_host.data()[1];
+        if (!(count > 0.0f)) return 0.0f;
+        const float effective_weight =
+            std::isfinite(gradient_weight) ? gradient_weight : 0.0f;
+        if (effective_weight != 0.0f) {
+            launch_scale_inplace_kernel(
+                selector_grad.raw_data(), effective_weight / count,
+                selector_grad.size);
+            const cudaError_t scale_status = cudaGetLastError();
+            if (scale_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("SSA selector gradient scale failed: ") +
+                    cudaGetErrorString(scale_status));
+            }
+            ssa_wsel_.add_grad(selector_grad);
+        }
+        return loss_sum / count;
+    }
+#endif
+
+    if (saved_q_rot_.get_device() == Device::GPU &&
+        strict_gpu_execution()) {
+        throw std::runtime_error(
+            "Strict GPU selector distillation requires head_dim <= 256 and "
+            "at most 512 blocks");
+    }
+
+    Tensor q_host = saved_q_rot_.get_device() == Device::GPU
+                        ? saved_q_rot_.cpu()
+                        : saved_q_rot_;
+    Tensor k_host = saved_k_rot_.get_device() == Device::GPU
+                        ? saved_k_rot_.cpu()
+                        : saved_k_rot_;
+    Tensor w_host = ssa_wsel_.data.get_device() == Device::GPU
+                        ? ssa_wsel_.data.cpu()
+                        : ssa_wsel_.data;
+    const float* qp = q_host.data();
+    const float* kp = k_host.data();
+    const float* W = w_host.data();
     const float scale = 1.0f / std::sqrt(static_cast<float>(d));
 
     Tensor dWsel({d, d}, Device::CPU);  // zero-filled
@@ -5324,28 +6046,39 @@ float Attention::accumulate_selector_distill_grad() {
     std::vector<float> pred(static_cast<size_t>(nb), 0.0f);
     std::vector<float> qsel(static_cast<size_t>(d), 0.0f);
 
-    for (int h = 0; h < nH; ++h) {
+    for (int batch = 0; batch < batch_size; ++batch) {
+      const int valid_len = saved_valid_lengths_.empty()
+                                ? S
+                                : std::clamp(
+                                      saved_valid_lengths_[static_cast<size_t>(batch)],
+                                      0, S);
+      const int valid_nb = (valid_len + Bsz - 1) / Bsz;
+      if (valid_nb < 2) continue;
+      for (int h = 0; h < nH; ++h) {
         const int kvh = std::min(h / std::max(kv_group_size, 1), nKV - 1);
         std::fill(bmean.begin(), bmean.end(), 0.0f);
-        for (int b = 0; b < nb; ++b) {
+        for (int b = 0; b < valid_nb; ++b) {
             const int st = b * Bsz;
-            const int en = std::min((b + 1) * Bsz, S);
+            const int en = std::min((b + 1) * Bsz, valid_len);
             for (int j = st; j < en; ++j) {
-                const size_t kb = ((static_cast<size_t>(j) * nKV) + kvh) * d;
+                const size_t kb =
+                    (((static_cast<size_t>(batch) * S + j) * nKV) + kvh) * d;
                 for (int c = 0; c < d; ++c)
                     bmean[static_cast<size_t>(b) * d + c] += kp[kb + c];
             }
             const float inv = 1.0f / static_cast<float>(std::max(en - st, 1));
             for (int c = 0; c < d; ++c) bmean[static_cast<size_t>(b) * d + c] *= inv;
         }
-        for (int i = 0; i < S; ++i) {
+        for (int i = 0; i < valid_len; ++i) {
             const int ncand = i / Bsz + 1;  // causal: blocks 0..i/Bsz visible
             if (ncand < 2) continue;
-            const size_t qb = ((static_cast<size_t>(i) * nH) + h) * d;
+            const size_t qb =
+                (((static_cast<size_t>(batch) * S + i) * nH) + h) * d;
             // TARGET: dense attention's per-block mass over j <= i.
             float mx = -1e30f;
             for (int j = 0; j <= i; ++j) {
-                const size_t kb = ((static_cast<size_t>(j) * nKV) + kvh) * d;
+                const size_t kb =
+                    (((static_cast<size_t>(batch) * S + j) * nKV) + kvh) * d;
                 float dv = 0.0f;
                 for (int c = 0; c < d; ++c) dv += qp[qb + c] * kp[kb + c];
                 attn[static_cast<size_t>(j)] = dv * scale;
@@ -5399,14 +6132,21 @@ float Attention::accumulate_selector_distill_grad() {
                     dw[static_cast<size_t>(a) * d + c] += dqa * qp[qb + c];
             }
         }
+      }
     }
     if (count == 0) {
         return 0.0f;
     }
-    const float lr = 0.1f;
     const float invc = 1.0f / static_cast<float>(count);
-    float* w = ssa_wsel_.data.data();
-    for (int i = 0; i < ssa_wsel_.data.size; ++i) w[i] -= lr * dw[i] * invc;
+    const float effective_weight = std::isfinite(gradient_weight)
+                                       ? gradient_weight
+                                       : 0.0f;
+    if (effective_weight != 0.0f) {
+        for (int i = 0; i < dWsel.size; ++i) {
+            dw[i] *= invc * effective_weight;
+        }
+        ssa_wsel_.add_grad(dWsel);
+    }
     return static_cast<float>(loss_sum / count);
 }
 
@@ -5725,10 +6465,15 @@ void Attention::restore_cache_batch(const std::vector<AttentionCacheSnapshot>& s
 
 MoERouter::MoERouter(int d_model_value, int n, int k)
     : num_experts(n),
-      top_k(std::min(k, n)),
+      top_k(k),
       aux_loss_coef(0.01f),
-      expert_loads(n, 0.0f),
-      gate(std::make_unique<BitLinear>(d_model_value, n, false)) {
+      expert_loads(n > 0 ? static_cast<size_t>(n) : 0U, 0.0f),
+      gate(std::make_unique<BitLinear>(d_model_value, n > 0 ? n : 1, false)) {
+  if (d_model_value <= 0 || n <= 0 || k <= 0 || k > n) {
+    throw std::invalid_argument(
+        "MoERouter requires d_model>0, num_experts>0 and top_k in "
+        "[1, num_experts]");
+  }
   // Opt-in full-precision router (NSOS_MOE_FP_ROUTER=1).  Routing is sensitive:
   // under QAT a ternary gate yields coarse, unstable assignments (risk of expert
   // collapse).  Marking the gate quantization-sensitive keeps it on the float
@@ -5744,25 +6489,62 @@ MoERouter::MoERouter(int d_model_value, int n, int k)
   }
 }
 
-std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
+void MoERouter::begin_aux_accumulation() {
+    aux_accumulation_active_ = true;
+    aux_forward_records_.clear();
+    accumulated_expert_loads_.assign(static_cast<size_t>(num_experts), 0.0f);
+}
+
+void MoERouter::finalize_aux_accumulation() {
+    if (aux_accumulation_active_ &&
+        accumulated_expert_loads_.size() == expert_loads.size()) {
+        expert_loads = accumulated_expert_loads_;
+    }
+    aux_accumulation_active_ = false;
+    aux_forward_records_.clear();
+    accumulated_expert_loads_.clear();
+}
+
+void MoERouter::cancel_aux_accumulation() {
+    aux_accumulation_active_ = false;
+    aux_forward_records_.clear();
+    accumulated_expert_loads_.clear();
+}
+
+std::pair<Tensor, Tensor> MoERouter::forward(
+    const Tensor& x, const std::vector<uint8_t>& valid_rows) {
+    if (x.shape.empty() || x.shape.back() <= 0) {
+        throw std::invalid_argument("MoERouter::forward requires a non-empty feature dimension");
+    }
+    const int rows = x.size / x.shape.back();
+    if (!valid_rows.empty()) {
+        if (valid_rows.size() != static_cast<size_t>(rows)) {
+            throw std::invalid_argument("MoERouter valid-row mask size mismatch");
+        }
+        if (std::any_of(valid_rows.begin(), valid_rows.end(),
+                        [](uint8_t value) { return value > 1U; })) {
+            throw std::invalid_argument("MoERouter valid-row mask must contain only 0 or 1");
+        }
+    }
     Tensor logits = gate->forward(x);
     Tensor weights = logits.softmax(-1);
 
-    // Save the PRE-mask softmax probabilities (host copy) for the differentiable
+    // Save the PRE-mask softmax probabilities on their original device for the
     // Switch aux loss.  Captured before top-k masking so it is the true routing
-    // distribution p[i,e].  Cheap (rows*num_experts floats); only read when the
+    // distribution p[i,e]. The clone is required because weights is mutated
     // Switch aux path is enabled — which is a TRAINING path, so at inference we
-    // skip it entirely: on GPU it is a per-token synchronous D2H that costs
-    // decode latency and aborts CUDA-graph capture.
+    // below. At inference the training-only retention is skipped entirely.
     if (gate->training_mode()) {
-        saved_probs_ =
-            weights.get_device() == Device::GPU ? weights.cpu() : weights.clone();
+        saved_probs_ = weights.clone();
+        if (aux_accumulation_active_) {
+            aux_forward_records_.push_back(
+                AuxForwardRecord{saved_probs_, x.clone(), valid_rows});
+        }
     } else {
         saved_probs_ = Tensor();
     }
 
     std::fill(expert_loads.begin(), expert_loads.end(), 0.0f);
-    const int rows = x.size / x.shape.back();
     if (rows <= 0 || num_experts <= 0) {
         return {logits, weights};
     }
@@ -5785,6 +6567,28 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
         launch_moe_topk_mask_kernel(weights.raw_data(), rows, num_experts,
                                     eff_top_k);
 
+        // Padding is semantically absent from routing, dispatch and load
+        // statistics. Zero invalid rows on the device before either consumer.
+        if (!valid_rows.empty()) {
+            GpuDeviceBuffer<uint8_t> valid_rows_gpu(valid_rows.size());
+            const cudaError_t copy_status = cudaMemcpy(
+                valid_rows_gpu.get(), valid_rows.data(), valid_rows.size(),
+                cudaMemcpyHostToDevice);
+            if (copy_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("MoE valid-row mask upload failed: ") +
+                    cudaGetErrorString(copy_status));
+            }
+            launch_moe_zero_invalid_rows_kernel(
+                weights.raw_data(), valid_rows_gpu.get(), rows, num_experts);
+            const cudaError_t launch_status = cudaGetLastError();
+            if (launch_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("MoE valid-row mask kernel failed: ") +
+                    cudaGetErrorString(launch_status));
+            }
+        }
+
         // Per-expert load accumulation: only training consumers read
         // expert_loads (aux regularization, layer-audit router records) — at
         // inference the D2H below is a per-token synchronous copy that costs
@@ -5802,6 +6606,12 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
             const float* loads_ptr = loads_host.data();
             for (int e = 0; e < num_experts; ++e) {
                 expert_loads[e] = loads_ptr[e];
+            }
+            if (aux_accumulation_active_ &&
+                accumulated_expert_loads_.size() == expert_loads.size()) {
+                for (size_t e = 0; e < expert_loads.size(); ++e) {
+                    accumulated_expert_loads_[e] += expert_loads[e];
+                }
             }
         }
         return {logits, weights};
@@ -5823,8 +6633,12 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
                 ranked.begin() + top_k,
                 ranked.end(),
                 [&](int lhs, int rhs) {
-                    return weight_ptr[row * num_experts + lhs] >
-                           weight_ptr[row * num_experts + rhs];
+                    const float lhs_value =
+                        weight_ptr[row * num_experts + lhs];
+                    const float rhs_value =
+                        weight_ptr[row * num_experts + rhs];
+                    return lhs_value > rhs_value ||
+                           (lhs_value == rhs_value && lhs < rhs);
                 });
             float selected_sum = 0.0f;
             for (int rank = 0; rank < top_k; ++rank) {
@@ -5840,8 +6654,20 @@ std::pair<Tensor, Tensor> MoERouter::forward(const Tensor& x) {
     }
 
     for (int row = 0; row < rows; ++row) {
+        if (!valid_rows.empty() && valid_rows[static_cast<size_t>(row)] == 0U) {
+            std::fill_n(weight_ptr + static_cast<size_t>(row) * num_experts,
+                        num_experts, 0.0f);
+            continue;
+        }
         for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
             expert_loads[expert_idx] += weight_ptr[row * num_experts + expert_idx];
+        }
+    }
+
+    if (aux_accumulation_active_ &&
+        accumulated_expert_loads_.size() == expert_loads.size()) {
+        for (size_t e = 0; e < expert_loads.size(); ++e) {
+            accumulated_expert_loads_[e] += expert_loads[e];
         }
     }
 
@@ -5899,18 +6725,58 @@ Tensor MoERouter::switch_aux_grad_logits(const Tensor& probs, int top_k,
     // probs: [T, N] pre-mask softmax (host or device).  Returns grad wrt the
     // router logits [T, N].  L = coef·N·Σ_e f_e·P_e, with f_e the hard dispatch
     // fraction (stop-grad) and P_e = mean_i p[i,e].
+    if (probs.shape.empty()) {
+        throw std::invalid_argument("Switch aux probabilities require rank >= 1");
+    }
+    if (!std::isfinite(coef)) {
+        throw std::invalid_argument("Switch aux coefficient must be finite");
+    }
     const int N = probs.shape.back();
     const int T = N > 0 ? probs.size / N : 0;
-    Tensor grad = Tensor::zeros({std::max(T, 0), std::max(N, 0)}, Device::CPU);
     if (out_loss) {
         *out_loss = 0.0f;
     }
     if (T <= 0 || N <= 0) {
-        return grad;
+        return Tensor::zeros({std::max(T, 0), std::max(N, 0)},
+                             probs.get_device());
     }
     const int k = std::clamp(top_k, 1, N);
-    Tensor probs_host = probs.get_device() == Device::GPU ? probs.cpu() : probs;
-    const float* p = probs_host.data();
+
+#ifdef USE_CUDA
+    if (probs.get_device() == Device::GPU) {
+        Tensor counts = Tensor::zeros({N}, Device::GPU);
+        Tensor probability_sums = Tensor::zeros({N}, Device::GPU);
+        Tensor grad = Tensor::zeros({T, N}, Device::GPU);
+        const bool deterministic =
+            determinism::deterministic_reductions_enabled();
+        launch_moe_switch_aux_stats_kernel(
+            probs.raw_data(), counts.raw_data(), probability_sums.raw_data(),
+            T, N, k, deterministic);
+        launch_moe_switch_aux_grad_kernel(
+            probs.raw_data(), counts.raw_data(), grad.raw_data(), T, N, coef);
+        Tensor loss_device;
+        if (out_loss != nullptr) {
+            loss_device = Tensor::zeros({1}, Device::GPU);
+            launch_moe_switch_aux_loss_kernel(
+                counts.raw_data(), probability_sums.raw_data(),
+                loss_device.raw_data(), T, N, coef, deterministic);
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Switch aux GPU kernel failed: ") +
+                cudaGetErrorString(launch_status));
+        }
+        if (out_loss != nullptr) {
+            Tensor loss_host = loss_device.cpu();
+            *out_loss = loss_host.data()[0];
+        }
+        return grad;
+    }
+#endif
+
+    Tensor grad = Tensor::zeros({T, N}, Device::CPU);
+    const float* p = probs.data();
     float* gz = grad.data();
 
     // Hard dispatch fraction f_e = (1/T) Σ_i 1[e ∈ topk(i)]  (treated as const).
@@ -5918,11 +6784,13 @@ Tensor MoERouter::switch_aux_grad_logits(const Tensor& probs, int top_k,
     std::vector<int> ranked(static_cast<size_t>(N));
     for (int i = 0; i < T; ++i) {
         std::iota(ranked.begin(), ranked.end(), 0);
-        std::partial_sort(ranked.begin(), ranked.begin() + k, ranked.end(),
-                          [&](int a, int b) {
-                              return p[static_cast<size_t>(i) * N + a] >
-                                     p[static_cast<size_t>(i) * N + b];
-                          });
+        std::partial_sort(
+            ranked.begin(), ranked.begin() + k, ranked.end(),
+            [&](int a, int b) {
+                const float lhs = p[static_cast<size_t>(i) * N + a];
+                const float rhs = p[static_cast<size_t>(i) * N + b];
+                return lhs > rhs || (lhs == rhs && a < b);
+            });
         for (int r = 0; r < k; ++r) {
             f[static_cast<size_t>(ranked[static_cast<size_t>(r)])] += 1.0;
         }
@@ -5964,7 +6832,162 @@ Tensor MoERouter::switch_aux_grad_logits(const Tensor& probs, int top_k,
 }
 
 float MoERouter::accumulate_switch_aux_grad(float coef) {
-    if (!gate || saved_probs_.size == 0 || coef == 0.0f) {
+    if (!gate || coef == 0.0f) {
+        cancel_aux_accumulation();
+        return 0.0f;
+    }
+
+    // Exact once-per-step objective across every bucket/micro-chunk.  Building
+    // the global probability matrix is important: averaging independently
+    // computed f_e * P_e products is not equivalent to computing the Switch
+    // objective from the complete batch. Inputs and probabilities remain on
+    // their original device; one aggregate gate replay produces one exact VJP.
+    if (!aux_forward_records_.empty()) {
+        const Device device = aux_forward_records_.front().probs.get_device();
+        const int input_dim = aux_forward_records_.front().input.shape.empty()
+                                  ? 0
+                                  : aux_forward_records_.front().input.shape.back();
+        if (input_dim <= 0) {
+            cancel_aux_accumulation();
+            throw std::runtime_error("Switch aux record has no input feature dimension");
+        }
+        int total_rows = 0;
+        for (const auto& record : aux_forward_records_) {
+            if (record.probs.get_device() != device ||
+                record.input.get_device() != device) {
+                cancel_aux_accumulation();
+                throw std::runtime_error("Switch aux records span multiple devices");
+            }
+            if (record.probs.size > 0 && num_experts > 0) {
+                if (record.probs.size % num_experts != 0) {
+                    cancel_aux_accumulation();
+                    throw std::runtime_error("Switch aux probability shape is inconsistent");
+                }
+                const int record_rows = record.probs.size / num_experts;
+                if (record.input.size != record_rows * input_dim) {
+                    cancel_aux_accumulation();
+                    throw std::runtime_error("Switch aux input/probability row mismatch");
+                }
+                if (!record.valid_rows.empty() &&
+                    record.valid_rows.size() != static_cast<size_t>(record_rows)) {
+                    cancel_aux_accumulation();
+                    throw std::runtime_error("Switch aux valid-row mask mismatch");
+                }
+                if (record.valid_rows.empty()) {
+                    total_rows += record_rows;
+                } else {
+                    total_rows += static_cast<int>(std::count(
+                        record.valid_rows.begin(), record.valid_rows.end(),
+                        static_cast<uint8_t>(1U)));
+                }
+            }
+        }
+        if (total_rows <= 0) {
+            cancel_aux_accumulation();
+            return 0.0f;
+        }
+
+        Tensor all_probs({total_rows, num_experts}, device);
+        Tensor all_input({total_rows, input_dim}, device);
+        int row_offset = 0;
+        for (const auto& record : aux_forward_records_) {
+            const int rows = record.probs.size / num_experts;
+            if (rows <= 0) continue;
+            const int valid_count = record.valid_rows.empty()
+                                        ? rows
+                                        : static_cast<int>(std::count(
+                                              record.valid_rows.begin(),
+                                              record.valid_rows.end(),
+                                              static_cast<uint8_t>(1U)));
+            if (record.valid_rows.empty()) {
+                copy_tensor_bytes(
+                    all_probs.raw_data() + static_cast<size_t>(row_offset) * num_experts,
+                    device, record.probs.raw_data(), device,
+                    static_cast<size_t>(rows) * num_experts * sizeof(float));
+                copy_tensor_bytes(
+                    all_input.raw_data() + static_cast<size_t>(row_offset) * input_dim,
+                    device, record.input.raw_data(), device,
+                    static_cast<size_t>(rows) * input_dim * sizeof(float));
+            } else if (device == Device::CPU) {
+                for (int row = 0, destination_row = 0; row < rows; ++row) {
+                    if (record.valid_rows[static_cast<size_t>(row)] == 0U) continue;
+                    std::memcpy(
+                        all_probs.data() +
+                            static_cast<size_t>(row_offset + destination_row) * num_experts,
+                        record.probs.data() + static_cast<size_t>(row) * num_experts,
+                        static_cast<size_t>(num_experts) * sizeof(float));
+                    std::memcpy(
+                        all_input.data() +
+                            static_cast<size_t>(row_offset + destination_row) * input_dim,
+                        record.input.data() + static_cast<size_t>(row) * input_dim,
+                        static_cast<size_t>(input_dim) * sizeof(float));
+                    ++destination_row;
+                }
+            } else {
+#ifdef USE_CUDA
+                std::vector<int> valid_indices;
+                valid_indices.reserve(static_cast<size_t>(valid_count));
+                for (int row = 0; row < rows; ++row) {
+                    if (record.valid_rows[static_cast<size_t>(row)] != 0U) {
+                        valid_indices.push_back(row);
+                    }
+                }
+                GpuDeviceBuffer<int> indices_gpu(valid_indices.size());
+                const cudaError_t copy_status = cudaMemcpy(
+                    indices_gpu.get(), valid_indices.data(),
+                    valid_indices.size() * sizeof(int), cudaMemcpyHostToDevice);
+                if (copy_status != cudaSuccess) {
+                    cancel_aux_accumulation();
+                    throw std::runtime_error(
+                        std::string("Switch aux index upload failed: ") +
+                        cudaGetErrorString(copy_status));
+                }
+                launch_moe_gather_rows_kernel(
+                    record.probs.raw_data(), indices_gpu.get(),
+                    all_probs.raw_data() +
+                        static_cast<size_t>(row_offset) * num_experts,
+                    valid_count, num_experts);
+                launch_moe_gather_rows_kernel(
+                    record.input.raw_data(), indices_gpu.get(),
+                    all_input.raw_data() +
+                        static_cast<size_t>(row_offset) * input_dim,
+                    valid_count, input_dim);
+                const cudaError_t launch_status = cudaGetLastError();
+                if (launch_status != cudaSuccess) {
+                    cancel_aux_accumulation();
+                    throw std::runtime_error(
+                        std::string("Switch aux row gather failed: ") +
+                        cudaGetErrorString(launch_status));
+                }
+#else
+                cancel_aux_accumulation();
+                throw std::runtime_error("GPU Switch aux requires a CUDA build");
+#endif
+            }
+            row_offset += valid_count;
+        }
+        if (row_offset != total_rows) {
+            cancel_aux_accumulation();
+            throw std::runtime_error("Switch aux aggregation row-count mismatch");
+        }
+
+        Tensor gate_logits = gate->forward(all_input);
+        float loss = 0.0f;
+        Tensor all_grad = switch_aux_grad_logits(all_probs, top_k, coef, &loss);
+        if (all_grad.size == gate_logits.size &&
+            all_grad.shape != gate_logits.shape) {
+            all_grad = all_grad.reshape(gate_logits.shape.dims);
+        }
+        if (gate->weight.data.get_device() != all_grad.get_device()) {
+            all_grad = all_grad.to(gate->weight.data.get_device());
+        }
+        (void)gate->backward(all_grad);
+        finalize_aux_accumulation();
+        return loss;
+    }
+
+    if (saved_probs_.size == 0) {
+        cancel_aux_accumulation();
         return 0.0f;
     }
     float loss = 0.0f;
@@ -5977,6 +7000,7 @@ float MoERouter::accumulate_switch_aux_grad(float coef) {
         grad_z = grad_z.to(gate->weight.data.get_device());
     }
     (void)gate->backward(grad_z);
+    finalize_aux_accumulation();
     return loss;
 }
 
@@ -5987,25 +7011,53 @@ Tensor MoERouter::router_grad_logits(const Tensor& probs, const Tensor& g_w,
     //   w_e = p_e/S
     //   g_p_j = (1/S)(g_w_j - sum_{e in K} g_w_e w_e)   (j in K, else 0)
     //   g_z_i = p_i (g_p_i - sum_j p_j g_p_j)           (softmax jacobian)
+    if (probs.shape.empty() || g_w.shape.empty()) {
+        throw std::invalid_argument("Router VJP requires rank >= 1 tensors");
+    }
+    if (probs.size != g_w.size || probs.shape.back() != g_w.shape.back()) {
+        throw std::invalid_argument("Router VJP probability/gradient shape mismatch");
+    }
+    if (probs.get_device() != g_w.get_device()) {
+        throw std::invalid_argument("Router VJP tensors must share a device");
+    }
     const int N = probs.shape.back();
     const int T = N > 0 ? probs.size / N : 0;
-    Tensor grad = Tensor::zeros({std::max(T, 0), std::max(N, 0)}, Device::CPU);
     if (T <= 0 || N <= 0) {
-        return grad;
+        return Tensor::zeros({std::max(T, 0), std::max(N, 0)},
+                             probs.get_device());
     }
     const int k = std::clamp(top_k, 1, N);
-    Tensor probs_host = probs.get_device() == Device::GPU ? probs.cpu() : probs;
-    Tensor gw_host = g_w.get_device() == Device::GPU ? g_w.cpu() : g_w;
-    const float* p = probs_host.data();
-    const float* gw = gw_host.data();
+
+#ifdef USE_CUDA
+    if (probs.get_device() == Device::GPU) {
+        Tensor grad = Tensor::zeros({T, N}, Device::GPU);
+        launch_moe_router_logits_grad_kernel(
+            probs.raw_data(), g_w.raw_data(), grad.raw_data(), T, N, k);
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("MoE router VJP kernel failed: ") +
+                cudaGetErrorString(launch_status));
+        }
+        return grad;
+    }
+#endif
+
+    Tensor grad = Tensor::zeros({T, N}, Device::CPU);
+    const float* p = probs.data();
+    const float* gw = g_w.data();
     float* gz = grad.data();
     std::vector<int> ranked(static_cast<size_t>(N));
     std::vector<float> gp(static_cast<size_t>(N));
     for (int i = 0; i < T; ++i) {
         const size_t base = static_cast<size_t>(i) * N;
         std::iota(ranked.begin(), ranked.end(), 0);
-        std::partial_sort(ranked.begin(), ranked.begin() + k, ranked.end(),
-                          [&](int a, int b) { return p[base + a] > p[base + b]; });
+        std::partial_sort(
+            ranked.begin(), ranked.begin() + k, ranked.end(),
+            [&](int a, int b) {
+                return p[base + a] > p[base + b] ||
+                       (p[base + a] == p[base + b] && a < b);
+            });
         double S = 0.0;
         for (int r = 0; r < k; ++r) S += p[base + ranked[static_cast<size_t>(r)]];
         if (S <= 0.0) continue;
@@ -6033,9 +7085,9 @@ Tensor MoERouter::router_grad_logits(const Tensor& probs, const Tensor& g_w,
     return grad;
 }
 
-void MoERouter::accumulate_task_router_grad(const Tensor& g_w) {
+Tensor MoERouter::accumulate_task_router_grad(const Tensor& g_w) {
     if (!gate || saved_probs_.size == 0 || g_w.size == 0) {
-        return;
+        return Tensor();
     }
     Tensor g_logits = router_grad_logits(saved_probs_, g_w, top_k);
     if (gate->weight.data.size > 0 &&
@@ -6045,7 +7097,7 @@ void MoERouter::accumulate_task_router_grad(const Tensor& g_w) {
     // Accumulates the gate's weight grads.  The input-gradient (dL/dx via the
     // routing path) is intentionally discarded here — the dominant dL/dx flows
     // through the expert paths; this term primarily trains the router.
-    (void)gate->backward(g_logits);
+    return gate->backward(g_logits);
 }
 
 std::vector<int> D2FDecoder::generate(

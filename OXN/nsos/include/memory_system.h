@@ -28,20 +28,6 @@ public:
         std::vector<std::vector<uint8_t>> compressed_items;
         std::chrono::system_clock::time_point last_access;
     };
-  // Tiered Index
-  std::vector<Cluster> clusters;
-  std::vector<Message> conversation_history;
-  
-  mutable std::mutex memory_mutex; // Mutex for thread safety
-  std::unique_ptr<tq::TurboQuantEngine> tq_engine;
-  std::unique_ptr<CausalMemoryStore> causal_store;
-  std::unique_ptr<OxtaMemFFI> oxtamem_store;
-
-  // Rhea: Instructional Memory (High fidelity constraints)
-  std::vector<std::string> instructional_memory;
-
-  int chunk_size;
-
   MemorySystem(int chunk_dim = 64);
 
   void store_episodic(const Tensor &state);
@@ -65,6 +51,20 @@ public:
   void run_ultra_compact();
   void microcompact_messages();
   void clear_runtime_state();
+
+private:
+  void microcompact_messages_locked();
+  void validate_state_shape(const Tensor& state, const char* operation) const;
+
+  // Tiered index is private: every access must hold memory_mutex.
+  std::vector<Cluster> clusters;
+  std::vector<Message> conversation_history;
+  mutable std::mutex memory_mutex;
+  std::unique_ptr<tq::TurboQuantEngine> tq_engine;
+  std::unique_ptr<CausalMemoryStore> causal_store;
+  std::unique_ptr<OxtaMemFFI> oxtamem_store;
+  std::vector<std::string> instructional_memory;
+  int chunk_size;
 };
 
 } // namespace nsos

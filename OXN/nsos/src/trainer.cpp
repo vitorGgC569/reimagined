@@ -2,18 +2,29 @@
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
 #include "../include/layer_audit.h"
+#include "../include/nsos_serializer.h"
 #include "../include/nsos/determinism.h"  // K4: ordered reductions under NSOS_DETERMINISTIC
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -22,6 +33,155 @@
 namespace nsos {
 
 namespace {
+
+constexpr uint32_t kTrainingStateMagic = 0x4E535452u;  // NSTR
+constexpr uint32_t kTrainingStateVersion = 2u;
+constexpr uint32_t kTrainingStateLegacyVersion = 1u;
+
+template <typename T>
+void write_training_pod(std::ostream& output, const T& value,
+                        const char* label) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    output.write(reinterpret_cast<const char*>(&value), sizeof(T));
+    if (!output) {
+        throw std::runtime_error(std::string("Training-state write failed: ") +
+                                 label);
+    }
+}
+
+template <typename T>
+T read_training_pod(std::istream& input, const char* label) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    T value{};
+    input.read(reinterpret_cast<char*>(&value), sizeof(T));
+    if (!input) {
+        throw std::runtime_error(std::string("Training-state truncated at ") +
+                                 label);
+    }
+    return value;
+}
+
+void write_training_string(std::ostream& output, const std::string& value) {
+    if (value.size() > 4096) {
+        throw std::runtime_error("Training-state parameter name is too long");
+    }
+    write_training_pod(output, static_cast<uint32_t>(value.size()),
+                       "string length");
+    output.write(value.data(), static_cast<std::streamsize>(value.size()));
+    if (!output) throw std::runtime_error("Training-state string write failed");
+}
+
+std::string read_training_string(std::istream& input) {
+    const uint32_t length = read_training_pod<uint32_t>(input, "string length");
+    if (length > 4096) {
+        throw std::runtime_error("Training-state parameter name exceeds limit");
+    }
+    std::string value(length, '\0');
+    if (length > 0) {
+        input.read(value.data(), static_cast<std::streamsize>(length));
+        if (!input) throw std::runtime_error("Training-state truncated in string");
+    }
+    return value;
+}
+
+uint64_t training_state_file_hash(const std::filesystem::path& path,
+                                  uint64_t& byte_count) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Cannot hash model checkpoint: " + path.string());
+    }
+    constexpr uint64_t kOffset = 1469598103934665603ull;
+    constexpr uint64_t kPrime = 1099511628211ull;
+    uint64_t hash = kOffset;
+    byte_count = 0;
+    std::array<char, 1 << 16> buffer{};
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = input.gcount();
+        byte_count += static_cast<uint64_t>(count);
+        for (std::streamsize i = 0; i < count; ++i) {
+            hash ^= static_cast<unsigned char>(buffer[static_cast<size_t>(i)]);
+            hash *= kPrime;
+        }
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("Failed while hashing model checkpoint");
+    }
+    return hash;
+}
+
+void replace_training_state_file(const std::filesystem::path& temporary,
+                                 const std::filesystem::path& destination) {
+#ifdef _WIN32
+    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        std::filesystem::remove(temporary);
+        throw std::runtime_error(
+            "Could not atomically replace training state (Win32 error " +
+            std::to_string(error) + ")");
+    }
+#else
+    std::error_code error;
+    std::filesystem::rename(temporary, destination, error);
+    if (error) {
+        std::filesystem::remove(temporary);
+        throw std::runtime_error("Could not atomically replace training state: " +
+                                 error.message());
+    }
+#endif
+}
+
+std::vector<std::pair<Parameter*, std::string>> stable_training_parameters(
+    JambaModel* model) {
+    std::vector<std::pair<Parameter*, std::string>> result;
+    std::unordered_map<std::string, size_t> counts;
+    for (Parameter* parameter : model->parameters()) {
+        if (!parameter) continue;
+        const std::string identity = !parameter->base_name.empty()
+                                         ? parameter->base_name
+                                         : parameter->name;
+        const size_t occurrence = counts[identity]++;
+        result.emplace_back(parameter,
+                            identity + "#" + std::to_string(occurrence));
+    }
+    return result;
+}
+
+struct TrainingStateMetadata {
+    float learning_rate = 0.0f;
+    float beta1 = 0.0f;
+    float beta2 = 0.0f;
+    float eps = 0.0f;
+    float weight_decay = 0.0f;
+    float max_grad_norm = 0.0f;
+    float min_learning_rate_scale = 0.0f;
+    float first_token_loss_scale = 0.0f;
+    float eos_loss_scale = 0.0f;
+    float repetition_unlikelihood_scale = 0.0f;
+    float moe_aux_loss_scale = 0.0f;
+    float pantheon_vib_beta = 0.0f;
+    float logit_l2_beta = 0.0f;
+    int32_t warmup_steps = 0;
+    int32_t global_step_count = 0;
+    int32_t total_training_steps = 0;
+    int32_t eos_token_id = 0;
+    int32_t optimizer_state_bits = 32;
+    TrainPhaseScheduler phase_scheduler;
+};
+
+struct TrainingParameterRecord {
+    Parameter* parameter = nullptr;
+    std::vector<float> m;
+    std::vector<float> v;
+    bool has_moments = false;
+    bool has_criticality = false;
+    bool has_external_lr_scale = false;
+    bool has_criticality_lr_scale = false;
+    float criticality = 0.0f;
+    float external_lr_scale = 1.0f;
+    float criticality_lr_scale = 1.0f;
+};
 
 #ifdef USE_CUDA
 bool trainer_force_cuda_sync() {
@@ -558,7 +718,65 @@ float* clip_norm_accumulator() {
     }();
     return d_accum;
 }
+
+int* finite_issue_accumulator() {
+    thread_local int* device_flag = [] {
+        int* value = nullptr;
+        if (cudaMalloc(&value, sizeof(int)) != cudaSuccess) {
+            value = nullptr;
+            (void)cudaGetLastError();
+        }
+        return value;
+    }();
+    return device_flag;
+}
 #endif
+
+void ensure_finite_optimizer_inputs(const std::vector<Parameter*>& params) {
+    bool host_issue = false;
+#ifdef USE_CUDA
+    int* device_issue =
+        gpu_custom_kernels_supported() ? finite_issue_accumulator() : nullptr;
+    if (device_issue) cudaMemset(device_issue, 0, sizeof(int));
+#endif
+    auto inspect = [&](const Tensor& tensor) {
+        if (tensor.size == 0) return;
+#ifdef USE_CUDA
+        if (device_issue && tensor.get_device() == Device::GPU) {
+            launch_check_stability_kernel(
+                device_issue, tensor.raw_data(),
+                std::numeric_limits<float>::max(), tensor.size);
+            return;
+        }
+#endif
+        Tensor host = tensor.get_device() == Device::GPU ? tensor.cpu() : tensor;
+        const float* values = host.data();
+        for (int index = 0; index < host.size; ++index) {
+            if (!std::isfinite(values[index])) {
+                host_issue = true;
+                return;
+            }
+        }
+    };
+    for (Parameter* parameter : params) {
+        if (!parameter || parameter->grad.size == 0) continue;
+        inspect(parameter->data);
+        inspect(parameter->grad);
+        if (host_issue) break;
+    }
+#ifdef USE_CUDA
+    if (device_issue) {
+        trainer_check_cuda("launch_check_stability_kernel(optimizer_gate)");
+        int gpu_issue = 0;
+        cudaMemcpy(&gpu_issue, device_issue, sizeof(int), cudaMemcpyDeviceToHost);
+        host_issue = host_issue || gpu_issue != 0;
+    }
+#endif
+    if (host_issue) {
+        throw std::runtime_error(
+            "optimizer step rejected: a parameter or gradient contains NaN/Inf");
+    }
+}
 
 float clip_gradients(const std::vector<Parameter*>& params, float max_norm) {
     float total_norm = 0.0f;
@@ -702,13 +920,13 @@ void apply_progressive_qat_phase(Trainer& trainer) {
     }
 }
 
-void apply_qat_regularization(Trainer& trainer, int accumulation_steps) {
+float apply_qat_regularization(Trainer& trainer, int accumulation_steps) {
     if (!trainer.model || !trainer.phase_scheduler.progressive_qat_enabled) {
-        return;
+        return 0.0f;
     }
     const auto effective = resolve_effective_qat_schedule(trainer);
     if (trainer.global_step_count < effective.semantic_warmup_steps) {
-        return;
+        return 0.0f;
     }
 
     const float ramp_denom = static_cast<float>(std::max(
@@ -722,13 +940,24 @@ void apply_qat_regularization(Trainer& trainer, int accumulation_steps) {
     // accumulation_steps in apply_optimizer_step.  Scale this once-per-step
     // regularizer by the same count so its effective coefficient is invariant
     // to batch size / gradient accumulation.
-    const float regularization =
+    const float base_regularization =
         trainer.phase_scheduler.ternary_regularization *
-        std::max(ramp, 0.0f) *
+        std::max(ramp, 0.0f);
+    const float regularization =
+        base_regularization *
         static_cast<float>(std::max(accumulation_steps, 1));
     if (regularization <= 0.0f) {
-        return;
+        return 0.0f;
     }
+
+    double host_penalty_grad_sq = 0.0;
+#ifdef USE_CUDA
+    float* device_penalty_grad_sq =
+        gpu_custom_kernels_supported() ? clip_norm_accumulator() : nullptr;
+    if (device_penalty_grad_sq) {
+        cudaMemset(device_penalty_grad_sq, 0, sizeof(float));
+    }
+#endif
 
     for (BitLinear* layer : trainer.model->collect_bitlinear_layers()) {
         if (!layer || !layer->has_full_precision_weight()) {
@@ -745,13 +974,65 @@ void apply_qat_regularization(Trainer& trainer, int accumulation_steps) {
         // reuses the QAT forward's GPU-resident scaled ternary tensor when
         // available; the old trainer-side quantize_weights() call was a CPU
         // loop over GPU managed memory and made ternary training unusably slow.
-        layer->add_qat_regularization_grad(regularization);
+        Tensor penalty_grad =
+            layer->add_qat_regularization_grad(regularization);
+        if (penalty_grad.size == 0) continue;
+#ifdef USE_CUDA
+        if (device_penalty_grad_sq &&
+            penalty_grad.get_device() == Device::GPU) {
+            launch_norm_kernel(device_penalty_grad_sq,
+                               penalty_grad.raw_data(), penalty_grad.size);
+            continue;
+        }
+#endif
+        Tensor host = penalty_grad.get_device() == Device::GPU
+                          ? penalty_grad.cpu()
+                          : penalty_grad;
+        const float* values = host.data();
+        for (int index = 0; index < host.size; ++index) {
+            host_penalty_grad_sq +=
+                static_cast<double>(values[index]) * values[index];
+        }
+    }
+
+#ifdef USE_CUDA
+    if (device_penalty_grad_sq) {
+        trainer_check_cuda("launch_norm_kernel(qat_regularization)");
+        float gpu_penalty_grad_sq = 0.0f;
+        cudaMemcpy(&gpu_penalty_grad_sq, device_penalty_grad_sq, sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        host_penalty_grad_sq += gpu_penalty_grad_sq;
+    }
+#endif
+    // penalty_grad = regularization * diff.  Report the post-accumulation
+    // objective whose gradient remains after apply_optimizer_step divides by
+    // accumulation_steps: 0.5 * base_regularization * ||diff||^2.
+    const double inverse_regularization_sq =
+        1.0 / (static_cast<double>(regularization) * regularization);
+    return static_cast<float>(
+        0.5 * static_cast<double>(base_regularization) *
+        host_penalty_grad_sq * inverse_regularization_sq);
+}
+
+void begin_moe_aux_accumulation(Trainer& trainer) {
+    if (!trainer.model) return;
+    for (auto& layer : trainer.model->layers) {
+        if (layer && layer->router) {
+            layer->router->begin_aux_accumulation();
+        }
     }
 }
 
-void apply_moe_aux_regularization(Trainer& trainer) {
-    if (!trainer.model || trainer.moe_aux_loss_scale <= 0.0f) {
-        return;
+float apply_moe_aux_regularization(Trainer& trainer, int accumulation_steps) {
+    if (!trainer.model) {
+        return 0.0f;
+    }
+
+    if (trainer.moe_aux_loss_scale <= 0.0f) {
+        for (auto& layer : trainer.model->layers) {
+            if (layer && layer->router) layer->router->cancel_aux_accumulation();
+        }
+        return 0.0f;
     }
 
     // Opt-in: differentiable Switch-Transformer aux loss instead of the legacy
@@ -763,20 +1044,29 @@ void apply_moe_aux_regularization(Trainer& trainer) {
     // legacy constant-per-row heuristic is not the gradient of any loss and is
     // ~a no-op once the gate is ternary).  NSOS_MOE_SWITCH_AUX=0 restores the
     // legacy heuristic for comparison.
-    static const bool switch_aux = [] {
-        const char* e = std::getenv("NSOS_MOE_SWITCH_AUX");
-        return e == nullptr || e[0] != '0';
-    }();
+    // The historical heuristic is not the derivative of any scalar objective.
+    // Production training therefore always uses the exact Switch objective;
+    // keeping a runtime switch here would make reported loss and gradients
+    // diverge again.
+    constexpr bool switch_aux = true;
+    const int objective_divisor = std::max(accumulation_steps, 1);
+    float total_effective_loss = 0.0f;
+    const float effective_aux_scale =
+        trainer.moe_aux_loss_scale *
+        static_cast<float>(std::max(accumulation_steps, 1));
 
     for (auto& layer : trainer.model->layers) {
         if (!layer || !layer->router || !layer->router->gate) {
             continue;
         }
         if (switch_aux) {
-            layer->router->accumulate_switch_aux_grad(
-                layer->router->aux_loss_coef * trainer.moe_aux_loss_scale);
+            total_effective_loss +=
+                layer->router->accumulate_switch_aux_grad(
+                    layer->router->aux_loss_coef * effective_aux_scale) /
+                static_cast<float>(objective_divisor);
             continue;
         }
+        layer->router->finalize_aux_accumulation();
         auto& loads = layer->router->expert_loads;
         if (loads.empty()) {
             continue;
@@ -802,7 +1092,7 @@ void apply_moe_aux_regularization(Trainer& trainer) {
             for (size_t expert = 0; expert < loads.size(); ++expert) {
                 imbalance[expert] = (loads[expert] - mean_load) *
                                     layer->router->aux_loss_coef *
-                                    trainer.moe_aux_loss_scale;
+                                    effective_aux_scale;
             }
             thread_local float* d_imb = nullptr;   // K6: race-free persistent buffer
             thread_local size_t d_imb_cap = 0;
@@ -832,7 +1122,8 @@ void apply_moe_aux_regularization(Trainer& trainer) {
         const int row_width = grad_host.shape[1];
         for (size_t expert = 0; expert < loads.size(); ++expert) {
             const float imbalance =
-                (loads[expert] - mean_load) * layer->router->aux_loss_coef * trainer.moe_aux_loss_scale;
+                (loads[expert] - mean_load) * layer->router->aux_loss_coef *
+                effective_aux_scale;
             for (int col = 0; col < row_width; ++col) {
                 grad_ptr[static_cast<int>(expert) * row_width + col] += imbalance;
             }
@@ -843,6 +1134,7 @@ void apply_moe_aux_regularization(Trainer& trainer) {
             gate_weight.grad = grad_host;
         }
     }
+    return total_effective_loss;
 }
 
 float compute_current_lr(const Trainer& trainer) {
@@ -933,121 +1225,354 @@ static void apply_adam_step_4bit(Trainer& trainer,
     p->mark_updated();
 }
 
-// OXTA-CRIT Lei 1 (docs/OXTA_CRIT_THEORY.md) — controlador de criticalidade.
-// E4+controle mediu que o QAT progressivo — e só ele — tira as camadas
-// lineares da banda crítica (frac g em [0.5,2]: 0.976 -> 0.214 em 240 steps),
-// onde g = gamma^2*(1-p0)*fan_in é o ganho de ramo ternário (regra absmean).
-// Este controlador aplica, a cada K steps, uma correção multiplicativa pequena
-// puxando cada peso rank-2 de volta ao seu ganho INICIAL g0 (capturado na 1a
-// visita): w *= exp(-(eta/2)*log(g/g0)), clampado a ±5% por aplicação.
-// Rescale puro: o PADRÃO ternário (sinais de round(w/gamma)) é invariante de
-// escala — só o balanço escala/esparsidade é restaurado (lei de covariação).
-// mark_updated() invalida os caches packed (repack-once permanece correto).
-// Opt-in experimental: NSOS_CRIT_REG=1 [NSOS_CRIT_REG_ETA=0.2]
-// [NSOS_CRIT_REG_EVERY=10]. Estado g0 é process-wide por Parameter*.
-void apply_criticality_regularization(Trainer& trainer,
-                                      const std::vector<Parameter*>& params) {
-    static const bool enabled = [] {
-        const char* e = std::getenv("NSOS_CRIT_REG");
-        return e != nullptr && e[0] == '1';
-    }();
-    if (!enabled) {
-        return;
-    }
-    static const float eta = [] {
-        const char* e = std::getenv("NSOS_CRIT_REG_ETA");
-        const float v = e ? std::strtof(e, nullptr) : 0.2f;
-        return (v > 0.0f && v <= 1.0f) ? v : 0.2f;
-    }();
-    static const int every = [] {
-        const char* e = std::getenv("NSOS_CRIT_REG_EVERY");
-        const int v = e ? std::atoi(e) : 10;
-        return v > 0 ? v : 10;
-    }();
-    if (trainer.global_step_count % every != 0) {
-        return;
-    }
-    // Baseline g0 per-instância (era static process-wide — vazava entre runs e
-    // instâncias).  Vive no Trainer junto de m_state/v_state.
-    std::unordered_map<Parameter*, float>& g0_map = trainer.crit_g0_state;
+struct CriticalityMetric {
+    Parameter* parameter = nullptr;
+    float gamma = 0.0f;
+    float gain = 0.0f;
+    int fan_in = 0;
+};
 
-    for (auto* p : params) {
-        if (!p || p->data.size == 0 || p->data.shape.size() != 2) continue;
-        const int rows = p->data.shape[0];
-        const int cols = p->data.shape[1];
-        if (rows <= 1 || cols <= 1) continue;
-
-        Tensor host = p->data.get_device() == Device::GPU ? p->data.cpu() : p->data;
-        const float* w = host.data();
-        const int n = host.size;
-        double abs_sum = 0.0;
-        for (int i = 0; i < n; ++i) abs_sum += std::fabs(w[i]);
-        const float gamma = static_cast<float>(abs_sum / std::max(n, 1));
-        if (gamma <= 0.0f) continue;
-        int zeros = 0;
-        const float half_gamma = 0.5f * gamma;
-        for (int i = 0; i < n; ++i) zeros += (std::fabs(w[i]) < half_gamma) ? 1 : 0;
-        const float p0 = static_cast<float>(zeros) / static_cast<float>(n);
-        const float g = gamma * gamma * (1.0f - p0) * static_cast<float>(cols);
-        if (g <= 0.0f) continue;
-
-        auto it = g0_map.find(p);
-        if (it == g0_map.end()) {
-            g0_map.emplace(p, g);  // baseline = ganho na 1a visita (init saudável)
-            continue;
-        }
-        const float log_ratio = std::log(g / it->second);
-        float log_c = -0.5f * eta * log_ratio;
-        log_c = std::clamp(log_c, -0.05f, 0.05f);
-        if (std::fabs(log_c) < 1e-5f) continue;
-        scale_tensor_inplace(p->data, std::exp(log_c));
-        p->mark_updated();
-    }
+bool strict_env_flag(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw) return false;
+    const std::string value(raw);
+    if (value == "1") return true;
+    if (value == "0") return false;
+    throw std::invalid_argument(std::string(name) + " must be 0 or 1");
 }
 
-// OXTA-CRIT §6 — in-loop SPACE-axis learning-rate controller (opt-in
-// NSOS_CRIT_LR=1).  Sets a per-parameter lr multiplier that nudges each rank-2
-// layer toward the critical branch gain g~1: g>1 (over-amplifying) -> lr<1,
-// g<1 (contracting) -> lr>1, with scale = clamp((g_target/g)^eta, 0.5, 2.0).
-// When enabled it OWNS per_param_lr_scale (re-set each step).  For a full
-// 3-axis loop, the Python SNR instrument (DEPTH axis) can multiply on top via
-// set_lr_scale_by_name AFTER the step (documented in criticality_instrument.py).
-void apply_criticality_lr_control(Trainer& trainer,
-                                  const std::vector<Parameter*>& params) {
-    static const bool enabled = [] {
-        const char* e = std::getenv("NSOS_CRIT_LR");
-        return e != nullptr && e[0] == '1';
-    }();
-    if (!enabled) {
-        return;
+float strict_env_float(const char* name, float fallback, float lo, float hi) {
+    const char* raw = std::getenv(name);
+    if (!raw) return fallback;
+    char* end = nullptr;
+    const float value = std::strtof(raw, &end);
+    if (!end || end == raw || *end != '\0' || !std::isfinite(value) ||
+        value < lo || value > hi) {
+        throw std::invalid_argument(std::string(name) + " is outside its valid range");
     }
-    static const float eta = [] {
-        const char* e = std::getenv("NSOS_CRIT_LR_ETA");
-        const float v = e ? std::strtof(e, nullptr) : 0.25f;
-        return (v > 0.0f && v <= 1.0f) ? v : 0.25f;
-    }();
-    const float g_target = 1.0f, lo = 0.5f, hi = 2.0f;
-    for (auto* p : params) {
-        if (!p || p->data.size == 0 || p->data.shape.size() != 2) continue;
-        const int rows = p->data.shape[0];
-        const int cols = p->data.shape[1];
-        if (rows <= 1 || cols <= 1) continue;
+    return value;
+}
+
+int strict_env_int(const char* name, int fallback, int lo) {
+    const char* raw = std::getenv(name);
+    if (!raw) return fallback;
+    char* end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (!end || end == raw || *end != '\0' || value < lo ||
+        value > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(std::string(name) + " is outside its valid range");
+    }
+    return static_cast<int>(value);
+}
+
+bool criticality_regularizer_enabled() {
+    return strict_env_flag("NSOS_CRIT_REG");
+}
+
+bool criticality_lr_enabled() {
+    return strict_env_flag("NSOS_CRIT_LR");
+}
+
+std::vector<Parameter*> active_ternary_weights(Trainer& trainer) {
+    std::vector<Parameter*> result;
+    if (!trainer.model) return result;
+    for (BitLinear* layer : trainer.model->collect_bitlinear_layers()) {
+        if (!layer || layer->quantization_sensitive() ||
+            layer->reference_path_enabled() || !layer->has_full_precision_weight()) {
+            continue;
+        }
+        Parameter* parameter = &layer->weight;
+        if (parameter->data.shape.size() != 2 || parameter->data.shape[0] <= 1 ||
+            parameter->data.shape[1] <= 1 ||
+            parameter->grad.size != parameter->data.size) {
+            continue;
+        }
+        result.push_back(parameter);
+    }
+    return result;
+}
+
+#ifdef USE_CUDA
+unsigned char* criticality_device_buffer(size_t bytes) {
+    thread_local unsigned char* buffer = nullptr;
+    thread_local size_t capacity = 0;
+    if (bytes == 0) return nullptr;
+    if (bytes > capacity) {
+        if (buffer) cudaFree(buffer);
+        buffer = nullptr;
+        const cudaError_t status = cudaMalloc(&buffer, bytes);
+        if (status != cudaSuccess) {
+            (void)cudaGetLastError();
+            capacity = 0;
+            return nullptr;
+        }
+        capacity = bytes;
+    }
+    return buffer;
+}
+
+size_t align_buffer_offset(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+void check_cuda_copy(cudaError_t status, const char* operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + " failed: " +
+                                 cudaGetErrorString(status));
+    }
+}
+#endif
+
+std::vector<CriticalityMetric> measure_active_criticality(Trainer& trainer) {
+    const std::vector<Parameter*> weights = active_ternary_weights(trainer);
+    std::vector<CriticalityMetric> metrics(weights.size());
+    std::vector<size_t> gpu_indices;
+    for (size_t index = 0; index < weights.size(); ++index) {
+        Parameter* p = weights[index];
+        metrics[index].parameter = p;
+        metrics[index].fan_in = p->data.shape[1];
+#ifdef USE_CUDA
+        if (p->data.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+            gpu_indices.push_back(index);
+            continue;
+        }
+#endif
         Tensor host = p->data.get_device() == Device::GPU ? p->data.cpu() : p->data;
-        const float* w = host.data();
-        const int n = host.size;
+        const float* values = host.data();
         double abs_sum = 0.0;
-        for (int i = 0; i < n; ++i) abs_sum += std::fabs(w[i]);
-        const float gamma = static_cast<float>(abs_sum / std::max(n, 1));
-        if (gamma <= 0.0f) continue;
+        for (int i = 0; i < host.size; ++i) abs_sum += std::fabs(values[i]);
+        const float gamma = static_cast<float>(
+            abs_sum / static_cast<double>(std::max<int64_t>(host.size, 1)));
         int zeros = 0;
-        const float half_gamma = 0.5f * gamma;
-        for (int i = 0; i < n; ++i) zeros += (std::fabs(w[i]) < half_gamma) ? 1 : 0;
-        const float p0 = static_cast<float>(zeros) / static_cast<float>(n);
-        const float g = gamma * gamma * (1.0f - p0) * static_cast<float>(cols);
-        if (g <= 0.0f) continue;
-        float scale = std::pow(g_target / g, eta);
-        scale = std::clamp(scale, lo, hi);
-        trainer.per_param_lr_scale[p] = scale;
+        const float threshold = 0.5f * gamma;
+        for (int i = 0; i < host.size; ++i) {
+            zeros += std::fabs(values[i]) < threshold ? 1 : 0;
+        }
+        metrics[index].gamma = gamma;
+        metrics[index].gain = gamma * gamma *
+            (1.0f - static_cast<float>(zeros) /
+                        static_cast<float>(std::max<int64_t>(host.size, 1))) *
+            static_cast<float>(metrics[index].fan_in);
+    }
+#ifdef USE_CUDA
+    if (!gpu_indices.empty()) {
+        const int count = static_cast<int>(gpu_indices.size());
+        std::vector<float*> host_weights(static_cast<size_t>(count));
+        std::vector<unsigned long long> host_offsets(static_cast<size_t>(count + 1));
+        std::vector<int> host_fan_in(static_cast<size_t>(count));
+        std::vector<float> host_gammas(static_cast<size_t>(count));
+        std::vector<float> host_gains(static_cast<size_t>(count));
+        unsigned long long total = 0;
+        for (int i = 0; i < count; ++i) {
+            const size_t metric_index = gpu_indices[static_cast<size_t>(i)];
+            Parameter* p = metrics[metric_index].parameter;
+            host_weights[static_cast<size_t>(i)] = p->data.raw_data();
+            host_offsets[static_cast<size_t>(i)] = total;
+            total += static_cast<unsigned long long>(p->data.size);
+            host_fan_in[static_cast<size_t>(i)] = metrics[metric_index].fan_in;
+        }
+        host_offsets[static_cast<size_t>(count)] = total;
+        size_t offset = sizeof(float*) * static_cast<size_t>(count);
+        offset = align_buffer_offset(offset, alignof(unsigned long long));
+        const size_t offsets_offset = offset;
+        offset += sizeof(unsigned long long) * static_cast<size_t>(count + 1);
+        offset = align_buffer_offset(offset, alignof(int));
+        const size_t fan_offset = offset;
+        offset += sizeof(int) * static_cast<size_t>(count);
+        offset = align_buffer_offset(offset, alignof(float));
+        const size_t gamma_offset = offset;
+        offset += sizeof(float) * static_cast<size_t>(count);
+        const size_t gain_offset = offset;
+        offset += sizeof(float) * static_cast<size_t>(count);
+        unsigned char* buffer = criticality_device_buffer(offset);
+        if (!buffer) throw std::runtime_error("Could not allocate criticality GPU metadata");
+        auto* device_weights = reinterpret_cast<float* const*>(buffer);
+        auto* device_offsets = reinterpret_cast<unsigned long long*>(buffer + offsets_offset);
+        auto* device_fan_in = reinterpret_cast<int*>(buffer + fan_offset);
+        auto* device_gammas = reinterpret_cast<float*>(buffer + gamma_offset);
+        auto* device_gains = reinterpret_cast<float*>(buffer + gain_offset);
+        check_cuda_copy(cudaMemcpy(buffer, host_weights.data(),
+                                   sizeof(float*) * static_cast<size_t>(count),
+                                   cudaMemcpyHostToDevice), "criticality pointer upload");
+        check_cuda_copy(cudaMemcpy(device_offsets, host_offsets.data(),
+                                   sizeof(unsigned long long) * static_cast<size_t>(count + 1),
+                                   cudaMemcpyHostToDevice), "criticality offset upload");
+        check_cuda_copy(cudaMemcpy(device_fan_in, host_fan_in.data(),
+                                   sizeof(int) * static_cast<size_t>(count),
+                                   cudaMemcpyHostToDevice), "criticality fan-in upload");
+        launch_multi_tensor_criticality_metrics(
+            device_weights, device_offsets, device_fan_in, count,
+            device_gammas, device_gains);
+        trainer_check_cuda("launch_multi_tensor_criticality_metrics");
+        check_cuda_copy(cudaMemcpy(host_gammas.data(), device_gammas,
+                                   sizeof(float) * static_cast<size_t>(count),
+                                   cudaMemcpyDeviceToHost), "criticality gamma download");
+        check_cuda_copy(cudaMemcpy(host_gains.data(), device_gains,
+                                   sizeof(float) * static_cast<size_t>(count),
+                                   cudaMemcpyDeviceToHost), "criticality gain download");
+        for (int i = 0; i < count; ++i) {
+            CriticalityMetric& metric = metrics[gpu_indices[static_cast<size_t>(i)]];
+            metric.gamma = host_gammas[static_cast<size_t>(i)];
+            metric.gain = host_gains[static_cast<size_t>(i)];
+        }
+    }
+#endif
+    return metrics;
+}
+
+void add_criticality_gradient(
+    const std::vector<CriticalityMetric>& metrics,
+    const std::vector<float>& coefficients) {
+#ifdef USE_CUDA
+    std::vector<size_t> gpu_indices;
+#endif
+    for (size_t index = 0; index < metrics.size(); ++index) {
+        Parameter* p = metrics[index].parameter;
+        const float coefficient = coefficients[index];
+        if (!p || coefficient == 0.0f) continue;
+#ifdef USE_CUDA
+        if (p->data.get_device() == Device::GPU &&
+            p->grad.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+            gpu_indices.push_back(index);
+            continue;
+        }
+#endif
+        Tensor host_weight = p->data.get_device() == Device::GPU
+                                 ? p->data.cpu()
+                                 : p->data;
+        Tensor host_grad = p->grad.get_device() == Device::GPU
+                               ? p->grad.cpu()
+                               : p->grad;
+        const float* weight = host_weight.data();
+        float* grad = host_grad.data();
+        for (int i = 0; i < host_grad.size; ++i) {
+            const float sign =
+                weight[i] > 0.0f ? 1.0f : (weight[i] < 0.0f ? -1.0f : 0.0f);
+            grad[i] += coefficient * sign;
+        }
+        if (p->grad.get_device() == Device::GPU) {
+            p->grad.copy_from(host_grad.to(Device::GPU));
+        }
+    }
+#ifdef USE_CUDA
+    if (!gpu_indices.empty()) {
+        const int count = static_cast<int>(gpu_indices.size());
+        std::vector<float*> host_weights(static_cast<size_t>(count));
+        std::vector<float*> host_grads(static_cast<size_t>(count));
+        std::vector<unsigned long long> host_offsets(static_cast<size_t>(count + 1));
+        std::vector<float> host_coefficients(static_cast<size_t>(count));
+        unsigned long long total = 0;
+        for (int i = 0; i < count; ++i) {
+            const size_t index = gpu_indices[static_cast<size_t>(i)];
+            Parameter* p = metrics[index].parameter;
+            host_weights[static_cast<size_t>(i)] = p->data.raw_data();
+            host_grads[static_cast<size_t>(i)] = p->grad.raw_data();
+            host_offsets[static_cast<size_t>(i)] = total;
+            total += static_cast<unsigned long long>(p->data.size);
+            host_coefficients[static_cast<size_t>(i)] = coefficients[index];
+        }
+        host_offsets[static_cast<size_t>(count)] = total;
+        size_t offset = sizeof(float*) * static_cast<size_t>(count) * 2;
+        offset = align_buffer_offset(offset, alignof(unsigned long long));
+        const size_t offsets_offset = offset;
+        offset += sizeof(unsigned long long) * static_cast<size_t>(count + 1);
+        offset = align_buffer_offset(offset, alignof(float));
+        const size_t coefficients_offset = offset;
+        offset += sizeof(float) * static_cast<size_t>(count);
+        unsigned char* buffer = criticality_device_buffer(offset);
+        if (!buffer) throw std::runtime_error("Could not allocate criticality GPU gradient metadata");
+        auto* device_weights = reinterpret_cast<float* const*>(buffer);
+        auto* device_grads = device_weights + count;
+        auto* device_offsets = reinterpret_cast<unsigned long long*>(buffer + offsets_offset);
+        auto* device_coefficients = reinterpret_cast<float*>(buffer + coefficients_offset);
+        check_cuda_copy(cudaMemcpy(buffer, host_weights.data(),
+                                   sizeof(float*) * static_cast<size_t>(count),
+                                   cudaMemcpyHostToDevice), "criticality weight pointer upload");
+        check_cuda_copy(cudaMemcpy(buffer + sizeof(float*) * static_cast<size_t>(count),
+                                   host_grads.data(),
+                                   sizeof(float*) * static_cast<size_t>(count),
+                                   cudaMemcpyHostToDevice), "criticality grad pointer upload");
+        check_cuda_copy(cudaMemcpy(device_offsets, host_offsets.data(),
+                                   sizeof(unsigned long long) * static_cast<size_t>(count + 1),
+                                   cudaMemcpyHostToDevice), "criticality grad offset upload");
+        check_cuda_copy(cudaMemcpy(device_coefficients, host_coefficients.data(),
+                                   sizeof(float) * static_cast<size_t>(count),
+                                   cudaMemcpyHostToDevice), "criticality coefficient upload");
+        launch_multi_tensor_criticality_grad(
+            device_weights, device_grads, device_offsets, device_coefficients,
+            count, total);
+        trainer_check_cuda("launch_multi_tensor_criticality_grad");
+    }
+#endif
+}
+
+// R = eta/2 * mean_l(log(g_l/g0_l)^2), with the discrete zero mask held
+// constant. SymPy gives dR/dw_i = 2*eta*log(g/g0)*sign(w_i)/(L*n*gamma).
+// The term is accumulated before clipping and Adam, so weights and moments stay
+// in the same coordinate system.
+float apply_criticality_regularization_gradient(
+    Trainer& trainer, const std::vector<CriticalityMetric>& metrics,
+    int accumulation_steps) {
+    if (!criticality_regularizer_enabled()) return 0.0f;
+    const float eta = strict_env_float(
+        "NSOS_CRIT_REG_ETA", 0.2f, std::numeric_limits<float>::min(), 1.0f);
+    const int every = strict_env_int("NSOS_CRIT_REG_EVERY", 10, 1);
+    if (trainer.global_step_count % every != 0) return 0.0f;
+
+    std::vector<float> log_ratios(metrics.size(), 0.0f);
+    size_t active = 0;
+    for (size_t index = 0; index < metrics.size(); ++index) {
+        const CriticalityMetric& metric = metrics[index];
+        if (!metric.parameter || !std::isfinite(metric.gamma) || metric.gamma <= 0.0f ||
+            !std::isfinite(metric.gain) || metric.gain <= 0.0f) {
+            continue;
+        }
+        auto baseline = trainer.crit_g0_state.find(metric.parameter);
+        if (baseline == trainer.crit_g0_state.end()) {
+            trainer.crit_g0_state.emplace(metric.parameter, metric.gain);
+            continue;
+        }
+        if (!std::isfinite(baseline->second) || baseline->second <= 0.0f) {
+            throw std::runtime_error("Invalid criticality baseline");
+        }
+        log_ratios[index] = std::log(metric.gain / baseline->second);
+        if (!std::isfinite(log_ratios[index])) {
+            throw std::runtime_error("Non-finite criticality regularizer");
+        }
+        ++active;
+    }
+    if (active == 0) return 0.0f;
+    const float inverse_active = 1.0f / static_cast<float>(active);
+    std::vector<float> coefficients(metrics.size(), 0.0f);
+    double loss = 0.0;
+    for (size_t index = 0; index < metrics.size(); ++index) {
+        if (log_ratios[index] == 0.0f || metrics[index].gamma <= 0.0f) continue;
+        loss += 0.5 * static_cast<double>(eta) * log_ratios[index] *
+                log_ratios[index] * inverse_active;
+        coefficients[index] =
+            2.0f * eta * log_ratios[index] * inverse_active /
+            (static_cast<float>(metrics[index].parameter->data.size) *
+             metrics[index].gamma) *
+            static_cast<float>(std::max(accumulation_steps, 1));
+    }
+    add_criticality_gradient(metrics, coefficients);
+    if (!std::isfinite(loss)) throw std::runtime_error("Non-finite criticality loss");
+    return static_cast<float>(loss);
+}
+
+void apply_composed_criticality_lr_control(
+    Trainer& trainer, const std::vector<CriticalityMetric>& metrics) {
+    trainer.criticality_lr_scale.clear();
+    if (!criticality_lr_enabled()) return;
+    const float eta = strict_env_float(
+        "NSOS_CRIT_LR_ETA", 0.25f, std::numeric_limits<float>::min(), 1.0f);
+    for (const CriticalityMetric& metric : metrics) {
+        if (!metric.parameter || !std::isfinite(metric.gain) || metric.gain <= 0.0f) {
+            continue;
+        }
+        trainer.criticality_lr_scale.emplace(
+            metric.parameter,
+            std::clamp(std::pow(1.0f / metric.gain, eta), 0.5f, 2.0f));
     }
 }
 
@@ -1150,7 +1675,11 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
     const size_t off_bytes =
         sizeof(unsigned long long) * static_cast<size_t>(n + 1);
     const size_t wd_bytes = static_cast<size_t>(n);
-    staging.resize(ptr_bytes + off_bytes + wd_bytes);
+    const size_t lr_offset =
+        (ptr_bytes + off_bytes + wd_bytes + alignof(float) - 1) &
+        ~(alignof(float) - 1);
+    const size_t lr_bytes = sizeof(float) * static_cast<size_t>(n);
+    staging.resize(lr_offset + lr_bytes);
     float** h_w = reinterpret_cast<float**>(staging.data());
     float** h_g = h_w + n;
     float** h_m = h_w + 2 * n;
@@ -1158,6 +1687,7 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
     auto* h_off =
         reinterpret_cast<unsigned long long*>(staging.data() + ptr_bytes);
     unsigned char* h_wd = staging.data() + ptr_bytes + off_bytes;
+    float* h_lr = reinterpret_cast<float*>(staging.data() + lr_offset);
     unsigned long long total = 0;
     for (int i = 0; i < n; ++i) {
         Parameter* p = active[static_cast<size_t>(i)];
@@ -1168,6 +1698,7 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
         h_off[i] = total;
         total += static_cast<unsigned long long>(p->data.size);
         h_wd[i] = should_apply_weight_decay(*p) ? 1 : 0;
+        h_lr[i] = trainer.lr_scale_for(p);
     }
     h_off[n] = total;
     if (total == 0) {
@@ -1186,6 +1717,7 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
     const auto* d_off =
         reinterpret_cast<const unsigned long long*>(d_meta + ptr_bytes);
     const unsigned char* d_wd = d_meta + ptr_bytes + off_bytes;
+    const float* d_lr = reinterpret_cast<const float*>(d_meta + lr_offset);
 
     cudaMemsetAsync(d_accum, 0, sizeof(float), 0);
     launch_multi_tensor_sqsum(d_accum, d_w, d_g, d_m, d_v, d_off, d_wd, n, total);
@@ -1210,9 +1742,10 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
     const float bc1 = 1.0f - std::pow(trainer.beta1, trainer.global_step_count);
     const float bc2 = 1.0f - std::pow(trainer.beta2, trainer.global_step_count);
 
-    launch_multi_tensor_adamw(d_w, d_g, d_m, d_v, d_off, d_wd, n, total, gscale,
-                              trainer.beta1, trainer.beta2, bc1, bc2, cur_lr,
-                              trainer.eps, trainer.weight_decay);
+    launch_multi_tensor_adamw(d_w, d_g, d_m, d_v, d_off, d_wd, d_lr, n,
+                              total, gscale, trainer.beta1, trainer.beta2,
+                              bc1, bc2, cur_lr, trainer.eps,
+                              trainer.weight_decay);
     trainer_check_cuda("launch_multi_tensor_adamw");
     for (auto* p : active) {
         p->mark_updated();
@@ -1221,21 +1754,39 @@ static bool apply_optimizer_step_fused(Trainer& trainer,
 }
 #endif  // USE_CUDA
 
-void apply_optimizer_step(Trainer& trainer,
-                          const std::vector<Parameter*>& params,
-                          int accumulation_steps,
-                          float* grad_norm_out = nullptr) {
-    // §6 space-axis lr controller (opt-in NSOS_CRIT_LR).  Populates
-    // per_param_lr_scale when enabled, which also forces the per-parameter path
-    // below (the fused optimizer applies a single global lr and is bypassed
-    // whenever per-parameter lr scales are active).
-    apply_criticality_lr_control(trainer, params);
+float apply_optimizer_step(Trainer& trainer,
+                           const std::vector<Parameter*>& params,
+                           int accumulation_steps,
+                           float* grad_norm_out = nullptr) {
+    if (!std::isfinite(trainer.learning_rate) || trainer.learning_rate < 0.0f ||
+        !std::isfinite(trainer.beta1) || trainer.beta1 < 0.0f || trainer.beta1 >= 1.0f ||
+        !std::isfinite(trainer.beta2) || trainer.beta2 < 0.0f || trainer.beta2 >= 1.0f ||
+        !std::isfinite(trainer.eps) || trainer.eps <= 0.0f ||
+        !std::isfinite(trainer.weight_decay) || trainer.weight_decay < 0.0f ||
+        !std::isfinite(trainer.max_grad_norm) || trainer.max_grad_norm <= 0.0f) {
+        throw std::invalid_argument("Trainer optimizer hyperparameters are invalid");
+    }
+    std::vector<CriticalityMetric> criticality_metrics;
+    if (criticality_regularizer_enabled() || criticality_lr_enabled()) {
+        criticality_metrics = measure_active_criticality(trainer);
+    }
+    apply_composed_criticality_lr_control(trainer, criticality_metrics);
+    const float criticality_loss =
+        apply_criticality_regularization_gradient(
+            trainer, criticality_metrics, accumulation_steps);
+    for (Parameter* parameter : params) {
+        if (!parameter) continue;
+        const float scale = trainer.lr_scale_for(parameter);
+        if (!std::isfinite(scale) || scale <= 0.0f) {
+            throw std::invalid_argument(
+                "Effective per-parameter learning-rate scale is invalid");
+        }
+    }
+    ensure_finite_optimizer_inputs(params);
 #ifdef USE_CUDA
-    if (trainer.per_param_lr_scale.empty() &&
-        apply_optimizer_step_fused(trainer, params, accumulation_steps,
+    if (apply_optimizer_step_fused(trainer, params, accumulation_steps,
                                    grad_norm_out)) {
-        apply_criticality_regularization(trainer, params);
-        return;
+        return criticality_loss;
     }
 #endif
     scale_gradients(params, 1.0f / std::max(accumulation_steps, 1));
@@ -1337,7 +1888,7 @@ void apply_optimizer_step(Trainer& trainer,
         p->mark_updated();
     }
 
-    apply_criticality_regularization(trainer, params);
+    return criticality_loss;
 }
 
 void record_training_audit_step(Trainer& trainer,
@@ -1386,7 +1937,57 @@ int* loss_token_device_buffer(int count) {
     }
     return buf;
 }
+
+float* repetition_loss_device_buffer() {
+    thread_local float* buffer = [] {
+        float* value = nullptr;
+        if (cudaMalloc(&value, sizeof(float)) != cudaSuccess) {
+            value = nullptr;
+            (void)cudaGetLastError();
+        }
+        return value;
+    }();
+    return buffer;
+}
 #endif
+
+std::vector<float> supervised_row_weights(
+    const Trainer& trainer, const std::vector<int>& answer_tokens) {
+    std::vector<float> weights(answer_tokens.size(), 1.0f);
+    if (answer_tokens.empty()) return weights;
+    weights.front() *= std::max(trainer.first_token_loss_scale, 0.0f);
+    if (answer_tokens.back() == trainer.eos_token_id) {
+        weights.back() *= std::max(trainer.eos_loss_scale, 0.0f);
+    }
+    return weights;
+}
+
+float effective_logit_l2_beta(const Trainer& trainer) {
+    if (trainer.logit_l2_beta != 0.0f &&
+        trainer.pantheon_vib_beta != 0.0f &&
+        trainer.logit_l2_beta != trainer.pantheon_vib_beta) {
+        throw std::invalid_argument(
+            "logit_l2_beta conflicts with deprecated pantheon_vib_beta");
+    }
+    const float beta = trainer.logit_l2_beta != 0.0f
+                           ? trainer.logit_l2_beta
+                           : trainer.pantheon_vib_beta;
+    if (!std::isfinite(beta) || beta < 0.0f) {
+        throw std::invalid_argument("logit_l2_beta must be finite and non-negative");
+    }
+    return beta;
+}
+
+float add_logit_l2_objective(const Tensor& logits, float beta, Tensor& grad) {
+    if (beta <= 0.0f || logits.size == 0) return 0.0f;
+    if (grad.shape != logits.shape || grad.get_device() != logits.get_device()) {
+        throw std::invalid_argument("logit L2 requires logits/gradient shape and device parity");
+    }
+    const float inverse_count = 1.0f / static_cast<float>(logits.size);
+    const float norm = logits.norm();
+    grad = grad.add(logits.mul(beta * inverse_count));
+    return 0.5f * beta * norm * norm * inverse_count;
+}
 
 void apply_supervised_gradient_weights(const Trainer& trainer,
                                        const std::vector<int>& answer_tokens,
@@ -1454,13 +2055,13 @@ void apply_supervised_gradient_weights(const Trainer& trainer,
     }
 }
 
-void apply_repetition_unlikelihood(const Trainer& trainer,
-                                   const std::vector<int>& answer_tokens,
-                                   const Tensor& answer_logits,
-                                   Tensor& answer_grad) {
+float apply_repetition_unlikelihood(const Trainer& trainer,
+                                    const std::vector<int>& answer_tokens,
+                                    const Tensor& answer_logits,
+                                    Tensor& answer_grad) {
     const float scale = std::max(trainer.repetition_unlikelihood_scale, 0.0f);
     if (scale <= 0.0f || answer_tokens.size() < 2 || answer_grad.size == 0) {
-        return;
+        return 0.0f;
     }
 
     Tensor probs = answer_logits.softmax(-1);
@@ -1475,14 +2076,18 @@ void apply_repetition_unlikelihood(const Trainer& trainer,
         probs.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
         const int rows = static_cast<int>(answer_tokens.size());
         int* d_tokens = loss_token_device_buffer(rows);
-        if (d_tokens) {
+        float* d_loss = repetition_loss_device_buffer();
+        if (d_tokens && d_loss) {
+            cudaMemset(d_loss, 0, sizeof(float));
             cudaMemcpy(d_tokens, answer_tokens.data(),
                        static_cast<size_t>(rows) * sizeof(int), cudaMemcpyHostToDevice);
             launch_repetition_unlikelihood_kernel(
-                answer_grad.raw_data(), probs.raw_data(), d_tokens, rows, vocab,
-                scale, trainer.eos_token_id);
+                d_loss, answer_grad.raw_data(), probs.raw_data(), d_tokens,
+                rows, vocab, scale, trainer.eos_token_id);
             trainer_check_cuda("launch_repetition_unlikelihood_kernel");
-            return;
+            float loss = 0.0f;
+            cudaMemcpy(&loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost);
+            return loss;
         }
     }
 #endif
@@ -1491,6 +2096,7 @@ void apply_repetition_unlikelihood(const Trainer& trainer,
     Tensor grad_host = answer_grad.get_device() == Device::GPU ? answer_grad.cpu() : answer_grad.clone();
     const float* prob_ptr = probs_host.data();
     float* grad_ptr = grad_host.data();
+    double loss = 0.0;
 
     for (int row = 1; row < static_cast<int>(answer_tokens.size()); ++row) {
         const int target_token = answer_tokens[row];
@@ -1531,6 +2137,8 @@ void apply_repetition_unlikelihood(const Trainer& trainer,
             }
             const float denom = std::max(1.0f - p_neg, 1e-6f);
             const float factor = scale * p_neg / denom;
+            loss += -static_cast<double>(scale) *
+                    std::log1p(-static_cast<double>(p_neg));
             for (int col = 0; col < vocab; ++col) {
                 row_grad[col] -= factor * row_probs[col];
             }
@@ -1539,6 +2147,7 @@ void apply_repetition_unlikelihood(const Trainer& trainer,
     }
 
     restore_staged_tensor(answer_grad, grad_host);
+    return static_cast<float>(loss);
 }
 
 void apply_supervised_gradient_weights_batch(const Trainer& trainer,
@@ -1587,13 +2196,14 @@ void apply_supervised_gradient_weights_batch(const Trainer& trainer,
     }
 }
 
-void apply_repetition_unlikelihood_batch(const Trainer& trainer,
-                                         const std::vector<std::vector<int>>& answer_batch,
-                                         const Tensor& answer_logits,
-                                         Tensor& answer_grad) {
+float apply_repetition_unlikelihood_batch(
+    const Trainer& trainer,
+    const std::vector<std::vector<int>>& answer_batch,
+    const Tensor& answer_logits,
+    Tensor& answer_grad) {
     const float scale = std::max(trainer.repetition_unlikelihood_scale, 0.0f);
     if (scale <= 0.0f || answer_batch.empty() || answer_grad.size == 0) {
-        return;
+        return 0.0f;
     }
     if (answer_logits.shape.size() != 3 || answer_grad.shape.size() != 3 ||
         answer_logits.shape[0] != static_cast<int>(answer_batch.size()) ||
@@ -1609,8 +2219,10 @@ void apply_repetition_unlikelihood_batch(const Trainer& trainer,
     const int batch_size = answer_logits.shape[0];
     const int seq_len = answer_logits.shape[1];
     const int vocab = answer_logits.shape[2];
+    const float inverse_batch = 1.0f / static_cast<float>(std::max(batch_size, 1));
     const float* prob_ptr = probs_host.data();
     float* grad_ptr = grad_host.data();
+    double loss = 0.0;
 
     for (int batch = 0; batch < batch_size; ++batch) {
         const auto& answer_tokens = answer_batch[static_cast<size_t>(batch)];
@@ -1656,7 +2268,9 @@ void apply_repetition_unlikelihood_batch(const Trainer& trainer,
                     continue;
                 }
                 const float denom = std::max(1.0f - p_neg, 1e-6f);
-                const float factor = scale * p_neg / denom;
+                const float factor = scale * inverse_batch * p_neg / denom;
+                loss += -static_cast<double>(scale * inverse_batch) *
+                        std::log1p(-static_cast<double>(p_neg));
                 for (int col = 0; col < vocab; ++col) {
                     row_grad[col] -= factor * row_probs[col];
                 }
@@ -1666,6 +2280,7 @@ void apply_repetition_unlikelihood_batch(const Trainer& trainer,
     }
 
     restore_staged_tensor(answer_grad, grad_host);
+    return static_cast<float>(loss);
 }
 
 float train_supervised_batch_impl(Trainer& trainer,
@@ -1682,8 +2297,12 @@ float train_supervised_batch_impl(Trainer& trainer,
     auto params = trainer.model->parameters();
     apply_progressive_qat_phase(trainer);
     zero_model_gradients(params);
+    begin_moe_aux_accumulation(trainer);
 
-    float total_loss = 0.0f;
+    double supervised_loss_sum = 0.0;
+    double repetition_loss_sum = 0.0;
+    double logit_l2_loss_sum = 0.0;
+    double sparse_selector_weighted_sum = 0.0;
     int sample_count = 0;
     AuxiliaryStackStats auxiliary_total;
     std::vector<size_t> sample_order(prompt_batch.size());
@@ -1800,7 +2419,11 @@ float train_supervised_batch_impl(Trainer& trainer,
         // SSA learned block-selector: distill this forward's dense per-block
         // attention mass into ssa_wsel_ (self-contained SGD; no-op unless sparse
         // attention is enabled and per-head Q/K were saved by the exact path).
-        trainer.model->accumulate_sparse_selector_grads();
+        const float selector_loss =
+            trainer.model->accumulate_sparse_selector_grads(
+                static_cast<float>(grouped_inputs.size()));
+        sparse_selector_weighted_sum +=
+            static_cast<double>(selector_loss) * grouped_inputs.size();
 
         const int batch_size = logits.shape[0];
         const int rows = logits.shape[1];
@@ -1830,18 +2453,18 @@ float train_supervised_batch_impl(Trainer& trainer,
 
             Tensor sample_logits = logits.slice(0, batch, batch + 1).reshape({rows, vocab});
             Tensor answer_logits = sample_logits.slice(0, answer_start, answer_end);
-            auto [loss, answer_grad] =
-                answer_logits.cross_entropy(grouped_answers[static_cast<size_t>(batch)]);
-            apply_supervised_gradient_weights(
-                trainer,
-                grouped_answers[static_cast<size_t>(batch)],
-                vocab,
-                answer_grad);
-            apply_repetition_unlikelihood(
+            const auto& answer_tokens = grouped_answers[static_cast<size_t>(batch)];
+            const std::vector<float> row_weights =
+                supervised_row_weights(trainer, answer_tokens);
+            auto [supervised_loss, answer_grad] =
+                answer_logits.cross_entropy_weighted(answer_tokens, row_weights);
+            const float repetition_loss = apply_repetition_unlikelihood(
                 trainer,
                 grouped_answers[static_cast<size_t>(batch)],
                 answer_logits,
                 answer_grad);
+            const float logit_l2_loss = add_logit_l2_objective(
+                answer_logits, effective_logit_l2_beta(trainer), answer_grad);
 
             // Single contiguous copy of this sample's answer-grad block into
             // full_grad.  In [batch, rows, vocab] layout the answer rows
@@ -1859,7 +2482,9 @@ float train_supervised_batch_impl(Trainer& trainer,
                               answer_grad.raw_data(), answer_grad.get_device(),
                               static_cast<size_t>(answer_rows) *
                                   static_cast<size_t>(vocab) * sizeof(float));
-            total_loss += loss;
+            supervised_loss_sum += supervised_loss;
+            repetition_loss_sum += repetition_loss;
+            logit_l2_loss_sum += logit_l2_loss;
             ++sample_count;
         }
 
@@ -1871,11 +2496,15 @@ float train_supervised_batch_impl(Trainer& trainer,
         tm_last = _tm_bwd1;
     }
 
-    apply_qat_regularization(trainer, std::max(sample_count, 1));
-    apply_moe_aux_regularization(trainer);
+    const int objective_samples = std::max(sample_count, 1);
+    const float qat_loss =
+        apply_qat_regularization(trainer, objective_samples);
+    const float moe_aux_loss =
+        apply_moe_aux_regularization(trainer, objective_samples);
     float grad_norm = 0.0f;
     const auto _tm_opt0 = tm_now();
-    apply_optimizer_step(trainer, params, std::max(sample_count, 1), &grad_norm);
+    const float criticality_loss = apply_optimizer_step(
+        trainer, params, std::max(sample_count, 1), &grad_norm);
     if (nsos_step_timing) {
         const auto _tm_opt1 = tm_now();
         tm_opt = tm_ms(_tm_opt1 - _tm_opt0).count();
@@ -1892,9 +2521,26 @@ float train_supervised_batch_impl(Trainer& trainer,
     }
     finalize_auxiliary_stats(auxiliary_total);
     trainer.last_auxiliary_stats = auxiliary_total;
-    const float mean_loss = total_loss / static_cast<float>(std::max(sample_count, 1));
-    record_training_audit_step(trainer, mean_loss, grad_norm, params.size());
-    return mean_loss;
+    TrainingObjectiveStats objective;
+    objective.supervised_cross_entropy = static_cast<float>(
+        supervised_loss_sum / static_cast<double>(objective_samples));
+    objective.repetition_unlikelihood = static_cast<float>(
+        repetition_loss_sum / static_cast<double>(objective_samples));
+    objective.logit_l2 = static_cast<float>(
+        logit_l2_loss_sum / static_cast<double>(objective_samples));
+    objective.sparse_selector = static_cast<float>(
+        sparse_selector_weighted_sum / static_cast<double>(objective_samples));
+    objective.qat_regularization = qat_loss;
+    objective.moe_auxiliary = moe_aux_loss;
+    objective.criticality_regularization = criticality_loss;
+    objective.total = objective.supervised_cross_entropy +
+                      objective.repetition_unlikelihood + objective.logit_l2 +
+                      objective.sparse_selector + objective.qat_regularization +
+                      objective.moe_auxiliary +
+                      objective.criticality_regularization;
+    trainer.last_objective_stats = objective;
+    record_training_audit_step(trainer, objective.total, grad_norm, params.size());
+    return objective.total;
 }
 
 } // namespace
@@ -1908,6 +2554,474 @@ Trainer::Trainer(JambaModel* m, float lr) : model(m), learning_rate(lr) {
 
 Trainer::~Trainer() = default;
 
+void Trainer::save_training_state(const std::string& state_path,
+                                  const std::string& model_path) const {
+    if (!model) throw std::runtime_error("Trainer has no model");
+    const std::filesystem::path model_file(model_path);
+    uint64_t model_bytes = 0;
+    const uint64_t model_hash =
+        training_state_file_hash(model_file, model_bytes);
+
+    const std::filesystem::path destination(state_path);
+    if (!destination.parent_path().empty()) {
+        std::filesystem::create_directories(destination.parent_path());
+    }
+    const std::filesystem::path temporary =
+        destination.parent_path() /
+        (destination.filename().string() + ".tmp." +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    try {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("Cannot open training state for writing");
+        }
+        write_training_pod(output, kTrainingStateMagic, "magic");
+        write_training_pod(output, kTrainingStateVersion, "version");
+        write_training_pod(
+            output, ModelSerializer::architecture_fingerprint(model),
+            "architecture fingerprint");
+        write_training_pod(output, model_bytes, "model byte count");
+        write_training_pod(output, model_hash, "model hash");
+        write_training_pod(output, model->training_rng_sequence(),
+                           "dropout RNG sequence");
+
+        for (float value : {learning_rate, beta1, beta2, eps, weight_decay,
+                            max_grad_norm, min_learning_rate_scale,
+                            first_token_loss_scale, eos_loss_scale,
+                            repetition_unlikelihood_scale, moe_aux_loss_scale,
+                            pantheon_vib_beta, logit_l2_beta}) {
+            write_training_pod(output, value, "trainer float");
+        }
+        for (int32_t value : {warmup_steps, global_step_count,
+                              total_training_steps, eos_token_id,
+                              optimizer_state_bits}) {
+            write_training_pod(output, value, "trainer integer");
+        }
+
+        auto write_bool = [&](bool value) {
+            write_training_pod(output, static_cast<uint8_t>(value ? 1 : 0),
+                               "scheduler boolean");
+        };
+        const auto& scheduler = phase_scheduler;
+        write_bool(scheduler.progressive_qat_enabled);
+        write_training_pod(output,
+                           static_cast<int32_t>(scheduler.semantic_warmup_steps),
+                           "semantic warmup");
+        write_training_pod(output,
+                           static_cast<int32_t>(scheduler.qat_start_step),
+                           "QAT start");
+        write_training_pod(
+            output, static_cast<int32_t>(scheduler.quantized_precision_bits),
+            "QAT precision");
+        write_training_pod(output, scheduler.ternary_regularization,
+                           "ternary regularization");
+        write_bool(scheduler.auxiliary_stack_enabled);
+        write_bool(scheduler.auxiliary_session_adapt_enabled);
+        write_bool(scheduler.auxiliary_reasoning_enabled);
+        write_bool(scheduler.auxiliary_memory_enabled);
+        for (int32_t value : {
+                 scheduler.auxiliary_reasoning_iterations,
+                 scheduler.auxiliary_reasoning_simulations}) {
+            write_training_pod(output, value, "auxiliary scheduler integer");
+        }
+        write_training_pod(output, scheduler.auxiliary_memory_blend,
+                           "auxiliary memory blend");
+        for (int32_t value : {
+                 scheduler.auxiliary_every_steps,
+                 scheduler.auxiliary_prompt_max_tokens,
+                 scheduler.auxiliary_answer_max_tokens,
+                 scheduler.auxiliary_memory_scope}) {
+            write_training_pod(output, value, "auxiliary scheduler integer");
+        }
+
+        const auto parameters = stable_training_parameters(model);
+        write_training_pod(output, static_cast<uint32_t>(parameters.size()),
+                           "parameter count");
+        for (const auto& [parameter, stable_name] : parameters) {
+            write_training_string(output, stable_name);
+            write_training_pod(output,
+                               static_cast<uint64_t>(parameter->data.size),
+                               "parameter elements");
+
+            std::vector<float> m_values;
+            std::vector<float> v_values;
+            bool has_moments = false;
+            const auto quant_it = quant_state.find(parameter);
+            if (quant_it != quant_state.end()) {
+                if (quant_it->second.n != parameter->data.size) {
+                    throw std::runtime_error(
+                        "Quantized optimizer state shape mismatch for " +
+                        stable_name);
+                }
+                m_values.resize(static_cast<size_t>(parameter->data.size));
+                v_values.resize(static_cast<size_t>(parameter->data.size));
+                quant4_load_m(quant_it->second, m_values.data(),
+                              parameter->data.size);
+                quant4_load_v(quant_it->second, v_values.data(),
+                              parameter->data.size);
+                has_moments = true;
+            } else {
+                const auto m_it = m_state.find(parameter);
+                const auto v_it = v_state.find(parameter);
+                if ((m_it == m_state.end()) != (v_it == v_state.end())) {
+                    throw std::runtime_error(
+                        "Incomplete Adam state for " + stable_name);
+                }
+                if (m_it != m_state.end()) {
+                    if (m_it->second.shape != parameter->data.shape ||
+                        v_it->second.shape != parameter->data.shape) {
+                        throw std::runtime_error(
+                            "Adam state shape mismatch for " + stable_name);
+                    }
+                    Tensor m_host = m_it->second.cpu();
+                    Tensor v_host = v_it->second.cpu();
+                    m_values.assign(m_host.data(),
+                                    m_host.data() + m_host.size);
+                    v_values.assign(v_host.data(),
+                                    v_host.data() + v_host.size);
+                    has_moments = true;
+                }
+            }
+
+            const auto criticality_it = crit_g0_state.find(parameter);
+            const auto external_lr_it = external_lr_scale.find(parameter);
+            const auto criticality_lr_it = criticality_lr_scale.find(parameter);
+            if ((criticality_it != crit_g0_state.end() &&
+                 (!std::isfinite(criticality_it->second) ||
+                  criticality_it->second <= 0.0f)) ||
+                (external_lr_it != external_lr_scale.end() &&
+                 (!std::isfinite(external_lr_it->second) ||
+                  external_lr_it->second <= 0.0f)) ||
+                (criticality_lr_it != criticality_lr_scale.end() &&
+                 (!std::isfinite(criticality_lr_it->second) ||
+                  criticality_lr_it->second <= 0.0f))) {
+                throw std::runtime_error(
+                    "Invalid per-parameter controller state for " + stable_name);
+            }
+            uint8_t flags = has_moments ? 1u : 0u;
+            if (criticality_it != crit_g0_state.end()) flags |= 2u;
+            if (external_lr_it != external_lr_scale.end()) flags |= 4u;
+            if (criticality_lr_it != criticality_lr_scale.end()) flags |= 8u;
+            write_training_pod(output, flags, "parameter flags");
+            write_training_pod(
+                output,
+                criticality_it == crit_g0_state.end() ? 0.0f
+                                                       : criticality_it->second,
+                "criticality baseline");
+            write_training_pod(
+                output,
+                external_lr_it == external_lr_scale.end()
+                    ? 1.0f
+                    : external_lr_it->second,
+                "external parameter LR scale");
+            write_training_pod(
+                output,
+                criticality_lr_it == criticality_lr_scale.end()
+                    ? 1.0f
+                    : criticality_lr_it->second,
+                "criticality parameter LR scale");
+            if (has_moments) {
+                const std::streamsize bytes = static_cast<std::streamsize>(
+                    static_cast<uint64_t>(parameter->data.size) * sizeof(float));
+                output.write(reinterpret_cast<const char*>(m_values.data()), bytes);
+                output.write(reinterpret_cast<const char*>(v_values.data()), bytes);
+                if (!output) {
+                    throw std::runtime_error(
+                        "Training-state moment write failed for " + stable_name);
+                }
+            }
+        }
+        output.flush();
+        if (!output) throw std::runtime_error("Training-state flush failed");
+        output.close();
+        if (!output) throw std::runtime_error("Training-state close failed");
+        replace_training_state_file(temporary, destination);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
+    }
+}
+
+void Trainer::load_training_state(const std::string& state_path,
+                                  const std::string& model_path) {
+    if (!model) throw std::runtime_error("Trainer has no model");
+    uint64_t actual_model_bytes = 0;
+    const uint64_t actual_model_hash = training_state_file_hash(
+        std::filesystem::path(model_path), actual_model_bytes);
+
+    std::ifstream input(state_path, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open training state");
+    const uint32_t magic = read_training_pod<uint32_t>(input, "magic");
+    const uint32_t version = read_training_pod<uint32_t>(input, "version");
+    if (magic != kTrainingStateMagic ||
+        (version != kTrainingStateVersion &&
+         version != kTrainingStateLegacyVersion)) {
+        throw std::runtime_error("Unsupported or corrupt training-state header");
+    }
+    const uint32_t fingerprint =
+        read_training_pod<uint32_t>(input, "architecture fingerprint");
+    if (fingerprint != ModelSerializer::architecture_fingerprint(model)) {
+        throw std::runtime_error(
+            "Training-state architecture fingerprint does not match model");
+    }
+    const uint64_t expected_model_bytes =
+        read_training_pod<uint64_t>(input, "model byte count");
+    const uint64_t expected_model_hash =
+        read_training_pod<uint64_t>(input, "model hash");
+    if (expected_model_bytes != actual_model_bytes ||
+        expected_model_hash != actual_model_hash) {
+        throw std::runtime_error(
+            "Training state belongs to a different model checkpoint");
+    }
+    const uint64_t rng_sequence =
+        read_training_pod<uint64_t>(input, "dropout RNG sequence");
+
+    TrainingStateMetadata metadata;
+    float* metadata_floats[] = {
+        &metadata.learning_rate,
+        &metadata.beta1,
+        &metadata.beta2,
+        &metadata.eps,
+        &metadata.weight_decay,
+        &metadata.max_grad_norm,
+        &metadata.min_learning_rate_scale,
+        &metadata.first_token_loss_scale,
+        &metadata.eos_loss_scale,
+        &metadata.repetition_unlikelihood_scale,
+        &metadata.moe_aux_loss_scale,
+        &metadata.pantheon_vib_beta,
+        &metadata.logit_l2_beta};
+    for (float* value : metadata_floats) {
+        *value = read_training_pod<float>(input, "trainer float");
+        if (!std::isfinite(*value)) {
+            throw std::runtime_error("Non-finite trainer metadata");
+        }
+    }
+    metadata.warmup_steps =
+        read_training_pod<int32_t>(input, "warmup steps");
+    metadata.global_step_count =
+        read_training_pod<int32_t>(input, "global step");
+    metadata.total_training_steps =
+        read_training_pod<int32_t>(input, "total training steps");
+    metadata.eos_token_id =
+        read_training_pod<int32_t>(input, "EOS token");
+    metadata.optimizer_state_bits =
+        read_training_pod<int32_t>(input, "optimizer state bits");
+    if (metadata.global_step_count < 0 || metadata.warmup_steps < 0 ||
+        metadata.total_training_steps < 0 ||
+        (metadata.optimizer_state_bits != 4 &&
+         metadata.optimizer_state_bits != 32)) {
+        throw std::runtime_error("Invalid trainer integer metadata");
+    }
+
+    auto read_bool = [&]() {
+        const uint8_t value =
+            read_training_pod<uint8_t>(input, "scheduler boolean");
+        if (value > 1) throw std::runtime_error("Invalid scheduler boolean");
+        return value != 0;
+    };
+    auto& scheduler = metadata.phase_scheduler;
+    scheduler.progressive_qat_enabled = read_bool();
+    scheduler.semantic_warmup_steps =
+        read_training_pod<int32_t>(input, "semantic warmup");
+    scheduler.qat_start_step =
+        read_training_pod<int32_t>(input, "QAT start");
+    scheduler.quantized_precision_bits =
+        read_training_pod<int32_t>(input, "QAT precision");
+    scheduler.ternary_regularization =
+        read_training_pod<float>(input, "ternary regularization");
+    scheduler.auxiliary_stack_enabled = read_bool();
+    scheduler.auxiliary_session_adapt_enabled = read_bool();
+    scheduler.auxiliary_reasoning_enabled = read_bool();
+    scheduler.auxiliary_memory_enabled = read_bool();
+    scheduler.auxiliary_reasoning_iterations =
+        read_training_pod<int32_t>(input, "auxiliary reasoning iterations");
+    scheduler.auxiliary_reasoning_simulations =
+        read_training_pod<int32_t>(input, "auxiliary reasoning simulations");
+    scheduler.auxiliary_memory_blend =
+        read_training_pod<float>(input, "auxiliary memory blend");
+    scheduler.auxiliary_every_steps =
+        read_training_pod<int32_t>(input, "auxiliary cadence");
+    scheduler.auxiliary_prompt_max_tokens =
+        read_training_pod<int32_t>(input, "auxiliary prompt limit");
+    scheduler.auxiliary_answer_max_tokens =
+        read_training_pod<int32_t>(input, "auxiliary answer limit");
+    scheduler.auxiliary_memory_scope =
+        read_training_pod<int32_t>(input, "auxiliary memory scope");
+    if (!std::isfinite(scheduler.ternary_regularization) ||
+        !std::isfinite(scheduler.auxiliary_memory_blend) ||
+        scheduler.semantic_warmup_steps < 0 || scheduler.qat_start_step < 0 ||
+        scheduler.auxiliary_every_steps <= 0) {
+        throw std::runtime_error("Invalid phase scheduler metadata");
+    }
+
+    const auto parameters = stable_training_parameters(model);
+    std::unordered_map<std::string, Parameter*> parameter_by_name;
+    parameter_by_name.reserve(parameters.size());
+    for (const auto& [parameter, stable_name] : parameters) {
+        parameter_by_name.emplace(stable_name, parameter);
+    }
+    const uint32_t record_count =
+        read_training_pod<uint32_t>(input, "parameter count");
+    if (record_count != parameters.size()) {
+        throw std::runtime_error(
+            "Training-state parameter count does not match model");
+    }
+    std::vector<TrainingParameterRecord> records;
+    records.reserve(record_count);
+    std::unordered_map<Parameter*, bool> seen;
+    for (uint32_t index = 0; index < record_count; ++index) {
+        const std::string stable_name = read_training_string(input);
+        const auto found = parameter_by_name.find(stable_name);
+        if (found == parameter_by_name.end()) {
+            throw std::runtime_error(
+                "Training-state parameter not found: " + stable_name);
+        }
+        Parameter* parameter = found->second;
+        if (!seen.emplace(parameter, true).second) {
+            throw std::runtime_error(
+                "Duplicate training-state parameter: " + stable_name);
+        }
+        const uint64_t elements =
+            read_training_pod<uint64_t>(input, "parameter elements");
+        if (elements != static_cast<uint64_t>(parameter->data.size)) {
+            throw std::runtime_error(
+                "Training-state shape mismatch for " + stable_name);
+        }
+        const uint8_t flags =
+            read_training_pod<uint8_t>(input, "parameter flags");
+        const uint8_t known_flags =
+            version == kTrainingStateLegacyVersion ? uint8_t{7} : uint8_t{15};
+        if ((flags & ~known_flags) != 0) {
+            throw std::runtime_error("Unknown training-state parameter flags");
+        }
+        TrainingParameterRecord record;
+        record.parameter = parameter;
+        record.has_moments = (flags & 1u) != 0;
+        record.has_criticality = (flags & 2u) != 0;
+        record.has_external_lr_scale = (flags & 4u) != 0;
+        record.has_criticality_lr_scale =
+            version >= 2u && (flags & 8u) != 0;
+        record.criticality =
+            read_training_pod<float>(input, "criticality baseline");
+        record.external_lr_scale =
+            read_training_pod<float>(input, "external parameter LR scale");
+        if (version >= 2u) {
+            record.criticality_lr_scale = read_training_pod<float>(
+                input, "criticality parameter LR scale");
+        }
+        if (!std::isfinite(record.criticality) ||
+            !std::isfinite(record.external_lr_scale) ||
+            record.external_lr_scale <= 0.0f ||
+            !std::isfinite(record.criticality_lr_scale) ||
+            record.criticality_lr_scale <= 0.0f) {
+            throw std::runtime_error(
+                "Invalid per-parameter training metadata");
+        }
+        if (record.has_moments) {
+            record.m.resize(static_cast<size_t>(elements));
+            record.v.resize(static_cast<size_t>(elements));
+            const std::streamsize bytes = static_cast<std::streamsize>(
+                elements * sizeof(float));
+            input.read(reinterpret_cast<char*>(record.m.data()), bytes);
+            input.read(reinterpret_cast<char*>(record.v.data()), bytes);
+            if (!input) {
+                throw std::runtime_error(
+                    "Training-state truncated in optimizer moments");
+            }
+            for (size_t i = 0; i < record.m.size(); ++i) {
+                if (!std::isfinite(record.m[i]) ||
+                    !std::isfinite(record.v[i]) || record.v[i] < 0.0f) {
+                    throw std::runtime_error(
+                        "Invalid optimizer moment in training state");
+                }
+            }
+        }
+        records.push_back(std::move(record));
+    }
+    char trailing = 0;
+    if (input.read(&trailing, 1)) {
+        throw std::runtime_error("Training state has trailing payload");
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("Training-state read failed before EOF");
+    }
+
+    // Commit only after the whole sidecar, model digest, and every tensor have
+    // validated.  A corrupt state therefore cannot leave a half-mutated Trainer.
+    learning_rate = metadata.learning_rate;
+    beta1 = metadata.beta1;
+    beta2 = metadata.beta2;
+    eps = metadata.eps;
+    weight_decay = metadata.weight_decay;
+    max_grad_norm = metadata.max_grad_norm;
+    min_learning_rate_scale = metadata.min_learning_rate_scale;
+    first_token_loss_scale = metadata.first_token_loss_scale;
+    eos_loss_scale = metadata.eos_loss_scale;
+    repetition_unlikelihood_scale = metadata.repetition_unlikelihood_scale;
+    moe_aux_loss_scale = metadata.moe_aux_loss_scale;
+    pantheon_vib_beta = metadata.pantheon_vib_beta;
+    logit_l2_beta = metadata.logit_l2_beta;
+    warmup_steps = metadata.warmup_steps;
+    global_step_count = metadata.global_step_count;
+    total_training_steps = metadata.total_training_steps;
+    eos_token_id = metadata.eos_token_id;
+    optimizer_state_bits = metadata.optimizer_state_bits;
+    phase_scheduler = metadata.phase_scheduler;
+    m_state.clear();
+    v_state.clear();
+    quant_state.clear();
+    crit_g0_state.clear();
+    external_lr_scale.clear();
+    criticality_lr_scale.clear();
+    for (auto& record : records) {
+        Parameter* parameter = record.parameter;
+        if (record.has_moments) {
+            if (optimizer_state_bits == 4 &&
+                parameter->data.get_device() == Device::CPU) {
+                Quant4OptState state;
+                quant4_store_m(record.m.data(), parameter->data.size, state);
+                const int rows = parameter->data.shape.size() == 2
+                                     ? parameter->data.shape[0]
+                                     : 0;
+                const int cols = parameter->data.shape.size() == 2
+                                     ? parameter->data.shape[1]
+                                     : 0;
+                quant4_store_v(record.v.data(), parameter->data.size,
+                               rows, cols, state);
+                quant_state.emplace(parameter, std::move(state));
+            } else {
+                Tensor m_tensor = Tensor::zeros(parameter->data.shape.dims,
+                                                parameter->data.get_device());
+                Tensor v_tensor = Tensor::zeros(parameter->data.shape.dims,
+                                                parameter->data.get_device());
+                Tensor m_host = Tensor::from_blob(
+                    record.m.data(), parameter->data.shape.dims, Device::CPU);
+                Tensor v_host = Tensor::from_blob(
+                    record.v.data(), parameter->data.shape.dims, Device::CPU);
+                m_tensor.copy_from(m_host.to(parameter->data.get_device()));
+                v_tensor.copy_from(v_host.to(parameter->data.get_device()));
+                m_state.emplace(parameter, std::move(m_tensor));
+                v_state.emplace(parameter, std::move(v_tensor));
+            }
+        }
+        if (record.has_criticality) {
+            crit_g0_state.emplace(parameter, record.criticality);
+        }
+        if (record.has_external_lr_scale) {
+            external_lr_scale.emplace(parameter, record.external_lr_scale);
+        }
+        if (record.has_criticality_lr_scale) {
+            criticality_lr_scale.emplace(
+                parameter, record.criticality_lr_scale);
+        }
+    }
+    model->set_training_rng_sequence(rng_sequence);
+}
+
 void Trainer::configure_progressive_qat(const TrainPhaseScheduler& scheduler) {
     phase_scheduler = scheduler;
     apply_progressive_qat_phase(*this);
@@ -1920,13 +3034,20 @@ bool Trainer::progressive_qat_active() const {
 }
 
 void Trainer::set_lr_scale_by_name(const std::string& name, float scale) {
-    if (!model) {
-        return;
+    if (!model) throw std::runtime_error("Trainer has no model");
+    if (name.empty() || !std::isfinite(scale) || scale <= 0.0f) {
+        throw std::invalid_argument(
+            "Parameter LR scale requires a non-empty name and finite scale > 0");
     }
+    bool matched = false;
     for (auto* p : model->parameters()) {
         if (p && p->name == name) {
-            per_param_lr_scale[p] = scale;
+            external_lr_scale[p] = scale;
+            matched = true;
         }
+    }
+    if (!matched) {
+        throw std::invalid_argument("Unknown parameter LR-scale name: " + name);
     }
 }
 
@@ -1941,46 +3062,35 @@ float Trainer::accumulate_gradients(const std::vector<int>& tokens,
     auto params = model->parameters();
     apply_progressive_qat_phase(*this);
     zero_model_gradients(params);
+    begin_moe_aux_accumulation(*this);
 
     model->reset_session();
     Context ctx;
     Tensor logits = model->forward_ids(inputs, &ctx);
     // SSA learned block-selector distillation (no-op unless sparse attention is on).
-    model->accumulate_sparse_selector_grads();
-    auto [loss, grad] = logits.cross_entropy(resolved_targets);
+    const float selector_loss = model->accumulate_sparse_selector_grads(1.0f);
+    auto [supervised_loss, grad] = logits.cross_entropy(resolved_targets);
 
     // ── Pantheon VIB-style L2 regularizer on logits ──────────────────────
-    // When pantheon_vib_beta > 0, add beta * 0.5 * mean(logits^2) to the
+    // When logit_l2_beta > 0, add beta * 0.5 * mean(logits^2) to the
     // loss and the corresponding gradient term (beta * logits / N) to the
     // grad tensor before backward.  This is a degenerate VIB compression
     // (variational layer not needed); pulls logits toward zero while CE
     // still pulls them toward correct targets.  See PANTHEON_VALIDATION_REPORT.
-    if (this->pantheon_vib_beta > 0.0f && logits.size > 0) {
-        const float beta = this->pantheon_vib_beta;
-        const int N = logits.size;
-        const Device dev = logits.get_device();
-        // CPU copy for scalar reduction (safe regardless of device).
-        Tensor logits_cpu = (dev == Device::CPU) ? logits : logits.to(Device::CPU);
-        const float* lh = logits_cpu.data();
-        double sumsq = 0.0;
-        for (int i = 0; i < N; ++i) sumsq += (double)lh[i] * lh[i];
-        const float l2_term = beta * 0.5f *
-            static_cast<float>(sumsq / static_cast<double>(std::max(N, 1)));
-        loss += l2_term;
-        // Build l2_grad on CPU, ship to grad's device, then add element-wise.
-        Tensor l2_grad_cpu = Tensor::zeros(logits.shape.dims, Device::CPU);
-        float* lg = l2_grad_cpu.data();
-        const float scale = beta / static_cast<float>(std::max(N, 1));
-        for (int i = 0; i < N; ++i) lg[i] = scale * lh[i];
-        Tensor l2_grad = (grad.get_device() == Device::CPU)
-                            ? l2_grad_cpu
-                            : l2_grad_cpu.to(grad.get_device());
-        grad = grad.add(l2_grad);
-    }
+    const float logit_l2_loss = add_logit_l2_objective(
+        logits, effective_logit_l2_beta(*this), grad);
     model->backward_external(grad, ctx);
-    apply_qat_regularization(*this, 1);
-    apply_moe_aux_regularization(*this);
-    return loss;
+    const float qat_loss = apply_qat_regularization(*this, 1);
+    const float moe_aux_loss = apply_moe_aux_regularization(*this, 1);
+    last_objective_stats = TrainingObjectiveStats{};
+    last_objective_stats.supervised_cross_entropy = supervised_loss;
+    last_objective_stats.logit_l2 = logit_l2_loss;
+    last_objective_stats.sparse_selector = selector_loss;
+    last_objective_stats.qat_regularization = qat_loss;
+    last_objective_stats.moe_auxiliary = moe_aux_loss;
+    last_objective_stats.total = supervised_loss + logit_l2_loss +
+                                 selector_loss + qat_loss + moe_aux_loss;
+    return last_objective_stats.total;
 }
 
 float Trainer::train_step(const std::vector<int>& tokens,
@@ -1989,12 +3099,16 @@ float Trainer::train_step(const std::vector<int>& tokens,
     // Factored so the criticality instrument can read gradients without
     // mutating weights (Trainer::accumulate_gradients).  Behavior identical
     // to the previous monolithic train_step.
-    const float loss = accumulate_gradients(tokens, targets);
+    (void)accumulate_gradients(tokens, targets);
     auto params = model->parameters();
     float grad_norm = 0.0f;
-    apply_optimizer_step(*this, params, 1, &grad_norm);
-    record_training_audit_step(*this, loss, grad_norm, params.size());
-    return loss;
+    const float criticality_loss =
+        apply_optimizer_step(*this, params, 1, &grad_norm);
+    last_objective_stats.criticality_regularization = criticality_loss;
+    last_objective_stats.total += criticality_loss;
+    record_training_audit_step(*this, last_objective_stats.total, grad_norm,
+                               params.size());
+    return last_objective_stats.total;
 }
 
 float Trainer::train_supervised(const std::vector<int>& prompt_tokens,
@@ -2032,6 +3146,7 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
              start += static_cast<size_t>(seq_len * effective_batch)) {
             apply_progressive_qat_phase(*this);
             zero_model_gradients(params);
+            begin_moe_aux_accumulation(*this);
             model->set_training_mode(true);
 
             std::vector<std::vector<int>> batch_inputs;
@@ -2100,7 +3215,10 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
             const int kCrossEntropyChunkSize =
                 (chunk_size_env > 0) ? chunk_size_env : samples;
 
-            float aggregate_loss = 0.0f;
+            double aggregate_supervised_loss = 0.0;
+            double aggregate_repetition_loss = 0.0;
+            double aggregate_logit_l2_loss = 0.0;
+            double aggregate_selector_loss = 0.0;
             int aggregate_samples = 0;
             for (int chunk_start = 0; chunk_start < samples;
                  chunk_start += kCrossEntropyChunkSize) {
@@ -2116,27 +3234,74 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
                         static_cast<size_t>(chunk_start * seq_len),
                     flat_targets.begin() +
                         static_cast<size_t>(chunk_end * seq_len));
+                std::vector<std::vector<int>> chunk_target_batch;
+                chunk_target_batch.reserve(static_cast<size_t>(chunk_samples));
+                for (int sample = 0; sample < chunk_samples; ++sample) {
+                    const auto begin =
+                        chunk_targets.begin() + static_cast<size_t>(sample * seq_len);
+                    chunk_target_batch.emplace_back(begin, begin + seq_len);
+                }
 
                 model->reset_session();
                 Context ctx;
                 Tensor logits = model->forward_ids_batch(chunk_inputs, &ctx);
                 // SSA learned block-selector distillation (no-op unless sparse on).
-                model->accumulate_sparse_selector_grads();
-                auto [loss, grad] = logits.cross_entropy(chunk_targets);
+                const float chunk_weight =
+                    static_cast<float>(chunk_samples) /
+                    static_cast<float>(std::max(samples, 1));
+                const float selector_loss =
+                    model->accumulate_sparse_selector_grads(chunk_weight);
+                auto [supervised_loss, grad] = logits.cross_entropy(chunk_targets);
+                const float repetition_loss = apply_repetition_unlikelihood_batch(
+                    *this, chunk_target_batch, logits, grad);
+                const float logit_l2_loss = add_logit_l2_objective(
+                    logits, effective_logit_l2_beta(*this), grad);
+                // cross_entropy returns a mean over the chunk's token rows.
+                // Weight each chunk by its sample fraction so accumulated
+                // gradients equal the full-batch mean regardless of chunking.
+                scale_tensor_inplace(grad, chunk_weight);
                 model->backward_external(grad, ctx);
 
-                aggregate_loss += loss * static_cast<float>(chunk_samples);
+                aggregate_supervised_loss +=
+                    static_cast<double>(supervised_loss) * chunk_samples;
+                aggregate_repetition_loss +=
+                    static_cast<double>(repetition_loss) * chunk_samples;
+                aggregate_logit_l2_loss +=
+                    static_cast<double>(logit_l2_loss) * chunk_samples;
+                aggregate_selector_loss +=
+                    static_cast<double>(selector_loss) * chunk_samples;
                 aggregate_samples += chunk_samples;
             }
 
-            const float mean_loss =
-                aggregate_loss / static_cast<float>(std::max(aggregate_samples, 1));
-
-            apply_qat_regularization(*this, samples);
-            apply_moe_aux_regularization(*this);
+            const int objective_samples = std::max(aggregate_samples, 1);
+            const float qat_loss = apply_qat_regularization(*this, 1);
+            const float moe_aux_loss = apply_moe_aux_regularization(*this, 1);
+            last_objective_stats = TrainingObjectiveStats{};
+            last_objective_stats.supervised_cross_entropy = static_cast<float>(
+                aggregate_supervised_loss / objective_samples);
+            last_objective_stats.repetition_unlikelihood = static_cast<float>(
+                aggregate_repetition_loss / objective_samples);
+            last_objective_stats.logit_l2 = static_cast<float>(
+                aggregate_logit_l2_loss / objective_samples);
+            last_objective_stats.sparse_selector = static_cast<float>(
+                aggregate_selector_loss / objective_samples);
+            last_objective_stats.qat_regularization = qat_loss;
+            last_objective_stats.moe_auxiliary = moe_aux_loss;
+            last_objective_stats.total =
+                last_objective_stats.supervised_cross_entropy +
+                last_objective_stats.repetition_unlikelihood +
+                last_objective_stats.logit_l2 +
+                last_objective_stats.sparse_selector +
+                last_objective_stats.qat_regularization +
+                last_objective_stats.moe_auxiliary;
             float grad_norm = 0.0f;
-            apply_optimizer_step(*this, params, samples, &grad_norm);
-            record_training_audit_step(*this, mean_loss, grad_norm, params.size());
+            const float criticality_loss =
+                apply_optimizer_step(*this, params, 1, &grad_norm);
+            last_objective_stats.criticality_regularization = criticality_loss;
+            last_objective_stats.total += criticality_loss;
+            const float mean_loss = last_objective_stats.total;
+            record_training_audit_step(*this, mean_loss, grad_norm,
+                                       params.size());
 
             ++internal_global_step;
             if (callback) {

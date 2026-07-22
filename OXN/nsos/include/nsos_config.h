@@ -2,6 +2,9 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
 
 namespace nsos {
 
@@ -86,17 +89,12 @@ struct ModelConfig {
     float chrass_density = 0.10f;  // 10% nonzero edges in adjacency
     uint32_t chrass_seed = 0x0CDA55u;
 
-    // ── Pantheon VIB-style compression regularizer (2026-05-25 wiring) ──
-    // When > 0, Trainer adds beta * 0.5 * mean(logits^2) to the cross-entropy
-    // loss, with the corresponding gradient (beta * logits / N) added to the
-    // backward grad before model->backward_external.  This is a degenerate
-    // case of Variational Information Bottleneck applied directly to logits
-    // (no variational layer needed) — pulls logits toward zero, encouraging
-    // confident but compressed representations.  Full VIB with per-feature
-    // mean+log_var (using pantheon::physics::InformationBottleneck) is a
-    // Phase 2 enhancement requiring additional gradient routing.
-    // Default 0.0 preserves byte-exact existing behavior.
-    // See docs/PANTHEON_VALIDATION_REPORT.md.
+    // Exact logit L2 regularizer: beta * 0.5 * mean(logits^2).  This is not a
+    // variational information bottleneck: it has no latent posterior, prior,
+    // reparameterization, or KL term.
+    float logit_l2_beta = 0.0f;
+    // Deprecated manifest/API alias retained only for old packs and scripts.
+    // If both names are non-zero they must agree exactly.
     float pantheon_vib_beta = 0.0f;
 
     // ── Slender embedding head-to-toe quantization (2026-05-25 wiring) ──
@@ -159,5 +157,110 @@ struct ModelConfig {
     // explicit backend policy, not by this name.
     bool use_flash_attn = false;
 };
+
+inline void validate_model_config(const ModelConfig& config) {
+    auto require_range = [](int value, int minimum, int maximum,
+                            const std::string& field) {
+        if (value < minimum || value > maximum) {
+            throw std::invalid_argument(
+                "ModelConfig." + field + " must be in [" +
+                std::to_string(minimum) + ", " +
+                std::to_string(maximum) + "]");
+        }
+    };
+    auto require_slot = [&](int period, int slot, const std::string& prefix) {
+        require_range(period, 1, 1'000'000, prefix + "_period");
+        if (slot < 0 || slot >= period) {
+            throw std::invalid_argument(
+                "ModelConfig." + prefix + "_slot must be in [0, period)");
+        }
+    };
+    require_range(config.num_layers, 1, 512, "num_layers");
+    require_range(config.d_model, 8, 65536, "d_model");
+    require_range(config.vocab_size, 2, 2'000'000, "vocab_size");
+    require_range(config.n_heads, 1, config.d_model, "n_heads");
+    if (config.d_model % config.n_heads != 0) {
+        throw std::invalid_argument(
+            "ModelConfig.d_model must be divisible by n_heads");
+    }
+    if (((config.d_model / config.n_heads) & 1) != 0) {
+        throw std::invalid_argument(
+            "ModelConfig attention head dimension must be even for RoPE");
+    }
+    require_range(config.n_kv_heads, 1, config.n_heads, "n_kv_heads");
+    if (config.n_heads % config.n_kv_heads != 0) {
+        throw std::invalid_argument(
+            "ModelConfig.n_heads must be divisible by n_kv_heads for GQA");
+    }
+    require_range(config.sliding_window, 1, NSOS_MAX_SEQ_LEN,
+                  "sliding_window");
+    require_range(config.max_context_tokens, 1, NSOS_MAX_SEQ_LEN,
+                  "max_context_tokens");
+    require_range(config.default_batch_size, 1, 4096,
+                  "default_batch_size");
+    require_slot(config.attention_period, config.attention_slot, "attention");
+    require_slot(config.moe_period, config.moe_slot, "moe");
+    require_slot(config.ttt_period, config.ttt_slot, "ttt");
+    require_range(config.num_experts, 1, 4096, "num_experts");
+    require_range(config.num_experts_per_token, 1, config.num_experts,
+                  "num_experts_per_token");
+    if (config.moe_expert_hidden_dim < 0) {
+        throw std::invalid_argument(
+            "ModelConfig.moe_expert_hidden_dim cannot be negative");
+    }
+    require_range(config.mamba_conv_kernel, 1, 16, "mamba_conv_kernel");
+    require_range(config.mamba_expand, 1, 8, "mamba_expand");
+    if (config.mamba2_faithful) {
+        const long long inner =
+            static_cast<long long>(config.mamba_expand) * config.d_model;
+        require_range(config.mamba_head_dim, 1,
+                      static_cast<int>((std::min)(inner, 4096LL)),
+                      "mamba_head_dim");
+        if (inner % config.mamba_head_dim != 0) {
+            throw std::invalid_argument(
+                "ModelConfig mamba_expand*d_model must be divisible by "
+                "mamba_head_dim");
+        }
+        const int mamba_heads = static_cast<int>(inner / config.mamba_head_dim);
+        require_range(config.mamba_n_groups, 1, mamba_heads,
+                      "mamba_n_groups");
+        if (mamba_heads % config.mamba_n_groups != 0) {
+            throw std::invalid_argument(
+                "ModelConfig Mamba head count must be divisible by "
+                "mamba_n_groups");
+        }
+    }
+    if (!std::isfinite(config.dropout) || config.dropout < 0.0f ||
+        config.dropout >= 1.0f) {
+        throw std::invalid_argument(
+            "ModelConfig.dropout must be finite and in [0, 1)");
+    }
+    if (!std::isfinite(config.rope_theta) || config.rope_theta <= 0.0f) {
+        throw std::invalid_argument(
+            "ModelConfig.rope_theta must be finite and positive");
+    }
+    if (!std::isfinite(config.chrass_density) ||
+        config.chrass_density < 0.0f || config.chrass_density > 1.0f) {
+        throw std::invalid_argument(
+            "ModelConfig.chrass_density must be finite and in [0, 1]");
+    }
+    if (!std::isfinite(config.logit_l2_beta) || config.logit_l2_beta < 0.0f ||
+        !std::isfinite(config.pantheon_vib_beta) ||
+        config.pantheon_vib_beta < 0.0f) {
+        throw std::invalid_argument(
+            "ModelConfig logit L2 coefficients must be finite and non-negative");
+    }
+    if (config.logit_l2_beta != 0.0f && config.pantheon_vib_beta != 0.0f &&
+        config.logit_l2_beta != config.pantheon_vib_beta) {
+        throw std::invalid_argument(
+            "ModelConfig.logit_l2_beta conflicts with deprecated "
+            "pantheon_vib_beta");
+    }
+    if (config.use_flash_attn) {
+        throw std::invalid_argument(
+            "ModelConfig.use_flash_attn is unsupported; select the validated "
+            "exact/sparse attention backend explicitly");
+    }
+}
 
 } // namespace nsos

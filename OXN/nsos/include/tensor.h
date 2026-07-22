@@ -14,12 +14,18 @@
 
 namespace nsos {
 
-// Mixed-precision GEMM control (BF16/FP16 Tensor Cores on sm_75+).
+// Mixed-precision GEMM control. FP16 Tensor Cores require sm_70+; native BF16
+// Tensor Cores require sm_80+ (Ampere). Requests are validated against the
+// active device before GEMM; unsupported modes fail loudly.
 // 0 = FP32 (default, bit-parity with CPU), 1 = BF16, 2 = FP16.  Master weights
 // and optimizer state remain FP32; only GEMM inputs are cast.  Default-OFF;
 // initialized from NSOS_MIXED_PRECISION env for back-compat.  See tensor.cpp.
 void set_matmul_precision_mode(int mode);
 int matmul_precision_mode();
+// When enabled, any Tensor operation that would execute a host fallback for a
+// GPU tensor throws instead of migrating Unified Memory silently.
+void set_strict_gpu_execution(bool enabled);
+bool strict_gpu_execution();
 
 // (auditoria #8) Cópia de bytes UNIFICADA entre TUs — implementação única em
 // tensor.cpp: D2D opt-in async no stream 0; H2D/D2H síncronos (lifetime do
@@ -50,7 +56,7 @@ struct PoolStats {
 };
 PoolStats pool_stats();
 void release_cached_memory();  // devolve TODO o cache ao driver (trim)
-// CUDA-graph capture guard (see ManagedPool): begin makes the pool
+// CUDA-graph capture guard: begin makes the pool
 // capture-safe (no cudaFree/trim/memGetInfo; capture-time buffers are
 // quarantined on free); end stops tracking new allocations but keeps the
 // quarantine; release (call ONLY after the captured graph is destroyed)
@@ -198,6 +204,14 @@ public:
     Tensor rmsnorm_backward(const Tensor& grad, const Tensor& x_norm,
                             float eps = 1e-6f) const;
     std::pair<float, Tensor> cross_entropy(const std::vector<int>& target) const;
+    // Mean weighted negative log-likelihood:
+    //   L = (1 / rows) * sum_i row_weights[i] * CE(logits_i, target_i).
+    // The returned gradient is the exact derivative of that scalar.  Keeping
+    // the denominator equal to rows preserves the historical meaning of the
+    // first-token/EOS multipliers used by Trainer.
+    std::pair<float, Tensor> cross_entropy_weighted(
+        const std::vector<int>& target,
+        const std::vector<float>& row_weights) const;
     std::pair<float, Tensor> mse_loss(const Tensor& target) const;
     
     Tensor reshape(std::vector<int> new_shape) const;

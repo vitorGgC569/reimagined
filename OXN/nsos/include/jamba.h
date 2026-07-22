@@ -56,7 +56,7 @@ struct RuntimeTelemetrySnapshot {
 class Attention {
 public:
   Attention(int d_model, int n_heads, int n_latents = 512, int n_kv_heads = 0,
-            float rope_theta = 10000.0f);
+            float rope_theta = 10000.0f, int sliding_window = 4096);
   Tensor forward(const Tensor &input, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
   void to(Device dev);
@@ -87,7 +87,7 @@ public:
   // attention pattern from the last exact-training forward into the sparse
   // selector.  Accumulates dWsel into ssa_wsel_.grad; returns the distill loss
   // (0 if the per-head tensors from the forward are unavailable).
-  float accumulate_selector_distill_grad();
+  float accumulate_selector_distill_grad(float gradient_weight = 1.0f);
   void reset();
   // Public pre-allocation hook for inference paths.  Reserves the KV
   // cache for `total_tokens` slots up-front so the per-token decode
@@ -130,6 +130,7 @@ private:
   std::unique_ptr<BitLinear> q_down_proj, kv_down_proj, out_proj;
   std::vector<float> cos_cached, sin_cached;
   int max_seq_len;
+  int sliding_window_;
   float theta;
   bool streaming_inference_ = false;
   int cached_tokens_ = 0;
@@ -154,7 +155,9 @@ private:
   size_t rope_gpu_uploaded_ = 0;
   void ensure_rope_gpu_cache();
   Tensor backward_exact_gpu(const Tensor& dy, int batch_size, int seq_len,
-                            int kv_dim, float scale);
+                             int kv_dim, float scale);
+  Tensor backward_sparse_gpu(const Tensor& dy, int batch_size, int seq_len,
+                             int kv_dim, float scale);
   bool exact_training_path_ = true;
   // SSA opt-in state (default OFF preserves exact existing behavior).
   bool sparse_enabled_ = false;
@@ -197,7 +200,12 @@ private:
 class MoERouter {
 public:
   MoERouter(int d_model, int n = 256, int k = 8);
-  std::pair<Tensor, Tensor> forward(const Tensor &x);
+  // valid_rows is a flattened [rows] mask (1 = real token, 0 = padding).
+  // Routing still returns a shape-preserving tensor for every row, while all
+  // load-balancing statistics and auxiliary-loss gradients exclude padding.
+  // An empty mask means every row is valid (rank-1/2 and legacy callers).
+  std::pair<Tensor, Tensor> forward(
+      const Tensor &x, const std::vector<uint8_t> &valid_rows = {});
   Tensor backward(const Tensor &grad_logits);
   void to(Device dev);
   std::vector<Parameter *> parameters();
@@ -215,6 +223,12 @@ public:
   // Returns the aux loss value (for logging).  Requires a prior forward()
   // (uses the saved pre-mask softmax probabilities).  Opt-in via the trainer.
   float accumulate_switch_aux_grad(float coef);
+  // A training step may contain several length buckets / micro-chunks.  Keep
+  // every router forward until the once-per-step Switch objective is formed so
+  // its value and gradient are invariant to chunking.
+  void begin_aux_accumulation();
+  void finalize_aux_accumulation();
+  void cancel_aux_accumulation();
   // Pure, testable core: given pre-mask softmax probs [T, N] and the active
   // top_k, returns the gradient of the Switch aux loss w.r.t. the logits
   // (same shape) and writes the loss value to *out_loss if non-null.  f_e uses
@@ -230,7 +244,7 @@ public:
   // weights, supplied by the block), this backprops through the top-k
   // renormalization and the softmax to the logits and into the gate.  Default
   // OFF preserves the historical behavior.
-  void accumulate_task_router_grad(const Tensor &g_w);
+  Tensor accumulate_task_router_grad(const Tensor &g_w);
   // Pure, testable core: gradient of the routing weights w.r.t. the logits,
   // given pre-mask softmax probs [T,N], the upstream g_w [T,N] and top_k.
   // Backprops renorm(top-k(softmax)).  Finite-difference gradchecked.
@@ -239,9 +253,17 @@ public:
   std::unique_ptr<BitLinear> gate, shared_expert_gate, shared_expert_up, shared_expert_down;
 
 private:
-  // Pre-mask softmax routing probabilities from the last forward (host copy),
+  struct AuxForwardRecord {
+    Tensor probs;
+    Tensor input;
+    std::vector<uint8_t> valid_rows;
+  };
+  // Pre-mask softmax routing probabilities from the last forward (same device),
   // needed by accumulate_switch_aux_grad.  Empty until the first forward.
   Tensor saved_probs_;
+  bool aux_accumulation_active_ = false;
+  std::vector<AuxForwardRecord> aux_forward_records_;
+  std::vector<float> accumulated_expert_loads_;
 };
 
 class JambaBlock {
@@ -291,7 +313,8 @@ public:
              // RoPE base (theta) for the attention layers; larger = more
              // position-invariant (content-recall) dims.  Env NSOS_ROPE_THETA
              // still overrides per construction.
-             float rope_theta = 10000.0f);
+             float rope_theta = 10000.0f,
+             int sliding_window = 4096);
   ~JambaBlock();
   Tensor forward(const Tensor &x, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
@@ -302,6 +325,7 @@ public:
   void set_streaming_inference(bool enabled);
   void set_training_mode(bool enabled);
   void set_batch_valid_lengths(const std::vector<int>& lengths);
+  void set_dropout_sequence(uint64_t sequence) { dropout_sequence_ = sequence; }
   void set_audit_collector(LayerAuditCollector* collector) { audit_collector_ = collector; }
   // Pacote A.1: when > 0 AND training_mode_ is false, forward_moe uses
   // this top-k instead of router->top_k.  Lets us train with top-2 and
@@ -351,6 +375,8 @@ private:
   int layer_idx, total_layers, d_model, num_experts;
   float dropout_rate_;
   bool training_mode_ = true;
+  uint64_t dropout_sequence_ = 0;
+  std::vector<int> active_batch_valid_lengths_;
   int inference_top_k_override_ = 0;  // Pacote A.1; 0 = no override
   int last_batch_size_ = 0;
   Tensor saved_input_;
@@ -383,23 +409,15 @@ private:
   // This vector is sized to num_experts and only the entries that
   // actually got non-empty input during forward are populated.
   std::vector<Tensor> saved_moe_pre_activations_;
-  // Task-router-grad (NSOS_MOE_ROUTER_GRAD): per-expert UNSCALED output rows
-  // saved by forward_moe, so backward can form g_w[r,e] = sum_dim(dy[r] *
-  // expert_out_e[r]).  Only populated on the non-batched path when the flag is
-  // on; empty otherwise (zero overhead).
+  // Task-router-grad: per-expert unscaled output rows for the ordered path.
   std::vector<Tensor> saved_moe_expert_out_;
-  // AUDIT #4+#5: cache of GPU routing outputs.  Forward populates
-  // these from the device buffers (one small D2H copy each).  Backward
-  // reuses them instead of re-launching the count/scan/assignment
-  // kernels and re-syncing host arrays.  Both are host-side, so they
-  // outlive the GpuDeviceBuffer scope from forward_moe_gpu_batched.
-  //
-  // saved_moe_permutation_host_[k] is the source row id at slot k
-  //   (slots are ordered by expert; experts in [0, num_experts)).
-  // saved_moe_offsets_host_[e]   is the start slot for expert e
-  // saved_moe_offsets_host_[e+1] is the end slot for expert e
-  // saved_moe_counts_host_[e]    is offsets[e+1] - offsets[e]
-  std::vector<int> saved_moe_permutation_host_;
+  // Batched GPU routing state retained per block. Counts/offsets are the only
+  // small host metadata needed to delimit expert GEMMs. Per-token permutation,
+  // scales and unscaled expert outputs remain device-resident through backward.
+  std::shared_ptr<void> saved_moe_permutation_device_;
+  int saved_moe_permutation_capacity_ = 0;
+  Tensor saved_moe_scale_device_;
+  Tensor saved_moe_permuted_output_;
   std::vector<int> saved_moe_offsets_host_;
   std::vector<int> saved_moe_counts_host_;
   int saved_moe_n_active_ = 0;
@@ -453,7 +471,7 @@ public:
                             int sink_blocks = 1);
   // Accumulate learned-selector (SSA) distillation grads on every attention
   // layer (call after an exact-training forward).  Returns total distill loss.
-  float accumulate_sparse_selector_grads();
+  float accumulate_sparse_selector_grads(float gradient_weight = 1.0f);
   // Phase 5b deeper: enable/disable the GPU __dp4a packed-inference
   // fast path on every BitLinear in the model in one call.  Safe to
   // toggle at runtime.  Caller is responsible for ensuring weights
@@ -480,6 +498,10 @@ public:
   void set_streaming_inference(bool enabled);
   void set_training_mode(bool enabled);
   bool training_mode() const { return training_mode_; }
+  uint64_t training_rng_sequence() const { return training_rng_sequence_; }
+  void set_training_rng_sequence(uint64_t sequence) {
+    training_rng_sequence_ = sequence;
+  }
   JambaSessionSnapshot fork_session() const;
   std::vector<JambaSessionSnapshot> fork_session_batch() const;
   void restore_session(const JambaSessionSnapshot& snapshot);
@@ -575,6 +597,9 @@ private:
   void apply_weight_tying_();
   bool streaming_inference_enabled_ = false;
   bool training_mode_ = true;
+  // Monotonic training-forward id used by stochastic layers.  Session resets
+  // deliberately do not rewind it; a full training checkpoint persists it.
+  uint64_t training_rng_sequence_ = 0;
   std::vector<int> last_input_ids_;
   std::vector<std::vector<int>> last_input_batches_;
   std::vector<int> last_input_batch_lengths_;

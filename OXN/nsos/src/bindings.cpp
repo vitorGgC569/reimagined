@@ -146,7 +146,7 @@ PYBIND11_MODULE(nsos_ext, m) {
         return determinism::deterministic_reductions_enabled();
     });
 
-    // Mixed-precision GEMM control (BF16/FP16 Tensor Cores on sm_75+).
+    // Mixed-precision GEMM control (FP16 on sm_70+, BF16 on sm_80+).
     // 0=FP32 (default), 1=BF16, 2=FP16.  Master weights/optimizer stay FP32;
     // only GEMM inputs are cast.  Lets the training plane flip BF16 on a modern
     // GPU for 2-4x throughput.  Accepts ints or the strings "fp32"/"bf16"/"fp16".
@@ -157,10 +157,15 @@ PYBIND11_MODULE(nsos_ext, m) {
         int mode = 0;
         if (s == "bf16" || s == "BF16") mode = 1;
         else if (s == "fp16" || s == "FP16") mode = 2;
-        else mode = 0;  // "fp32"/anything else
+        else if (s == "fp32" || s == "FP32") mode = 0;
+        else throw std::invalid_argument(
+            "precision must be fp32, fp16, or bf16");
         set_matmul_precision_mode(mode);
     }, py::arg("precision"));
     m.def("matmul_precision_mode", []() { return matmul_precision_mode(); });
+    m.def("set_strict_gpu_execution", &set_strict_gpu_execution,
+          py::arg("enabled"));
+    m.def("strict_gpu_execution", &strict_gpu_execution);
 
     py::enum_<Device>(m, "Device")
         .value("CPU", Device::CPU)
@@ -204,8 +209,9 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("use_chrass", &ModelConfig::use_chrass)
         .def_readwrite("chrass_density", &ModelConfig::chrass_density)
         .def_readwrite("chrass_seed", &ModelConfig::chrass_seed)
-        // Pantheon VIB-style L2 regularizer (2026-05-25 wiring).
-        // See OXN/nsos/docs/PANTHEON_VALIDATION_REPORT.md.
+        // Exact logit L2.  The old pantheon_vib name remains read/write only
+        // for backward compatibility with old experiment scripts.
+        .def_readwrite("logit_l2_beta", &ModelConfig::logit_l2_beta)
         .def_readwrite("pantheon_vib_beta", &ModelConfig::pantheon_vib_beta)
         // Slender embedding head-to-toe quantization (2026-05-25 wiring).
         // See OXN/nsos/docs/SLENDER_INTEGRATION.md.
@@ -535,6 +541,17 @@ PYBIND11_MODULE(nsos_ext, m) {
              py::keep_alive<1, 2>())
         .def("model_config", &JambaModel::model_config, py::return_value_policy::reference_internal)
         .def("to", &JambaModel::to)
+        .def("ternary_weight_parameters", [](JambaModel& model) {
+            (void)model.parameters();  // refresh stable fully-qualified names
+            std::vector<Parameter*> result;
+            for (BitLinear* layer : model.collect_bitlinear_layers()) {
+                if (layer && !layer->quantization_sensitive() &&
+                    layer->has_full_precision_weight()) {
+                    result.push_back(&layer->weight);
+                }
+            }
+            return result;
+        }, py::return_value_policy::reference_internal)
         .def("parameters", &JambaModel::parameters, py::return_value_policy::reference_internal);
 
     py::class_<TrainPhaseScheduler>(m, "TrainPhaseScheduler")
@@ -582,6 +599,21 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("memory_cosine", &AuxiliaryStackStats::memory_cosine)
         .def_readwrite("final_target_delta_norm", &AuxiliaryStackStats::final_target_delta_norm);
 
+    py::class_<TrainingObjectiveStats>(m, "TrainingObjectiveStats")
+        .def(py::init<>())
+        .def_readwrite("supervised_cross_entropy",
+                       &TrainingObjectiveStats::supervised_cross_entropy)
+        .def_readwrite("repetition_unlikelihood",
+                       &TrainingObjectiveStats::repetition_unlikelihood)
+        .def_readwrite("logit_l2", &TrainingObjectiveStats::logit_l2)
+        .def_readwrite("sparse_selector", &TrainingObjectiveStats::sparse_selector)
+        .def_readwrite("qat_regularization",
+                       &TrainingObjectiveStats::qat_regularization)
+        .def_readwrite("moe_auxiliary", &TrainingObjectiveStats::moe_auxiliary)
+        .def_readwrite("criticality_regularization",
+                       &TrainingObjectiveStats::criticality_regularization)
+        .def_readwrite("total", &TrainingObjectiveStats::total);
+
     py::class_<Trainer>(m, "Trainer")
         .def(py::init<JambaModel*, float>(), py::arg("model"), py::arg("learning_rate") = 0.001f)
         .def_readwrite("learning_rate", &Trainer::learning_rate)
@@ -595,6 +627,8 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("eos_loss_scale", &Trainer::eos_loss_scale)
         .def_readwrite("repetition_unlikelihood_scale", &Trainer::repetition_unlikelihood_scale)
         .def_readwrite("moe_aux_loss_scale", &Trainer::moe_aux_loss_scale)
+        .def_readwrite("logit_l2_beta", &Trainer::logit_l2_beta)
+        .def_readwrite("pantheon_vib_beta", &Trainer::pantheon_vib_beta)
         .def_readwrite("warmup_steps", &Trainer::warmup_steps)
         .def_readwrite("global_step_count", &Trainer::global_step_count)
         .def_readwrite("total_training_steps", &Trainer::total_training_steps)
@@ -604,8 +638,13 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_readwrite("optimizer_state_bits", &Trainer::optimizer_state_bits)
         .def_readwrite("phase_scheduler", &Trainer::phase_scheduler)
         .def_readwrite("last_auxiliary_stats", &Trainer::last_auxiliary_stats)
+        .def_readwrite("last_objective_stats", &Trainer::last_objective_stats)
         .def("configure_progressive_qat", &Trainer::configure_progressive_qat, py::arg("scheduler"))
         .def("progressive_qat_active", &Trainer::progressive_qat_active)
+        .def("save_training_state", &Trainer::save_training_state,
+             py::arg("state_path"), py::arg("model_path"))
+        .def("load_training_state", &Trainer::load_training_state,
+             py::arg("state_path"), py::arg("model_path"))
         // GIL released around the C++ training step (forward+backward+optimizer
         // are pure C++).  train_loop below keeps the GIL: it invokes a Python
         // callback per step.

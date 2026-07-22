@@ -103,6 +103,103 @@ __global__ void moe_load_accumulate_kernel(const float *__restrict__ weights,
   }
 }
 
+__global__ void moe_zero_invalid_rows_kernel(
+    float *__restrict__ weights, const uint8_t *__restrict__ valid_rows,
+    int batch, int num_experts) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = batch * num_experts;
+  if (idx >= total) return;
+  if (valid_rows[idx / num_experts] == 0) weights[idx] = 0.0f;
+}
+
+__global__ void moe_switch_aux_stats_kernel(
+    const float *__restrict__ probs, float *__restrict__ counts,
+    float *__restrict__ prob_sums, int rows, int num_experts, int top_k) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  const float *p = probs + static_cast<size_t>(row) * num_experts;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    atomicAdd(&prob_sums[expert], p[expert]);
+  }
+  const int effective_top_k = min(max(top_k, 1), num_experts);
+  // Stable top-k membership without a fixed-size local array.  An expert's
+  // rank is the number of strictly larger probabilities plus equal-valued
+  // experts with a smaller index.  This exactly defines tie-breaking and
+  // works for any num_experts/top_k supported by the tensor shape.
+  for (int expert = 0; expert < num_experts; ++expert) {
+    int rank = 0;
+    const float value = p[expert];
+    for (int candidate = 0; candidate < num_experts; ++candidate) {
+      const float other = p[candidate];
+      if (other > value || (other == value && candidate < expert)) ++rank;
+    }
+    if (rank < effective_top_k) atomicAdd(&counts[expert], 1.0f);
+  }
+}
+
+__global__ void moe_switch_aux_stats_deterministic_kernel(
+    const float *__restrict__ probs, float *__restrict__ counts,
+    float *__restrict__ prob_sums, int rows, int num_experts, int top_k) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  const int effective_top_k = min(max(top_k, 1), num_experts);
+  for (int row = 0; row < rows; ++row) {
+    const float *p = probs + static_cast<size_t>(row) * num_experts;
+    for (int expert = 0; expert < num_experts; ++expert) {
+      prob_sums[expert] += p[expert];
+      int rank = 0;
+      const float value = p[expert];
+      for (int candidate = 0; candidate < num_experts; ++candidate) {
+        const float other = p[candidate];
+        if (other > value || (other == value && candidate < expert)) ++rank;
+      }
+      if (rank < effective_top_k) counts[expert] += 1.0f;
+    }
+  }
+}
+
+__global__ void moe_switch_aux_grad_kernel(
+    const float *__restrict__ probs, const float *__restrict__ counts,
+    float *__restrict__ grad, int rows, int num_experts, float coef) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  const size_t base = static_cast<size_t>(row) * num_experts;
+  double dot_count = 0.0;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    dot_count += static_cast<double>(counts[expert]) * probs[base + expert];
+  }
+  const double scale = static_cast<double>(coef) * num_experts /
+                       (static_cast<double>(rows) * rows);
+  for (int expert = 0; expert < num_experts; ++expert) {
+    const double probability = probs[base + expert];
+    grad[base + expert] = static_cast<float>(
+        scale * probability * (counts[expert] - dot_count));
+  }
+}
+
+__global__ void moe_switch_aux_loss_kernel(
+    const float *__restrict__ counts, const float *__restrict__ prob_sums,
+    float *__restrict__ loss, int rows, int num_experts, float coef) {
+  const int expert = blockIdx.x * blockDim.x + threadIdx.x;
+  if (expert >= num_experts) return;
+  const double scale = static_cast<double>(coef) * num_experts /
+                       (static_cast<double>(rows) * rows);
+  atomicAdd(loss, static_cast<float>(
+                      scale * counts[expert] * prob_sums[expert]));
+}
+
+__global__ void moe_switch_aux_loss_deterministic_kernel(
+    const float *__restrict__ counts, const float *__restrict__ prob_sums,
+    float *__restrict__ loss, int rows, int num_experts, float coef) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  const double scale = static_cast<double>(coef) * num_experts /
+                       (static_cast<double>(rows) * rows);
+  double total = 0.0;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    total += static_cast<double>(counts[expert]) * prob_sums[expert];
+  }
+  *loss = static_cast<float>(scale * total);
+}
+
 // =====================================================================
 // Phase 4-extended: batched MoE pipeline kernels.
 // See include/cuda/kernels.cuh for the contract / recipe overview.
@@ -221,6 +318,91 @@ __global__ void moe_scatter_add_weighted_kernel(
   atomicAdd(&y[dst_row * dim + d], scaled);
 }
 
+__global__ void moe_scale_rows_kernel(const float *__restrict__ input,
+                                      const float *__restrict__ scale,
+                                      float *__restrict__ output, int rows,
+                                      int dim) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * dim;
+  if (idx >= total) return;
+  output[idx] = input[idx] * scale[idx / dim];
+}
+
+__global__ void moe_router_weight_grad_kernel(
+    const float *__restrict__ dy,
+    const float *__restrict__ unscaled_expert_output,
+    const int *__restrict__ permutation, const int *__restrict__ offsets,
+    float *__restrict__ grad_weights, int n_active, int dim,
+    int num_experts) {
+  const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  if (slot >= n_active) return;
+  int expert = 0;
+  while (expert + 1 < num_experts && slot >= offsets[expert + 1]) ++expert;
+  const int row = permutation[slot];
+  double dot = 0.0;
+  const size_t dy_base = static_cast<size_t>(row) * dim;
+  const size_t output_base = static_cast<size_t>(slot) * dim;
+  for (int d = 0; d < dim; ++d) {
+    dot += static_cast<double>(dy[dy_base + d]) *
+           unscaled_expert_output[output_base + d];
+  }
+  grad_weights[static_cast<size_t>(row) * num_experts + expert] =
+      static_cast<float>(dot);
+}
+
+__device__ __forceinline__ bool moe_stable_topk_member(
+    const float *probabilities, int expert, int num_experts, int top_k) {
+  int rank = 0;
+  const float value = probabilities[expert];
+  for (int candidate = 0; candidate < num_experts; ++candidate) {
+    const float other = probabilities[candidate];
+    if (other > value || (other == value && candidate < expert)) ++rank;
+  }
+  return rank < top_k;
+}
+
+__global__ void moe_router_logits_grad_kernel(
+    const float *__restrict__ probs,
+    const float *__restrict__ grad_weights,
+    float *__restrict__ grad_logits, int rows, int num_experts, int top_k) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  const size_t base = static_cast<size_t>(row) * num_experts;
+  const float *p = probs + base;
+  const float *gw = grad_weights + base;
+  const int effective_top_k = min(max(top_k, 1), num_experts);
+  double selected_sum = 0.0;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    if (moe_stable_topk_member(p, expert, num_experts, effective_top_k)) {
+      selected_sum += p[expert];
+    }
+  }
+  if (!(selected_sum > 0.0)) {
+    for (int expert = 0; expert < num_experts; ++expert) {
+      grad_logits[base + expert] = 0.0f;
+    }
+    return;
+  }
+  double grad_dot_weight = 0.0;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    if (moe_stable_topk_member(p, expert, num_experts, effective_top_k)) {
+      grad_dot_weight += static_cast<double>(gw[expert]) * p[expert] /
+                         selected_sum;
+    }
+  }
+  // For renormalized top-k, sum_j p_j*g_p_j is analytically zero, so the
+  // softmax VJP reduces to w_j*(g_w_j - <g_w,w>) on selected experts.
+  for (int expert = 0; expert < num_experts; ++expert) {
+    if (moe_stable_topk_member(p, expert, num_experts, effective_top_k)) {
+      grad_logits[base + expert] = static_cast<float>(
+          (static_cast<double>(p[expert]) / selected_sum) *
+          (gw[expert] - grad_dot_weight));
+    } else {
+      grad_logits[base + expert] = 0.0f;
+    }
+  }
+}
+
 // Dense single-row decode accumulation: out[i] += (*scale_dev) * y[i], with
 // the scale read from DEVICE memory (the row's routing weight for one
 // expert).  Host never sees the weights -> no per-token D2H, and the read
@@ -262,6 +444,59 @@ void launch_moe_load_accumulate_kernel(const float *weights,
   const int blocks = (total + threads - 1) / threads;
   moe_load_accumulate_kernel<<<blocks, threads>>>(weights, expert_loads, batch,
                                                   num_experts);
+}
+
+void launch_moe_zero_invalid_rows_kernel(float *weights,
+                                         const uint8_t *valid_rows,
+                                         int batch, int num_experts) {
+  if (batch <= 0 || num_experts <= 0 || valid_rows == nullptr) return;
+  const int total = batch * num_experts;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  moe_zero_invalid_rows_kernel<<<blocks, threads>>>(
+      weights, valid_rows, batch, num_experts);
+}
+
+void launch_moe_switch_aux_stats_kernel(const float *probs, float *counts,
+                                        float *prob_sums, int rows,
+                                        int num_experts, int top_k,
+                                        bool deterministic) {
+  if (rows <= 0 || num_experts <= 0 || top_k <= 0) return;
+  if (deterministic) {
+    moe_switch_aux_stats_deterministic_kernel<<<1, 1>>>(
+        probs, counts, prob_sums, rows, num_experts, top_k);
+    return;
+  }
+  const int threads = 128;
+  const int blocks = (rows + threads - 1) / threads;
+  moe_switch_aux_stats_kernel<<<blocks, threads>>>(
+      probs, counts, prob_sums, rows, num_experts, top_k);
+}
+
+void launch_moe_switch_aux_grad_kernel(const float *probs,
+                                       const float *counts, float *grad,
+                                       int rows, int num_experts, float coef) {
+  if (rows <= 0 || num_experts <= 0) return;
+  const int threads = 128;
+  const int blocks = (rows + threads - 1) / threads;
+  moe_switch_aux_grad_kernel<<<blocks, threads>>>(
+      probs, counts, grad, rows, num_experts, coef);
+}
+
+void launch_moe_switch_aux_loss_kernel(const float *counts,
+                                       const float *prob_sums, float *loss,
+                                       int rows, int num_experts, float coef,
+                                       bool deterministic) {
+  if (rows <= 0 || num_experts <= 0) return;
+  if (deterministic) {
+    moe_switch_aux_loss_deterministic_kernel<<<1, 1>>>(
+        counts, prob_sums, loss, rows, num_experts, coef);
+    return;
+  }
+  const int threads = 256;
+  const int blocks = (num_experts + threads - 1) / threads;
+  moe_switch_aux_loss_kernel<<<blocks, threads>>>(
+      counts, prob_sums, loss, rows, num_experts, coef);
 }
 
 void launch_moe_count_per_expert_kernel(const float *weights, int *counts,
@@ -320,6 +555,37 @@ void launch_moe_scatter_add_weighted_kernel(const float *permuted_output,
   const int blocks = (total + threads - 1) / threads;
   moe_scatter_add_weighted_kernel<<<blocks, threads>>>(
       permuted_output, permutation, scale, y, N_active, dim);
+}
+
+void launch_moe_scale_rows_kernel(const float *input, const float *scale,
+                                  float *output, int rows, int dim) {
+  if (rows <= 0 || dim <= 0) return;
+  const int total = rows * dim;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  moe_scale_rows_kernel<<<blocks, threads>>>(input, scale, output, rows, dim);
+}
+
+void launch_moe_router_weight_grad_kernel(
+    const float *dy, const float *unscaled_expert_output,
+    const int *permutation, const int *offsets, float *grad_weights,
+    int n_active, int dim, int num_experts) {
+  if (n_active <= 0 || dim <= 0 || num_experts <= 0) return;
+  const int threads = 128;
+  const int blocks = (n_active + threads - 1) / threads;
+  moe_router_weight_grad_kernel<<<blocks, threads>>>(
+      dy, unscaled_expert_output, permutation, offsets, grad_weights,
+      n_active, dim, num_experts);
+}
+
+void launch_moe_router_logits_grad_kernel(
+    const float *probs, const float *grad_weights, float *grad_logits,
+    int rows, int num_experts, int top_k) {
+  if (rows <= 0 || num_experts <= 0 || top_k <= 0) return;
+  const int threads = 128;
+  const int blocks = (rows + threads - 1) / threads;
+  moe_router_logits_grad_kernel<<<blocks, threads>>>(
+      probs, grad_weights, grad_logits, rows, num_experts, top_k);
 }
 
 }  // extern "C"

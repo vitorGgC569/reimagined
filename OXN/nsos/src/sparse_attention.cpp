@@ -1,9 +1,11 @@
 #include <cstdio>
 #include "sparse_attention.h"
+#include "nsos/determinism.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -14,8 +16,200 @@
 namespace nsos {
 
 namespace {
+void select_sparse_positions(
+    int query_index, int sequence_length, int head_dim, int block_size,
+    const SparseAttentionConfig& cfg, const float* route,
+    const float* block_means, float scale, std::vector<char>& selected,
+    std::vector<std::pair<float, int>>& candidates, std::vector<int>& positions,
+    long long* block_score_pairs);
+}
+
+SparseAttentionBackwardResult sparse_selective_attention_backward(
+    const Tensor& Q, const Tensor& K, const Tensor& V,
+    const SparseAttentionConfig& cfg, const Tensor& dOut,
+    const Tensor* Wsel) {
+  if (Q.shape.size() != 2 || K.shape != Q.shape || V.shape != Q.shape ||
+      dOut.shape != Q.shape) {
+    throw std::invalid_argument(
+        "sparse_selective_attention_backward expects aligned rank-2 tensors");
+  }
+#ifdef USE_CUDA
+  if (Q.get_device() == Device::GPU && K.get_device() == Device::GPU &&
+      V.get_device() == Device::GPU && dOut.get_device() == Device::GPU &&
+      Q.shape[1] <= 256 && cfg.top_k_blocks >= 0 &&
+      cfg.top_k_blocks <= 64) {
+    const int n = Q.shape[0];
+    const int d = Q.shape[1];
+    const int B = std::max(cfg.block_size, 1);
+    const int nb = (n + B - 1) / B;
+    const float scale = cfg.scale > 0.0f
+                            ? cfg.scale
+                            : 1.0f / std::sqrt(static_cast<float>(d));
+    Tensor route_owned;
+    const Tensor* route = &Q;
+    if (Wsel != nullptr) {
+      if (Wsel->get_device() != Device::GPU) {
+        throw std::invalid_argument(
+            "GPU SSA backward requires Wsel on the GPU");
+      }
+      if (Wsel->shape.size() == 2 && Wsel->shape[0] == d &&
+          Wsel->shape[1] == d) {
+        route_owned = Q.matmul(Wsel->transpose());
+        route = &route_owned;
+      }
+    }
+    Tensor block_means({nb, d}, Device::GPU);
+    Tensor dQ = Tensor::zeros({n, d}, Device::GPU);
+    Tensor dK = Tensor::zeros({n, d}, Device::GPU);
+    Tensor dV = Tensor::zeros({n, d}, Device::GPU);
+    cuda::launch_sparse_block_means(
+        K.raw_data(), block_means.raw_data(), n, d, B);
+    cuda::launch_sparse_selective_attention_backward(
+        Q.raw_data(), K.raw_data(), V.raw_data(), route->raw_data(),
+        block_means.raw_data(), dOut.raw_data(), dQ.raw_data(), dK.raw_data(),
+        dV.raw_data(), n, d, B, cfg.top_k_blocks, cfg.local_blocks,
+        cfg.sink_blocks, scale,
+        determinism::deterministic_reductions_enabled());
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("SSA backward CUDA launch failed: ") +
+          cudaGetErrorString(status));
+    }
+    return {dQ, dK, dV};
+  }
+#endif
+  if (Q.get_device() == Device::GPU && strict_gpu_execution()) {
+    throw std::runtime_error(
+        "Strict GPU execution forbids SSA backward host fallback");
+  }
+
+  const Device output_device = Q.get_device();
+  Tensor q_host = output_device == Device::GPU ? Q.cpu() : Q;
+  Tensor k_host = K.get_device() == Device::GPU ? K.cpu() : K;
+  Tensor v_host = V.get_device() == Device::GPU ? V.cpu() : V;
+  Tensor go_host = dOut.get_device() == Device::GPU ? dOut.cpu() : dOut;
+  Tensor w_host;
+  const Tensor* w_ptr = nullptr;
+  if (Wsel != nullptr) {
+    w_host = Wsel->get_device() == Device::GPU ? Wsel->cpu() : *Wsel;
+    w_ptr = &w_host;
+  }
+
+  const int n = q_host.shape[0];
+  const int d = q_host.shape[1];
+  const int B = std::max(cfg.block_size, 1);
+  const int nb = (n + B - 1) / B;
+  const float scale =
+      cfg.scale > 0.0f ? cfg.scale : 1.0f / std::sqrt(static_cast<float>(d));
+
+  Tensor block_mean({nb, d}, Device::CPU);
+  float* bm = block_mean.data();
+  const float* k = k_host.data();
+  for (int block = 0; block < nb; ++block) {
+    const int begin = block * B;
+    const int end = std::min((block + 1) * B, n);
+    for (int row = begin; row < end; ++row) {
+      for (int dim = 0; dim < d; ++dim) {
+        bm[static_cast<size_t>(block) * d + dim] +=
+            k[static_cast<size_t>(row) * d + dim];
+      }
+    }
+    const float inv = 1.0f / static_cast<float>(std::max(end - begin, 1));
+    for (int dim = 0; dim < d; ++dim) {
+      bm[static_cast<size_t>(block) * d + dim] *= inv;
+    }
+  }
+
+  const float* q = q_host.data();
+  const float* route = q;
+  Tensor route_owned;
+  if (w_ptr != nullptr && w_ptr->shape.size() == 2 &&
+      w_ptr->shape[0] == d && w_ptr->shape[1] == d) {
+    route_owned = q_host.matmul(w_ptr->transpose());
+    route = route_owned.data();
+  }
+
+  Tensor dQ({n, d}, Device::CPU);
+  Tensor dK({n, d}, Device::CPU);
+  Tensor dV({n, d}, Device::CPU);
+  float* dq = dQ.data();
+  float* dk = dK.data();
+  float* dv = dV.data();
+  const float* v = v_host.data();
+  const float* go = go_host.data();
+
+  std::vector<char> selected;
+  std::vector<std::pair<float, int>> candidates;
+  std::vector<int> positions;
+  std::vector<float> probabilities;
+  std::vector<float> dprobabilities;
+  for (int i = 0; i < n; ++i) {
+    select_sparse_positions(i, n, d, B, cfg, route, bm, scale, selected,
+                            candidates, positions, nullptr);
+    if (positions.empty()) continue;
+
+    probabilities.assign(positions.size(), 0.0f);
+    float max_score = -std::numeric_limits<float>::infinity();
+    for (size_t slot = 0; slot < positions.size(); ++slot) {
+      const int j = positions[slot];
+      float score = 0.0f;
+      for (int dim = 0; dim < d; ++dim) {
+        score += q[static_cast<size_t>(i) * d + dim] *
+                 k[static_cast<size_t>(j) * d + dim];
+      }
+      probabilities[slot] = score * scale;
+      max_score = std::max(max_score, probabilities[slot]);
+    }
+    float sum = 0.0f;
+    for (float& value : probabilities) {
+      value = std::exp(value - max_score);
+      sum += value;
+    }
+    const float inv_sum = 1.0f / (sum + 1e-20f);
+    for (float& value : probabilities) value *= inv_sum;
+
+    dprobabilities.assign(positions.size(), 0.0f);
+    float softmax_dot = 0.0f;
+    for (size_t slot = 0; slot < positions.size(); ++slot) {
+      const int j = positions[slot];
+      float upstream = 0.0f;
+      for (int dim = 0; dim < d; ++dim) {
+        upstream += go[static_cast<size_t>(i) * d + dim] *
+                    v[static_cast<size_t>(j) * d + dim];
+        dv[static_cast<size_t>(j) * d + dim] +=
+            probabilities[slot] * go[static_cast<size_t>(i) * d + dim];
+      }
+      dprobabilities[slot] = upstream;
+      softmax_dot += probabilities[slot] * upstream;
+    }
+
+    for (size_t slot = 0; slot < positions.size(); ++slot) {
+      const int j = positions[slot];
+      const float dscore = probabilities[slot] *
+                           (dprobabilities[slot] - softmax_dot) * scale;
+      for (int dim = 0; dim < d; ++dim) {
+        dq[static_cast<size_t>(i) * d + dim] +=
+            dscore * k[static_cast<size_t>(j) * d + dim];
+        dk[static_cast<size_t>(j) * d + dim] +=
+            dscore * q[static_cast<size_t>(i) * d + dim];
+      }
+    }
+  }
+
+  if (output_device == Device::GPU) {
+    return {dQ.to(Device::GPU), dK.to(Device::GPU), dV.to(Device::GPU)};
+  }
+  return {dQ, dK, dV};
+}
+
+namespace {
 void ssa_warn_gpu_once(const Tensor& t) {
     if (t.get_device() != Device::GPU) return;
+    if (strict_gpu_execution()) {
+        throw std::runtime_error(
+            "Strict GPU execution forbids SSA host fallback");
+    }
     static bool warned = false;
     if (!warned) {
         warned = true;
@@ -24,6 +218,65 @@ void ssa_warn_gpu_once(const Tensor& t) {
                      "CUDA ainda) — entrada GPU sera copiada; use só em "
                      "fine-tune/inferencia CPU\n");
     }
+}
+
+void select_sparse_positions(
+    int query_index, int sequence_length, int head_dim, int block_size,
+    const SparseAttentionConfig& cfg, const float* route,
+    const float* block_means, float scale, std::vector<char>& selected,
+    std::vector<std::pair<float, int>>& candidates, std::vector<int>& positions,
+    long long* block_score_pairs = nullptr) {
+  const int current_block = query_index / block_size;
+  const int candidate_blocks = current_block + 1;
+  selected.assign(static_cast<size_t>(candidate_blocks), 0);
+
+  const int sinks =
+      std::min(std::max(cfg.sink_blocks, 0), candidate_blocks);
+  for (int block = 0; block < sinks; ++block) {
+    selected[static_cast<size_t>(block)] = 1;
+  }
+
+  const int local = std::max(cfg.local_blocks, 0);
+  const int local_begin = std::max(0, current_block - local + 1);
+  for (int block = local_begin; block <= current_block; ++block) {
+    selected[static_cast<size_t>(block)] = 1;
+  }
+
+  if (cfg.top_k_blocks > 0) {
+    candidates.clear();
+    for (int block = 0; block < candidate_blocks; ++block) {
+      if (selected[static_cast<size_t>(block)]) continue;
+      float score = 0.0f;
+      for (int dim = 0; dim < head_dim; ++dim) {
+        score += route[static_cast<size_t>(query_index) * head_dim + dim] *
+                 block_means[static_cast<size_t>(block) * head_dim + dim];
+      }
+      candidates.emplace_back(score * scale, block);
+    }
+    if (block_score_pairs) {
+      *block_score_pairs += static_cast<long long>(candidates.size());
+    }
+    const int keep =
+        std::min(cfg.top_k_blocks, static_cast<int>(candidates.size()));
+    std::partial_sort(
+        candidates.begin(), candidates.begin() + keep, candidates.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+    for (int rank = 0; rank < keep; ++rank) {
+      selected[static_cast<size_t>(
+          candidates[static_cast<size_t>(rank)].second)] = 1;
+    }
+  }
+
+  positions.clear();
+  for (int block = 0; block < candidate_blocks; ++block) {
+    if (!selected[static_cast<size_t>(block)]) continue;
+    const int begin = block * block_size;
+    const int end = std::min((block + 1) * block_size, query_index + 1);
+    for (int key_index = begin;
+         key_index < end && key_index < sequence_length; ++key_index) {
+      positions.push_back(key_index);
+    }
+  }
 }
 }  // namespace
 
@@ -73,7 +326,6 @@ Tensor sparse_selective_attention(const Tensor& Q, const Tensor& K,
                                   const SparseAttentionConfig& cfg,
                                   SparseAttentionStats* stats,
                                   const Tensor* Wsel) {
-  ssa_warn_gpu_once(Q);
   const int n = Q.shape[0];
   const int d = Q.shape[1];
   const int B = std::max(cfg.block_size, 1);
@@ -107,6 +359,8 @@ Tensor sparse_selective_attention(const Tensor& Q, const Tensor& K,
     return out_gpu;
   }
 #endif
+
+  ssa_warn_gpu_once(Q);
 
   const float* q = Q.data();
   const float* k = K.data();
@@ -166,61 +420,8 @@ Tensor sparse_selective_attention(const Tensor& Q, const Tensor& K,
   std::vector<float> sc;
 
   for (int i = 0; i < n; ++i) {
-    const int cur = i / B;          // block containing query i
-    const int ncand = cur + 1;      // causal: only blocks 0..cur are visible
-
-    selected.assign(static_cast<size_t>(ncand), 0);
-
-    // Attention sinks: the first `sink_blocks` blocks (always attended).
-    const int sink = std::min(std::max(cfg.sink_blocks, 0), ncand);
-    for (int b = 0; b < sink; ++b) {
-      selected[static_cast<size_t>(b)] = 1;
-    }
-    // Local window: the most recent `local_blocks` blocks.
-    const int local = std::max(cfg.local_blocks, 0);
-    const int lo = std::max(0, cur - local + 1);
-    for (int b = lo; b <= cur; ++b) {
-      selected[static_cast<size_t>(b)] = 1;
-    }
-
-    // Content selection: score the query against each not-yet-selected block
-    // summary and keep the top-k highest.
-    if (cfg.top_k_blocks > 0) {
-      cand.clear();
-      for (int b = 0; b < ncand; ++b) {
-        if (selected[static_cast<size_t>(b)]) {
-          continue;
-        }
-        float s = 0.0f;
-        for (int c = 0; c < d; ++c) {
-          s += route[static_cast<size_t>(i) * d + c] * bm[static_cast<size_t>(b) * d + c];
-        }
-        cand.emplace_back(s * scale, b);
-      }
-      block_score_pairs += static_cast<long long>(cand.size());
-      const int kk = std::min(cfg.top_k_blocks, static_cast<int>(cand.size()));
-      std::partial_sort(
-          cand.begin(), cand.begin() + kk, cand.end(),
-          [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-            return a.first > b.first;
-          });
-      for (int t = 0; t < kk; ++t) {
-        selected[static_cast<size_t>(cand[static_cast<size_t>(t)].second)] = 1;
-      }
-    }
-
-    // Gather the causal key positions inside the selected blocks.
-    js.clear();
-    for (int b = 0; b < ncand; ++b) {
-      if (!selected[static_cast<size_t>(b)]) {
-        continue;
-      }
-      const int start = b * B;
-      const int end = std::min((b + 1) * B, i + 1);  // causal: j <= i
-      for (int j = start; j < end; ++j) {
-        js.push_back(j);
-      }
-    }
+    select_sparse_positions(i, n, d, B, cfg, route, bm, scale, selected,
+                            cand, js, &block_score_pairs);
 
     // Exact softmax attention over the selected positions only.
     sc.assign(js.size(), 0.0f);

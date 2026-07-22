@@ -32,6 +32,26 @@ void launch_sparse_selective_attention(const float* q, const float* k,
                                        const float* bm, float* out, int n, int d,
                                        int B, int top_k, int local_blocks,
                                        int sink_blocks, float scale);
+void launch_sparse_selective_attention_decode(
+    const float* q_current, const float* k_cache, const float* v_cache,
+    const float* route_current, const float* block_means, float* out,
+    int cached_tokens, int d, int B, int top_k, int local_blocks,
+    int sink_blocks, float scale);
+
+// Exact VJP for the selected sparse graph. Gradients are with respect to Q/K/V;
+// hard block selection is stop-gradient. Outputs must be pre-zeroed.
+void launch_sparse_selective_attention_backward(
+    const float* q, const float* k, const float* v, const float* route,
+    const float* bm, const float* d_out, float* d_q, float* d_k, float* d_v,
+    int n, int d, int B, int top_k, int local_blocks, int sink_blocks,
+    float scale, bool deterministic);
+
+// Dense-attention block-mass distillation objective for the learned selector.
+// d_w, loss and count are accumulators and must be zero-initialized.
+void launch_sparse_selector_distill(
+    const float* q, const float* k, const float* block_means,
+    const float* w_selector, float* d_w, float* loss, float* count,
+    int n, int d, int B, float scale, bool deterministic);
 #endif  // USE_CUDA
 
 }  // namespace cuda

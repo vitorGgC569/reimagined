@@ -466,6 +466,10 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gradcheck PRIVATE nsos_core)
     add_test(NAME test_gradcheck COMMAND test_gradcheck)
 
+    add_executable(test_training_invariants tests/test_training_invariants.cpp)
+    target_link_libraries(test_training_invariants PRIVATE nsos_core)
+    add_test(NAME test_training_invariants COMMAND test_training_invariants)
+
     # 4-bit optimizer states (Li et al. 2023): roundtrip error, zero-point
     # robustness of v, end-to-end Adam parity vs FP32, ~8x memory saving.
     add_executable(test_optimizer_4bit tests/test_optimizer_4bit.cpp)
@@ -740,3 +744,8 @@ if (NSOS_BUILD_TESTS)
             PROPERTIES ENVIRONMENT "NSOS_CUDA_SYNC=1")
     endif()
 endif()
+
+# Standalone repro for the TTT-in-model construction crash (debug diagnosis).
+# Built unconditionally so it can be produced with a minimal CPU-only config.
+add_executable(repro_ttt tests/repro_ttt.cpp)
+target_link_libraries(repro_ttt PRIVATE nsos_core)

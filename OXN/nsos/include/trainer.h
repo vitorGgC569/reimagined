@@ -50,6 +50,17 @@ struct AuxiliaryStackStats {
     float final_target_delta_norm = 0.0f;
 };
 
+struct TrainingObjectiveStats {
+    float supervised_cross_entropy = 0.0f;
+    float repetition_unlikelihood = 0.0f;
+    float logit_l2 = 0.0f;
+    float sparse_selector = 0.0f;
+    float qat_regularization = 0.0f;
+    float moe_auxiliary = 0.0f;
+    float criticality_regularization = 0.0f;
+    float total = 0.0f;
+};
+
 class Trainer {
 public:
     JambaModel* model;
@@ -66,10 +77,10 @@ public:
     float eos_loss_scale = 0.35f;
     float repetition_unlikelihood_scale = 0.0f;
     float moe_aux_loss_scale = 0.01f;
-    // Pantheon VIB-style logits L2 regularizer (2026-05-25 wiring).
-    // When > 0, adds beta * 0.5 * mean(logits^2) to loss + grad contribution.
-    // 0.0 = OFF (default).  Validated standalone Pantheon battery 14/14 PASS.
+    // Deprecated compatibility name.  This term is logit L2, not a
+    // variational information bottleneck.  New code should use logit_l2_beta.
     float pantheon_vib_beta = 0.0f;
+    float logit_l2_beta = 0.0f;
     int warmup_steps = 20;
     int global_step_count = 0;
     int total_training_steps = 1000; // Valor base para o scheduler de LR
@@ -95,24 +106,35 @@ public:
     // de m_state/v_state para que cada Trainer tenha sua própria linha de base.
     std::unordered_map<Parameter*, float> crit_g0_state;
 
-    // OXTA-CRIT §6 closed loop — per-parameter learning-rate multiplier.  The
-    // optimizer multiplies the global lr by this factor per parameter (default
-    // 1.0 when absent), so a controller can give each layer its own effective
-    // step size.  Two producers: (1) the in-loop C++ branch-gain controller
-    // (NSOS_CRIT_LR=1, SPACE axis); (2) the Python SNR instrument pushing
-    // lr_l ∝ r_l^γ via set_lr_scale_by_name (DEPTH axis / backward Lyapunov).
-    // Empty by default -> exact previous behavior (and the fused GPU optimizer
-    // stays enabled; it is bypassed only when this map is non-empty).
-    std::unordered_map<Parameter*, float> per_param_lr_scale;
+    // OXTA-CRIT §6 closed loop.  Keep independent controller state so update
+    // order cannot make one producer silently overwrite the other: external is
+    // the Python replica-coherence/SNR controller; criticality is the in-loop
+    // branch-gain controller.  AdamW consumes their product.  The fused GPU
+    // optimizer accepts this effective scale directly and therefore remains on.
+    std::unordered_map<Parameter*, float> external_lr_scale;
+    std::unordered_map<Parameter*, float> criticality_lr_scale;
     float lr_scale_for(Parameter* p) const {
-        auto it = per_param_lr_scale.find(p);
-        return it == per_param_lr_scale.end() ? 1.0f : it->second;
+        const auto external = external_lr_scale.find(p);
+        const auto criticality = criticality_lr_scale.find(p);
+        return (external == external_lr_scale.end() ? 1.0f : external->second) *
+               (criticality == criticality_lr_scale.end()
+                    ? 1.0f
+                    : criticality->second);
     }
     void set_lr_scale_by_name(const std::string& name, float scale);
-    void clear_lr_scales() { per_param_lr_scale.clear(); }
+    void clear_lr_scales() { external_lr_scale.clear(); }
+
+    // Versioned, crash-safe optimizer/scheduler/RNG sidecar.  `model_path` is
+    // hashed into the state file so a torn pair or an accidentally mixed model
+    // and optimizer checkpoint is rejected before any Trainer state mutates.
+    void save_training_state(const std::string& state_path,
+                             const std::string& model_path) const;
+    void load_training_state(const std::string& state_path,
+                             const std::string& model_path);
 
     TrainPhaseScheduler phase_scheduler;
     AuxiliaryStackStats last_auxiliary_stats;
+    TrainingObjectiveStats last_objective_stats;
     Trainer(JambaModel* m, float lr = 0.001f);
     ~Trainer();
 

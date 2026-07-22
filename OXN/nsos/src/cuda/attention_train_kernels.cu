@@ -112,7 +112,8 @@ __global__ void attn_reduce_group_kernel(float* __restrict__ out,
 // Rows with i >= valid_b come out all-zero (matches host rows left untouched).
 __global__ void attn_masked_softmax_kernel(float* __restrict__ p,
                                            const int* __restrict__ valid,
-                                           int B, int H, int S, float scale) {
+                                           int B, int H, int S, float scale,
+                                           int sliding_window) {
   const long long row = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
   const long long rows = static_cast<long long>(B) * H * S;
   if (row >= rows) return;
@@ -125,19 +126,21 @@ __global__ void attn_masked_softmax_kernel(float* __restrict__ p,
     return;
   }
   const int limit = (i < valid_len - 1 ? i : valid_len - 1);
+  const int begin = max(0, i - sliding_window + 1);
   float max_s = -3.0e38f;
-  for (int j = 0; j <= limit; ++j) {
+  for (int j = begin; j <= limit; ++j) {
     const float sc = prow[j] * scale;
     if (sc > max_s) max_s = sc;
   }
   float sum = 0.0f;
-  for (int j = 0; j <= limit; ++j) {
+  for (int j = begin; j <= limit; ++j) {
     const float e = expf(prow[j] * scale - max_s);
     prow[j] = e;
     sum += e;
   }
   const float inv = 1.0f / fmaxf(sum, 1e-9f);
-  for (int j = 0; j <= limit; ++j) prow[j] *= inv;
+  for (int j = 0; j < begin; ++j) prow[j] = 0.0f;
+  for (int j = begin; j <= limit; ++j) prow[j] *= inv;
   for (int j = limit + 1; j < S; ++j) prow[j] = 0.0f;
 }
 
@@ -264,10 +267,11 @@ extern "C" void launch_attn_reduce_group(float* out, const float* src, int B, in
 }
 
 extern "C" void launch_attn_masked_softmax(float* p, const int* valid, int B, int H,
-                                int S, float scale) {
+                                int S, float scale, int sliding_window) {
   const long long rows = static_cast<long long>(B) * H * S;
   if (rows <= 0) return;
-  attn_masked_softmax_kernel<<<blocks_for(rows), kThreads>>>(p, valid, B, H, S, scale);
+  attn_masked_softmax_kernel<<<blocks_for(rows), kThreads>>>(
+      p, valid, B, H, S, scale, sliding_window);
 }
 
 extern "C" void launch_attn_softmax_backward(float* ds, const float* p, const float* dp,

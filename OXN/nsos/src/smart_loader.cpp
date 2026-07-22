@@ -19,9 +19,12 @@
 
 #include "smart_loader.h"
 
+#include <algorithm>
 #include <fcntl.h>
+#include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <utility>
 
 #ifdef _WIN32
@@ -148,6 +151,12 @@ void SmartLoader::worker_loop() {
       result.error_msg =
           "[SmartLoader] GPU destination tensor unsupported: " + req->filepath;
       std::cerr << result.error_msg << std::endl;
+    } else if (req->destination->size < 0 ||
+               (req->destination->size > 0 && req->destination->raw_data() == nullptr) ||
+               static_cast<uint64_t>(req->destination->size) >
+                   (std::numeric_limits<size_t>::max)() / sizeof(float)) {
+      result.error_msg = "[SmartLoader] invalid destination tensor: " + req->filepath;
+      std::cerr << result.error_msg << std::endl;
     } else if (req->size >
                static_cast<size_t>(req->destination->size) * sizeof(float)) {
       // Refuse to read more bytes than the destination tensor can hold; a
@@ -159,22 +168,54 @@ void SmartLoader::worker_loop() {
                          sizeof(float)) +
           " bytes: " + req->filepath;
       std::cerr << result.error_msg << std::endl;
+    } else if (req->filepath.empty()) {
+      result.error_msg = "[SmartLoader] file path must not be empty";
+    } else if (req->offset > static_cast<size_t>((std::numeric_limits<long long>::max)())) {
+      result.error_msg = "[SmartLoader] file offset exceeds supported range: " + req->filepath;
     } else {
       const int fd = NSOS_OPEN(req->filepath.c_str(), NSOS_O_RDONLY);
       if (fd < 0) {
         result.error_msg = "[SmartLoader] open failed: " + req->filepath;
         std::cerr << result.error_msg << std::endl;
       } else {
-        const io_ssize_t bytes = NSOS_PREAD(
-            fd, req->destination->data(), req->size,
-            static_cast<long long>(req->offset));
+        size_t total_read = 0;
+        bool read_failed = false;
+        while (total_read < req->size) {
+          const size_t remaining = req->size - total_read;
+          const size_t chunk = (std::min)(
+              remaining,
+              static_cast<size_t>((std::numeric_limits<int>::max)()));
+          if (total_read > static_cast<size_t>((std::numeric_limits<long long>::max)()) -
+                               req->offset) {
+            result.error_msg =
+                "[SmartLoader] positioned read offset overflow: " + req->filepath;
+            read_failed = true;
+            break;
+          }
+          const io_ssize_t bytes = NSOS_PREAD(
+              fd,
+              reinterpret_cast<unsigned char*>(req->destination->raw_data()) + total_read,
+              chunk,
+              static_cast<long long>(req->offset + total_read));
+          if (bytes < 0) {
+            if (errno == EINTR) {
+              continue;
+            }
+            result.error_msg = "[SmartLoader] pread failed: " + req->filepath;
+            read_failed = true;
+            break;
+          }
+          if (bytes == 0) {
+            break;
+          }
+          total_read += static_cast<size_t>(bytes);
+        }
         NSOS_CLOSE(fd);
 
-        if (bytes < 0) {
-          result.error_msg = "[SmartLoader] pread failed: " + req->filepath;
+        if (read_failed) {
           std::cerr << result.error_msg << std::endl;
         } else {
-          result.bytes_read = bytes;
+          result.bytes_read = static_cast<io_ssize_t>(total_read);
         }
       }
     }

@@ -42,6 +42,7 @@ struct FusedOptMeta {
     float* const* v;
     const unsigned long long* offsets;  // [n_tensors + 1] prefixo de elementos
     const unsigned char* wd_flags;      // [n_tensors]
+    const float* lr_scales;             // [n_tensors], nullable for sqsum
     int n_tensors;
     unsigned long long total;
 };
@@ -107,11 +108,81 @@ __global__ void multi_tensor_adamw_kernel(FusedOptMeta meta,
         const float v = beta2 * meta.v[t][k] + (1.0f - beta2) * g * g;
         meta.m[t][k] = m;
         meta.v[t][k] = v;
+        const float p_lr = lr * (meta.lr_scales ? meta.lr_scales[t] : 1.0f);
         float w = meta.w[t][k];
         if (meta.wd_flags[t]) {
-            w -= lr * weight_decay * w;
+            w -= p_lr * weight_decay * w;
         }
-        meta.w[t][k] = w - lr * (m / bc1) / (sqrtf(v / bc2) + eps);
+        meta.w[t][k] = w - p_lr * (m / bc1) / (sqrtf(v / bc2) + eps);
+    }
+}
+
+// One block owns one tensor.  This fixed association gives a deterministic
+// reduction order and avoids both atomics and the old full-tensor D2H copies.
+__global__ void multi_tensor_criticality_metrics_kernel(
+    float* const* w, const unsigned long long* offsets, const int* fan_in,
+    int n_tensors, float* gammas, float* gains) {
+    const int t = static_cast<int>(blockIdx.x);
+    if (t >= n_tensors) return;
+    const unsigned long long n64 = offsets[t + 1] - offsets[t];
+    if (n64 == 0) {
+        if (threadIdx.x == 0) {
+            gammas[t] = 0.0f;
+            gains[t] = 0.0f;
+        }
+        return;
+    }
+    __shared__ float abs_partial[kThreads];
+    __shared__ unsigned int zero_partial[kThreads];
+    float local_abs = 0.0f;
+    for (unsigned long long i = threadIdx.x; i < n64; i += blockDim.x) {
+        local_abs += fabsf(w[t][i]);
+    }
+    abs_partial[threadIdx.x] = local_abs;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            abs_partial[threadIdx.x] += abs_partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float gamma = abs_partial[0] / static_cast<float>(n64);
+    unsigned int local_zeros = 0;
+    const float threshold = 0.5f * gamma;
+    for (unsigned long long i = threadIdx.x; i < n64; i += blockDim.x) {
+        local_zeros += fabsf(w[t][i]) < threshold ? 1u : 0u;
+    }
+    zero_partial[threadIdx.x] = local_zeros;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            zero_partial[threadIdx.x] += zero_partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float nonzero_fraction =
+            1.0f - static_cast<float>(zero_partial[0]) /
+                       static_cast<float>(n64);
+        gammas[t] = gamma;
+        gains[t] = gamma * gamma * nonzero_fraction *
+                   static_cast<float>(fan_in[t]);
+    }
+}
+
+__global__ void multi_tensor_criticality_grad_kernel(
+    float* const* w, float* const* g, const unsigned long long* offsets,
+    const float* coefficients, int n_tensors, unsigned long long total) {
+    for (unsigned long long i =
+             blockIdx.x * static_cast<unsigned long long>(blockDim.x) +
+             threadIdx.x;
+         i < total;
+         i += static_cast<unsigned long long>(gridDim.x) * blockDim.x) {
+        const int t = find_tensor(offsets, n_tensors, i);
+        const unsigned long long k = i - offsets[t];
+        const float value = w[t][k];
+        const float sign = value > 0.0f ? 1.0f : (value < 0.0f ? -1.0f : 0.0f);
+        g[t][k] += coefficients[t] * sign;
     }
 }
 
@@ -132,7 +203,7 @@ extern "C" void launch_multi_tensor_sqsum(float* accum,
                                           int n_tensors,
                                           unsigned long long total) {
     if (total == 0 || n_tensors <= 0) return;
-    FusedOptMeta meta{w, g, m, v, offsets, wd_flags, n_tensors, total};
+    FusedOptMeta meta{w, g, m, v, offsets, wd_flags, nullptr, n_tensors, total};
     multi_tensor_sqsum_kernel<<<blocks_for_total(total), kThreads>>>(accum, meta);
 }
 
@@ -142,6 +213,7 @@ extern "C" void launch_multi_tensor_adamw(float* const* w,
                                           float* const* v,
                                           const unsigned long long* offsets,
                                           const unsigned char* wd_flags,
+                                          const float* lr_scales,
                                           int n_tensors,
                                           unsigned long long total,
                                           float gscale,
@@ -153,9 +225,26 @@ extern "C" void launch_multi_tensor_adamw(float* const* w,
                                           float eps,
                                           float weight_decay) {
     if (total == 0 || n_tensors <= 0) return;
-    FusedOptMeta meta{w, g, m, v, offsets, wd_flags, n_tensors, total};
+    FusedOptMeta meta{w, g, m, v, offsets, wd_flags, lr_scales, n_tensors,
+                      total};
     multi_tensor_adamw_kernel<<<blocks_for_total(total), kThreads>>>(
         meta, gscale, beta1, beta2, bc1, bc2, lr, eps, weight_decay);
+}
+
+extern "C" void launch_multi_tensor_criticality_metrics(
+    float* const* w, const unsigned long long* offsets, const int* fan_in,
+    int n_tensors, float* gammas, float* gains) {
+    if (n_tensors <= 0) return;
+    multi_tensor_criticality_metrics_kernel<<<n_tensors, kThreads>>>(
+        w, offsets, fan_in, n_tensors, gammas, gains);
+}
+
+extern "C" void launch_multi_tensor_criticality_grad(
+    float* const* w, float* const* g, const unsigned long long* offsets,
+    const float* coefficients, int n_tensors, unsigned long long total) {
+    if (n_tensors <= 0 || total == 0) return;
+    multi_tensor_criticality_grad_kernel<<<blocks_for_total(total), kThreads>>>(
+        w, g, offsets, coefficients, n_tensors, total);
 }
 
 namespace {

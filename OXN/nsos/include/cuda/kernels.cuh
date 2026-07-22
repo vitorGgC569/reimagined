@@ -86,10 +86,10 @@ void launch_norm_kernel(float *d_sum_sq, const float *in, int n);
 // Repetition-unlikelihood gradient adjustment fully on GPU (mirrors the host
 // loop in trainer.cpp::apply_repetition_unlikelihood).  grad/probs are
 // [rows, vocab] device pointers; answer_tokens is a [rows] device int buffer.
-void launch_repetition_unlikelihood_kernel(float *grad, const float *probs,
-                                           const int *answer_tokens, int rows,
-                                           int vocab, float scale,
-                                           int eos_token_id);
+void launch_repetition_unlikelihood_kernel(
+    float *d_loss, float *grad, const float *probs,
+    const int *answer_tokens, int rows, int vocab, float scale,
+    int eos_token_id);
 
 // ── GQA attention TRAINING path (src/cuda/attention_train_kernels.cu) ──────
 // Glue kernels keeping Attention forward-saves and the exact-cache backward
@@ -105,7 +105,7 @@ void launch_attn_unpermute_heads(float *out, const float *src, int B, int H,
 void launch_attn_reduce_group(float *out, const float *src, int B, int S,
                               int KV, int hd, int H, int group);
 void launch_attn_masked_softmax(float *p, const int *valid, int B, int H,
-                                int S, float scale);
+                                int S, float scale, int sliding_window);
 void launch_attn_softmax_backward(float *ds, const float *p, const float *dp,
                                   int B, int H, int S, float scale);
 void launch_batched_transpose_last2(float *out, const float *src, int N,
@@ -132,10 +132,22 @@ void launch_add_row_broadcast(float *grad, const float *row_add, int rows,
 void launch_multi_tensor_adamw(float *const *w, float *const *g,
                                float *const *m, float *const *v,
                                const unsigned long long *offsets,
-                               const unsigned char *wd_flags, int n_tensors,
+                               const unsigned char *wd_flags,
+                               const float *lr_scales, int n_tensors,
                                unsigned long long total, float gscale,
                                float beta1, float beta2, float bc1, float bc2,
                                float lr, float eps, float weight_decay);
+
+// OXTA-CRIT: one fixed-order block per tensor computes absmean and the exact
+// ternary branch gain without copying full weights to the host.  The companion
+// kernel adds a pre-Adam radial regularizer to the already accumulated grads.
+void launch_multi_tensor_criticality_metrics(
+    float *const *w, const unsigned long long *offsets, const int *fan_in,
+    int n_tensors, float *gammas, float *gains);
+void launch_multi_tensor_criticality_grad(
+    float *const *w, float *const *g,
+    const unsigned long long *offsets, const float *coefficients,
+    int n_tensors, unsigned long long total);
 
 void launch_check_stability_kernel(int *d_found_issue, const float *in,
                                    float max_val, int n);
@@ -181,6 +193,22 @@ void launch_moe_scale_accum_row_kernel(float *out, const float *y,
 void launch_moe_load_accumulate_kernel(const float *weights,
                                        float *expert_loads, int batch,
                                        int num_experts);
+void launch_moe_zero_invalid_rows_kernel(float *weights,
+                                         const uint8_t *valid_rows,
+                                         int batch, int num_experts);
+// Device-resident Switch auxiliary objective. `counts` and `prob_sums` are
+// pre-zeroed [num_experts]; `loss` is pre-zeroed [1]. top_k <= 64.
+void launch_moe_switch_aux_stats_kernel(const float *probs, float *counts,
+                                        float *prob_sums, int rows,
+                                        int num_experts, int top_k,
+                                        bool deterministic);
+void launch_moe_switch_aux_grad_kernel(const float *probs,
+                                       const float *counts, float *grad,
+                                       int rows, int num_experts, float coef);
+void launch_moe_switch_aux_loss_kernel(const float *counts,
+                                       const float *prob_sums, float *loss,
+                                       int rows, int num_experts, float coef,
+                                       bool deterministic);
 
 // =====================================================================
 // Batched MoE dispatch primitives (Phase 4-extended).
@@ -239,6 +267,15 @@ void launch_moe_scatter_add_weighted_kernel(const float *permuted_output,
                                              const int *permutation,
                                              const float *scale, float *y,
                                              int N_active, int dim);
+void launch_moe_scale_rows_kernel(const float *input, const float *scale,
+                                  float *output, int rows, int dim);
+void launch_moe_router_weight_grad_kernel(
+    const float *dy, const float *unscaled_expert_output,
+    const int *permutation, const int *offsets, float *grad_weights,
+    int n_active, int dim, int num_experts);
+void launch_moe_router_logits_grad_kernel(
+    const float *probs, const float *grad_weights, float *grad_logits,
+    int rows, int num_experts, int top_k);
 
 // =====================================================================
 // BitNet 1.58-bit GPU dispatch primitives (Phase 5a of the GPU plan).
@@ -294,6 +331,9 @@ void launch_ste_clip_weight_grad_device_scale_kernel(float *dW, const float *w,
 // HPC Fused Cross-Entropy: softmax + log + NLL in single kernel
 void launch_fused_cross_entropy(float *d_loss, float *grad, const float *logits,
                                 const int *target, int batch, int vocab);
+void launch_fused_cross_entropy_weighted(
+    float *d_loss, float *grad, const float *logits, const int *target,
+    const float *row_weights, int batch, int vocab);
 
 // Broadcast kernels
 void launch_add_broadcast_kernel(float *out, const float *a, const float *b,
@@ -311,7 +351,7 @@ void launch_gqa_causal_attention_kernel(const float *q_flat, const float *kv_fla
                                         float *out, int seq_len, int d_model,
                                         int n_heads, int n_kv_heads,
                                         int head_dim, int kv_group_size,
-                                        float theta);
+                                        float theta, int sliding_window);
 void launch_batched_gqa_causal_attention_kernel(const float *q_flat,
                                                 const float *kv_flat,
                                                 float *out,
@@ -322,7 +362,8 @@ void launch_batched_gqa_causal_attention_kernel(const float *q_flat,
                                                 int n_kv_heads,
                                                 int head_dim,
                                                 int kv_group_size,
-                                                float theta);
+                                                float theta,
+                                                int sliding_window);
 void launch_gqa_append_kv_cache_kernel(const float *kv_flat, float *key_cache,
                                        float *value_cache, int cache_row,
                                        int n_kv_heads, int head_dim,
@@ -334,7 +375,8 @@ void launch_gqa_cached_attention_decode_kernel(const float *q_flat,
                                                int d_model, int n_heads,
                                                int n_kv_heads, int head_dim,
                                                int kv_group_size,
-                                               float theta);
+                                               float theta,
+                                               int sliding_window);
 
 // ── CUDA Graphs (opt-in NSOS_CUDA_GRAPH) ─────────────────────────────────────
 // Decode-step launch-overhead amortization: capture the per-token kernel sequence

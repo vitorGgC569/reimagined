@@ -390,8 +390,8 @@ static cudaStream_t tensor_copy_stream() {
 namespace {
 
 // ── GPU caching allocator (PyTorch-style caching allocator) ───────────────
-// Per-step training allocates/frees many managed tensors with RECURRING exact
-// sizes (same shapes every iteration).  cudaMallocManaged/cudaFree are
+// Per-step training allocates/frees many device tensors with recurring exact
+// sizes. Driver allocation/free calls are
 // heavyweight, partially-synchronizing driver calls; doing dozens per step adds
 // avoidable overhead AND makes CUDA Graph capture impossible (allocation is
 // illegal during capture).  This pool keeps freed blocks on per-exact-size free
@@ -399,7 +399,7 @@ namespace {
 // perfect (zero fragmentation) and addresses are stable across steps (the
 // precondition for graph replay; warm the pool with one step, then capture
 // hits only the free list -> no driver alloc inside the captured region).
-// Disable with NSOS_GPU_POOL=0 (falls back to raw cudaMallocManaged/cudaFree).
+// Disable with NSOS_GPU_POOL=0 (falls back to raw driver allocation/free).
 class ManagedPool {
 public:
     static ManagedPool& instance() {
@@ -568,6 +568,24 @@ private:
     ManagedPool() {
         const char* env = std::getenv("NSOS_GPU_POOL");
         enabled_ = !(env && std::string(env) == "0");
+        // Explicit GPU models enable strict execution before their first device
+        // allocation. They therefore receive true device memory (cudaMalloc),
+        // which cannot page-fault into host execution. Legacy callers that
+        // explicitly allow host fallbacks keep Unified Memory compatibility.
+        const char* memory_env = std::getenv("NSOS_GPU_MEMORY");
+        if (memory_env != nullptr) {
+            const std::string mode(memory_env);
+            if (mode == "device") {
+                managed_memory_ = false;
+            } else if (mode == "managed") {
+                managed_memory_ = true;
+            } else {
+                throw std::runtime_error(
+                    "NSOS_GPU_MEMORY must be 'device' or 'managed'");
+            }
+        } else {
+            managed_memory_ = !strict_gpu_execution();
+        }
         // Cap on CACHED (free-list) bytes.  Unified Memory oversubscribes
         // SILENTLY (no OOM — it just thrashes via page eviction), so an
         // unbounded cache (e.g. interleaving an inference and a training working
@@ -599,12 +617,16 @@ private:
         cached_bytes_ = 0;
     }
 
-    static void* raw_alloc(size_t bytes) {
+    void* raw_alloc(size_t bytes) const {
         void* raw = nullptr;
-        if (cudaMallocManaged(&raw, bytes) != cudaSuccess) {
+        const cudaError_t allocation_status = managed_memory_
+                                                  ? cudaMallocManaged(&raw, bytes)
+                                                  : cudaMalloc(&raw, bytes);
+        if (allocation_status != cudaSuccess) {
             (void)cudaGetLastError();
             return nullptr;
         }
+        if (!managed_memory_) return raw;
         // Pascal+Windows hardening, applied ONCE per physical block (it then
         // persists across every pooled reuse): hint the driver that this UM
         // block is accessed by host and device so pages stay migratable rather
@@ -635,6 +657,7 @@ private:
     }
 
     bool enabled_ = true;
+    bool managed_memory_ = true;
     size_t cached_bytes_ = 0;  // current sum of free-list block sizes
     size_t live_bytes_ = 0;    // soma dos blocos atualmente entregues a Tensors
     unsigned dealloc_probe_ = 0;        // cadência da guarda de pressão UM
@@ -674,6 +697,11 @@ bool tensor_skip_fill_flag();
 static void warn_host_fallback_once(const char* op, Device dev) {
 #ifdef USE_CUDA
     if (dev != Device::GPU) return;
+    if (strict_gpu_execution()) {
+        throw std::runtime_error(
+            std::string("Strict GPU execution forbids host fallback in '") +
+            op + "'");
+    }
     static std::mutex m;
     static std::set<std::string> warned;
     std::lock_guard<std::mutex> lk(m);
@@ -686,6 +714,19 @@ static void warn_host_fallback_once(const char* op, Device dev) {
 #else
     (void)op; (void)dev;
 #endif
+}
+
+static std::atomic<bool>& strict_gpu_execution_storage() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
+void set_strict_gpu_execution(bool enabled) {
+    strict_gpu_execution_storage().store(enabled, std::memory_order_relaxed);
+}
+
+bool strict_gpu_execution() {
+    return strict_gpu_execution_storage().load(std::memory_order_relaxed);
 }
 
 
@@ -705,11 +746,9 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
     float* raw_ptr = nullptr;
     if (device == Device::GPU) {
 #ifdef USE_CUDA
-        // Allocate from the managed caching pool.  cudaMallocManaged +
-        // cudaMemAdvise (Pascal+Windows UM hardening) happen once per physical
-        // block inside the pool; a pooled reuse returns a ready, advise-tagged
-        // block with no driver call.  sync_host_access remains the safety net
-        // for host access regardless.
+        // Strict GPU models use native device memory; explicitly fallback-
+        // compatible callers may select managed memory. Both share the same
+        // size-classed caching allocator and stable-address graph semantics.
         raw_ptr = static_cast<float*>(
             ManagedPool::instance().allocate(static_cast<size_t>(size) * sizeof(float)));
 #endif
@@ -987,13 +1026,13 @@ void gpu_pool_release_capture() {
 }
 
 Tensor Tensor::random(const std::vector<int>& s, Device dev) {
-    Tensor t(s, dev);
+    Tensor t(s, Device::CPU);
     std::normal_distribution<float> dist(0.0f, 0.02f);
     float* dst = t.data();
     for (int i = 0; i < t.size; ++i) {
         dst[i] = dist(tensor_rng());
     }
-    return t;
+    return dev == Device::CPU ? t : t.to(dev);
 }
 
 Tensor Tensor::uniform(const std::vector<int>& s, float low, float high,
@@ -1011,7 +1050,7 @@ Tensor Tensor::uniform(const std::vector<int>& s, float low, float high,
 }
 
 Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev) {
-    Tensor t(s, dev);
+    Tensor t(s, Device::CPU);
     float fan_in = s.empty() ? 1.0f : static_cast<float>(s.back());
     float bound = std::sqrt(6.0f / std::max(fan_in, 1.0f));
     std::uniform_real_distribution<float> dist(-bound, bound);
@@ -1019,7 +1058,7 @@ Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev) {
     for (int i = 0; i < t.size; ++i) {
         dst[i] = dist(tensor_rng());
     }
-    return t;
+    return dev == Device::CPU ? t : t.to(dev);
 }
 
 Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev,
@@ -1028,7 +1067,7 @@ Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev,
         // Preserve historical behavior for seed=0 (un-seeded path).
         return kaiming_uniform(s, dev);
     }
-    Tensor t(s, dev);
+    Tensor t(s, Device::CPU);
     float fan_in = s.empty() ? 1.0f : static_cast<float>(s.back());
     float bound = std::sqrt(6.0f / std::max(fan_in, 1.0f));
     std::uniform_real_distribution<float> dist(-bound, bound);
@@ -1037,11 +1076,11 @@ Tensor Tensor::kaiming_uniform(const std::vector<int>& s, Device dev,
     for (int i = 0; i < t.size; ++i) {
         dst[i] = dist(local_rng);
     }
-    return t;
+    return dev == Device::CPU ? t : t.to(dev);
 }
 
 Tensor Tensor::xavier_uniform(const std::vector<int>& s, Device dev) {
-    Tensor t(s, dev);
+    Tensor t(s, Device::CPU);
     // Pesos são [out, in] row-major: fan_out = s.front(), fan_in = s.back().
     // (Os rótulos estavam trocados; sem efeito numérico — a fórmula de Xavier
     // usa fan_in + fan_out simetricamente — corrigido por clareza.)
@@ -1053,22 +1092,22 @@ Tensor Tensor::xavier_uniform(const std::vector<int>& s, Device dev) {
     for (int i = 0; i < t.size; ++i) {
         dst[i] = dist(tensor_rng());
     }
-    return t;
+    return dev == Device::CPU ? t : t.to(dev);
 }
 
 Tensor Tensor::eye(int n, Device dev) {
-    Tensor t = zeros({n, n}, dev);
+    Tensor t = zeros({n, n}, Device::CPU);
     float* dst = t.data();
     for (int i = 0; i < n; ++i) {
         dst[i * n + i] = 1.0f;
     }
-    return t;
+    return dev == Device::CPU ? t : t.to(dev);
 }
 
 Tensor Tensor::from_scalar(float val, Device dev) {
-    Tensor t({1}, dev);
+    Tensor t({1}, Device::CPU);
     t.data()[0] = val;
-    return t;
+    return dev == Device::CPU ? t : t.to(dev);
 }
 
 void Tensor::clip_grad_norm_(std::vector<Tensor>& params, float max_norm) {
@@ -1085,6 +1124,13 @@ void Tensor::clip_grad_norm_(std::vector<Tensor>& params, float max_norm) {
 
     float scale = max_norm / (total_norm + 1e-6f);
     for (auto& p : params) {
+#ifdef USE_CUDA
+        if (p.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
+            launch_scale_inplace_kernel(p.raw_data(), scale, p.size);
+            sync_cuda();
+            continue;
+        }
+#endif
         float* dst = p.data();
         for (int i = 0; i < p.size; ++i) {
             dst[i] *= scale;
@@ -1201,19 +1247,59 @@ static std::atomic<int>& matmul_precision_mode_storage() {
         const std::string v(env);
         if (v == "bf16" || v == "BF16") return 1;
         if (v == "fp16" || v == "FP16") return 2;
-        return 0;
+        if (v == "fp32" || v == "FP32") return 0;
+        throw std::invalid_argument(
+            "NSOS_MIXED_PRECISION must be fp32, fp16, or bf16");
     }()};
     return mode;
 }
 
 void set_matmul_precision_mode(int mode) {
-    if (mode < 0 || mode > 2) mode = 0;
+    if (mode < 0 || mode > 2) {
+        throw std::invalid_argument(
+            "matmul precision mode must be 0 (FP32), 1 (BF16), or 2 (FP16)");
+    }
     matmul_precision_mode_storage().store(mode, std::memory_order_relaxed);
 }
 
 int matmul_precision_mode() {
     return matmul_precision_mode_storage().load(std::memory_order_relaxed);
 }
+
+#ifdef USE_CUDA
+void validate_matmul_precision_for_active_device(int mode) {
+    if (mode == 0) return;
+    int device_id = 0;
+    if (cudaGetDevice(&device_id) != cudaSuccess) {
+        throw std::runtime_error(
+            "Cannot resolve active CUDA device for mixed precision");
+    }
+    thread_local int cached_device = -1;
+    thread_local int cached_major = -1;
+    thread_local int cached_minor = -1;
+    if (cached_device != device_id) {
+        cudaDeviceProp properties{};
+        if (cudaGetDeviceProperties(&properties, device_id) != cudaSuccess) {
+            throw std::runtime_error(
+                "Cannot query CUDA compute capability for mixed precision");
+        }
+        cached_device = device_id;
+        cached_major = properties.major;
+        cached_minor = properties.minor;
+    }
+    if (mode == 1 && cached_major < 8) {
+        throw std::runtime_error(
+            "BF16 Tensor-Core GEMM requires sm_80 or newer; active device is "
+            "sm_" + std::to_string(cached_major) +
+            std::to_string(cached_minor) +
+            ". Select FP16 on Turing/T4 (sm_75) or FP32.");
+    }
+    if (mode == 2 && cached_major < 7) {
+        throw std::runtime_error(
+            "FP16 Tensor-Core GEMM requires sm_70 or newer");
+    }
+}
+#endif
 
 Tensor Tensor::matmul(const Tensor& other) const {
     if (shape.size() < 2 || other.shape.size() < 2) {
@@ -1299,6 +1385,7 @@ Tensor Tensor::matmul(const Tensor& other) const {
         const int mixed_mode = matmul_precision_mode();
 
         if (mixed_mode != 0) {
+            validate_matmul_precision_for_active_device(mixed_mode);
             // cublasGemmEx with mixed precision: A and B in lower
             // precision, accumulation and C in FP32.  We allocate
             // workspace tensors for the BF16/FP16 copies of A and B
@@ -1495,7 +1582,7 @@ Tensor Tensor::transpose(int dim0, int dim1) const {
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported() &&
         rank == 2 && dim0 == 0 && dim1 == 1) {
-        launch_transpose2d_kernel(result.data(), data(), shape[0], shape[1]);
+        launch_transpose2d_kernel(result.raw_data(), raw_data(), shape[0], shape[1]);
         sync_cuda();
         return result;
     }
@@ -1734,6 +1821,15 @@ Tensor Tensor::sum(int dim, bool keepdim) const {
 
     if (rank == 1) {
         Tensor result({1}, device);
+#ifdef USE_CUDA
+        if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
+            launch_mean_kernel(result.raw_data(), raw_data(), 1, size, 1);
+            launch_scale_inplace_kernel(result.raw_data(),
+                                         static_cast<float>(size), 1);
+            sync_cuda();
+            return result;
+        }
+#endif
         float total = 0.0f;
         for (int i = 0; i < size; ++i) {
             total += data()[i];
@@ -1855,7 +1951,8 @@ Tensor Tensor::to(Device dev) const {
     // Cópia integral sobrescreve tudo — sem zero-fill.
     Tensor result = Tensor::uninitialized(shape.dims, dev);
     if (size > 0) {
-        copy_tensor_bytes(result.data(), result.device, data(), device, size * sizeof(float));
+        copy_tensor_bytes(result.raw_data(), result.device, raw_data(), device,
+                          size * sizeof(float));
     }
     return result;
 }
@@ -1931,7 +2028,8 @@ void Tensor::copy_from(const Tensor& other) {
             return;
         }
 #endif
-        copy_tensor_bytes(data(), device, other.data(), other.device, size * sizeof(float));
+        copy_tensor_bytes(raw_data(), device, other.raw_data(), other.device,
+                          size * sizeof(float));
     }
 }
 
@@ -2167,6 +2265,22 @@ static int* ce_target_scratch(int rows) {
     }
     return p;
 }
+static float* ce_weight_scratch(int rows) {
+    thread_local float* p = nullptr;
+    thread_local int cap = 0;
+    if (rows <= 0) return nullptr;
+    if (rows > cap) {
+        if (p) cudaFree(p);
+        p = nullptr;
+        if (cudaMalloc(&p, static_cast<size_t>(rows) * sizeof(float)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cap = 0;
+            return nullptr;
+        }
+        cap = rows;
+    }
+    return p;
+}
 #endif
 
 std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) const {
@@ -2228,7 +2342,7 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
             sum_exp += grad_ptr[row * classes + c];
         }
 
-        float inv_sum = 1.0f / std::max(sum_exp, 1e-8f);
+        const float inv_sum = 1.0f / sum_exp;
         int target_class = target[row];
         if (target_class < 0 || target_class >= classes) {
             throw std::out_of_range("cross_entropy target out of range");
@@ -2238,8 +2352,9 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
             grad_ptr[row * classes + c] *= inv_sum;
         }
 
-        float prob = std::max(grad_ptr[row * classes + target_class], 1e-8f);
-        loss += -std::log(prob);
+        // Stable log-sum-exp NLL.  The former max(prob, 1e-8) cap made the
+        // scalar flat in the tail while returning a non-zero softmax gradient.
+        loss += max_logit + std::log(sum_exp) - row_ptr[target_class];
         grad_ptr[row * classes + target_class] -= 1.0f;
     }
 
@@ -2248,6 +2363,94 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
         grad_ptr[i] *= inv_rows;
     }
 
+    return {loss * inv_rows, grad};
+}
+
+std::pair<float, Tensor> Tensor::cross_entropy_weighted(
+    const std::vector<int>& target,
+    const std::vector<float>& row_weights) const {
+    const int rank = static_cast<int>(shape.size());
+    if (rank < 2) {
+        throw std::runtime_error("cross_entropy_weighted expects rank >= 2 logits");
+    }
+    const int classes = shape.back();
+    const int rows = size / classes;
+    if (static_cast<int>(target.size()) != rows ||
+        static_cast<int>(row_weights.size()) != rows) {
+        throw std::runtime_error("cross_entropy_weighted row count mismatch");
+    }
+    for (int row = 0; row < rows; ++row) {
+        if (target[static_cast<size_t>(row)] < 0 ||
+            target[static_cast<size_t>(row)] >= classes) {
+            throw std::out_of_range("cross_entropy_weighted target out of range");
+        }
+        const float weight_value = row_weights[static_cast<size_t>(row)];
+        if (!std::isfinite(weight_value) || weight_value < 0.0f) {
+            throw std::invalid_argument(
+                "cross_entropy_weighted requires finite non-negative row weights");
+        }
+    }
+
+    Tensor grad(shape.dims, device);
+    float loss = 0.0f;
+
+#ifdef USE_CUDA
+    if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
+        float* d_loss = ce_loss_scratch();
+        int* d_target = ce_target_scratch(rows);
+        float* d_weights = ce_weight_scratch(rows);
+        if (d_loss != nullptr && d_target != nullptr && d_weights != nullptr) {
+            cudaMemset(d_loss, 0, sizeof(float));
+            cudaMemcpy(d_target, target.data(),
+                       static_cast<size_t>(rows) * sizeof(int),
+                       cudaMemcpyHostToDevice);
+            cudaMemcpy(d_weights, row_weights.data(),
+                       static_cast<size_t>(rows) * sizeof(float),
+                       cudaMemcpyHostToDevice);
+            launch_fused_cross_entropy_weighted(
+                d_loss, grad.raw_data(), raw_data(), d_target, d_weights,
+                rows, classes);
+            sync_cuda();
+            const float inv_rows = 1.0f / std::max(rows, 1);
+            launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
+            sync_cuda();
+            loss = copy_scalar_from_device(d_loss) * inv_rows;
+            return {loss, grad};
+        }
+    }
+#endif
+
+    const float* logits = data();
+    float* grad_ptr = grad.data();
+    for (int row = 0; row < rows; ++row) {
+        const float* row_ptr = logits + static_cast<size_t>(row) * classes;
+        float max_logit = row_ptr[0];
+        for (int col = 1; col < classes; ++col) {
+            max_logit = std::max(max_logit, row_ptr[col]);
+        }
+        float sum_exp = 0.0f;
+        for (int col = 0; col < classes; ++col) {
+            const float exponential = std::exp(row_ptr[col] - max_logit);
+            grad_ptr[static_cast<size_t>(row) * classes + col] = exponential;
+            sum_exp += exponential;
+        }
+        const float inverse_sum = 1.0f / sum_exp;
+        const float row_weight = row_weights[static_cast<size_t>(row)];
+        for (int col = 0; col < classes; ++col) {
+            grad_ptr[static_cast<size_t>(row) * classes + col] *= inverse_sum;
+        }
+        const int target_class = target[static_cast<size_t>(row)];
+        loss += row_weight *
+                (max_logit + std::log(sum_exp) - row_ptr[target_class]);
+        grad_ptr[static_cast<size_t>(row) * classes + target_class] -= 1.0f;
+        for (int col = 0; col < classes; ++col) {
+            grad_ptr[static_cast<size_t>(row) * classes + col] *= row_weight;
+        }
+    }
+    const float inv_rows = 1.0f / std::max(rows, 1);
+    for (int index = 0; index < grad.size; ++index) {
+        grad_ptr[index] *= inv_rows;
+    }
     return {loss * inv_rows, grad};
 }
 
@@ -2273,6 +2476,10 @@ std::pair<float, Tensor> Tensor::mse_loss(const Tensor& target) const {
 }
 
 void Tensor::print(const std::string& name, int max_elements) const {
+    if (device == Device::GPU) {
+        cpu().print(name, max_elements);
+        return;
+    }
     if (!name.empty()) {
         std::cout << name << " ";
     }
@@ -2311,7 +2518,7 @@ Tensor Tensor::from_blob(void* ptr, std::vector<int> s, Device d, bool take_owne
     } else {
         t = Tensor(s, d);
         if (t.size > 0) {
-            copy_tensor_bytes(t.data(), d, static_cast<const float*>(ptr), d,
+            copy_tensor_bytes(t.raw_data(), d, static_cast<const float*>(ptr), d,
                               static_cast<size_t>(t.size) * sizeof(float));
         }
     }

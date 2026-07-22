@@ -12,11 +12,17 @@ namespace nsos {
 namespace {
 
 constexpr std::array<char, 4> kMessageFormatMagic{{'N', 'S', 'M', '1'}};
-constexpr float kMaxMemorySimilarityLogit = 40.0f;
+constexpr size_t kMaxMessageFieldBytes = 4 * 1024 * 1024;
+constexpr size_t kMaxInstructionBytes = 1024 * 1024;
+constexpr size_t kMaxInstructions = 10000;
+constexpr size_t kMaxClusters = 4096;
+constexpr size_t kMaxItemsPerCluster = 1024;
+constexpr float kClusterRadiusSquared = 10.0f;
 
 void append_u32(std::vector<uint8_t>& out, uint32_t value) {
-  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&value);
-  out.insert(out.end(), bytes, bytes + sizeof(value));
+  for (size_t byte = 0; byte < sizeof(value); ++byte) {
+    out.push_back(static_cast<uint8_t>((value >> (byte * 8)) & 0xffu));
+  }
 }
 
 uint32_t read_u32(const std::vector<uint8_t>& bytes, size_t& offset) {
@@ -24,13 +30,15 @@ uint32_t read_u32(const std::vector<uint8_t>& bytes, size_t& offset) {
     throw std::runtime_error("Corrupted message payload");
   }
   uint32_t value = 0;
-  std::memcpy(&value, bytes.data() + offset, sizeof(value));
+  for (size_t byte = 0; byte < sizeof(value); ++byte) {
+    value |= static_cast<uint32_t>(bytes[offset + byte]) << (byte * 8);
+  }
   offset += sizeof(value);
   return value;
 }
 
 void append_string_field(std::vector<uint8_t>& out, const std::string& value) {
-  if (value.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+  if (value.size() > kMaxMessageFieldBytes) {
     throw std::runtime_error("Message field too large to serialize");
   }
   append_u32(out, static_cast<uint32_t>(value.size()));
@@ -39,7 +47,7 @@ void append_string_field(std::vector<uint8_t>& out, const std::string& value) {
 
 std::string read_string_field(const std::vector<uint8_t>& bytes, size_t& offset) {
   const uint32_t length = read_u32(bytes, offset);
-  if (offset + length > bytes.size()) {
+  if (length > kMaxMessageFieldBytes || length > bytes.size() - offset) {
     throw std::runtime_error("Corrupted message payload");
   }
   std::string value(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
@@ -48,11 +56,11 @@ std::string read_string_field(const std::vector<uint8_t>& bytes, size_t& offset)
   return value;
 }
 
-float stable_similarity_weight(float dot) {
-  if (!std::isfinite(dot)) {
+float bounded_similarity_weight(float cosine) {
+  if (!std::isfinite(cosine)) {
     return 0.0f;
   }
-  return std::exp(std::clamp(dot, -kMaxMemorySimilarityLogit, kMaxMemorySimilarityLogit));
+  return std::exp(std::clamp(cosine, -1.0f, 1.0f));
 }
 
 std::vector<uint8_t> serialize_message(const Message& msg) {
@@ -76,6 +84,9 @@ Message deserialize_message(const std::vector<uint8_t>& bytes) {
     message.agent_id = read_string_field(bytes, offset);
     message.timestamp = read_string_field(bytes, offset);
     message.content = read_string_field(bytes, offset);
+    if (offset != bytes.size()) {
+      throw std::runtime_error("Message payload has trailing bytes");
+    }
     return message;
   }
 
@@ -100,22 +111,47 @@ std::vector<uint8_t> serialize_tensor_state(const Tensor& state) {
   const uint32_t rank = static_cast<uint32_t>(host_state.shape.size());
   const size_t header_bytes = sizeof(rank) + rank * sizeof(int32_t);
   const size_t data_bytes = static_cast<size_t>(host_state.size) * sizeof(float);
-  std::vector<uint8_t> bytes(header_bytes + data_bytes);
-  uint8_t* out = bytes.data();
-  std::memcpy(out, &rank, sizeof(rank));
-  out += sizeof(rank);
+  std::vector<uint8_t> encoded;
+  encoded.reserve(header_bytes + data_bytes);
+  append_u32(encoded, rank);
   for (int dim : host_state.shape.dims) {
-    int32_t dim32 = dim;
-    std::memcpy(out, &dim32, sizeof(dim32));
-    out += sizeof(dim32);
+    if (dim <= 0) throw std::invalid_argument("Memory tensor dimensions must be positive");
+    append_u32(encoded, static_cast<uint32_t>(dim));
   }
-  std::memcpy(out, host_state.data(), data_bytes);
-  return bytes;
+  const float* data = host_state.data();
+  for (int64_t index = 0; index < host_state.size; ++index) {
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(data[index]));
+    std::memcpy(&bits, &data[index], sizeof(bits));
+    append_u32(encoded, bits);
+  }
+  return encoded;
 }
 
 } // namespace
 
-MemorySystem::MemorySystem(int chunk_dim) : chunk_size(chunk_dim) {}
+MemorySystem::MemorySystem(int chunk_dim) : chunk_size(chunk_dim) {
+  if (chunk_dim <= 0 || chunk_dim > 1'048'576) {
+    throw std::invalid_argument("MemorySystem chunk_dim must be in 1..1048576");
+  }
+}
+
+void MemorySystem::validate_state_shape(const Tensor& state,
+                                        const char* operation) const {
+  if (state.size != chunk_size || state.shape.size() == 0) {
+    throw std::invalid_argument(
+        std::string(operation) + " requires exactly " +
+        std::to_string(chunk_size) + " finite values");
+  }
+  Tensor host = state.get_device() == Device::GPU ? state.cpu() : state;
+  const float* values = host.data();
+  for (int64_t index = 0; index < host.size; ++index) {
+    if (!std::isfinite(values[index])) {
+      throw std::invalid_argument(std::string(operation) +
+                                  " rejects non-finite state values");
+    }
+  }
+}
 
 void MemorySystem::add_cluster(const Tensor &state, const std::string &label) {
   (void)label;
@@ -123,8 +159,10 @@ void MemorySystem::add_cluster(const Tensor &state, const std::string &label) {
 }
 
 void MemorySystem::enable_causal_store(const std::string& path) {
+  auto backend = std::make_unique<CausalMemoryStore>(path);
   std::lock_guard<std::mutex> lock(memory_mutex);
-  causal_store = std::make_unique<CausalMemoryStore>(path);
+  causal_store = std::move(backend);
+  oxtamem_store.reset();
 }
 
 bool MemorySystem::enable_oxtamem_store(const std::string& library_path,
@@ -136,11 +174,24 @@ bool MemorySystem::enable_oxtamem_store(const std::string& library_path,
     return false;
   }
   oxtamem_store = std::move(backend);
+  causal_store.reset();
   return true;
 }
 
 void MemorySystem::store_episodic(const Tensor &state) {
+  validate_state_shape(state, "store_episodic");
+  Tensor state_cpu = state.get_device() == Device::GPU ? state.cpu() : state.clone();
+  const std::vector<uint8_t> serialized = serialize_tensor_state(state_cpu);
   std::lock_guard<std::mutex> lock(memory_mutex);
+
+  // A single configured persistent backend is the source of truth. Publish to
+  // it before mutating the runtime index so a failed write cannot create a
+  // memory that disappears after restart.
+  if (causal_store) {
+    causal_store->append("episodic", serialized);
+  } else if (oxtamem_store && !oxtamem_store->write("episodic", serialized)) {
+    throw std::runtime_error("OxtaMem episodic write failed");
+  }
 
   // Initialize cluster's access time
   auto now = std::chrono::system_clock::now();
@@ -151,8 +202,6 @@ void MemorySystem::store_episodic(const Tensor &state) {
   // the CPU -> undefined behavior / segfault.  The clones stored in the
   // cluster preserve the original device so retrieval semantics and
   // checkpoint contents are unchanged for CPU callers.
-  Tensor state_cpu = (state.get_device() == Device::GPU) ? state.cpu() : state;
-
   // Clustered episodic storage with centroid routing.
   float best_dist = 1e9;
   int best_cluster = -1;
@@ -181,54 +230,63 @@ void MemorySystem::store_episodic(const Tensor &state) {
   }
 
   // Threshold to create new cluster
-  float CLUSTER_RADIUS = 10.0f; // Tunable
-  if (best_cluster == -1 || best_dist > CLUSTER_RADIUS) {
+  if (best_cluster == -1 || best_dist > kClusterRadiusSquared) {
+    if (clusters.size() >= kMaxClusters) {
+      const auto oldest = std::min_element(
+          clusters.begin(), clusters.end(),
+          [](const Cluster& lhs, const Cluster& rhs) {
+            return lhs.last_access < rhs.last_access;
+          });
+      if (oldest != clusters.end()) clusters.erase(oldest);
+    }
     // Create new
     Cluster c;
-    c.centroid = state.clone(); // Clone
-    c.items.push_back(state.clone());
+    // Runtime memory is host-resident by design: retaining training states on
+    // their source GPU would grow VRAM without bound, while every retrieval and
+    // TurboQuant operation is host-side anyway.
+    c.centroid = state_cpu.clone();
+    c.items.push_back(state_cpu.clone());
       c.last_access = now;
       clusters.push_back(c);
   } else {
     // Add to existing
-    clusters[best_cluster].items.push_back(state.clone());
+    auto& items = clusters[best_cluster].items;
+    if (items.size() >= kMaxItemsPerCluster) {
+      items.erase(items.begin());
+    }
+    items.push_back(state_cpu.clone());
     clusters[best_cluster].last_access = now;
     // Update centroid (Moving Average).  Operate on a host copy then write
     // the result back onto the centroid in its original device, keeping the
     // host-pointer arithmetic safe for GPU-resident centroids.
     float alpha = 0.1f;
-    const Device centroid_device = clusters[best_cluster].centroid.get_device();
-    Tensor centroid_cpu = centroid_device == Device::GPU
-                              ? clusters[best_cluster].centroid.cpu()
-                              : clusters[best_cluster].centroid;
+    Tensor centroid_cpu = clusters[best_cluster].centroid;
     if (centroid_cpu.size == state_cpu.size) {
       float *c = centroid_cpu.data();
       const float *s = state_cpu.data();
       for (int k = 0; k < state_cpu.size; ++k)
         c[k] = (1 - alpha) * c[k] + alpha * s[k];
-      clusters[best_cluster].centroid =
-          centroid_device == Device::GPU ? centroid_cpu.to(centroid_device)
-                                         : centroid_cpu;
+      clusters[best_cluster].centroid = centroid_cpu;
     }
-  }
-
-  if (causal_store) {
-    causal_store->append("episodic", serialize_tensor_state(state));
-  }
-  if (oxtamem_store) {
-    oxtamem_store->write("episodic", serialize_tensor_state(state));
   }
 }
 
 void MemorySystem::add_instruction(const std::string &instr) {
+  if (instr.empty() || instr.size() > kMaxInstructionBytes) {
+    throw std::invalid_argument("Instruction must be 1 byte..1 MiB");
+  }
   std::lock_guard<std::mutex> lock(memory_mutex);
+  if (instructional_memory.size() >= kMaxInstructions) {
+    instructional_memory.erase(instructional_memory.begin());
+  }
   instructional_memory.push_back(instr);
 }
 
 Tensor MemorySystem::retrieve(const Tensor &query) {
+  validate_state_shape(query, "retrieve");
+  Tensor query_cpu = query.get_device() == Device::GPU ? query.cpu() : query;
   std::lock_guard<std::mutex> lock(memory_mutex);
 
-  Tensor query_cpu = (query.get_device() == Device::GPU) ? query.cpu() : query;
   const float *query_ptr = query_cpu.data();
   if (clusters.empty() || query_cpu.size == 0) {
     return Tensor::zeros(query_cpu.shape.dims, Device::CPU).to(query.get_device());
@@ -249,10 +307,8 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
         clusters[i].centroid.get_device() == Device::GPU ? clusters[i].centroid.cpu()
                                                          : clusters[i].centroid;
     const float *c = centroid_cpu.data();
-    // Centroids of a different dimensionality than the query must not be
-    // indexed past their buffer; only the overlapping prefix contributes.
-    const int centroid_extent = std::min(query_cpu.size, centroid_cpu.size);
-    for (int k = 0; k < centroid_extent; ++k) {
+    if (centroid_cpu.size != query_cpu.size) continue;
+    for (int k = 0; k < query_cpu.size; ++k) {
       dot += c[k] * query_ptr[k];
       centroid_norm_sq += c[k] * c[k];
     }
@@ -291,17 +347,18 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
       Tensor mem_cpu = mem.get_device() == Device::GPU ? mem.cpu() : mem;
       float dot = 0;
       const float *mem_ptr = mem_cpu.data();
-      // The query, the stored item, and the accumulation buffer may differ
-      // in length; clamp every access to their common extent so neither
-      // query_ptr, mem_ptr nor context_cpu is indexed out of bounds.
-      const int mem_extent =
-          std::min(mem_cpu.size, std::min(query_cpu.size, context_cpu.size));
-      for (int i = 0; i < mem_extent; ++i)
+      if (mem_cpu.size != query_cpu.size) continue;
+      float memory_norm_sq = 0.0f;
+      for (int i = 0; i < query_cpu.size; ++i) {
         dot += query_ptr[i] * mem_ptr[i];
+        memory_norm_sq += mem_ptr[i] * mem_ptr[i];
+      }
 
-      float weight = stable_similarity_weight(dot);
+      const float cosine = dot /
+          (query_norm * std::sqrt(std::max(memory_norm_sq, 1e-8f)));
+      const float weight = bounded_similarity_weight(cosine);
 
-      for (int i = 0; i < mem_extent; ++i)
+      for (int i = 0; i < query_cpu.size; ++i)
         context_cpu.data()[i] += mem_ptr[i] * weight;
       total_weight += weight;
     }
@@ -309,16 +366,22 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
     // Process compressed items via TurboQuant Dot
     if (tq_engine && !clusters[idx].compressed_items.empty()) {
         for (const auto &compressed_mem : clusters[idx].compressed_items) {
-            float dot = tq_engine->dot(query_vec, compressed_mem);
-            float weight = stable_similarity_weight(dot);
-
             // Decode entirely to reconstruct the state as we need it for weighting.
-            // The decoded vector length need not match the accumulation buffer,
-            // so clamp to the smaller extent to avoid writing past context_cpu.
             std::vector<float> decoded = tq_engine->decode(compressed_mem);
-            const size_t decoded_extent =
-                std::min(decoded.size(), static_cast<size_t>(context_cpu.size));
-            for (size_t i = 0; i < decoded_extent; ++i) {
+            if (decoded.size() != static_cast<size_t>(query_cpu.size)) continue;
+            float dot = 0.0f;
+            float memory_norm_sq = 0.0f;
+            bool finite = true;
+            for (size_t i = 0; i < decoded.size(); ++i) {
+                finite = finite && std::isfinite(decoded[i]);
+                dot += query_vec[i] * decoded[i];
+                memory_norm_sq += decoded[i] * decoded[i];
+            }
+            if (!finite) continue;
+            const float cosine = dot /
+                (query_norm * std::sqrt(std::max(memory_norm_sq, 1e-8f)));
+            const float weight = bounded_similarity_weight(cosine);
+            for (size_t i = 0; i < decoded.size(); ++i) {
                 context_cpu.data()[i] += decoded[i] * weight;
             }
             total_weight += weight;
@@ -335,24 +398,37 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
 }
 
 std::vector<Tensor> MemorySystem::retrieve(const Tensor &query, size_t top_k) {
+  validate_state_shape(query, "retrieve(top_k)");
+  if (top_k > 4096) {
+    throw std::invalid_argument("retrieve top_k exceeds 4096");
+  }
+  Tensor query_cpu = query.get_device() == Device::GPU ? query.cpu() : query;
   std::lock_guard<std::mutex> lock(memory_mutex);
   std::vector<std::pair<float, Tensor>> ranked;
   ranked.reserve(clusters.size());
 
-  Tensor query_cpu = (query.get_device() == Device::GPU) ? query.cpu() : query;
   const float *query_ptr = query_cpu.data();
+  float query_norm_sq = 0.0f;
+  for (int64_t i = 0; i < query_cpu.size; ++i) {
+    query_norm_sq += query_ptr[i] * query_ptr[i];
+  }
+  const float query_norm = std::sqrt(std::max(query_norm_sq, 1e-8f));
 
   for (const auto &cluster : clusters) {
     Tensor centroid_cpu =
         cluster.centroid.get_device() == Device::GPU ? cluster.centroid.cpu()
                                                      : cluster.centroid;
     const float *centroid_ptr = centroid_cpu.data();
+    if (centroid_cpu.size != query_cpu.size) continue;
     float dot = 0.0f;
-    const int extent = std::min(query_cpu.size, centroid_cpu.size);
-    for (int i = 0; i < extent; ++i) {
+    float centroid_norm_sq = 0.0f;
+    for (int i = 0; i < query_cpu.size; ++i) {
       dot += query_ptr[i] * centroid_ptr[i];
+      centroid_norm_sq += centroid_ptr[i] * centroid_ptr[i];
     }
-    ranked.push_back({dot, cluster.centroid});
+    const float cosine = dot /
+        (query_norm * std::sqrt(std::max(centroid_norm_sq, 1e-8f)));
+    ranked.push_back({cosine, centroid_cpu});
   }
 
   std::partial_sort(
@@ -365,7 +441,9 @@ std::vector<Tensor> MemorySystem::retrieve(const Tensor &query, size_t top_k) {
   const size_t limit = std::min(top_k, ranked.size());
   results.reserve(limit);
   for (size_t i = 0; i < limit; ++i) {
-    results.push_back(ranked[i].second);
+    results.push_back(query.get_device() == Device::GPU
+                          ? ranked[i].second.to(Device::GPU)
+                          : ranked[i].second.clone());
   }
   return results;
 }
@@ -376,7 +454,7 @@ void MemorySystem::run_auto_dream() {
 
   // Initialize engine precisely
   if (!tq_engine && !clusters[0].items.empty()) {
-      int dim = clusters[0].items[0].size;
+      int dim = chunk_size;
       if (dim % 2 == 0 && dim > 0) {
           tq_engine = std::make_unique<tq::TurboQuantEngine>(dim);
       }
@@ -407,6 +485,14 @@ void MemorySystem::run_auto_dream() {
               cluster.compressed_items.insert(cluster.compressed_items.end(),
                                               encoded_items.begin(),
                                               encoded_items.end());
+              if (cluster.compressed_items.size() > kMaxItemsPerCluster) {
+                  const size_t excess =
+                      cluster.compressed_items.size() - kMaxItemsPerCluster;
+                  cluster.compressed_items.erase(
+                      cluster.compressed_items.begin(),
+                      cluster.compressed_items.begin() +
+                          static_cast<std::ptrdiff_t>(excess));
+              }
               cluster.items.clear();
           }
       }
@@ -414,18 +500,27 @@ void MemorySystem::run_auto_dream() {
 }
 
 void MemorySystem::add_message(const Message &msg) {
+    if (msg.role.empty()) {
+        throw std::invalid_argument("Message role must not be empty");
+    }
+    const std::vector<uint8_t> serialized = serialize_message(msg);
+    if (serialized.size() > 16ull * 1024ull * 1024ull) {
+        throw std::invalid_argument("Serialized message exceeds 16 MiB");
+    }
     std::lock_guard<std::mutex> lock(memory_mutex);
-    conversation_history.push_back(msg);
-    microcompact_messages();
     if (causal_store) {
-        causal_store->append("messages", serialize_message(msg));
+        causal_store->append("messages", serialized);
+    } else if (oxtamem_store && !oxtamem_store->write("messages", serialized)) {
+        throw std::runtime_error("OxtaMem message write failed");
     }
-    if (oxtamem_store) {
-        oxtamem_store->write("messages", serialize_message(msg));
-    }
+    conversation_history.push_back(msg);
+    microcompact_messages_locked();
 }
 
 std::vector<Message> MemorySystem::recall_recent_messages(size_t depth) const {
+    if (depth > 1024) {
+        throw std::invalid_argument("Message recall depth exceeds 1024");
+    }
     std::lock_guard<std::mutex> lock(memory_mutex);
     std::vector<Message> messages;
 
@@ -451,13 +546,18 @@ std::vector<Message> MemorySystem::recall_recent_messages(size_t depth) const {
     }
     const size_t begin =
         conversation_history.size() > depth ? conversation_history.size() - depth : 0;
-    messages.insert(messages.end(),
-                    conversation_history.begin() + static_cast<std::ptrdiff_t>(begin),
-                    conversation_history.end());
+    for (size_t index = conversation_history.size(); index > begin; --index) {
+        messages.push_back(conversation_history[index - 1]);
+    }
     return messages;
 }
 
 void MemorySystem::microcompact_messages() {
+    std::lock_guard<std::mutex> lock(memory_mutex);
+    microcompact_messages_locked();
+}
+
+void MemorySystem::microcompact_messages_locked() {
     if (conversation_history.size() > 20) {
         // Snipping oldest messages
         conversation_history.erase(conversation_history.begin(), conversation_history.begin() + 10);
@@ -479,7 +579,12 @@ void MemorySystem::run_ultra_compact() {
             std::vector<std::vector<float>> decoded_items;
             for (const auto& comp : cluster.compressed_items) {
                 try {
-                    decoded_items.push_back(tq_engine->decode(comp));
+                    auto decoded = tq_engine->decode(comp);
+                    if (decoded.size() == static_cast<size_t>(chunk_size) &&
+                        std::all_of(decoded.begin(), decoded.end(),
+                                    [](float value) { return std::isfinite(value); })) {
+                        decoded_items.push_back(std::move(decoded));
+                    }
                 } catch (const std::exception& error) {
                     std::cerr << "[MemorySystem] UltraCompact decode failed: "
                               << error.what() << "\n";
@@ -489,7 +594,7 @@ void MemorySystem::run_ultra_compact() {
             if (decoded_items.empty()) continue;
 
             // 2. Compute Weighted Average (Centroid Rollup)
-            size_t dim = decoded_items[0].size();
+            const size_t dim = static_cast<size_t>(chunk_size);
             std::vector<float> rollup(dim, 0.0f);
             for (const auto& item : decoded_items) {
                 for (size_t i = 0; i < dim; ++i) rollup[i] += item[i];
@@ -503,8 +608,14 @@ void MemorySystem::run_ultra_compact() {
                 cluster.compressed_items.push_back(new_centroid_compressed);
                 
                 // Update the floating-point centroid tensor too
-                float* c_data = cluster.centroid.data();
-                for (size_t i = 0; i < dim; ++i) c_data[i] = rollup[i];
+                Tensor centroid_cpu = cluster.centroid.get_device() == Device::GPU
+                                          ? cluster.centroid.cpu()
+                                          : cluster.centroid;
+                if (centroid_cpu.size == static_cast<int64_t>(dim)) {
+                    float* c_data = centroid_cpu.data();
+                    for (size_t i = 0; i < dim; ++i) c_data[i] = rollup[i];
+                    cluster.centroid = std::move(centroid_cpu);
+                }
                 
                 std::cout << "[UltraCompact] Cluster consolidated into 1 summarized state.\n";
             } catch (const std::exception& error) {

@@ -15,7 +15,11 @@ combine model-driven novelty with memory-driven novelty.
 """
 
 from __future__ import annotations
+import math
 from typing import Optional, Sequence
+
+VECTOR_DIMENSIONS = 128
+MAX_VALUE_BYTES = 16 * 1024 * 1024
 
 
 class SelectiveWriter:
@@ -45,6 +49,8 @@ class SelectiveWriter:
     ) -> None:
         if not (0.0 <= novelty_threshold <= 2.0):
             raise ValueError("novelty_threshold must be in [0, 2] (cosine distance)")
+        if not math.isfinite(float(surprise_floor)):
+            raise ValueError("surprise_floor must be finite")
         self.engine = engine
         self.novelty_threshold = float(novelty_threshold)
         self.surprise_floor = float(surprise_floor)
@@ -71,10 +77,24 @@ class SelectiveWriter:
         (distance >= novelty_threshold), OR an external ``extra_surprise`` score
         clears ``surprise_floor``.
         """
+        if not isinstance(token_id, str) or not token_id or "\x00" in token_id:
+            raise ValueError("token_id must be a non-empty string without NUL")
+        if len(token_id.encode("utf-8")) > 1024:
+            raise ValueError("token_id exceeds 1024 UTF-8 bytes")
+        if not isinstance(value, bytes) or len(value) > MAX_VALUE_BYTES:
+            raise ValueError("value must be bytes no larger than 16 MiB")
+        vector = [float(component) for component in vector]
+        norm_squared = sum(component * component for component in vector)
+        if (len(vector) != VECTOR_DIMENSIONS or not all(map(math.isfinite, vector))
+                or not math.isfinite(norm_squared) or norm_squared <= 1e-12):
+            raise ValueError("vector must contain exactly 128 finite values and have non-zero norm")
+        if extra_surprise is not None and not math.isfinite(float(extra_surprise)):
+            raise ValueError("extra_surprise must be finite when provided")
+
         self.seen += 1
 
         if extra_surprise is not None and extra_surprise >= self.surprise_floor:
-            self.engine.write_with_vector(token_id, value, list(vector))
+            self.engine.write_with_vector(token_id, value, vector)
             self.written += 1
             return True
 
@@ -83,7 +103,7 @@ class SelectiveWriter:
             self.skipped += 1
             return False
 
-        self.engine.write_with_vector(token_id, value, list(vector))
+        self.engine.write_with_vector(token_id, value, vector)
         self.written += 1
         return True
 

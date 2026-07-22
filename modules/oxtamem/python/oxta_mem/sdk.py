@@ -10,6 +10,7 @@ except ImportError:
 
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 MAX_RECALL_DEPTH = 1024
+MAX_KEY_BYTES = 1024
 
 class GeodesicClient:
     """
@@ -28,18 +29,27 @@ class GeodesicClient:
             import redis
             host = kwargs.get("host", "localhost")
             port = kwargs.get("port", 6379)
+            if not isinstance(host, str) or not host or not (1 <= int(port) <= 65535):
+                raise ValueError("redis host/port are invalid")
             password = kwargs.get("password", kwargs.get("auth_token"))
             self.conn = redis.Redis(
                 host=host,
                 port=port,
                 password=password,
                 decode_responses=False,
+                socket_connect_timeout=float(kwargs.get("connect_timeout", 5.0)),
+                socket_timeout=float(kwargs.get("socket_timeout", 10.0)),
+                ssl=bool(kwargs.get("ssl", False)),
             )
         elif driver == "native":
             # Assumes geodesic_engine is built and installed in python path
             from .native import PyGeodesicEngine
             path = kwargs.get("db_path", "geodesic.db")
             size = kwargs.get("size_mb", 100)
+            if not isinstance(path, str) or not path or "\x00" in path:
+                raise ValueError("db_path must be a non-empty string without NUL")
+            if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= 32768:
+                raise ValueError("size_mb must be an integer in 1..32768")
             self.conn = PyGeodesicEngine(path, size)
         else:
             raise ValueError("Unknown driver. Use 'redis' or 'native'")
@@ -78,7 +88,7 @@ class GeodesicClient:
 
         if data is None or isinstance(data, (bool, int, float, list, dict)):
             payload = b"JSON:" + json.dumps(
-                data, separators=(",", ":"), ensure_ascii=False
+                data, separators=(",", ":"), ensure_ascii=False, allow_nan=False
             ).encode("utf-8")
             if len(payload) > MAX_PAYLOAD_BYTES:
                 raise ValueError("serialized payload exceeds the 16 MiB limit")
@@ -117,6 +127,7 @@ class GeodesicClient:
 
     def save(self, key: str, value):
         """Saves any object (Tensor, Array, Dict) to the timeline."""
+        self._validate_key(key)
         payload = self._serialize(value)
 
         if self.driver_type == "redis":
@@ -126,6 +137,7 @@ class GeodesicClient:
 
     def load_latest(self, key: str):
         """Retrieves the latest state of the object."""
+        self._validate_key(key)
         if self.driver_type == "redis":
             data = self.conn.get(key)
         else:
@@ -136,6 +148,7 @@ class GeodesicClient:
 
     def recall_history(self, key: str, depth: int):
         """Returns a list of states (time travel)."""
+        self._validate_key(key)
         depth = int(depth)
         if depth < 0 or depth > MAX_RECALL_DEPTH:
             raise ValueError("depth must be between 0 and 1024")
@@ -144,3 +157,10 @@ class GeodesicClient:
         else:
             raw_list = self.conn.recall(key, depth)
         return [self._deserialize(x) for x in raw_list]
+
+    @staticmethod
+    def _validate_key(key: str):
+        if not isinstance(key, str) or not key or "\x00" in key:
+            raise ValueError("key must be a non-empty string without NUL")
+        if len(key.encode("utf-8")) > MAX_KEY_BYTES:
+            raise ValueError("UTF-8 key exceeds 1024 bytes")

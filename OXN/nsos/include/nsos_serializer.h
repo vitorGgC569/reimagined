@@ -89,6 +89,14 @@ public:
             fs.write((char*)&len, 4);
             fs.write(abs_name.c_str(), len);
         }
+        fs.flush();
+        if (!fs) {
+            throw std::runtime_error("Checkpoint write/flush failed");
+        }
+        fs.close();
+        if (!fs) {
+            throw std::runtime_error("Checkpoint close failed");
+        }
     }
 
     static void load(JambaModel* model, const std::string& filename, bool strict = true) {

@@ -86,6 +86,7 @@ public:
   void to(Device dev);
   std::vector<Parameter *> parameters();
   void set_streaming_mode(bool enabled);
+  void set_training_mode(bool enabled) { training_mode_ = enabled; }
   bool streaming_mode() const { return streaming_inference_; }
   // True when the corrected selective-SSM path is active.  Used to gate batched
   // fork/restore streaming (that path snapshots only the legacy [1,d_model]
@@ -256,6 +257,9 @@ private:
   };
   static thread_local ThreadBuffers buffers_;
   bool streaming_inference_ = false;
+  bool training_mode_ = true;
+  bool faithful_recompute_active_ = false;
+  Tensor faithful_checkpoint_input_;
   std::shared_ptr<Tensor> streaming_state_;
   size_t gpu_fast_path_hits_ = 0;
   size_t gpu_fast_path_fallbacks_ = 0;

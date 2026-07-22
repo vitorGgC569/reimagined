@@ -67,6 +67,21 @@ Tensor sparse_selective_attention(const Tensor& Q, const Tensor& K,
                                   SparseAttentionStats* stats = nullptr,
                                   const Tensor* Wsel = nullptr);
 
+struct SparseAttentionBackwardResult {
+  Tensor dQ;
+  Tensor dK;
+  Tensor dV;
+};
+
+// Exact VJP of sparse_selective_attention for the selected attention graph.
+// The discrete top-k block choice is treated as stop-gradient; Q/K/V gradients
+// exactly match the sparse forward executed for that fixed selection.  Wsel is
+// trained by the differentiable block-mass distillation objective below.
+SparseAttentionBackwardResult sparse_selective_attention_backward(
+    const Tensor& Q, const Tensor& K, const Tensor& V,
+    const SparseAttentionConfig& cfg, const Tensor& dOut,
+    const Tensor* Wsel = nullptr);
+
 // ── Learned block selection (training-time, differentiable) ──
 // The fixed mean-key router above is training-free.  Here a LEARNABLE scorer
 // `Wsel` ([d, d]) projects the query (q_sel = Wsel @ q); the block relevance
