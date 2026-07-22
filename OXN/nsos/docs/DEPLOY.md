@@ -1,41 +1,82 @@
 # Deployment Guidance
 
-> **Status:** **skeleton (Phase 0 PR-0.3)**. Full content (TLS guidance, healthcheck wiring, reverse proxy snippets, FFI failure handling) lands in **Phase 4**.
->
-> Until Phase 4 lands, this file is the placeholder pointer; if you need to deploy today, follow the constraints listed under "Hard constraints" below — they apply already.
+`nsos_api_server` is the only supported HTTP serving binary. The retired
+`src/server.cpp` demonstration is intentionally non-operational.
 
----
+## Required security posture
 
-## Hard constraints (apply now, will not change)
+- Token authentication is mandatory. Use `NSOS_API_TOKEN` or `--auth-token`.
+  The only exception is explicit `--allow-unauthenticated-local` on loopback.
+- Non-loopback binding is accepted only behind a TLS-terminating proxy and
+  requires all of `--trust-proxy-headers`, `--require-tls-proxy-header`, and
+  `--trusted-proxy-ips <ip[,ip...]>`. Forwarded headers from any other peer are
+  ignored and cannot assert HTTPS or choose a rate-limit identity.
+- Use an authentication token of at least 16 bytes outside loopback.
+- Administrative training and pack endpoints are disabled unless
+  `--enable-admin-endpoints` is supplied. Keep them disabled on public serving
+  processes.
+- Wildcard CORS is opt-in through `--allow-cors` and is intended only for local
+  or separately protected deployments.
 
-These are the constraints the supported product currently enforces; deployments outside them are unsupported.
-
-- **Authentication** — `nsos_api_server` enforces token auth when `--host` is not loopback. Required env var (or flag): `NSOS_API_TOKEN` / `--auth-token`. No bypass except `--allow-unauthenticated-local` and only when explicitly set.
-- **Admin endpoints** — `/train-text`, `/train-batch`, `/train-corpus`, `/pack` are gated behind `--enable-admin-endpoints`. They must remain off in any deployment that exposes the port outside trusted infrastructure.
-- **TLS** — TLS termination is the responsibility of a reverse proxy (nginx, caddy, cloud load balancer). The product reads `X-Forwarded-Proto` only when `--require-tls-proxy-header` is set. Running `nsos_api_server` directly on a public interface is **not supported**.
-- **OxtaMem companion** — must remain loopback-bound (`127.0.0.1`) by default. Authentication required for non-loopback. Frame, connection, and timeout limits are documented in `modules/oxtamem/oxta_engine/src/main.rs` and must not be raised without a documented threat model.
-- **Resource limits** — request body size, header size, queue depth, rate-limit, and per-request timeouts are configured in `OXN/nsos/src/api_server.cpp::ApiServerConfig`. Do not raise them silently; document any change.
-- **Pack root** — when `nsos_api_server` is started with admin endpoints, set `--pack-root` to a directory whose canonicalized path stays inside a single configured root. The HTTP API rejects any pack target outside that root.
-
-## To be authored in Phase 4
-
-- **Healthcheck on HTTP** — Docker `HEALTHCHECK` invoking `curl -fsS http://127.0.0.1:${NSOS_PORT:-8080}/info -H "Authorization: Bearer ${NSOS_HEALTH_TOKEN}"`. The current Python-import-only healthcheck is to be replaced.
-- **Minimum nginx and caddy snippets** — terminating TLS and forwarding `X-Forwarded-Proto` to `nsos_api_server`.
-- **Reference hardware** — for `edge_throughput_tokens_per_second_cpu` measurement (Phase 6 scorecard threshold).
-- **OxtaMem FFI failure modes** — what to expect in logs when `oxtamem_create()` / `oxtamem_open()` fails, and how to choose between abort vs `--no-oxtamem` degraded mode (logging will be added in Phase 4.D).
-- **Build matrix** — supported OS / compiler combinations with checksums for the Dockerfile build context.
-- **Secrets handling** — recommendations for injecting `NSOS_API_TOKEN`, `NSOS_HEALTH_TOKEN`, `OXTAMEM_AUTH_TOKEN` (env vars vs secret managers).
-- **Operational runbook** — what to do when a release gate fails in production: rollback, log collection, and bisection.
-
-## Today: minimal Docker run
+Example behind a reverse proxy on `10.0.0.10`:
 
 ```sh
-docker build -t nsos-mvp .
-docker run --rm -d --name nsos \
-  -e NSOS_API_TOKEN=changeme \
-  -p 127.0.0.1:8080:8080 \
-  nsos-mvp
-curl -fsS http://127.0.0.1:8080/info -H "Authorization: Bearer changeme"
+nsos_api_server --model /models/pack \
+  --host 0.0.0.0 --port 8080 \
+  --auth-token "$NSOS_API_TOKEN" \
+  --trust-proxy-headers \
+  --require-tls-proxy-header \
+  --trusted-proxy-ips 10.0.0.10
 ```
 
-Note: this maps to `127.0.0.1` only. Do not bind `0.0.0.0` until you have a reverse proxy in front and `--require-tls-proxy-header` set.
+The proxy must overwrite, not append, `X-Forwarded-For` and
+`X-Forwarded-Proto`, and must send `X-Forwarded-Proto: https`.
+
+## Health and readiness
+
+- `GET /health` reports process liveness (`status=alive`).
+- `GET /ready` returns HTTP 200 only when workers, the loaded model, and the
+  inference replica pool are initialized. It returns HTTP 503 otherwise.
+- `GET /metrics` requires authentication unless the deployment deliberately
+  changes the health authentication policy.
+
+## Resource controls
+
+Keep finite bounds for headers, bodies, worker queue, socket timeout,
+generation tokens, batch prompts, training sizes, rate-limit clients, and SSE
+pending bytes. Relevant CLI controls include:
+
+- `--max-header-bytes`, `--max-body-bytes`, `--max-queue-depth`
+- `--rate-limit-rpm`, `--max-rate-limit-clients`
+- `--max-stream-pending-bytes`, `--socket-timeout-ms`
+- `--max-generate-tokens`, `--max-request-context`, `--max-batch-prompts`
+- the `--max-train-*` family
+
+SSE generation applies bounded backpressure. A disconnected or stalled client
+cannot grow an unbounded token queue.
+
+## Model packs
+
+Set `--pack-root` to a dedicated directory. Relative pack targets are
+canonicalized beneath it; path traversal and symlink escape are rejected.
+Absolute output paths remain disabled unless explicitly enabled. Pack children
+are durably flushed and atomically replaced, with the checksummed manifest
+published last.
+
+## OxtaMem
+
+The companion service is loopback-first and requires authentication outside
+loopback. Its durable mode uses a checksummed incremental metadata journal and
+periodic full snapshots. `set_sync_on_write(false)` is only for bulk ingestion
+that accepts loss of writes since the last explicit `flush()` after a crash.
+
+## Local-only example
+
+```sh
+nsos_api_server --model /models/pack \
+  --host 127.0.0.1 --port 8080 \
+  --auth-token "$NSOS_API_TOKEN"
+curl -fsS http://127.0.0.1:8080/ready
+curl -fsS http://127.0.0.1:8080/info \
+  -H "Authorization: Bearer $NSOS_API_TOKEN"
+```

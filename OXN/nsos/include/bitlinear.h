@@ -117,6 +117,12 @@ public:
   }
   bool training_mode() const { return training_mode_; }
 
+  // Release only activation state retained for backward.  This is used by
+  // layer-level gradient checkpointing after a forward result has been
+  // produced: parameters, packed weights and inference caches remain intact,
+  // while the next backward explicitly recomputes these activations.
+  void discard_backward_state();
+
   Tensor forward(const Tensor &input);
   Tensor backward(const Tensor &grad_output);
   void to(Device dev);
@@ -128,11 +134,17 @@ public:
   int output_features() const { return out_features; }
   bool uses_bias() const { return use_bias; }
   BitLinearPackedState export_packed_state() const;
+  // Bytes owned by packed/inference caches, excluding public Parameters
+  // (which callers account separately).
+  size_t auxiliary_memory_usage_bytes() const;
   void import_packed_state(const BitLinearPackedState& state,
                            Device dev = Device::CPU,
                            bool release_full_precision = false);
   Tensor quantize_weights(const Tensor &w_float); // SOTA for benchmarks/tests
-  void add_qat_regularization_grad(float regularization);
+  // Adds regularization * (W - stopgrad(Q(W))) to weight.grad and returns that
+  // exact penalty-gradient tensor so Trainer can reduce the matching scalar
+  // objective with one device synchronization for the whole model.
+  Tensor add_qat_regularization_grad(float regularization);
 
 private:
   Tensor quantize_activations_bitnet(const Tensor &x,

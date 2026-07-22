@@ -17,6 +17,7 @@ static bool test_kan_wired() {
   std::cout << "[KAN] ";
   ModelConfig cfg;
   cfg.num_layers = 3; cfg.d_model = 64; cfg.vocab_size = 128;
+  cfg.n_heads = 8; cfg.n_kv_heads = 4;
   cfg.mamba2_faithful = false;  // isolate the legacy dense-FFN/KAN switch
   cfg.use_kan = true;
   JambaModel model(cfg, Device::CPU);
@@ -57,6 +58,7 @@ static bool test_kan_wired() {
 static bool test_kan_off_preserves_dense() {
   ModelConfig cfg;
   cfg.num_layers = 2; cfg.d_model = 64; cfg.vocab_size = 128;
+  cfg.n_heads = 8; cfg.n_kv_heads = 4;
   cfg.mamba2_faithful = false;  // legacy mode is the dense-FFN baseline
   cfg.use_kan = false;
   JambaModel model(cfg, Device::CPU);

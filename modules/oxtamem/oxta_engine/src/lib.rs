@@ -8,6 +8,9 @@ use std::ffi::{CStr, c_char};
 use std::ptr;
 use std::slice;
 use std::sync::Mutex;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+pub const OXTAMEM_ABI_VERSION: u32 = 1;
 
 #[pymodule]
 fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -77,7 +80,7 @@ impl PyGeodesicEngine {
             .collect())
     }
 
-    // Defer per-write metadata fsync (huge throughput win for bulk ingestion);
+    // Defer the per-write journal fsync (useful for bulk ingestion);
     // call flush() to persist. See GeodesicEngine::set_sync_on_write.
     fn set_sync_on_write(&mut self, sync_on_write: bool) {
         self.inner.set_sync_on_write(sync_on_write);
@@ -140,21 +143,28 @@ fn cstr_to_string(ptr: *const c_char) -> Option<String> {
     c_str.to_str().ok().map(|s| s.to_string())
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn oxtamem_abi_version() -> u32 {
+    OXTAMEM_ABI_VERSION
+}
+
 /// # Safety
 ///
 /// `path` must be a valid, NUL-terminated C string pointer for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxtamem_create(path: *const c_char, size_mb: u64) -> *mut OxtaMemHandle {
-    let Some(path_string) = cstr_to_string(path) else {
-        return ptr::null_mut();
-    };
-
-    match GeodesicEngine::new(path_string, size_mb) {
-        Ok(engine) => Box::into_raw(Box::new(OxtaMemHandle {
-            inner: Mutex::new(engine),
-        })),
-        Err(_) => ptr::null_mut(),
-    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(path_string) = cstr_to_string(path) else {
+            return ptr::null_mut();
+        };
+        match GeodesicEngine::new(path_string, size_mb) {
+            Ok(engine) => Box::into_raw(Box::new(OxtaMemHandle {
+                inner: Mutex::new(engine),
+            })),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 /// # Safety
@@ -165,9 +175,9 @@ pub unsafe extern "C" fn oxtamem_destroy(handle: *mut OxtaMemHandle) {
     if handle.is_null() {
         return;
     }
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         drop(Box::from_raw(handle));
-    }
+    }));
 }
 
 /// # Safety
@@ -181,19 +191,26 @@ pub unsafe extern "C" fn oxtamem_write(
     value: *const u8,
     value_len: usize,
 ) -> bool {
-    if handle.is_null() || value.is_null() || value_len > MAX_VALUE_BYTES {
-        return false;
-    }
-
-    let Some(token) = cstr_to_string(token_id) else {
-        return false;
-    };
-    let payload = unsafe { slice::from_raw_parts(value, value_len) }.to_vec();
-    let guard = unsafe { &*handle };
-    match guard.inner.lock() {
-        Ok(mut engine) => engine.write(&token, payload).is_ok(),
-        Err(_) => false,
-    }
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() || (value.is_null() && value_len != 0) ||
+            value_len > MAX_VALUE_BYTES {
+            return false;
+        }
+        let Some(token) = cstr_to_string(token_id) else {
+            return false;
+        };
+        let payload = if value_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(value, value_len) }.to_vec()
+        };
+        let guard = unsafe { &*handle };
+        match guard.inner.lock() {
+            Ok(mut engine) => engine.write(&token, payload).is_ok(),
+            Err(_) => false,
+        }
+    }))
+    .unwrap_or(false)
 }
 
 /// # Safety
@@ -208,22 +225,25 @@ pub unsafe extern "C" fn oxtamem_read_latest(
     out_data: *mut *mut u8,
     out_len: *mut usize,
 ) -> bool {
-    if handle.is_null() {
-        return false;
-    }
-
-    let Some(token) = cstr_to_string(token_id) else {
-        return false;
-    };
-    let guard = unsafe { &*handle };
-    let Ok(engine) = guard.inner.lock() else {
-        return false;
-    };
-
-    match engine.read_latest(&token) {
-        Some(node) => write_allocated_buffer(node.value, out_data, out_len),
-        None => false,
-    }
+    catch_unwind(AssertUnwindSafe(|| {
+        if !out_data.is_null() { unsafe { *out_data = ptr::null_mut() }; }
+        if !out_len.is_null() { unsafe { *out_len = 0 }; }
+        if handle.is_null() || out_data.is_null() || out_len.is_null() {
+            return false;
+        }
+        let Some(token) = cstr_to_string(token_id) else {
+            return false;
+        };
+        let guard = unsafe { &*handle };
+        let Ok(engine) = guard.inner.lock() else {
+            return false;
+        };
+        match engine.read_latest(&token) {
+            Some(node) => write_allocated_buffer(node.value, out_data, out_len),
+            None => false,
+        }
+    }))
+    .unwrap_or(false)
 }
 
 /// # Safety
@@ -239,27 +259,31 @@ pub unsafe extern "C" fn oxtamem_recall(
     out_data: *mut *mut u8,
     out_len: *mut usize,
 ) -> bool {
-    if handle.is_null() {
-        return false;
-    }
-
-    let Some(token) = cstr_to_string(token_id) else {
-        return false;
-    };
-    let guard = unsafe { &*handle };
-    let Ok(engine) = guard.inner.lock() else {
-        return false;
-    };
-
-    let payloads = engine
-        .recall(&token, depth)
-        .into_iter()
-        .map(|node| node.value)
-        .collect::<Vec<_>>();
-    match serialize_nodes(payloads) {
-        Some(encoded) => write_allocated_buffer(encoded, out_data, out_len),
-        None => false,
-    }
+    catch_unwind(AssertUnwindSafe(|| {
+        if !out_data.is_null() { unsafe { *out_data = ptr::null_mut() }; }
+        if !out_len.is_null() { unsafe { *out_len = 0 }; }
+        if handle.is_null() || out_data.is_null() || out_len.is_null() ||
+            depth > crate::engine::MAX_RECALL_DEPTH {
+            return false;
+        }
+        let Some(token) = cstr_to_string(token_id) else {
+            return false;
+        };
+        let guard = unsafe { &*handle };
+        let Ok(engine) = guard.inner.lock() else {
+            return false;
+        };
+        let payloads = engine
+            .recall(&token, depth)
+            .into_iter()
+            .map(|node| node.value)
+            .collect::<Vec<_>>();
+        match serialize_nodes(payloads) {
+            Some(encoded) => write_allocated_buffer(encoded, out_data, out_len),
+            None => false,
+        }
+    }))
+    .unwrap_or(false)
 }
 
 /// # Safety
@@ -271,7 +295,7 @@ pub unsafe extern "C" fn oxtamem_free_buffer(data: *mut u8, len: usize) {
         return;
     }
 
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         drop(Vec::from_raw_parts(data, len, len));
-    }
+    }));
 }

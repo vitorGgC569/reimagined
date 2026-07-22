@@ -252,6 +252,8 @@ int main() {
         config.num_layers = 1;
         config.d_model = 64;
         config.vocab_size = 128;
+        config.n_heads = 8;
+        config.n_kv_heads = 4;
         config.max_context_tokens = 256;
 
         InferenceEngine engine;

@@ -2,7 +2,9 @@
 
 #include <exception>
 #include <cstdlib>
+#include <charconv>
 #include <iostream>
+#include <limits>
 #include <string>
 
 using namespace nsos;
@@ -11,8 +13,11 @@ namespace {
 
 std::string value_after_flag(int argc, char* argv[], const std::string& flag,
                              const std::string& fallback = "") {
-    for (int i = 1; i + 1 < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         if (flag == argv[i]) {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("missing value for " + flag);
+            }
             return argv[i + 1];
         }
     }
@@ -33,11 +38,14 @@ int int_after_flag(int argc, char* argv[], const std::string& flag, int fallback
     if (value.empty()) {
         return fallback;
     }
-    try {
-        return std::stoi(value);
-    } catch (const std::exception&) {
-        return fallback;
+    int parsed = 0;
+    const char* first = value.data();
+    const char* last = first + value.size();
+    const auto result = std::from_chars(first, last, parsed, 10);
+    if (result.ec != std::errc{} || result.ptr != last) {
+        throw std::runtime_error("invalid integer value for " + flag + ": " + value);
     }
+    return parsed;
 }
 
 std::string env_or_empty(const char* key) {
@@ -45,8 +53,26 @@ std::string env_or_empty(const char* key) {
     return value ? std::string(value) : std::string();
 }
 
+std::vector<std::string> comma_separated_values(const std::string& value) {
+    std::vector<std::string> values;
+    size_t cursor = 0;
+    while (cursor < value.size()) {
+        const size_t separator = value.find(',', cursor);
+        const size_t end = separator == std::string::npos ? value.size() : separator;
+        const std::string item = value.substr(cursor, end - cursor);
+        if (item.empty()) {
+            throw std::runtime_error("trusted proxy IP list contains an empty entry");
+        }
+        values.push_back(item);
+        if (separator == std::string::npos) break;
+        cursor = separator + 1;
+    }
+    return values;
+}
+
 bool is_loopback_host(const std::string& host) {
-    return host.empty() || host == "localhost" || host == "127.0.0.1" || host == "::1";
+    return host.empty() || host == "localhost" || host == "localhost." ||
+           host == "127.0.0.1" || host == "::1" || host == "0:0:0:0:0:0:0:1";
 }
 
 void validate_server_config(const HttpApiServerConfig& config) {
@@ -64,6 +90,18 @@ void validate_server_config(const HttpApiServerConfig& config) {
     }
     if (config.require_tls_proxy_header && !config.trust_proxy_headers) {
         throw std::runtime_error("--require-tls-proxy-header requires --trust-proxy-headers");
+    }
+    if (config.trust_proxy_headers && config.trusted_proxy_ips.empty()) {
+        throw std::runtime_error(
+            "--trust-proxy-headers requires --trusted-proxy-ips with exact proxy peers");
+    }
+    if (!loopback && (!config.require_tls_proxy_header || !config.trust_proxy_headers)) {
+        throw std::runtime_error(
+            "non-loopback HTTP API requires --trust-proxy-headers and "
+            "--require-tls-proxy-header behind a trusted TLS terminator");
+    }
+    if (!loopback && config.auth_token.size() < 16) {
+        throw std::runtime_error("non-loopback HTTP API requires an auth token of at least 16 bytes");
     }
 }
 
@@ -103,6 +141,12 @@ int main(int argc, char* argv[]) {
         server_config.rate_limit_requests_per_minute =
             static_cast<size_t>(int_after_flag(argc, argv, "--rate-limit-rpm",
                                                static_cast<int>(server_config.rate_limit_requests_per_minute)));
+        server_config.max_rate_limit_clients =
+            static_cast<size_t>(int_after_flag(argc, argv, "--max-rate-limit-clients",
+                                               static_cast<int>(server_config.max_rate_limit_clients)));
+        server_config.max_stream_pending_bytes =
+            static_cast<size_t>(int_after_flag(argc, argv, "--max-stream-pending-bytes",
+                                               static_cast<int>(server_config.max_stream_pending_bytes)));
         server_config.socket_timeout_ms =
             int_after_flag(argc, argv, "--socket-timeout-ms", server_config.socket_timeout_ms);
         server_config.max_generate_tokens =
@@ -148,6 +192,11 @@ int main(int argc, char* argv[]) {
         }
         if (has_flag(argc, argv, "--trust-proxy-headers")) {
             server_config.trust_proxy_headers = true;
+        }
+        const std::string trusted_proxy_ips =
+            value_after_flag(argc, argv, "--trusted-proxy-ips", "");
+        if (!trusted_proxy_ips.empty()) {
+            server_config.trusted_proxy_ips = comma_separated_values(trusted_proxy_ips);
         }
         if (has_flag(argc, argv, "--require-tls-proxy-header")) {
             server_config.require_tls_proxy_header = true;

@@ -5,7 +5,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cctype>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +15,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -20,6 +23,15 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -79,16 +91,87 @@ std::filesystem::path atomic_temp_path(const std::filesystem::path& path) {
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 }
 
+void sync_file_to_storage(const std::filesystem::path& path) {
+#ifdef _WIN32
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("Could not open file for durable flush: " + path.string());
+    }
+    const BOOL flushed = FlushFileBuffers(handle);
+    const DWORD error = flushed ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    if (!flushed) {
+        throw std::runtime_error("Could not durably flush file: " + path.string() +
+                                 " (Win32 error " + std::to_string(error) + ")");
+    }
+#else
+    const int descriptor = ::open(path.c_str(), O_RDONLY);
+    if (descriptor < 0) {
+        throw std::runtime_error("Could not open file for durable flush: " + path.string());
+    }
+    const int result = ::fsync(descriptor);
+    const int saved_errno = errno;
+    ::close(descriptor);
+    if (result != 0) {
+        throw std::runtime_error("Could not durably flush file: " + path.string() +
+                                 ": " + std::strerror(saved_errno));
+    }
+#endif
+}
+
+void sync_parent_directory(const std::filesystem::path& path) {
+#ifndef _WIN32
+    const std::filesystem::path parent = path.parent_path().empty()
+                                             ? std::filesystem::path(".")
+                                             : path.parent_path();
+    const int descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if (descriptor < 0) {
+        throw std::runtime_error("Could not open directory for durable flush: " +
+                                 parent.string());
+    }
+    const int result = ::fsync(descriptor);
+    const int saved_errno = errno;
+    ::close(descriptor);
+    if (result != 0) {
+        throw std::runtime_error("Could not durably flush directory: " + parent.string() +
+                                 ": " + std::strerror(saved_errno));
+    }
+#else
+    (void)path;
+    // MoveFileExW(..., MOVEFILE_WRITE_THROUGH) below supplies the corresponding
+    // Windows durability guarantee for the rename and directory metadata.
+#endif
+}
+
 void replace_file(const std::filesystem::path& temp_path, const std::filesystem::path& final_path) {
+    try {
+        sync_file_to_storage(temp_path);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temp_path, ignored);
+        throw;
+    }
+#ifdef _WIN32
+    if (!MoveFileExW(temp_path.c_str(), final_path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        std::filesystem::remove(temp_path);
+        throw std::runtime_error(
+            "Could not atomically replace file: " + final_path.string() +
+            " (Win32 error " + std::to_string(error) + ")");
+    }
+#else
     std::error_code ec;
-    std::filesystem::remove(final_path, ec);
-    ec.clear();
     std::filesystem::rename(temp_path, final_path, ec);
     if (ec) {
         std::filesystem::remove(temp_path);
         throw std::runtime_error("Could not atomically replace file: " + final_path.string() +
                                  ": " + ec.message());
     }
+#endif
+    sync_parent_directory(final_path);
 }
 
 void ensure_regular_file_within_limit(const std::filesystem::path& path,
@@ -124,7 +207,20 @@ std::filesystem::path pack_child_path(const std::filesystem::path& pack_root,
     if (child.empty() || child.is_absolute() || path_has_parent_traversal(child)) {
         throw std::runtime_error("Model pack manifest contains unsafe " + label + " path");
     }
-    return (pack_root / child).lexically_normal();
+    std::error_code ec;
+    const fs::path canonical_root = fs::weakly_canonical(pack_root, ec);
+    if (ec) {
+        throw std::runtime_error("Could not canonicalize model pack root");
+    }
+    const fs::path candidate = fs::weakly_canonical(pack_root / child, ec);
+    if (ec) {
+        throw std::runtime_error("Could not canonicalize model pack " + label + " path");
+    }
+    const fs::path relative = candidate.lexically_relative(canonical_root);
+    if (relative.empty() || relative.is_absolute() || path_has_parent_traversal(relative)) {
+        throw std::runtime_error("Model pack " + label + " resolves outside the pack root");
+    }
+    return candidate;
 }
 
 std::unordered_map<std::string, std::string> read_key_value_file(const std::filesystem::path& path) {
@@ -136,16 +232,31 @@ std::unordered_map<std::string, std::string> read_key_value_file(const std::file
     }
 
     std::string line;
+    size_t line_number = 0;
     while (std::getline(input, line)) {
+        ++line_number;
         line = trim_copy(line);
         if (line.empty() || line[0] == '#') {
             continue;
         }
         const auto sep = line.find('=');
         if (sep == std::string::npos) {
-            continue;
+            throw std::runtime_error(
+                "Malformed key/value line " + std::to_string(line_number) +
+                " in " + path.string());
         }
-        values.emplace(trim_copy(line.substr(0, sep)), trim_copy(line.substr(sep + 1)));
+        const std::string key = trim_copy(line.substr(0, sep));
+        if (key.empty()) {
+            throw std::runtime_error(
+                "Empty key on line " + std::to_string(line_number) +
+                " in " + path.string());
+        }
+        const auto [unused, inserted] = values.emplace(
+            key, trim_copy(line.substr(sep + 1)));
+        if (!inserted) {
+            throw std::runtime_error(
+                "Duplicate key '" + key + "' in " + path.string());
+        }
     }
     return values;
 }
@@ -397,7 +508,9 @@ void write_model_config(const std::filesystem::path& path, const ModelConfig& co
             {"dropout", std::to_string(config.dropout)},
             {"mcts_simulations", std::to_string(config.mcts_simulations)},
             {"mcts_depth", std::to_string(config.mcts_depth)},
-            {"checkpoint_path", config.checkpoint_path},
+            // A model pack is self-contained; persisting a machine-local
+            // checkpoint path leaks host layout and can inject config lines.
+            {"checkpoint_path", ""},
             {"max_context_tokens", std::to_string(config.max_context_tokens)},
             {"default_batch_size", std::to_string(config.default_batch_size)},
             {"use_cuda", config.use_cuda ? "true" : "false"},
@@ -413,6 +526,7 @@ void write_model_config(const std::filesystem::path& path, const ModelConfig& co
             {"use_chrass", config.use_chrass ? "true" : "false"},
             {"chrass_density", std::to_string(config.chrass_density)},
             {"chrass_seed", std::to_string(config.chrass_seed)},
+            {"logit_l2_beta", std::to_string(config.logit_l2_beta)},
             {"pantheon_vib_beta", std::to_string(config.pantheon_vib_beta)},
             {"use_slender_embedding", config.use_slender_embedding ? "true" : "false"},
             {"mamba_proper_ssm", config.mamba_proper_ssm ? "true" : "false"},
@@ -434,20 +548,54 @@ ModelConfig read_model_config(const std::filesystem::path& path) {
         const auto it = values.find(key);
         if (it == values.end()) return fallback;
         const auto parsed = parse_integer(it->second);
-        return parsed ? static_cast<int>(*parsed) : fallback;
+        if (!parsed || *parsed < std::numeric_limits<int>::min() ||
+            *parsed > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("Invalid integer ModelConfig." + key);
+        }
+        return static_cast<int>(*parsed);
     };
     auto get_float = [&](const std::string& key, float fallback) {
         const auto it = values.find(key);
         if (it == values.end()) return fallback;
         try {
-            return std::stof(it->second);
+            const std::string value = trim_copy(it->second);
+            size_t consumed = 0;
+            const float parsed = std::stof(value, &consumed);
+            if (consumed != value.size()) {
+                throw std::runtime_error("trailing characters");
+            }
+            return parsed;
         } catch (const std::exception&) {
-            return fallback;
+            throw std::runtime_error("Invalid floating-point ModelConfig." + key);
         }
     };
     auto get_bool = [&](const std::string& key, bool fallback) {
         const auto it = values.find(key);
-        return it == values.end() ? fallback : parse_bool(it->second, fallback);
+        if (it == values.end()) return fallback;
+        std::string value = trim_copy(it->second);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        if (value == "1" || value == "true") return true;
+        if (value == "0" || value == "false") return false;
+        throw std::runtime_error("Invalid boolean ModelConfig." + key);
+    };
+    auto get_u32 = [&](const std::string& key, uint32_t fallback) {
+        const auto it = values.find(key);
+        if (it == values.end()) return fallback;
+        try {
+            const std::string value = trim_copy(it->second);
+            size_t consumed = 0;
+            const unsigned long long parsed = std::stoull(value, &consumed);
+            if (consumed != value.size() ||
+                parsed > std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error("out of range");
+            }
+            return static_cast<uint32_t>(parsed);
+        } catch (const std::exception&) {
+            throw std::runtime_error("Invalid uint32 ModelConfig." + key);
+        }
     };
     auto get_string = [&](const std::string& key, const std::string& fallback) {
         const auto it = values.find(key);
@@ -487,8 +635,8 @@ ModelConfig read_model_config(const std::filesystem::path& path) {
     config.use_kan = get_bool("use_kan", config.use_kan);
     config.use_chrass = get_bool("use_chrass", config.use_chrass);
     config.chrass_density = get_float("chrass_density", config.chrass_density);
-    config.chrass_seed = static_cast<uint32_t>(
-        get_int("chrass_seed", static_cast<int>(config.chrass_seed)));
+    config.chrass_seed = get_u32("chrass_seed", config.chrass_seed);
+    config.logit_l2_beta = get_float("logit_l2_beta", config.logit_l2_beta);
     config.pantheon_vib_beta = get_float("pantheon_vib_beta", config.pantheon_vib_beta);
     config.use_slender_embedding =
         get_bool("use_slender_embedding", config.use_slender_embedding);
@@ -513,27 +661,7 @@ ModelConfig read_model_config(const std::filesystem::path& path) {
 }
 
 void validate_model_config_for_pack(const ModelConfig& config) {
-    auto require_range = [](int value, int minimum, int maximum, const std::string& name) {
-        if (value < minimum || value > maximum) {
-            throw std::runtime_error("Model pack config field '" + name + "' must be between " +
-                                     std::to_string(minimum) + " and " +
-                                     std::to_string(maximum));
-        }
-    };
-    require_range(config.num_layers, 1, 512, "num_layers");
-    require_range(config.d_model, 8, 65536, "d_model");
-    require_range(config.vocab_size, 2, 2'000'000, "vocab_size");
-    require_range(config.n_heads, 1, 4096, "n_heads");
-    require_range(config.n_kv_heads, 1, 4096, "n_kv_heads");
-    require_range(config.sliding_window, 1, NSOS_MAX_SEQ_LEN, "sliding_window");
-    require_range(config.max_context_tokens, 1, NSOS_MAX_SEQ_LEN, "max_context_tokens");
-    require_range(config.default_batch_size, 1, 4096, "default_batch_size");
-    require_range(config.mamba_expand, 1, 8, "mamba_expand");
-    require_range(config.mamba_head_dim, 1, 4096, "mamba_head_dim");
-    require_range(config.mamba_n_groups, 1, 4096, "mamba_n_groups");
-    if (config.dropout < 0.0f || config.dropout >= 1.0f || !std::isfinite(config.dropout)) {
-        throw std::runtime_error("Model pack config field 'dropout' must be finite and in [0, 1)");
-    }
+    validate_model_config(config);
 }
 
 void apply_model_config_overrides(ModelConfig& base, const ModelConfig& overrides) {
@@ -593,6 +721,9 @@ void apply_model_config_overrides(ModelConfig& base, const ModelConfig& override
         base.chrass_density = overrides.chrass_density;
     }
     if (overrides.chrass_seed != defaults.chrass_seed) base.chrass_seed = overrides.chrass_seed;
+    if (std::abs(overrides.logit_l2_beta - defaults.logit_l2_beta) > 1e-9f) {
+        base.logit_l2_beta = overrides.logit_l2_beta;
+    }
     if (std::abs(overrides.pantheon_vib_beta - defaults.pantheon_vib_beta) > 1e-9f) {
         base.pantheon_vib_beta = overrides.pantheon_vib_beta;
     }
@@ -666,12 +797,76 @@ struct SamplerWorkspace {
     std::vector<int> banned;
 };
 
+float bounded_logit(float value) {
+    if (std::isnan(value)) {
+        return -1.0e30f;
+    }
+    if (value == std::numeric_limits<float>::infinity()) {
+        return 1.0e30f;
+    }
+    if (value == -std::numeric_limits<float>::infinity()) {
+        return -1.0e30f;
+    }
+    return std::clamp(value, -1.0e30f, 1.0e30f);
+}
+
+void validate_generation_options(const GenerationOptions& options,
+                                 int vocab_size) {
+    constexpr int kAbsoluteMaxGeneratedTokens = 1 << 20;
+    constexpr int kAbsoluteMaxContextTokens = 1 << 24;
+    if (options.max_tokens < 0 || options.max_tokens > kAbsoluteMaxGeneratedTokens) {
+        throw std::invalid_argument("max_tokens is outside the supported range");
+    }
+    if (options.min_new_tokens < 0 ||
+        options.min_new_tokens > kAbsoluteMaxGeneratedTokens) {
+        throw std::invalid_argument("min_new_tokens is outside the supported range");
+    }
+    if (!std::isfinite(options.temperature) || options.temperature < 0.0f ||
+        options.temperature > 100.0f) {
+        throw std::invalid_argument("temperature must be finite and between 0 and 100");
+    }
+    if (!std::isfinite(options.top_p) || options.top_p <= 0.0f ||
+        options.top_p > 1.0f) {
+        throw std::invalid_argument("top_p must be finite and in (0, 1]");
+    }
+    if (options.top_k < 0 || (vocab_size > 0 && options.top_k > vocab_size)) {
+        throw std::invalid_argument("top_k must be between 0 and the vocabulary size");
+    }
+    if (options.eos_token_id < 0 || options.eos_token_id >= vocab_size) {
+        throw std::invalid_argument("eos_token_id is outside the model vocabulary");
+    }
+    if (options.max_context_tokens > kAbsoluteMaxContextTokens) {
+        throw std::invalid_argument("max_context_tokens exceeds the supported range");
+    }
+    if (!std::isfinite(options.repetition_penalty) ||
+        options.repetition_penalty < 1.0f || options.repetition_penalty > 100.0f) {
+        throw std::invalid_argument(
+            "repetition_penalty must be finite and between 1 and 100");
+    }
+    if (options.no_repeat_ngram_size < 0 || options.no_repeat_ngram_size > 128) {
+        throw std::invalid_argument("no_repeat_ngram_size must be between 0 and 128");
+    }
+}
+
+struct StreamingInferenceGuard {
+    JambaModel* model = nullptr;
+    ~StreamingInferenceGuard() {
+        if (model != nullptr) {
+            try {
+                model->set_streaming_inference(false);
+            } catch (...) {
+                // State cleanup must never replace an in-flight exception.
+            }
+        }
+    }
+};
+
 int select_best_token_fallback(const std::vector<float>& scaled,
                                int vocab_size,
                                int eos_token_id,
                                bool suppress_control_tokens,
                                const std::function<bool(int, int)>& is_control_token) {
-    int best = 0;
+    int best = -1;
     float best_value = -1e30f;
     for (int token = 0; token < vocab_size; ++token) {
         if (token == eos_token_id) {
@@ -680,12 +875,13 @@ int select_best_token_fallback(const std::vector<float>& scaled,
         if (suppress_control_tokens && is_control_token(token, vocab_size)) {
             continue;
         }
-        if (scaled[static_cast<size_t>(token)] > best_value) {
-            best_value = scaled[static_cast<size_t>(token)];
+        const float value = bounded_logit(scaled[static_cast<size_t>(token)]);
+        if (value > best_value) {
+            best_value = value;
             best = token;
         }
     }
-    return best;
+    return best >= 0 ? best : (eos_token_id >= 0 ? eos_token_id : 0);
 }
 
 // Single source of truth for the no-repeat-ngram banned set, used by both the
@@ -794,7 +990,7 @@ int sample_from_host_logits_row(const float* raw,
                 if (suppress_control && is_control_token(token, vocab_size)) {
                     continue;
                 }
-                float value = raw[token];
+                float value = bounded_logit(raw[token]);
                 if (repeated[static_cast<size_t>(token)]) {
                     if (value >= 0.0f) {
                         value /= penalty;
@@ -815,8 +1011,9 @@ int sample_from_host_logits_row(const float* raw,
                 if (suppress_control && is_control_token(token, vocab_size)) {
                     continue;
                 }
-                if (raw[token] > best_value) {
-                    best_value = raw[token];
+                const float value = bounded_logit(raw[token]);
+                if (value > best_value) {
+                    best_value = value;
                     best_token = token;
                 }
             }
@@ -849,7 +1046,7 @@ int sample_from_host_logits_row(const float* raw,
     const float temp = std::max(options.temperature, 1e-6f);
     workspace.scaled.resize(static_cast<size_t>(vocab_size));
     for (int token = 0; token < vocab_size; ++token) {
-        workspace.scaled[static_cast<size_t>(token)] = raw[token] / temp;
+        workspace.scaled[static_cast<size_t>(token)] = bounded_logit(raw[token]) / temp;
     }
 
     if (generated_so_far > 0 && options.repetition_penalty > 1.0f) {
@@ -876,8 +1073,9 @@ int sample_from_host_logits_row(const float* raw,
                          workspace.candidate_indices.begin() + top_k,
                          workspace.candidate_indices.end(),
                          [&](int lhs, int rhs) {
-                             return workspace.scaled[static_cast<size_t>(lhs)] >
-                                    workspace.scaled[static_cast<size_t>(rhs)];
+                             const float left = workspace.scaled[static_cast<size_t>(lhs)];
+                             const float right = workspace.scaled[static_cast<size_t>(rhs)];
+                             return left != right ? left > right : lhs < rhs;
                          });
         workspace.candidate_indices.resize(static_cast<size_t>(top_k));
     }
@@ -936,8 +1134,9 @@ int sample_from_host_logits_row(const float* raw,
         std::sort(workspace.candidate_indices.begin(),
                   workspace.candidate_indices.end(),
                   [&](int lhs, int rhs) {
-                      return workspace.scaled[static_cast<size_t>(lhs)] >
-                             workspace.scaled[static_cast<size_t>(rhs)];
+                      const float left = workspace.scaled[static_cast<size_t>(lhs)];
+                      const float right = workspace.scaled[static_cast<size_t>(rhs)];
+                      return left != right ? left > right : lhs < rhs;
                   });
         const float max_val = workspace.scaled[static_cast<size_t>(workspace.candidate_indices.front())];
         float sum_exp = 0.0f;
@@ -1055,7 +1254,7 @@ public:
                 int& out_token) {
         if (vocab <= 0 || raw_row_device == nullptr) return false;
         if (!ensure(vocab)) return false;
-        if (!control_built_) build_control(vocab, is_control_token);
+        if (!control_built_ && !build_control(vocab, is_control_token)) return false;
 
         const size_t generated_so_far =
             output_tokens.size() > prompt_tokens_used
@@ -1068,20 +1267,26 @@ public:
              i < output_tokens.size(); ++i) {
             const int t = output_tokens[i];
             if (t >= 0 && t < vocab) {
-                cudaMemsetAsync(d_repeated_ + t, 1, 1, 0);
+                if (cudaMemsetAsync(d_repeated_ + t, 1, 1, 0) != cudaSuccess) {
+                    return false;
+                }
             }
         }
         marked_count_ = generated_so_far;
 
         // seen mask: zero, then scatter no-repeat-ngram bans + blocked-EOS.
-        cudaMemsetAsync(d_seen_, 0, static_cast<size_t>(vocab), 0);
+        if (cudaMemsetAsync(d_seen_, 0, static_cast<size_t>(vocab), 0) != cudaSuccess) {
+            return false;
+        }
         if (generated_so_far > 0 && options.no_repeat_ngram_size > 1) {
             compute_no_repeat_ngram_banned(output_tokens, prompt_tokens_used,
                                            options.no_repeat_ngram_size,
                                            generated_so_far, banned_);
             for (int t : banned_) {
                 if (t >= 0 && t < vocab) {
-                    cudaMemsetAsync(d_seen_ + t, 1, 1, 0);
+                    if (cudaMemsetAsync(d_seen_ + t, 1, 1, 0) != cudaSuccess) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1090,7 +1295,10 @@ public:
                 static_cast<size_t>(std::max(options.min_new_tokens, 0)) &&
             options.eos_token_id >= 0 && options.eos_token_id < vocab;
         if (block_eos) {
-            cudaMemsetAsync(d_seen_ + options.eos_token_id, 1, 1, 0);
+            if (cudaMemsetAsync(d_seen_ + options.eos_token_id, 1, 1, 0) !=
+                cudaSuccess) {
+                return false;
+            }
         }
         const bool suppress_control =
             generated_so_far <
@@ -1134,7 +1342,7 @@ public:
         // -1 sentinel: every candidate was masked.  Fall back to the host greedy
         // branch, which scans for the first allowed token then EOS/0 (the GPU
         // kernel cannot reproduce that scan), so behaviour matches exactly.
-        if (token < 0) return false;
+        if (token < 0 || token >= vocab) return false;
         out_token = token;
         return true;
     }
@@ -1158,22 +1366,28 @@ private:
             (void)cudaGetLastError();
             h_result_ = nullptr;
         }
-        cudaMemset(d_repeated_, 0, bytes);
-        cudaMemset(d_control_, 0, bytes);
+        if (cudaMemset(d_repeated_, 0, bytes) != cudaSuccess ||
+            cudaMemset(d_control_, 0, bytes) != cudaSuccess) {
+            free_all();
+            return false;
+        }
         vocab_ = vocab;
         control_built_ = false;
         marked_count_ = 0;
         return true;
     }
-    void build_control(int vocab,
+    bool build_control(int vocab,
                        const std::function<bool(int, int)>& is_control_token) {
         std::vector<unsigned char> host(static_cast<size_t>(vocab), 0);
         for (int t = 0; t < vocab; ++t) {
             host[static_cast<size_t>(t)] = is_control_token(t, vocab) ? 1 : 0;
         }
-        cudaMemcpy(d_control_, host.data(), static_cast<size_t>(vocab),
-                   cudaMemcpyHostToDevice);
+        if (cudaMemcpy(d_control_, host.data(), static_cast<size_t>(vocab),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            return false;
+        }
         control_built_ = true;
+        return true;
     }
     void free_all() {
         if (d_repeated_) cudaFree(d_repeated_);
@@ -1265,6 +1479,8 @@ bool InferenceEngine::try_load_model_pack(const std::string& path,
     const Device device = this->config.use_cuda ? Device::GPU : Device::CPU;
     this->model = std::make_unique<JambaModel>(this->config, device);
     this->trainer = std::make_unique<Trainer>(this->model.get(), 0.001f);
+    this->trainer->logit_l2_beta = this->config.logit_l2_beta;
+    this->trainer->pantheon_vib_beta = this->config.pantheon_vib_beta;
     this->model->set_training_mode(false);
 
     this->tokenizer = Tokenizer();
@@ -1307,58 +1523,56 @@ bool InferenceEngine::try_load_model_pack(const std::string& path,
 }
 
 bool InferenceEngine::load_model(const std::string& path, const ModelConfig& config_value) {
-    this->loaded_from_pack_ = false;
-
-    if (!path.empty()) {
-        try {
-            if (try_load_model_pack(path, config_value)) {
-                return true;
-            }
-        } catch (const std::exception& ex) {
-            std::cerr << "[InferenceEngine] Failed to load model pack '" << path
-                      << "': " << ex.what() << std::endl;
-            return false;
-        }
-    }
-
-    this->config = config_value;
-    const Device device = this->config.use_cuda ? Device::GPU : Device::CPU;
-
-    this->model = std::make_unique<JambaModel>(this->config, device);
-    this->trainer = std::make_unique<Trainer>(this->model.get(), 0.001f);
-    // Wire Pantheon VIB-style regularizer (0 = OFF, default).
-    this->trainer->pantheon_vib_beta = this->config.pantheon_vib_beta;
-    this->model->set_training_mode(false);
-
-    if (!path.empty()) {
-        std::error_code exists_ec;
-        if (!std::filesystem::exists(path, exists_ec) || exists_ec) {
-            std::cerr << "[InferenceEngine] Checkpoint not found at '" << path << "'."
-                      << std::endl;
-            return false;
-        }
-    }
-
-    this->tokenizer = Tokenizer();
-    try_load_tokenizer(path);
-
-    if (path.empty()) {
-        return true;
-    }
+    auto commit = [&](InferenceEngine&& staged) {
+        this->model = std::move(staged.model);
+        this->trainer = std::move(staged.trainer);
+        this->tokenizer = std::move(staged.tokenizer);
+        this->config = staged.config;
+        this->last_metrics_ = {};
+        this->loaded_from_pack_ = staged.loaded_from_pack_;
+    };
 
     try {
-        if (std::filesystem::exists(path) && std::filesystem::is_regular_file(path)) {
-            this->model->load(path);
-            return true;
+        if (!path.empty()) {
+            InferenceEngine staged_pack;
+            if (staged_pack.try_load_model_pack(path, config_value)) {
+                commit(std::move(staged_pack));
+                return true;
+            }
         }
+
+        if (!path.empty()) {
+            std::error_code exists_ec;
+            if (!std::filesystem::exists(path, exists_ec) || exists_ec ||
+                !std::filesystem::is_regular_file(path, exists_ec) || exists_ec) {
+                std::cerr << "[InferenceEngine] Checkpoint not found or not a regular file at '"
+                          << path << "'." << std::endl;
+                return false;
+            }
+        }
+
+        InferenceEngine staged;
+        staged.config = config_value;
+        validate_model_config(staged.config);
+        const Device device = staged.config.use_cuda ? Device::GPU : Device::CPU;
+        staged.model = std::make_unique<JambaModel>(staged.config, device);
+        staged.trainer = std::make_unique<Trainer>(staged.model.get(), 0.001f);
+        staged.trainer->logit_l2_beta = staged.config.logit_l2_beta;
+        staged.trainer->pantheon_vib_beta = staged.config.pantheon_vib_beta;
+        staged.model->set_training_mode(false);
+        staged.tokenizer = Tokenizer();
+        staged.try_load_tokenizer(path);
+        if (!path.empty()) {
+            staged.model->load(path);
+        }
+        staged.loaded_from_pack_ = false;
+        commit(std::move(staged));
+        return true;
     } catch (const std::exception& ex) {
-        std::cerr << "[InferenceEngine] Failed to load checkpoint '" << path
+        std::cerr << "[InferenceEngine] Failed to load model from '" << path
                   << "': " << ex.what() << std::endl;
         return false;
     }
-
-    std::cerr << "[InferenceEngine] Checkpoint not found at '" << path << "'." << std::endl;
-    return false;
 }
 
 void InferenceEngine::try_load_tokenizer(const std::string& path) {
@@ -1476,6 +1690,11 @@ std::string InferenceEngine::generate_stream(
     if (!this->model) {
         throw std::runtime_error("No model loaded");
     }
+    validate_generation_options(options, this->config.vocab_size);
+    constexpr size_t kMaxDirectPromptBytes = 16ull * 1024ull * 1024ull;
+    if (prompt.size() > kMaxDirectPromptBytes) {
+        throw std::invalid_argument("prompt exceeds the direct SDK byte limit");
+    }
 
     auto started_at = std::chrono::steady_clock::now();
     std::vector<int> prompt_tokens = sanitize_token_ids(this->tokenizer.encode(prompt));
@@ -1537,9 +1756,8 @@ std::string InferenceEngine::generate_stream(
     // verify capture==eager once before any graphed decode is relied upon.  Logged
     // once per process; never gates the hot path (decode still runs eagerly).
     {
-        static bool cuda_graph_probed = false;
-        if (!cuda_graph_probed) {
-            cuda_graph_probed = true;
+        static std::once_flag cuda_graph_probe_once;
+        std::call_once(cuda_graph_probe_once, [] {
             const char* graph_env = std::getenv("NSOS_CUDA_GRAPH");
             if (graph_env && graph_env[0] == '1') {
                 const int supported = cuda_graphs_supported();
@@ -1549,7 +1767,7 @@ std::string InferenceEngine::generate_stream(
                     "[nsos] CUDA Graphs probe: supported=%d self_test=%s\n",
                     supported, self_test ? "PASS" : "FAIL");
             }
-        }
+        });
     }
 #endif
     auto sample_next_token = [&](const Tensor& logits) -> int {
@@ -1579,11 +1797,17 @@ std::string InferenceEngine::generate_stream(
             }
         }
 #endif
+        if (logits.shape.empty()) {
+            throw std::runtime_error("Model returned logits without a vocabulary dimension");
+        }
         Tensor host_logits = (logits.get_device() == Device::GPU) ? logits.cpu() : logits;
         if (host_logits.size == 0) {
             return options.eos_token_id;
         }
         const int vocab_size = host_logits.shape.back();
+        if (vocab_size <= 0 || vocab_size > host_logits.size) {
+            throw std::runtime_error("Model returned an invalid logits shape");
+        }
         const int last_offset = host_logits.size - vocab_size;
         return sample_from_host_logits_row(
             host_logits.data() + last_offset,
@@ -1606,6 +1830,7 @@ std::string InferenceEngine::generate_stream(
     last_metrics_.used_streaming = can_use_streaming;
     this->model->reset_session();
     this->model->set_streaming_inference(can_use_streaming);
+    StreamingInferenceGuard streaming_guard{this->model.get()};
 
     // ─────────────────────────────────────────────────────────────────
     // INFERENCE BOTTLENECK #1 mitigation (2026-05-17):
@@ -1693,13 +1918,12 @@ std::string InferenceEngine::generate_stream(
             const int next_token = sample_next_token(logits);
             output.push_back(next_token);
 
+            if (next_token == options.eos_token_id) {
+                break;
+            }
             const std::string piece = decode_token_piece(this->tokenizer, next_token);
             if (on_chunk) {
                 on_chunk(piece);
-            }
-
-            if (next_token == options.eos_token_id) {
-                break;
             }
 
             if (try_decode_graph) {
@@ -1726,13 +1950,12 @@ std::string InferenceEngine::generate_stream(
             const int next_token = sample_next_token(logits);
             output.push_back(next_token);
 
+            if (next_token == options.eos_token_id) {
+                break;
+            }
             const std::string piece = decode_token_piece(this->tokenizer, next_token);
             if (on_chunk) {
                 on_chunk(piece);
-            }
-
-            if (next_token == options.eos_token_id) {
-                break;
             }
         }
         decode_finished_at = std::chrono::steady_clock::now();
@@ -1741,6 +1964,9 @@ std::string InferenceEngine::generate_stream(
 
     std::string result;
     for (size_t i = prompt_tokens_used; i < output.size(); ++i) {
+        if (output[i] == options.eos_token_id) {
+            continue;
+        }
         result += decode_token_piece(this->tokenizer, output[i]);
     }
 
@@ -1790,11 +2016,24 @@ std::vector<std::string> InferenceEngine::generate_batch(
     if (!this->model) {
         throw std::runtime_error("No model loaded");
     }
+    validate_generation_options(options, this->config.vocab_size);
 
     auto started_at = std::chrono::steady_clock::now();
     if (prompts.empty()) {
         last_metrics_ = {};
         return {};
+    }
+    constexpr size_t kMaxDirectBatchPrompts = 1024;
+    constexpr size_t kMaxDirectBatchBytes = 64ull * 1024ull * 1024ull;
+    if (prompts.size() > kMaxDirectBatchPrompts) {
+        throw std::invalid_argument("prompt batch exceeds the direct SDK item limit");
+    }
+    size_t total_prompt_bytes = 0;
+    for (const auto& prompt : prompts) {
+        if (prompt.size() > kMaxDirectBatchBytes - total_prompt_bytes) {
+            throw std::invalid_argument("prompt batch exceeds the direct SDK byte limit");
+        }
+        total_prompt_bytes += prompt.size();
     }
 
     struct BatchItem {
@@ -1804,6 +2043,8 @@ std::vector<std::string> InferenceEngine::generate_batch(
         Tensor cached_logits;
         JambaSessionSnapshot snapshot;
         bool has_snapshot = false;
+        std::mt19937 rng;
+        SamplerWorkspace sampler_workspace;
     };
 
     GenerationMetrics aggregate{};
@@ -1825,18 +2066,9 @@ std::vector<std::string> InferenceEngine::generate_batch(
     const bool can_use_streaming = this->model->supports_streaming_inference();
     aggregate.used_streaming = can_use_streaming;
     this->model->set_streaming_inference(can_use_streaming);
+    StreamingInferenceGuard streaming_guard{this->model.get()};
     this->model->reset_session();
 
-    uint64_t sampler_sequence = 1469598103934665603ull;
-    for (const auto& prompt : prompts) {
-        sampler_sequence ^= fnv1a_hash_text(prompt);
-        sampler_sequence *= 1099511628211ull;
-    }
-    sampler_sequence ^=
-        (static_cast<uint64_t>(std::max(options.max_tokens, 0)) << 32) ^
-        static_cast<uint64_t>(std::max(options.eos_token_id, 0));
-    std::mt19937 rng = make_sampler_rng("generate_batch", sampler_sequence);
-    SamplerWorkspace sampler_workspace;
     std::vector<std::string> token_piece_cache;
     std::vector<char> token_piece_loaded;
 
@@ -1854,17 +2086,16 @@ std::vector<std::string> InferenceEngine::generate_batch(
     };
 
     auto sample_next_token =
-        [&](const float* raw, int vocab_size, const std::vector<int>& output_tokens,
-            size_t prompt_tokens_used) {
+        [&](const float* raw, int vocab_size, BatchItem& item) {
             return sample_from_host_logits_row(
                 raw,
                 vocab_size,
                 top_k,
                 options,
-                output_tokens,
-                prompt_tokens_used,
-                rng,
-                sampler_workspace,
+                item.output_tokens,
+                item.prompt_tokens_used,
+                item.rng,
+                item.sampler_workspace,
                 [&](int token, int current_vocab_size) {
                     return cached_token_piece(token, current_vocab_size).rfind("<|", 0) == 0;
                 },
@@ -1884,6 +2115,11 @@ std::vector<std::string> InferenceEngine::generate_batch(
                 items[index].output_tokens.end() - context_limit);
         }
         items[index].prompt_tokens_used = items[index].output_tokens.size();
+        const uint64_t item_sequence =
+            fnv1a_hash_text(prompts[index]) ^
+            (static_cast<uint64_t>(std::max(options.max_tokens, 0)) << 32) ^
+            static_cast<uint64_t>(std::max(options.eos_token_id, 0));
+        items[index].rng = make_sampler_rng("generate_batch_item", item_sequence);
     }
 
     for (const auto& item : items) {
@@ -1915,7 +2151,13 @@ std::vector<std::string> InferenceEngine::generate_batch(
             this->model->set_streaming_inference(true);
             Tensor logits = this->model->forward_ids(items[item_index].output_tokens, nullptr);
             Tensor host_logits = to_host_logits(logits);
+            if (host_logits.shape.empty()) {
+                throw std::runtime_error("Model returned logits without a vocabulary dimension");
+            }
             const int vocab_size = host_logits.shape.back();
+            if (vocab_size <= 0 || vocab_size > host_logits.size) {
+                throw std::runtime_error("Model returned an invalid prefill logits shape");
+            }
             const int last_offset = host_logits.size - vocab_size;
             Tensor row_logits({1, vocab_size}, Device::CPU);
             std::memcpy(row_logits.data(),
@@ -1939,10 +2181,8 @@ std::vector<std::string> InferenceEngine::generate_batch(
                 const Tensor& host_logits = items[index].cached_logits;
                 const int vocab_size = host_logits.shape.back();
                 const size_t last_offset = static_cast<size_t>(host_logits.size - vocab_size);
-                const int next_token = sample_next_token(host_logits.data() + last_offset,
-                                                         vocab_size,
-                                                         items[index].output_tokens,
-                                                         items[index].prompt_tokens_used);
+                const int next_token = sample_next_token(
+                    host_logits.data() + last_offset, vocab_size, items[index]);
                 items[index].output_tokens.push_back(next_token);
                 ++aggregate.generated_tokens;
                 if (next_token == options.eos_token_id) {
@@ -1968,11 +2208,18 @@ std::vector<std::string> InferenceEngine::generate_batch(
             this->model->restore_session_batch(active_snapshots);
             Tensor next_logits_batch = this->model->forward_ids_batch(batch_next_tokens, nullptr);
             Tensor host_logits_batch = to_host_logits(next_logits_batch);
+            if (host_logits_batch.shape.size() != 3) {
+                throw std::runtime_error("Model returned invalid batched streaming logits rank");
+            }
             const int batch_count = host_logits_batch.shape[0];
             const int max_seq_len = host_logits_batch.shape[1];
             const int vocab_size = host_logits_batch.shape[2];
             const float* logits_ptr = host_logits_batch.data();
             auto updated_snapshots = this->model->fork_session_batch();
+            if (batch_count != static_cast<int>(active_indices.size()) || max_seq_len <= 0 ||
+                vocab_size <= 0 || updated_snapshots.size() != active_indices.size()) {
+                throw std::runtime_error("Model returned inconsistent batched streaming state");
+            }
 
             for (int row = 0; row < batch_count; ++row) {
                 const size_t item_index = active_indices[static_cast<size_t>(row)];
@@ -2000,6 +2247,11 @@ std::vector<std::string> InferenceEngine::generate_batch(
             this->model->set_streaming_inference(true);
             Tensor logits = this->model->forward_ids(items[index].output_tokens, nullptr);
             items[index].cached_logits = to_host_logits(logits);
+            if (items[index].cached_logits.shape.empty() ||
+                items[index].cached_logits.shape.back() <= 0 ||
+                items[index].cached_logits.shape.back() > items[index].cached_logits.size) {
+                throw std::runtime_error("Model returned an invalid prefill logits shape");
+            }
             items[index].snapshot = this->model->fork_session();
             items[index].has_snapshot = true;
         }
@@ -2015,10 +2267,8 @@ std::vector<std::string> InferenceEngine::generate_batch(
                 const Tensor& host_logits = items[index].cached_logits;
                 const int vocab_size = host_logits.shape.back();
                 const size_t last_offset = static_cast<size_t>(host_logits.size - vocab_size);
-                const int next_token = sample_next_token(host_logits.data() + last_offset,
-                                                         vocab_size,
-                                                         items[index].output_tokens,
-                                                         items[index].prompt_tokens_used);
+                const int next_token = sample_next_token(
+                    host_logits.data() + last_offset, vocab_size, items[index]);
                 items[index].output_tokens.push_back(next_token);
                 ++aggregate.generated_tokens;
                 if (next_token == options.eos_token_id) {
@@ -2066,21 +2316,29 @@ std::vector<std::string> InferenceEngine::generate_batch(
             Tensor logits_batch = this->model->forward_ids_batch(batch_inputs, nullptr);
             Tensor host_logits = (logits_batch.get_device() == Device::GPU) ? logits_batch.cpu()
                                                                             : logits_batch;
+            if (host_logits.shape.size() != 3) {
+                throw std::runtime_error("Model returned invalid batched logits rank");
+            }
             const int batch_count = host_logits.shape[0];
             const int max_seq_len = host_logits.shape[1];
             const int vocab_size = host_logits.shape[2];
             const float* logits_ptr = host_logits.data();
+            if (batch_count != static_cast<int>(active_indices.size()) || max_seq_len <= 0 ||
+                vocab_size <= 0) {
+                throw std::runtime_error("Model returned inconsistent batched logits shape");
+            }
 
             for (int row = 0; row < batch_count; ++row) {
                 const size_t item_index = active_indices[static_cast<size_t>(row)];
                 const int valid_len = static_cast<int>(batch_inputs[static_cast<size_t>(row)].size());
+                if (valid_len <= 0 || valid_len > max_seq_len) {
+                    throw std::runtime_error("Model returned invalid batched sequence padding");
+                }
                 const size_t row_offset =
                     ((static_cast<size_t>(row) * max_seq_len) + static_cast<size_t>(valid_len - 1)) *
                     static_cast<size_t>(vocab_size);
-                const int next_token = sample_next_token(logits_ptr + row_offset,
-                                                         vocab_size,
-                                                         items[item_index].output_tokens,
-                                                         items[item_index].prompt_tokens_used);
+                const int next_token = sample_next_token(
+                    logits_ptr + row_offset, vocab_size, items[item_index]);
                 items[item_index].output_tokens.push_back(next_token);
                 ++aggregate.generated_tokens;
                 if (next_token == options.eos_token_id) {
@@ -2097,6 +2355,9 @@ std::vector<std::string> InferenceEngine::generate_batch(
         for (size_t token_index = items[index].prompt_tokens_used;
              token_index < items[index].output_tokens.size();
              ++token_index) {
+            if (items[index].output_tokens[token_index] == options.eos_token_id) {
+                continue;
+            }
             outputs[index] += decode_token_piece(this->tokenizer,
                                                  items[index].output_tokens[token_index]);
         }
@@ -2167,8 +2428,22 @@ bool InferenceEngine::save_checkpoint(const std::string& path) const {
     if (!this->model || path.empty()) {
         return false;
     }
-    this->model->save(path);
-    return true;
+    const std::filesystem::path destination(path);
+    const std::filesystem::path temporary = atomic_temp_path(destination);
+    try {
+        if (!destination.parent_path().empty()) {
+            std::filesystem::create_directories(destination.parent_path());
+        }
+        this->model->save(temporary.string());
+        replace_file(temporary, destination);
+        return true;
+    } catch (const std::exception& ex) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        std::cerr << "[NSOS] Failed to save checkpoint '" << path << "': "
+                  << ex.what() << std::endl;
+        return false;
+    }
 }
 
 bool InferenceEngine::save_model_pack(const std::string& directory) const {
@@ -2179,45 +2454,62 @@ bool InferenceEngine::save_model_pack(const std::string& directory) const {
     }
 
     const fs::path pack_root(directory);
-    fs::create_directories(pack_root);
+    try {
+        fs::create_directories(pack_root);
 
-    const fs::path weights_path = pack_root / "model.nsos.bin";
-    const fs::path tokenizer_path = pack_root / "tokenizer.nsos";
-    const fs::path config_path = pack_root / "config.nsos";
-    const fs::path edge_linear_path = pack_root / "edge_linear.nsos";
-    const fs::path manifest_path = pack_root / "manifest.nsos";
+        const fs::path weights_path = pack_root / "model.nsos.bin";
+        const fs::path tokenizer_path = pack_root / "tokenizer.nsos";
+        const fs::path config_path = pack_root / "config.nsos";
+        const fs::path edge_linear_path = pack_root / "edge_linear.nsos";
+        const fs::path manifest_path = pack_root / "manifest.nsos";
 
-    const fs::path weights_temp = atomic_temp_path(weights_path);
-    const fs::path edge_linear_temp = atomic_temp_path(edge_linear_path);
-    const fs::path tokenizer_temp = atomic_temp_path(tokenizer_path);
-    this->model->save(weights_temp.string());
-    replace_file(weights_temp, weights_path);
-    this->model->save_edge_linear_pack(edge_linear_temp.string());
-    replace_file(edge_linear_temp, edge_linear_path);
-    this->tokenizer.save_pack(tokenizer_temp.string());
-    replace_file(tokenizer_temp, tokenizer_path);
-    write_model_config(config_path, this->config);
+        const fs::path weights_temp = atomic_temp_path(weights_path);
+        const fs::path edge_linear_temp = atomic_temp_path(edge_linear_path);
+        const fs::path tokenizer_temp = atomic_temp_path(tokenizer_path);
+        try {
+            this->model->save(weights_temp.string());
+            replace_file(weights_temp, weights_path);
+            this->model->save_edge_linear_pack(edge_linear_temp.string());
+            replace_file(edge_linear_temp, edge_linear_path);
+            this->tokenizer.save_pack(tokenizer_temp.string());
+            replace_file(tokenizer_temp, tokenizer_path);
+            write_model_config(config_path, this->config);
 
-    write_key_value_file(
-        manifest_path,
-        {
-            {"format", "nsos-pack-v2"},
-            {"version", "2"},
-            {"weights", weights_path.filename().string()},
-            {"edge_linear", edge_linear_path.filename().string()},
-            {"tokenizer", tokenizer_path.filename().string()},
-            {"config", config_path.filename().string()},
-            {"checksum_weights", fnv1a_checksum_file(weights_path)},
-            {"checksum_edge_linear", fnv1a_checksum_file(edge_linear_path)},
-            {"checksum_tokenizer", fnv1a_checksum_file(tokenizer_path)},
-            {"checksum_config", fnv1a_checksum_file(config_path)},
-            {"sha256_weights", sha256_checksum_file(weights_path)},
-            {"sha256_edge_linear", sha256_checksum_file(edge_linear_path)},
-            {"sha256_tokenizer", sha256_checksum_file(tokenizer_path)},
-            {"sha256_config", sha256_checksum_file(config_path)},
-        });
+            // Publish the manifest last. Readers either see the previous
+            // manifest (and reject a mismatched partial generation) or the
+            // complete new generation; they never accept unchecked children.
+            write_key_value_file(
+                manifest_path,
+                {
+                    {"format", "nsos-pack-v2"},
+                    {"version", "2"},
+                    {"weights", weights_path.filename().string()},
+                    {"edge_linear", edge_linear_path.filename().string()},
+                    {"tokenizer", tokenizer_path.filename().string()},
+                    {"config", config_path.filename().string()},
+                    {"checksum_weights", fnv1a_checksum_file(weights_path)},
+                    {"checksum_edge_linear", fnv1a_checksum_file(edge_linear_path)},
+                    {"checksum_tokenizer", fnv1a_checksum_file(tokenizer_path)},
+                    {"checksum_config", fnv1a_checksum_file(config_path)},
+                    {"sha256_weights", sha256_checksum_file(weights_path)},
+                    {"sha256_edge_linear", sha256_checksum_file(edge_linear_path)},
+                    {"sha256_tokenizer", sha256_checksum_file(tokenizer_path)},
+                    {"sha256_config", sha256_checksum_file(config_path)},
+                });
+        } catch (...) {
+            std::error_code ignored;
+            fs::remove(weights_temp, ignored);
+            fs::remove(edge_linear_temp, ignored);
+            fs::remove(tokenizer_temp, ignored);
+            throw;
+        }
 
-    return true;
+        return true;
+    } catch (const std::exception& ex) {
+        std::cerr << "[NSOS] Failed to save model pack '" << directory << "': "
+                  << ex.what() << std::endl;
+        return false;
+    }
 }
 
 std::unique_ptr<InferenceEngine> InferenceEngine::clone_for_inference() const {
@@ -2232,7 +2524,9 @@ std::unique_ptr<InferenceEngine> InferenceEngine::clone_for_inference() const {
 
     const Device device = replica->config.use_cuda ? Device::GPU : Device::CPU;
     replica->model = std::make_unique<JambaModel>(replica->config, device);
-    replica->trainer = std::make_unique<Trainer>(replica->model.get(), 0.001f);
+    // Serving replicas are immutable and never execute admin training. Avoid a
+    // Trainer object and optimizer-facing state in every replica.
+    replica->trainer.reset();
     replica->model->set_training_mode(false);
     replica->model->set_streaming_inference(false);
 
@@ -2260,10 +2554,6 @@ std::unique_ptr<InferenceEngine> InferenceEngine::clone_for_inference() const {
                                      std::to_string(index));
         }
         dst->data.copy_from(src->data);
-        if (src->grad.size > 0 && dst->grad.size == src->grad.size &&
-            dst->grad.shape == src->grad.shape) {
-            dst->grad.copy_from(src->grad);
-        }
         dst->version = src->version;
     }
 
@@ -2285,6 +2575,97 @@ std::unique_ptr<InferenceEngine> InferenceEngine::clone_for_inference() const {
 
     replica->last_metrics_ = this->last_metrics_;
     return replica;
+}
+
+std::unique_ptr<InferenceEngine> InferenceEngine::clone_for_training() const {
+    if (!this->model || !this->trainer) {
+        throw std::runtime_error("Cannot clone training engine without a loaded trainer");
+    }
+
+    auto clone = clone_for_inference();
+    clone->model->set_training_mode(true);
+    clone->model->set_streaming_inference(false);
+    clone->trainer = std::make_unique<Trainer>(clone->model.get(), this->trainer->learning_rate);
+
+    const Trainer& source = *this->trainer;
+    Trainer& target = *clone->trainer;
+    target.beta1 = source.beta1;
+    target.beta2 = source.beta2;
+    target.eps = source.eps;
+    target.weight_decay = source.weight_decay;
+    target.max_grad_norm = source.max_grad_norm;
+    target.min_learning_rate_scale = source.min_learning_rate_scale;
+    target.first_token_loss_scale = source.first_token_loss_scale;
+    target.eos_loss_scale = source.eos_loss_scale;
+    target.repetition_unlikelihood_scale = source.repetition_unlikelihood_scale;
+    target.moe_aux_loss_scale = source.moe_aux_loss_scale;
+    target.pantheon_vib_beta = source.pantheon_vib_beta;
+    target.logit_l2_beta = source.logit_l2_beta;
+    target.warmup_steps = source.warmup_steps;
+    target.global_step_count = source.global_step_count;
+    target.total_training_steps = source.total_training_steps;
+    target.eos_token_id = source.eos_token_id;
+    target.optimizer_state_bits = source.optimizer_state_bits;
+    target.phase_scheduler = source.phase_scheduler;
+    target.last_auxiliary_stats = source.last_auxiliary_stats;
+    target.last_objective_stats = source.last_objective_stats;
+
+    const auto source_parameters = this->model->parameters();
+    const auto target_parameters = clone->model->parameters();
+    if (source_parameters.size() != target_parameters.size()) {
+        throw std::runtime_error("Training clone parameter count mismatch");
+    }
+    for (size_t index = 0; index < source_parameters.size(); ++index) {
+        Parameter* src = source_parameters[index];
+        Parameter* dst = target_parameters[index];
+        if (!src || !dst) {
+            throw std::runtime_error("Training clone encountered null parameter");
+        }
+        if (src->data.size == 0) {
+            throw std::runtime_error(
+                "Training cannot start from an inference-only packed model");
+        }
+        if (src->grad.size > 0) {
+            if (dst->grad.size == 0 || dst->grad.shape != src->grad.shape) {
+                dst->grad = src->grad.clone();
+            } else {
+                dst->grad.copy_from(src->grad);
+            }
+        } else {
+            dst->grad = Tensor();
+        }
+
+        if (const auto it = source.m_state.find(src); it != source.m_state.end()) {
+            target.m_state.emplace(dst, it->second.clone());
+        }
+        if (const auto it = source.v_state.find(src); it != source.v_state.end()) {
+            target.v_state.emplace(dst, it->second.clone());
+        }
+        if (const auto it = source.quant_state.find(src); it != source.quant_state.end()) {
+            target.quant_state.emplace(dst, it->second);
+        }
+        if (const auto it = source.crit_g0_state.find(src); it != source.crit_g0_state.end()) {
+            target.crit_g0_state.emplace(dst, it->second);
+        }
+        if (const auto it = source.external_lr_scale.find(src);
+            it != source.external_lr_scale.end()) {
+            target.external_lr_scale.emplace(dst, it->second);
+        }
+        if (const auto it = source.criticality_lr_scale.find(src);
+            it != source.criticality_lr_scale.end()) {
+            target.criticality_lr_scale.emplace(dst, it->second);
+        }
+    }
+
+    if (target.m_state.size() != source.m_state.size() ||
+        target.v_state.size() != source.v_state.size() ||
+        target.quant_state.size() != source.quant_state.size() ||
+        target.crit_g0_state.size() != source.crit_g0_state.size() ||
+        target.external_lr_scale.size() != source.external_lr_scale.size() ||
+        target.criticality_lr_scale.size() != source.criticality_lr_scale.size()) {
+        throw std::runtime_error("Training clone optimizer state referenced an unknown parameter");
+    }
+    return clone;
 }
 
 bool InferenceEngine::try_evaluate_simple_math(const std::string& prompt,
@@ -2311,17 +2692,40 @@ bool InferenceEngine::try_evaluate_simple_math(const std::string& prompt,
 
     long long expected = 0;
     switch (expr[op_pos]) {
-    case '+':
+    case '+': {
+        if ((*rhs > 0 && *lhs > std::numeric_limits<long long>::max() - *rhs) ||
+            (*rhs < 0 && *lhs < std::numeric_limits<long long>::min() - *rhs)) {
+            return false;
+        }
         expected = *lhs + *rhs;
         break;
-    case '-':
+    }
+    case '-': {
+        if ((*rhs > 0 && *lhs < std::numeric_limits<long long>::min() + *rhs) ||
+            (*rhs < 0 && *lhs > std::numeric_limits<long long>::max() + *rhs)) {
+            return false;
+        }
         expected = *lhs - *rhs;
         break;
-    case '*':
+    }
+    case '*': {
+        if ((*lhs > 0 && *rhs > 0 &&
+             *lhs > std::numeric_limits<long long>::max() / *rhs) ||
+            (*lhs > 0 && *rhs < 0 &&
+             *rhs < std::numeric_limits<long long>::min() / *lhs) ||
+            (*lhs < 0 && *rhs > 0 &&
+             *lhs < std::numeric_limits<long long>::min() / *rhs) ||
+            (*lhs < 0 && *rhs < 0 &&
+             *rhs < std::numeric_limits<long long>::max() / *lhs)) {
+            return false;
+        }
         expected = *lhs * *rhs;
         break;
+    }
     case '/':
-        if (*rhs == 0 || (*lhs % *rhs) != 0) {
+        if (*rhs == 0 ||
+            (*lhs == std::numeric_limits<long long>::min() && *rhs == -1) ||
+            (*lhs % *rhs) != 0) {
             return false;
         }
         expected = *lhs / *rhs;
@@ -2358,11 +2762,37 @@ size_t InferenceEngine::get_memory_usage() const {
     }
 
     size_t bytes = 0;
-    for (auto* param : this->model->parameters()) {
-        if (param) {
-            bytes += static_cast<size_t>(param->data.size) * sizeof(float);
-            bytes += static_cast<size_t>(param->grad.size) * sizeof(float);
+    const auto add = [&](size_t amount) {
+        if (amount > (std::numeric_limits<size_t>::max)() - bytes) {
+            bytes = (std::numeric_limits<size_t>::max)();
+        } else {
+            bytes += amount;
         }
+    };
+    const auto add_tensor = [&](const Tensor& tensor) {
+        if (tensor.size <= 0) return;
+        const size_t elements = static_cast<size_t>(tensor.size);
+        if (elements > (std::numeric_limits<size_t>::max)() / sizeof(float)) {
+            add((std::numeric_limits<size_t>::max)());
+        } else {
+            add(elements * sizeof(float));
+        }
+    };
+
+    std::unordered_set<const Parameter*> seen_parameters;
+    for (auto* param : this->model->parameters()) {
+        if (param && seen_parameters.insert(param).second) {
+            add_tensor(param->data);
+            add_tensor(param->grad);
+        }
+    }
+    for (const BitLinear* layer : this->model->collect_bitlinear_layers()) {
+        if (layer) add(layer->auxiliary_memory_usage_bytes());
+    }
+    if (this->trainer) {
+        for (const auto& [unused, state] : this->trainer->m_state) add_tensor(state);
+        for (const auto& [unused, state] : this->trainer->v_state) add_tensor(state);
+        for (const auto& [unused, state] : this->trainer->quant_state) add(state.bytes());
     }
     return bytes;
 }

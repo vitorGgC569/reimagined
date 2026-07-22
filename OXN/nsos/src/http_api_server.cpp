@@ -53,6 +53,10 @@ struct BadRequest : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+struct StreamAborted : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct JsonValue {
     enum class Type { Null, Bool, Number, String, Array, Object };
 
@@ -172,7 +176,12 @@ private:
             skip_ws();
             expect(':');
             skip_ws();
-            value.object_value.emplace(key.string_value, parse_value(depth));
+            JsonValue member = parse_value(depth);
+            const auto [unused, inserted] =
+                value.object_value.emplace(key.string_value, std::move(member));
+            if (!inserted) {
+                error("duplicate object key");
+            }
             skip_ws();
             if (peek() == '}') {
                 consume();
@@ -219,6 +228,9 @@ private:
                 break;
             }
             if (ch != '\\') {
+                if (static_cast<unsigned char>(ch) < 0x20u) {
+                    error("unescaped control character in string");
+                }
                 value.string_value.push_back(ch);
                 continue;
             }
@@ -298,7 +310,14 @@ private:
 
         JsonValue value;
         value.type = JsonValue::Type::Number;
-        value.number_value = std::stod(input_.substr(begin, pos_ - begin));
+        try {
+            value.number_value = std::stod(input_.substr(begin, pos_ - begin));
+        } catch (const std::exception&) {
+            error("number is outside the supported range");
+        }
+        if (!std::isfinite(value.number_value)) {
+            error("number must be finite");
+        }
         return value;
     }
 
@@ -354,6 +373,23 @@ std::string trim_copy(const std::string& text) {
     }
     const auto last = text.find_last_not_of(" \t\r\n");
     return text.substr(first, last - first + 1);
+}
+
+bool is_http_token_char(unsigned char c) {
+    if (std::isalnum(c)) return true;
+    switch (c) {
+    case '!': case '#': case '$': case '%': case '&': case '\'': case '*':
+    case '+': case '-': case '.': case '^': case '_': case '`': case '|': case '~':
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_valid_header_value(const std::string& value) {
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return c == '\t' || (c >= 0x20u && c != 0x7fu);
+    });
 }
 
 void append_utf8_codepoint(std::string& out, uint32_t codepoint) {
@@ -570,7 +606,13 @@ std::optional<int> json_int(const JsonValue& object, const std::string& key) {
     if (!value || !(*value)->is_number()) {
         return std::nullopt;
     }
-    return static_cast<int>(std::llround((*value)->number_value));
+    const double number = (*value)->number_value;
+    if (!std::isfinite(number) || std::trunc(number) != number ||
+        number < static_cast<double>((std::numeric_limits<int>::min)()) ||
+        number > static_cast<double>((std::numeric_limits<int>::max)())) {
+        throw BadRequest("field '" + key + "' must be an integer in range");
+    }
+    return static_cast<int>(number);
 }
 
 std::optional<float> json_float(const JsonValue& object, const std::string& key) {
@@ -578,7 +620,13 @@ std::optional<float> json_float(const JsonValue& object, const std::string& key)
     if (!value || !(*value)->is_number()) {
         return std::nullopt;
     }
-    return static_cast<float>((*value)->number_value);
+    const double number = (*value)->number_value;
+    if (!std::isfinite(number) ||
+        number < -static_cast<double>((std::numeric_limits<float>::max)()) ||
+        number > static_cast<double>((std::numeric_limits<float>::max)())) {
+        throw BadRequest("field '" + key + "' must be a finite float in range");
+    }
+    return static_cast<float>(number);
 }
 
 std::vector<std::string> json_string_array(const JsonValue& object, const std::string& key) {
@@ -596,20 +644,13 @@ std::vector<std::string> json_string_array(const JsonValue& object, const std::s
     return out;
 }
 
-// build_http_response is called for every outgoing response.
-// When config_.allow_cors is set, CORS headers replace the same-origin
-// defaults so the Oxta browser UI (served from file:// or a dev server)
-// can call /generate without preflight failures.
-// The config_ pointer is a file-scope accessor set once on server init.
-static const HttpApiServerConfig* g_response_config = nullptr;
-
-std::string build_http_response(const HttpResponse& response,
-                                bool omit_content_length = false) {
+std::string serialize_http_response(const HttpResponse& response,
+                                    bool omit_content_length,
+                                    bool allow_cors) {
     std::map<std::string, std::string> headers = response.headers;
     headers.try_emplace("X-Content-Type-Options", "nosniff");
     headers.try_emplace("X-Frame-Options", "DENY");
     headers.try_emplace("Referrer-Policy", "no-referrer");
-    const bool allow_cors = g_response_config && g_response_config->allow_cors;
     if (allow_cors) {
         // Permissive CORS — only use in local dev or trusted LAN.
         headers["Access-Control-Allow-Origin"]  = "*";
@@ -645,8 +686,10 @@ std::string build_http_response(const HttpResponse& response,
 bool send_all(SOCKET socket, const std::string& bytes) {
     size_t sent_total = 0;
     while (sent_total < bytes.size()) {
-        const int sent = send(socket, bytes.data() + sent_total,
-                              static_cast<int>(bytes.size() - sent_total), 0);
+        const size_t remaining = bytes.size() - sent_total;
+        const int chunk = static_cast<int>((std::min)(
+            remaining, static_cast<size_t>((std::numeric_limits<int>::max)())));
+        const int sent = send(socket, bytes.data() + sent_total, chunk, 0);
         if (sent <= 0) {
             return false;
         }
@@ -724,6 +767,12 @@ bool decode_chunked_body(SOCKET socket,
         }
         if (size_text.empty()) {
             error_message = "chunked request contained empty chunk size";
+            return false;
+        }
+        if (!std::all_of(size_text.begin(), size_text.end(), [](unsigned char c) {
+                return std::isxdigit(c) != 0;
+            })) {
+            error_message = "chunked request contained invalid chunk size";
             return false;
         }
 
@@ -857,10 +906,17 @@ std::string socket_peer_ip(SOCKET socket) {
     return "unknown";
 }
 
+bool is_trusted_proxy_peer(SOCKET socket, const HttpApiServerConfig& config) {
+    if (!config.trust_proxy_headers) return false;
+    const std::string peer = socket_peer_ip(socket);
+    return std::find(config.trusted_proxy_ips.begin(), config.trusted_proxy_ips.end(), peer) !=
+           config.trusted_proxy_ips.end();
+}
+
 std::string request_client_identity(const HttpRequest& request,
                                     SOCKET client_socket,
                                     const HttpApiServerConfig& config) {
-    if (config.trust_proxy_headers) {
+    if (is_trusted_proxy_peer(client_socket, config)) {
         const auto forwarded = request.headers.find("x-forwarded-for");
         if (forwarded != request.headers.end()) {
             std::string identity = forwarded->second;
@@ -878,11 +934,12 @@ std::string request_client_identity(const HttpRequest& request,
 }
 
 bool request_declares_https(const HttpRequest& request,
+                            SOCKET client_socket,
                             const HttpApiServerConfig& config) {
     if (!config.require_tls_proxy_header) {
         return true;
     }
-    if (!config.trust_proxy_headers) {
+    if (!is_trusted_proxy_peer(client_socket, config)) {
         return false;
     }
     const auto forwarded = request.headers.find("x-forwarded-proto");
@@ -893,7 +950,8 @@ bool request_declares_https(const HttpRequest& request,
 }
 
 bool is_loopback_host(const std::string& host) {
-    return host.empty() || host == "localhost" || host == "127.0.0.1" || host == "::1";
+    return host.empty() || host == "localhost" || host == "localhost." ||
+           host == "127.0.0.1" || host == "::1" || host == "0:0:0:0:0:0:0:1";
 }
 
 bool server_auth_configuration_is_valid(const HttpApiServerConfig& config) {
@@ -910,16 +968,57 @@ bool server_auth_configuration_is_valid(const HttpApiServerConfig& config) {
     if (config.require_tls_proxy_header && !config.trust_proxy_headers) {
         return false;
     }
+    if (config.trust_proxy_headers && config.trusted_proxy_ips.empty()) {
+        return false;
+    }
+    for (const auto& peer : config.trusted_proxy_ips) {
+        if (peer.empty() || peer.size() > INET6_ADDRSTRLEN ||
+            peer.find_first_of(" \t\r\n,") != std::string::npos) {
+            return false;
+        }
+    }
+    if (!loopback && (!config.require_tls_proxy_header || !config.trust_proxy_headers ||
+                      config.auth_token.size() < 16)) {
+        return false;
+    }
+    if (config.port < 0 || config.port > 65535 || config.worker_threads < 0 ||
+        config.worker_threads > 256 || config.inference_replicas < 0 ||
+        config.inference_replicas > 64 || config.max_header_bytes == 0 ||
+        config.max_header_bytes > 1024 * 1024 || config.max_body_bytes == 0 ||
+        config.max_body_bytes > 64 * 1024 * 1024 || config.max_queue_depth == 0 ||
+        config.max_queue_depth > 65536 || config.socket_timeout_ms <= 0 ||
+        config.rate_limit_requests_per_minute > 1000000 ||
+        config.max_rate_limit_clients == 0 || config.max_rate_limit_clients > 1000000 ||
+        config.max_stream_pending_bytes == 0 ||
+        config.max_stream_pending_bytes > 64 * 1024 * 1024 ||
+        config.max_json_depth <= 0 || config.max_json_depth > 128 ||
+        config.max_generate_tokens < 0 || config.max_generate_tokens > (1 << 20) ||
+        config.max_context_tokens_per_request <= 0 ||
+        config.max_context_tokens_per_request > (1 << 24) ||
+        config.max_prompts_per_batch == 0 || config.max_prompts_per_batch > 1024 ||
+        config.max_train_steps <= 0 || config.max_train_steps > 1000000 ||
+        config.max_train_epochs <= 0 || config.max_train_epochs > 10000 ||
+        config.max_train_batch_size <= 0 || config.max_train_batch_size > 65536 ||
+        config.max_train_seq_len < 2 || config.max_train_seq_len > (1 << 20) ||
+        config.max_train_corpus_steps <= 0 || config.max_train_corpus_steps > 10000000 ||
+        config.max_train_text_bytes == 0 ||
+        config.max_train_text_bytes > config.max_body_bytes ||
+        (config.enable_admin_endpoints && config.auth_token.empty()) ||
+        config.auth_token.find_first_of("\r\n\0", 0, 3) != std::string::npos) {
+        return false;
+    }
     return true;
 }
 
 bool constant_time_equals(const std::string& lhs, const std::string& rhs) {
-    if (lhs.size() != rhs.size()) {
-        return false;
-    }
-    unsigned char diff = 0;
-    for (size_t i = 0; i < lhs.size(); ++i) {
-        diff |= static_cast<unsigned char>(lhs[i] ^ rhs[i]);
+    size_t diff = lhs.size() ^ rhs.size();
+    const size_t extent = (std::max)(lhs.size(), rhs.size());
+    for (size_t i = 0; i < extent; ++i) {
+        const unsigned char left =
+            i < lhs.size() ? static_cast<unsigned char>(lhs[i]) : 0;
+        const unsigned char right =
+            i < rhs.size() ? static_cast<unsigned char>(rhs[i]) : 0;
+        diff |= static_cast<size_t>(left ^ right);
     }
     return diff == 0;
 }
@@ -943,7 +1042,8 @@ int bounded_int(const JsonValue& payload,
 }
 
 void validate_generation_options(GenerationOptions& options,
-                                 const HttpApiServerConfig& config) {
+                                 const HttpApiServerConfig& config,
+                                 int vocab_size) {
     if (options.max_tokens < 0 || options.max_tokens > config.max_generate_tokens) {
         throw BadRequest("field 'max_tokens' must be between 0 and " +
                                  std::to_string(config.max_generate_tokens));
@@ -962,8 +1062,11 @@ void validate_generation_options(GenerationOptions& options,
     if (!std::isfinite(options.top_p) || options.top_p <= 0.0f || options.top_p > 1.0f) {
         throw BadRequest("field 'top_p' must be finite and between 0 and 1");
     }
-    if (options.top_k < 0) {
-        throw BadRequest("field 'top_k' must be non-negative");
+    if (options.top_k < 0 || options.top_k > vocab_size) {
+        throw BadRequest("field 'top_k' must be between 0 and the model vocabulary size");
+    }
+    if (options.eos_token_id < 0 || options.eos_token_id >= vocab_size) {
+        throw BadRequest("field 'eos_token_id' is outside the model vocabulary");
     }
 }
 
@@ -993,7 +1096,20 @@ std::filesystem::path resolve_pack_output_directory(const HttpApiServerConfig& c
     }
     fs::path root(config.pack_output_root.empty() ? "artifacts/model_packs"
                                                   : config.pack_output_root);
-    fs::path target = (root / requested_path).lexically_normal();
+    std::error_code ec;
+    const fs::path canonical_root = fs::weakly_canonical(root, ec);
+    if (ec) throw BadRequest("pack output root could not be canonicalized");
+    const fs::path target = fs::weakly_canonical(root / requested_path, ec);
+    if (ec) throw BadRequest("pack output directory could not be canonicalized");
+    const fs::path relative = target.lexically_relative(canonical_root);
+    if (relative.is_absolute()) {
+        throw BadRequest("pack output directory resolves outside configured root");
+    }
+    for (const auto& part : relative) {
+        if (part == "..") {
+            throw BadRequest("pack output directory resolves outside configured root");
+        }
+    }
     return target;
 }
 
@@ -1056,8 +1172,12 @@ RequestReadResult read_http_request(SOCKET socket, const HttpApiServerConfig& co
 
     std::istringstream request_line_stream(request_line);
     request_line_stream >> result.request.method >> result.request.raw_target >> result.request.version;
+    std::string unexpected_request_line_field;
+    request_line_stream >> unexpected_request_line_field;
     if (result.request.method.empty() || result.request.raw_target.empty() ||
-        result.request.version.empty()) {
+        result.request.version.empty() || !unexpected_request_line_field.empty() ||
+        (result.request.version != "HTTP/1.1" && result.request.version != "HTTP/1.0") ||
+        result.request.raw_target.empty() || result.request.raw_target.front() != '/') {
         result.error = make_error_response(400, "Bad Request", request_id, "invalid_request_line",
                                            "malformed request line");
         return result;
@@ -1091,21 +1211,54 @@ RequestReadResult read_http_request(SOCKET socket, const HttpApiServerConfig& co
         }
         const std::string key = to_lower_copy(trim_copy(header_line.substr(0, sep)));
         const std::string value = trim_copy(header_line.substr(sep + 1));
-        result.request.headers[key] = value;
+        if (key.empty() ||
+            !std::all_of(key.begin(), key.end(), [](unsigned char c) {
+                return is_http_token_char(c);
+            }) ||
+            !is_valid_header_value(value)) {
+            result.error = make_error_response(400, "Bad Request", request_id, "invalid_header",
+                                               "header name is invalid");
+            return result;
+        }
+        const auto [unused, inserted] = result.request.headers.emplace(key, value);
+        if (!inserted) {
+            result.error = make_error_response(400, "Bad Request", request_id,
+                                               "duplicate_header",
+                                               "duplicate request headers are not accepted");
+            return result;
+        }
     }
 
-    const bool transfer_chunked =
-        [&]() {
-            const auto transfer = result.request.headers.find("transfer-encoding");
-            return transfer != result.request.headers.end() &&
-                   to_lower_copy(transfer->second).find("chunked") != std::string::npos;
-        }();
+    bool transfer_chunked = false;
+    const auto transfer = result.request.headers.find("transfer-encoding");
+    if (transfer != result.request.headers.end()) {
+        const std::string encoding = to_lower_copy(trim_copy(transfer->second));
+        if (encoding != "chunked") {
+            result.error = make_error_response(400, "Bad Request", request_id,
+                                               "unsupported_transfer_encoding",
+                                               "only transfer-encoding: chunked is supported");
+            return result;
+        }
+        if (result.request.headers.count("content-length") != 0) {
+            result.error = make_error_response(400, "Bad Request", request_id,
+                                               "ambiguous_body_length",
+                                               "content-length and transfer-encoding cannot coexist");
+            return result;
+        }
+        transfer_chunked = true;
+    }
 
     size_t content_length = 0;
     if (!transfer_chunked) {
         const auto content_length_it = result.request.headers.find("content-length");
         if (content_length_it != result.request.headers.end()) {
             try {
+                if (content_length_it->second.empty() ||
+                    !std::all_of(content_length_it->second.begin(),
+                                 content_length_it->second.end(),
+                                 [](unsigned char c) { return std::isdigit(c) != 0; })) {
+                    throw std::invalid_argument("invalid content length");
+                }
                 size_t parsed_chars = 0;
                 const unsigned long long parsed =
                     std::stoull(content_length_it->second, &parsed_chars, 10);
@@ -1122,10 +1275,10 @@ RequestReadResult read_http_request(SOCKET socket, const HttpApiServerConfig& co
                 return result;
             }
         } else if (expects_json_body(result.request)) {
-            const std::string existing_body = raw.substr(header_end + 4);
-            if (!existing_body.empty()) {
-                content_length = existing_body.size();
-            }
+            result.error = make_error_response(411, "Length Required", request_id,
+                                               "length_required",
+                                               "request body requires content-length or chunked encoding");
+            return result;
         }
     }
 
@@ -1248,10 +1401,7 @@ std::string server_metrics_json(const HttpApiServer& server, uint64_t uptime_ms,
 } // namespace
 
 HttpApiServer::HttpApiServer(InferenceEngine& engine, HttpApiServerConfig config)
-    : engine_(engine), config_(std::move(config)), server_socket_(kInvalidSocket) {
-    // Wire global config pointer used by build_http_response for CORS injection.
-    g_response_config = &config_;
-}
+    : engine_(engine), config_(std::move(config)), server_socket_(kInvalidSocket) {}
 
 HttpApiServer::~HttpApiServer() {
     stop();
@@ -1296,6 +1446,12 @@ void HttpApiServer::close_socket(SOCKET socket) {
 size_t HttpApiServer::desired_inference_replica_count() const {
     if (config_.inference_replicas > 0) {
         return static_cast<size_t>(config_.inference_replicas);
+    }
+    // Replicating a complete model on one accelerator multiplies VRAM without
+    // creating independent GPU hardware. Operators can still opt in explicitly
+    // for multi-GPU/process-specific deployments.
+    if (engine_.config.use_cuda) {
+        return 1;
     }
     const unsigned int hardware = std::thread::hardware_concurrency();
     const int desired_workers =
@@ -1402,9 +1558,20 @@ bool HttpApiServer::start() {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(config_.port));
-    address.sin_addr.s_addr = config_.host.empty() || config_.host == "0.0.0.0"
-                                  ? htonl(INADDR_ANY)
-                                  : inet_addr(config_.host.c_str());
+    const std::string bind_host =
+        config_.host == "localhost" || config_.host == "localhost." ||
+                config_.host == "::1" || config_.host == "0:0:0:0:0:0:0:1"
+            ? "127.0.0.1"
+            : config_.host;
+    if (bind_host == "0.0.0.0") {
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (bind_host.empty()) {
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (inet_pton(AF_INET, bind_host.c_str(), &address.sin_addr) != 1) {
+        close_socket(server_socket_);
+        server_socket_ = kInvalidSocket;
+        return false;
+    }
 
     if (bind(server_socket_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         close_socket(server_socket_);
@@ -1441,6 +1608,10 @@ bool HttpApiServer::start() {
 }
 
 void HttpApiServer::serve_forever() {
+    const auto build_http_response = [&](const HttpResponse& response,
+                                         bool omit_content_length = false) {
+        return serialize_http_response(response, omit_content_length, config_.allow_cors);
+    };
     if (!start()) {
         throw std::runtime_error("failed to start HTTP API server");
     }
@@ -1490,6 +1661,7 @@ void HttpApiServer::stop() {
     }
 
     queue_cv_.notify_all();
+    replica_cv_.notify_all();
 
     for (auto& worker : workers_) {
         if (worker.joinable()) {
@@ -1536,6 +1708,10 @@ void HttpApiServer::worker_loop() {
 }
 
 void HttpApiServer::handle_client(SOCKET client_socket) {
+    const auto build_http_response = [&](const HttpResponse& response,
+                                         bool omit_content_length = false) {
+        return serialize_http_response(response, omit_content_length, config_.allow_cors);
+    };
     const uint64_t request_id = ++request_counter_;
     const RequestReadResult read_result = read_http_request(client_socket, config_, request_id);
     if (!read_result.success) {
@@ -1569,7 +1745,7 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
         return;
     }
 
-    if (!request_declares_https(request, config_)) {
+    if (!request_declares_https(request, client_socket, config_)) {
         rejected_requests_.fetch_add(1);
         HttpResponse response = make_error_response(
             426, "Upgrade Required", request_id, "https_required",
@@ -1589,25 +1765,13 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
         size_t remaining = 0;
         {
             std::lock_guard<std::mutex> lock(rate_limit_mutex_);
-            auto& timestamps = recent_requests_by_client_[client_identity];
-            while (!timestamps.empty() && now - timestamps.front() > window) {
-                timestamps.pop_front();
-            }
-            if (timestamps.size() < config_.rate_limit_requests_per_minute) {
-                timestamps.push_back(now);
-                allowed = true;
-                remaining = config_.rate_limit_requests_per_minute - timestamps.size();
-            } else {
-                remaining = 0;
-            }
             // Bound the rate-limit map: periodically (and whenever it grows
             // large) sweep out every client whose window has fully expired.
             // Without this, an endless stream of distinct identities (e.g. a
             // spoofed X-Forwarded-For per request) leaks one map entry each,
             // forever — a memory-exhaustion DoS.  Runs under rate_limit_mutex_.
-            constexpr size_t kRateLimitMaxClients = 100000;
             if (((++rate_limit_sweep_counter_) & 0x3FFu) == 0 ||
-                recent_requests_by_client_.size() > kRateLimitMaxClients) {
+                recent_requests_by_client_.size() >= config_.max_rate_limit_clients) {
                 for (auto it = recent_requests_by_client_.begin();
                      it != recent_requests_by_client_.end();) {
                     auto& dq = it->second;
@@ -1619,6 +1783,30 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
                     } else {
                         ++it;
                     }
+                }
+            }
+
+            auto client_it = recent_requests_by_client_.find(client_identity);
+            if (client_it == recent_requests_by_client_.end()) {
+                // Never use operator[] before enforcing the cardinality cap:
+                // an attacker controlling X-Forwarded-For could otherwise
+                // grow this map even when every existing identity is active.
+                if (recent_requests_by_client_.size() < config_.max_rate_limit_clients) {
+                    client_it = recent_requests_by_client_
+                                    .emplace(client_identity,
+                                             std::deque<std::chrono::steady_clock::time_point>{})
+                                    .first;
+                }
+            }
+            if (client_it != recent_requests_by_client_.end()) {
+                auto& timestamps = client_it->second;
+                while (!timestamps.empty() && now - timestamps.front() > window) {
+                    timestamps.pop_front();
+                }
+                if (timestamps.size() < config_.rate_limit_requests_per_minute) {
+                    timestamps.push_back(now);
+                    allowed = true;
+                    remaining = config_.rate_limit_requests_per_minute - timestamps.size();
                 }
             }
         }
@@ -1653,9 +1841,15 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             std::shared_lock<std::shared_mutex> state_lock(model_state_mutex_);
             fn(engine_);
         };
-        auto with_mutating_engine = [&](const auto& fn) {
+        auto with_transactional_training_engine = [&](const auto& fn) {
             std::unique_lock<std::shared_mutex> state_lock(model_state_mutex_);
-            fn(engine_);
+            // Administrative training is opt-in and prioritizes correctness:
+            // mutate a deep model+optimizer clone and publish it only after the
+            // full operation succeeds with finite outputs. Any exception leaves
+            // the serving model and its replicas byte-for-byte untouched.
+            std::unique_ptr<InferenceEngine> staged = engine_.clone_for_training();
+            fn(*staged);
+            engine_ = std::move(*staged);
             sync_inference_replicas_locked();
         };
         auto with_inference_replica = [&](const auto& fn) {
@@ -1684,16 +1878,28 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
                 return client_queue_.size();
             }();
 
+            bool ready = true;
+            if (request.path == "/ready") {
+                std::shared_lock<std::shared_mutex> state_lock(model_state_mutex_);
+                std::lock_guard<std::mutex> replica_lock(replica_mutex_);
+                ready = workers_started_.load() && !stop_requested_.load() &&
+                        engine_.model != nullptr && !inference_replicas_.empty() &&
+                        inference_replicas_.size() == desired_inference_replica_count();
+            }
+            const std::string status = request.path == "/health"
+                                           ? "alive"
+                                           : (ready ? "ready" : "not_ready");
             const std::string body = join_json_fields({
-                "\"ok\":true",
+                "\"ok\":" + json_bool(ready),
                 "\"request_id\":" + std::to_string(request_id),
-                "\"status\":\"ok\"",
+                "\"status\":\"" + status + "\"",
                 "\"api\":\"" + std::string(kApiVersion) + "\"",
                 "\"uptime_ms\":" + std::to_string(uptime_ms),
                 "\"active_requests\":" + std::to_string(active_requests_.load()),
                 "\"queue_depth\":" + std::to_string(queue_depth),
             });
-            HttpResponse response = make_json_response(200, "OK", body);
+            HttpResponse response = make_json_response(
+                ready ? 200 : 503, ready ? "OK" : "Service Unavailable", body);
             response.headers["X-Request-ID"] = std::to_string(request_id);
             send_all(client_socket, build_http_response(response));
             return;
@@ -1770,7 +1976,7 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             if (const auto value = json_int(payload, "top_k")) options.top_k = *value;
             if (const auto value = json_int(payload, "eos_token_id")) options.eos_token_id = *value;
             if (const auto value = json_int(payload, "max_context_tokens")) options.max_context_tokens = *value;
-            validate_generation_options(options, config_);
+            validate_generation_options(options, config_, engine_.config.vocab_size);
 
             std::string text;
             GenerationMetrics metrics;
@@ -1803,7 +2009,7 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             if (const auto value = json_int(payload, "top_k")) options.top_k = *value;
             if (const auto value = json_int(payload, "eos_token_id")) options.eos_token_id = *value;
             if (const auto value = json_int(payload, "max_context_tokens")) options.max_context_tokens = *value;
-            validate_generation_options(options, config_);
+            validate_generation_options(options, config_, engine_.config.vocab_size);
             const auto prompts = json_string_array(payload, "prompts");
             if (prompts.empty()) {
                 throw BadRequest("field 'prompts' must contain at least one prompt");
@@ -1854,7 +2060,7 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             if (const auto value = json_int(payload, "top_k")) options.top_k = *value;
             if (const auto value = json_int(payload, "eos_token_id")) options.eos_token_id = *value;
             if (const auto value = json_int(payload, "max_context_tokens")) options.max_context_tokens = *value;
-            validate_generation_options(options, config_);
+            validate_generation_options(options, config_, engine_.config.vocab_size);
 
             HttpResponse head;
             head.status_code = 200;
@@ -1873,36 +2079,46 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             std::mutex stream_mutex;
             std::condition_variable stream_cv;
             std::deque<std::string> pending_chunks;
+            size_t pending_bytes = 0;
             bool stream_finished = false;
+            bool stream_failed = false;
             std::thread sender([&] {
                 while (true) {
-                    std::deque<std::string> local_chunks;
-                    bool finished = false;
+                    std::string chunk;
                     {
                         std::unique_lock<std::mutex> lock(stream_mutex);
                         stream_cv.wait(lock, [&] {
-                            return stream_finished || !pending_chunks.empty();
+                            return stream_finished || stream_failed ||
+                                   !pending_chunks.empty();
                         });
-                        pending_chunks.swap(local_chunks);
-                        finished = stream_finished;
-                    }
-
-                    for (const auto& chunk : local_chunks) {
-                        if (!send_all(client_socket,
-                                      "event: chunk\n"
-                                      "data: {\"request_id\":" +
-                                          std::to_string(request_id) + ",\"chunk\":\"" +
-                                          json_escape(chunk) + "\"}\n\n")) {
-                            return;
-                        }
-                    }
-
-                    if (finished) {
-                        std::lock_guard<std::mutex> lock(stream_mutex);
+                        if (stream_failed) return;
                         if (pending_chunks.empty()) {
-                            return;
+                            if (stream_finished) return;
+                            continue;
                         }
+                        chunk = std::move(pending_chunks.front());
+                        pending_chunks.pop_front();
                     }
+
+                    const bool sent = send_all(client_socket,
+                                               "event: chunk\n"
+                                               "data: {\"request_id\":" +
+                                                   std::to_string(request_id) +
+                                                   ",\"chunk\":\"" +
+                                                   json_escape(chunk) + "\"}\n\n");
+                    bool finished = false;
+                    {
+                        std::lock_guard<std::mutex> lock(stream_mutex);
+                        pending_bytes -= (std::min)(pending_bytes, chunk.size());
+                        if (!sent) {
+                            stream_failed = true;
+                            pending_chunks.clear();
+                            pending_bytes = 0;
+                        }
+                        finished = stream_finished && pending_chunks.empty();
+                    }
+                    stream_cv.notify_all();
+                    if (!sent || finished) return;
                 }
             });
             JoinThreadGuard sender_guard{&sender};
@@ -1924,17 +2140,34 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
                     cv.notify_all();
                 }
             } finish_signal{stream_mutex, stream_cv, stream_finished};
-            with_inference_replica([&](InferenceEngine& engine) {
-                final_text = engine.generate_stream(
-                    prompt, options, [&](const std::string& chunk) {
-                        {
-                            std::lock_guard<std::mutex> lock(stream_mutex);
+            bool aborted = false;
+            try {
+                with_inference_replica([&](InferenceEngine& engine) {
+                    final_text = engine.generate_stream(
+                        prompt, options, [&](const std::string& chunk) {
+                            if (chunk.empty()) return;
+                            if (chunk.size() > config_.max_stream_pending_bytes) {
+                                throw StreamAborted("stream chunk exceeded configured buffer");
+                            }
+                            std::unique_lock<std::mutex> lock(stream_mutex);
+                            stream_cv.wait(lock, [&] {
+                                return stream_failed || stop_requested_.load() ||
+                                       pending_bytes <=
+                                           config_.max_stream_pending_bytes - chunk.size();
+                            });
+                            if (stream_failed || stop_requested_.load()) {
+                                throw StreamAborted("stream client disconnected");
+                            }
+                            pending_bytes += chunk.size();
                             pending_chunks.push_back(chunk);
-                        }
-                        stream_cv.notify_one();
-                    });
-                metrics = engine.last_generation_metrics();
-            });
+                            lock.unlock();
+                            stream_cv.notify_one();
+                        });
+                    metrics = engine.last_generation_metrics();
+                });
+            } catch (const StreamAborted&) {
+                aborted = true;
+            }
             {
                 std::lock_guard<std::mutex> lock(stream_mutex);
                 stream_finished = true;
@@ -1946,6 +2179,9 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             // or placing "done" before a queued chunk.
             if (sender.joinable()) {
                 sender.join();
+            }
+            if (aborted || stream_failed) {
+                return;
             }
             update_latest_generation_metrics(metrics);
 
@@ -1974,9 +2210,17 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             }
 
             float loss = 0.0f;
-            with_mutating_engine([&](InferenceEngine& engine) {
+            with_transactional_training_engine([&](InferenceEngine& engine) {
+                const std::vector<int> tokens =
+                    engine.sanitize_token_ids(engine.tokenizer.encode(text));
+                if (tokens.size() < 2) {
+                    throw BadRequest("field 'text' must encode to at least two tokens");
+                }
                 for (int i = 0; i < steps; ++i) {
-                    loss = engine.train_step(text);
+                    loss = engine.train_step(tokens, {});
+                }
+                if (!std::isfinite(loss)) {
+                    throw std::runtime_error("training produced a non-finite loss");
                 }
             });
 
@@ -2009,6 +2253,9 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
                                          std::to_string(config_.max_prompts_per_batch));
             }
             for (const auto& text : texts) {
+                if (text.empty()) {
+                    throw BadRequest("field 'texts' must not contain empty samples");
+                }
                 if (text.size() > config_.max_train_text_bytes) {
                     throw BadRequest("field 'texts' contains an item exceeding configured byte limit");
                 }
@@ -2016,13 +2263,26 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
 
             float last_loss = 0.0f;
             size_t updates = 0;
-            with_mutating_engine([&](InferenceEngine& engine) {
+            with_transactional_training_engine([&](InferenceEngine& engine) {
+                std::vector<std::vector<int>> token_batches;
+                token_batches.reserve(texts.size());
+                for (const auto& text : texts) {
+                    std::vector<int> tokens =
+                        engine.sanitize_token_ids(engine.tokenizer.encode(text));
+                    if (tokens.size() < 2) {
+                        throw BadRequest(
+                            "each item in field 'texts' must encode to at least two tokens");
+                    }
+                    token_batches.push_back(std::move(tokens));
+                }
                 for (int epoch = 0; epoch < epochs; ++epoch) {
-                    for (const auto& text : texts) {
-                        if (text.empty()) continue;
-                        last_loss = engine.train_step(text);
+                    for (const auto& tokens : token_batches) {
+                        last_loss = engine.train_step(tokens, {});
                         ++updates;
                     }
+                }
+                if (!std::isfinite(last_loss)) {
+                    throw std::runtime_error("training produced a non-finite loss");
                 }
             });
 
@@ -2059,37 +2319,59 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             if (corpus.size() > config_.max_body_bytes) {
                 throw BadRequest("field 'corpus' exceeds configured byte limit");
             }
+            const auto learning_rate = json_float(payload, "learning_rate");
+            const auto weight_decay = json_float(payload, "weight_decay");
+            const auto max_grad_norm = json_float(payload, "max_grad_norm");
+            const auto min_learning_rate_scale =
+                json_float(payload, "min_learning_rate_scale");
+            const auto warmup_steps = json_int(payload, "warmup_steps");
+            if (learning_rate && (*learning_rate <= 0.0f || *learning_rate > 1.0f)) {
+                throw BadRequest("field 'learning_rate' must be in (0, 1]");
+            }
+            if (weight_decay && (*weight_decay < 0.0f || *weight_decay > 10.0f)) {
+                throw BadRequest("field 'weight_decay' must be between 0 and 10");
+            }
+            if (max_grad_norm && (*max_grad_norm <= 0.0f || *max_grad_norm > 1000000.0f)) {
+                throw BadRequest("field 'max_grad_norm' must be in (0, 1000000]");
+            }
+            if (min_learning_rate_scale &&
+                (*min_learning_rate_scale <= 0.0f || *min_learning_rate_scale > 1.0f)) {
+                throw BadRequest("field 'min_learning_rate_scale' must be in (0, 1]");
+            }
+            if (warmup_steps && (*warmup_steps < 0 || *warmup_steps > 100000000)) {
+                throw BadRequest("field 'warmup_steps' must be between 0 and 100000000");
+            }
 
             float last_loss = 0.0f;
             size_t token_count = 0;
-            with_mutating_engine([&](InferenceEngine& engine) {
+            with_transactional_training_engine([&](InferenceEngine& engine) {
                 if (!engine.trainer) {
                     throw std::runtime_error("trainer is not initialized");
-                }
-
-                if (const auto value = json_float(payload, "learning_rate")) {
-                    engine.trainer->learning_rate = *value;
-                }
-                if (const auto value = json_float(payload, "weight_decay")) {
-                    engine.trainer->weight_decay = *value;
-                }
-                if (const auto value = json_float(payload, "max_grad_norm")) {
-                    engine.trainer->max_grad_norm = *value;
-                }
-                if (const auto value = json_float(payload, "min_learning_rate_scale")) {
-                    engine.trainer->min_learning_rate_scale = *value;
-                }
-                if (const auto value = json_int(payload, "warmup_steps")) {
-                    engine.trainer->warmup_steps = *value;
                 }
 
                 std::vector<int> tokens =
                     engine.sanitize_token_ids(engine.tokenizer.encode(corpus));
                 token_count = tokens.size();
+                if (token_count < 2) {
+                    throw BadRequest("field 'corpus' must encode to at least two tokens");
+                }
+
+                // Apply overrides only after all input-derived validation has
+                // passed; the whole staged engine is discarded on later error.
+                if (learning_rate) engine.trainer->learning_rate = *learning_rate;
+                if (weight_decay) engine.trainer->weight_decay = *weight_decay;
+                if (max_grad_norm) engine.trainer->max_grad_norm = *max_grad_norm;
+                if (min_learning_rate_scale) {
+                    engine.trainer->min_learning_rate_scale = *min_learning_rate_scale;
+                }
+                if (warmup_steps) engine.trainer->warmup_steps = *warmup_steps;
 
                 engine.trainer->train_loop(
                     tokens, epochs, batch_size, seq_len,
                     [&](int, float loss) { last_loss = loss; }, max_steps);
+                if (!std::isfinite(last_loss)) {
+                    throw std::runtime_error("training produced a non-finite loss");
+                }
             });
 
             const std::string body = join_json_fields({
@@ -2125,6 +2407,9 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             with_read_engine([&](InferenceEngine& engine) {
                 saved = engine.save_model_pack(output_directory.string());
             });
+            if (!saved) {
+                throw std::runtime_error("model pack persistence failed");
+            }
 
             const std::string body = join_json_fields({
                 "\"ok\":" + json_bool(saved),
@@ -2132,8 +2417,7 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
                 "\"saved\":" + json_bool(saved),
                 "\"directory\":\"" + json_escape(output_directory.string()) + "\"",
             });
-            HttpResponse response =
-                make_json_response(saved ? 200 : 400, saved ? "OK" : "Bad Request", body);
+            HttpResponse response = make_json_response(200, "OK", body);
             response.headers["X-Request-ID"] = std::to_string(request_id);
             send_all(client_socket, build_http_response(response));
             return;

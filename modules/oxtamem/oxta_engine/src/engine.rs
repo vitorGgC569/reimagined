@@ -18,6 +18,102 @@ const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_METADATA_HEADS: usize = 1_000_000;
 const MAX_VECTOR_RECORDS: usize = 100_000;
 const MAX_ARCHIVED_NODE_BYTES: u64 = MAX_VALUE_BYTES as u64 + 1024 * 1024;
+const METADATA_MAGIC: &[u8; 8] = b"OXTAMT02";
+const METADATA_VERSION: u32 = 2;
+const METADATA_ENVELOPE_BYTES: usize = 8 + 4 + 8 + 8;
+const JOURNAL_MAGIC: &[u8; 8] = b"OXTAJR01";
+const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_ENVELOPE_BYTES: usize = 8 + 4 + 8 + 8;
+const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_JOURNAL_COMPACTION_RECORDS: usize = 1024;
+const NODE_MAGIC: &[u8; 8] = b"OXTAND02";
+const NODE_VERSION: u32 = 2;
+const NODE_ENVELOPE_BYTES: usize = 8 + 4 + 8 + 8;
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 1469598103934665603u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211u64);
+    }
+    hash
+}
+
+fn appended_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    let status = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "OxtaMem arena is already open by another process",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn lock_file_exclusive(_file: &File) -> io::Result<()> {
+    // Windows exclusivity is established by OpenOptionsExt::share_mode(0).
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let status = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if status == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)?;
+    if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        // The rename is already the logical commit point. A directory fsync is
+        // best-effort here: returning an error after the commit would invite a
+        // caller retry even though the new snapshot is already visible.
+        let _ = File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(())
+}
 
 /// usearch needs capacity reserved before `add`; inserting into a zero-capacity
 /// index dereferences uninitialised internals and crashes the process (this path
@@ -31,6 +127,19 @@ fn ensure_index_capacity(idx: &Index, wanted: usize) -> Result<(), String> {
             .map_err(|e| format!("Vector index reserve error: {e}"))?;
     }
     Ok(())
+}
+
+fn valid_search_vector(vector: &[f32]) -> bool {
+    if vector.len() != DEFAULT_VECTOR_DIMENSIONS
+        || vector.iter().any(|value| !value.is_finite())
+    {
+        return false;
+    }
+    let norm_squared = vector
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>();
+    norm_squared.is_finite() && norm_squared > 1e-12
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
@@ -48,6 +157,14 @@ pub struct EngineMetadata {
     pub vector_records: HashMap<u64, Vec<f32>>,
 }
 
+#[derive(Archive, Deserialize, Serialize, Debug)]
+struct JournalEntry {
+    token_id: String,
+    address: u64,
+    current_offset: u64,
+    vector: Option<Vec<f32>>,
+}
+
 pub struct GeodesicEngine {
     pub heads: HashMap<String, u64>, // Maps Variable ID -> Offset in File
     #[allow(dead_code)] // File needs to be kept alive for mmap
@@ -55,14 +172,17 @@ pub struct GeodesicEngine {
     mmap: MmapMut,
     current_offset: u64,
     meta_path: PathBuf,
+    journal_path: PathBuf,
     // Hybrid Search: In-Memory Vector Index
     vector_index: Option<Index>,
     vector_records: HashMap<u64, Vec<f32>>,
     max_size_bytes: u64,
-    // When false, per-write metadata persistence is deferred until flush()/Drop.
+    // When true, each write appends a checksummed O(1) durability journal
+    // record. When false, persistence is deferred until flush()/Drop.
     sync_on_write: bool,
     // Set on every append, cleared on persist; lets Drop skip a no-op fsync.
     dirty: bool,
+    journal_records_since_snapshot: usize,
 }
 
 impl GeodesicEngine {
@@ -82,12 +202,19 @@ impl GeodesicEngine {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
+        let mut file_options = OpenOptions::new();
+        file_options
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false) // Do not truncate existing files
-            .open(&db_path)?;
+            .truncate(false); // Do not truncate existing files
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            file_options.share_mode(0);
+        }
+        let file = file_options.open(&db_path)?;
+        lock_file_exclusive(&file)?;
 
         let requested_size_bytes = size_mb
             .checked_mul(1024)
@@ -123,12 +250,22 @@ impl GeodesicEngine {
         let index = Index::new(&options)
             .map_err(|e| io::Error::other(format!("vector index init error: {}", e)))?;
 
+        const LEGACY_METADATA_EXTENSION: &str = "meta";
+        let preferred_meta_path = appended_sidecar(&db_path, ".meta");
+        let legacy_meta_path = db_path.with_extension(LEGACY_METADATA_EXTENSION);
+        let meta_path = if preferred_meta_path.exists() || !legacy_meta_path.exists() {
+            preferred_meta_path
+        } else {
+            legacy_meta_path
+        };
+        let journal_path = appended_sidecar(&meta_path, ".journal");
         let mut engine = Self {
             heads: HashMap::new(),
             file,
             mmap,
             current_offset: 0,
-            meta_path: db_path.with_extension("meta"),
+            meta_path,
+            journal_path,
             vector_index: Some(index),
             vector_records: HashMap::new(),
             // Hard ceiling for arena growth; ensure_capacity doubles the mmap up
@@ -136,9 +273,12 @@ impl GeodesicEngine {
             max_size_bytes: absolute_max_bytes,
             sync_on_write: true,
             dirty: false,
+            journal_records_since_snapshot: 0,
         };
 
         engine.restore_metadata()?;
+        engine.restore_journal()?;
+        engine.rebuild_vector_index()?;
         Ok(engine)
     }
 
@@ -158,7 +298,46 @@ impl GeodesicEngine {
         if bytes.is_empty() {
             return Ok(());
         }
-        let metadata = rkyv::from_bytes::<EngineMetadata, rkyv::rancor::Error>(&bytes)
+        let payload: &[u8] = if bytes.starts_with(METADATA_MAGIC) {
+            if bytes.len() < METADATA_ENVELOPE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata envelope is truncated",
+                ));
+            }
+            let version = u32::from_le_bytes(
+                bytes[8..12]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad metadata version"))?,
+            );
+            let payload_len = u64::from_le_bytes(
+                bytes[12..20]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad metadata length"))?,
+            );
+            let checksum = u64::from_le_bytes(
+                bytes[20..28]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad metadata checksum"))?,
+            );
+            let payload_len = usize::try_from(payload_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "metadata length overflows usize")
+            })?;
+            if version != METADATA_VERSION
+                || payload_len != bytes.len() - METADATA_ENVELOPE_BYTES
+                || fnv1a64(&bytes[METADATA_ENVELOPE_BYTES..]) != checksum
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata envelope validation failed",
+                ));
+            }
+            &bytes[METADATA_ENVELOPE_BYTES..]
+        } else {
+            // Version-1 compatibility: legacy files were raw rkyv payloads.
+            &bytes
+        };
+        let metadata = rkyv::from_bytes::<EngineMetadata, rkyv::rancor::Error>(payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         if metadata.current_offset > self.mmap.len() as u64 {
@@ -188,8 +367,7 @@ impl GeodesicEngine {
         }
         for (address, vector) in &metadata.vector_records {
             if *address >= metadata.current_offset
-                || vector.len() != DEFAULT_VECTOR_DIMENSIONS
-                || vector.iter().any(|value| !value.is_finite())
+                || !valid_search_vector(vector)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -211,12 +389,235 @@ impl GeodesicEngine {
             }
         }
 
-        if let Some(idx) = &mut self.vector_index {
-            ensure_index_capacity(idx, self.vector_records.len()).map_err(io::Error::other)?;
-            for (address, vector) in &self.vector_records {
-                idx.add(*address, vector)
-                    .map_err(|e| io::Error::other(format!("Vector index restore error: {}", e)))?;
+        Ok(())
+    }
+
+    fn truncate_journal_to(&self, length: u64) -> io::Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.journal_path)?;
+        file.set_len(length)?;
+        file.sync_all()
+    }
+
+    fn restore_journal(&mut self) -> io::Result<()> {
+        if !self.journal_path.exists() {
+            return Ok(());
+        }
+        let journal_len = std::fs::metadata(&self.journal_path)?.len();
+        if journal_len > MAX_JOURNAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metadata journal exceeds configured limit",
+            ));
+        }
+        let bytes = std::fs::read(&self.journal_path)?;
+        let mut cursor = 0usize;
+        let mut records = 0usize;
+
+        while cursor < bytes.len() {
+            let remaining = bytes.len() - cursor;
+            if remaining < JOURNAL_ENVELOPE_BYTES {
+                self.truncate_journal_to(cursor as u64)?;
+                break;
             }
+            if &bytes[cursor..cursor + 8] != JOURNAL_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata journal magic is invalid",
+                ));
+            }
+            let version = u32::from_le_bytes(
+                bytes[cursor + 8..cursor + 12]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad journal version"))?,
+            );
+            let payload_len = u64::from_le_bytes(
+                bytes[cursor + 12..cursor + 20]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad journal length"))?,
+            );
+            let checksum = u64::from_le_bytes(
+                bytes[cursor + 20..cursor + 28]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad journal checksum"))?,
+            );
+            if version != JOURNAL_VERSION || payload_len > MAX_JOURNAL_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata journal envelope is invalid",
+                ));
+            }
+            let payload_len = usize::try_from(payload_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "journal length overflows usize")
+            })?;
+            let record_end = cursor
+                .checked_add(JOURNAL_ENVELOPE_BYTES)
+                .and_then(|value| value.checked_add(payload_len))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "journal record size overflow")
+                })?;
+            if record_end > bytes.len() {
+                // A crash can leave only the final append incomplete. The last
+                // fully checksummed record remains the durable commit point.
+                self.truncate_journal_to(cursor as u64)?;
+                break;
+            }
+            let payload = &bytes[cursor + JOURNAL_ENVELOPE_BYTES..record_end];
+            if fnv1a64(payload) != checksum {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata journal checksum mismatch",
+                ));
+            }
+            let entry = rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(payload)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            cursor = record_end;
+            records = records.saturating_add(1);
+
+            // A snapshot may have committed just before a crash prevented the
+            // journal truncation. Such records are idempotently skipped.
+            if entry.current_offset <= self.current_offset {
+                continue;
+            }
+            if entry.token_id.is_empty()
+                || entry.token_id.len() > MAX_TOKEN_ID_BYTES
+                || entry.address != self.current_offset
+                || entry.current_offset <= entry.address
+                || entry.current_offset > self.mmap.len() as u64
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata journal references an invalid node range",
+                ));
+            }
+            let previous_offset = self.current_offset;
+            self.current_offset = entry.current_offset;
+            let Some(node) = self.read_node_at(entry.address) else {
+                self.current_offset = previous_offset;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata journal references an invalid node",
+                ));
+            };
+            if node.prev != self.heads.get(&entry.token_id).copied() {
+                self.current_offset = previous_offset;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata journal breaks a node history chain",
+                ));
+            }
+            if let Some(vector) = entry.vector {
+                if !valid_search_vector(&vector)
+                    || self.vector_records.len() >= MAX_VECTOR_RECORDS
+                {
+                    self.current_offset = previous_offset;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metadata journal contains an invalid vector record",
+                    ));
+                }
+                self.vector_records.insert(entry.address, vector);
+            }
+            self.heads.insert(entry.token_id, entry.address);
+        }
+        self.journal_records_since_snapshot = records;
+        Ok(())
+    }
+
+    fn rebuild_vector_index(&mut self) -> io::Result<()> {
+        if let Some(index) = &mut self.vector_index {
+            ensure_index_capacity(index, self.vector_records.len()).map_err(io::Error::other)?;
+            for (address, vector) in &self.vector_records {
+                index.add(*address, vector).map_err(|error| {
+                    io::Error::other(format!("Vector index restore error: {error}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_incremental(
+        &mut self,
+        token_id: &str,
+        address: u64,
+        vector: Option<&[f32]>,
+    ) -> io::Result<()> {
+        let entry = JournalEntry {
+            token_id: token_id.to_string(),
+            address,
+            current_offset: self.current_offset,
+            vector: vector.map(|values| values.to_vec()),
+        };
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&entry)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let record_bytes = JOURNAL_ENVELOPE_BYTES
+            .checked_add(payload.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "journal size overflow"))?;
+        if record_bytes as u64 > MAX_JOURNAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "journal record exceeds configured limit",
+            ));
+        }
+
+        let data_len = self.current_offset.checked_sub(address).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid journal node range")
+        })?;
+        self.mmap.flush_range(
+            usize::try_from(address)
+                .map_err(|_| io::Error::other("journal address overflows usize"))?,
+            usize::try_from(data_len)
+                .map_err(|_| io::Error::other("journal range overflows usize"))?,
+        )?;
+        self.file.sync_data()?;
+
+        let existing_len = std::fs::metadata(&self.journal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let journal_would_overflow = match existing_len.checked_add(record_bytes as u64) {
+            Some(length) => length > MAX_JOURNAL_BYTES,
+            None => true,
+        };
+        if journal_would_overflow {
+            // The full snapshot includes the just-written logical state, so a
+            // successful compaction itself is the durable commit.
+            return self.persist_metadata();
+        }
+
+        let mut bytes = Vec::with_capacity(record_bytes);
+        bytes.extend_from_slice(JOURNAL_MAGIC);
+        bytes.extend_from_slice(&JOURNAL_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&fnv1a64(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        let mut journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&self.journal_path)?;
+        use std::io::Write;
+        if let Err(error) = journal.write_all(&bytes).and_then(|_| journal.sync_all()) {
+            let _ = journal.set_len(existing_len).and_then(|_| journal.sync_all());
+            return Err(error);
+        }
+        drop(journal);
+        self.journal_records_since_snapshot =
+            self.journal_records_since_snapshot.saturating_add(1);
+
+        // Snapshot after O(N) new records for O(1) amortized persistence. A
+        // failed compaction is harmless: the journal is already durable.
+        let compact_after = self
+            .heads
+            .len()
+            .saturating_add(self.vector_records.len())
+            .max(MIN_JOURNAL_COMPACTION_RECORDS);
+        if self.journal_records_since_snapshot >= compact_after {
+            let _ = self.persist_metadata();
         }
         Ok(())
     }
@@ -227,19 +628,30 @@ impl GeodesicEngine {
             current_offset: self.current_offset,
             vector_records: self.vector_records.clone(),
         };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&metadata)
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&metadata)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        if bytes.len() as u64 > MAX_METADATA_BYTES {
+        let total_bytes = METADATA_ENVELOPE_BYTES
+            .checked_add(payload.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "metadata size overflow"))?;
+        if total_bytes as u64 > MAX_METADATA_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "metadata exceeds configured limit",
             ));
         }
+        let mut bytes = Vec::with_capacity(total_bytes);
+        bytes.extend_from_slice(METADATA_MAGIC);
+        bytes.extend_from_slice(&METADATA_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&fnv1a64(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
         // Data must reach the mapped file before metadata publishes pointers
         // to it.  This prevents a metadata head from surviving a torn node.
-        self.mmap.flush()?;
+        if self.current_offset > 0 {
+            self.mmap.flush_range(0, self.current_offset as usize)?;
+        }
         self.file.sync_data()?;
-        let tmp_path = self.meta_path.with_extension("meta.tmp");
+        let tmp_path = appended_sidecar(&self.meta_path, ".tmp");
         {
             let mut tmp = OpenOptions::new()
                 .write(true)
@@ -250,7 +662,14 @@ impl GeodesicEngine {
             tmp.write_all(&bytes)?;
             tmp.sync_all()?;
         }
-        std::fs::rename(&tmp_path, &self.meta_path)?;
+        atomic_replace(&tmp_path, &self.meta_path)?;
+        // The snapshot is now the commit point. Journal cleanup is idempotent:
+        // if truncation fails, replay skips entries already covered by
+        // current_offset, so reporting a false write failure would be worse.
+        if self.truncate_journal_to(0).is_ok() {
+            let _ = std::fs::remove_file(&self.journal_path);
+            self.journal_records_since_snapshot = 0;
+        }
         self.dirty = false;
         Ok(())
     }
@@ -285,10 +704,9 @@ impl GeodesicEngine {
         Ok(())
     }
 
-    /// When `false`, `write`/`write_with_vector` skip the per-write metadata
-    /// fsync; call `flush()` (or drop the engine) to persist.  Trades recent-write
-    /// crash durability for throughput — the node bytes are already durably in the
-    /// arena, only the metadata pointer that references them is deferred.
+    /// When `false`, `write`/`write_with_vector` skip the per-write journal
+    /// fsync; call `flush()` (or drop the engine) to persist. Trades recent-write
+    /// crash durability for throughput.
     pub fn set_sync_on_write(&mut self, sync_on_write: bool) {
         self.sync_on_write = sync_on_write;
     }
@@ -299,9 +717,20 @@ impl GeodesicEngine {
     }
 
     pub fn write(&mut self, token_id: &str, value: Vec<u8>) -> Result<u64, String> {
+        let previous_head = self.heads.get(token_id).copied();
+        let previous_offset = self.current_offset;
+        let previous_dirty = self.dirty;
         let addr = self.write_internal(token_id, value)?;
         if self.sync_on_write {
-            self.persist_metadata().map_err(|e| e.to_string())?;
+            if let Err(error) = self.persist_incremental(token_id, addr, None) {
+                self.rollback_logical_write(
+                    token_id,
+                    previous_head,
+                    previous_offset,
+                    previous_dirty,
+                );
+                return Err(error.to_string());
+            }
         }
         Ok(addr)
     }
@@ -320,8 +749,8 @@ impl GeodesicEngine {
                 vector.len()
             ));
         }
-        if vector.iter().any(|value| !value.is_finite()) {
-            return Err("Vector contains non-finite values".to_string());
+        if !valid_search_vector(&vector) {
+            return Err("Vector must contain finite values and have non-zero norm".to_string());
         }
         // Enforce the same cap the restore path checks, atomically before writing
         // anything — otherwise a store can accept vectors it can never reopen with.
@@ -330,20 +759,44 @@ impl GeodesicEngine {
                 "vector index is full: {MAX_VECTOR_RECORDS} records is the maximum the store can reopen with"
             ));
         }
-        let addr = self.write_internal(token_id, value)?;
-
         if let Some(idx) = &mut self.vector_index {
-            // Use the address as the Key in the vector index
-            // Note: usearch keys are u64, perfect for our address/offset
             let wanted = idx.size() + 1;
             ensure_index_capacity(idx, wanted)?;
-            idx.add(addr, &vector)
-                .map_err(|e| format!("Vector index error: {}", e))?;
         }
 
-        self.vector_records.insert(addr, vector);
+        let previous_head = self.heads.get(token_id).copied();
+        let previous_offset = self.current_offset;
+        let previous_dirty = self.dirty;
+        let addr = self.write_internal(token_id, value)?;
+
+        if let Some(idx) = &mut self.vector_index
+            && let Err(error) = idx.add(addr, &vector)
+        {
+            let _ = idx.remove(addr);
+            self.rollback_logical_write(
+                token_id,
+                previous_head,
+                previous_offset,
+                previous_dirty,
+            );
+            return Err(format!("Vector index error: {error}"));
+        }
+
+        self.vector_records.insert(addr, vector.clone());
         if self.sync_on_write {
-            self.persist_metadata().map_err(|e| e.to_string())?;
+            if let Err(error) = self.persist_incremental(token_id, addr, Some(&vector)) {
+                self.vector_records.remove(&addr);
+                if let Some(idx) = &mut self.vector_index {
+                    let _ = idx.remove(addr);
+                }
+                self.rollback_logical_write(
+                    token_id,
+                    previous_head,
+                    previous_offset,
+                    previous_dirty,
+                );
+                return Err(error.to_string());
+            }
         }
 
         Ok(addr)
@@ -356,11 +809,20 @@ impl GeodesicEngine {
         if value.len() > MAX_VALUE_BYTES {
             return Err(format!("value exceeds {} bytes", MAX_VALUE_BYTES));
         }
+        if !self.heads.contains_key(token_id) && self.heads.len() >= MAX_METADATA_HEADS {
+            return Err(format!(
+                "head index is full: {MAX_METADATA_HEADS} unique keys is the maximum"
+            ));
+        }
         let prev_ptr = self.heads.get(token_id).copied();
-        let timestamp = std::time::SystemTime::now()
+        let wall_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_millis() as u64;
+        let timestamp = prev_ptr
+            .and_then(|address| self.read_node_at(address))
+            .map(|previous| wall_timestamp.max(previous.timestamp.saturating_add(1)))
+            .unwrap_or(wall_timestamp);
 
         let node = Node {
             value,
@@ -368,7 +830,16 @@ impl GeodesicEngine {
             timestamp,
         };
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&node).map_err(|e| e.to_string())?;
+        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&node).map_err(|e| e.to_string())?;
+        let total_bytes = NODE_ENVELOPE_BYTES
+            .checked_add(payload.len())
+            .ok_or_else(|| "serialized node length overflow".to_string())?;
+        let mut bytes = Vec::with_capacity(total_bytes);
+        bytes.extend_from_slice(NODE_MAGIC);
+        bytes.extend_from_slice(&NODE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&fnv1a64(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
 
         let len = u64::try_from(bytes.len()).map_err(|_| "serialized node is too large")?;
         if len > MAX_ARCHIVED_NODE_BYTES {
@@ -397,6 +868,25 @@ impl GeodesicEngine {
         self.dirty = true;
 
         Ok(node_addr)
+    }
+
+    fn rollback_logical_write(
+        &mut self,
+        token_id: &str,
+        previous_head: Option<u64>,
+        previous_offset: u64,
+        previous_dirty: bool,
+    ) {
+        self.current_offset = previous_offset;
+        self.dirty = previous_dirty;
+        match previous_head {
+            Some(address) => {
+                self.heads.insert(token_id.to_string(), address);
+            }
+            None => {
+                self.heads.remove(token_id);
+            }
+        }
     }
 
     pub fn read_latest(&self, token_id: &str) -> Option<Node> {
@@ -428,8 +918,28 @@ impl GeodesicEngine {
 
         let data_end_usize = usize::try_from(data_end).ok()?;
         let bytes = &self.mmap[data_start_usize..data_end_usize];
+        let payload = if bytes.starts_with(NODE_MAGIC) {
+            if bytes.len() < NODE_ENVELOPE_BYTES {
+                return None;
+            }
+            let version = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+            let payload_len = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+            let checksum = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
+            let payload_len = usize::try_from(payload_len).ok()?;
+            if version != NODE_VERSION
+                || payload_len != bytes.len() - NODE_ENVELOPE_BYTES
+                || fnv1a64(&bytes[NODE_ENVELOPE_BYTES..]) != checksum
+            {
+                return None;
+            }
+            &bytes[NODE_ENVELOPE_BYTES..]
+        } else {
+            // Version-1 compatibility: legacy arena records contained the raw
+            // rkyv Node payload immediately after the outer u64 length.
+            bytes
+        };
 
-        let node = rkyv::from_bytes::<Node, rkyv::rancor::Error>(bytes).ok()?;
+        let node = rkyv::from_bytes::<Node, rkyv::rancor::Error>(payload).ok()?;
         if node.value.len() > MAX_VALUE_BYTES || node.prev.is_some_and(|previous| previous >= addr)
         {
             return None;
@@ -489,8 +999,7 @@ impl GeodesicEngine {
     /// threshold on relevance instead of blindly trusting the top-k ordering.
     pub fn search_similar_scored(&self, vector: Vec<f32>, k: usize) -> Vec<(f32, Node)> {
         let mut results = Vec::new();
-        if vector.len() != DEFAULT_VECTOR_DIMENSIONS
-            || vector.iter().any(|value| !value.is_finite())
+        if !valid_search_vector(&vector)
             || k == 0
             || k > MAX_SEARCH_RESULTS
         {
@@ -538,7 +1047,7 @@ mod tests {
             std::process::id(),
             nonce
         ));
-        let meta = db.with_extension("meta");
+        let meta = appended_sidecar(&db, ".meta");
         (db, meta)
     }
 
@@ -800,6 +1309,107 @@ mod tests {
             GeodesicEngine::new(&db, 2).is_err(),
             "torn metadata must fail to open, not load a corrupt store"
         );
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+    }
+
+    #[test]
+    fn metadata_failure_rolls_back_logical_write() {
+        let (db, meta) = test_paths("rollback");
+        let journal = appended_sidecar(&meta, ".journal");
+        let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+        engine.write("stable", vec![1]).unwrap();
+        let before_offset = engine.current_offset;
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+
+        assert!(engine.write("rejected", vec![2]).is_err());
+        assert_eq!(engine.current_offset, before_offset);
+        assert!(engine.read_latest("rejected").is_none());
+        assert_eq!(engine.read_latest("stable").unwrap().value, vec![1]);
+
+        let vector = unit_vector(DEFAULT_VECTOR_DIMENSIONS, 0);
+        assert!(
+            engine
+                .write_with_vector("vector-rejected", vec![3], vector.clone())
+                .is_err()
+        );
+        assert!(engine.read_latest("vector-rejected").is_none());
+        assert!(engine.search_similar(vector, 1).is_empty());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(journal);
+        let _ = std::fs::remove_file(meta);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn journal_replays_durable_writes_and_recovers_torn_tail() {
+        let (db, meta) = test_paths("journal_replay");
+        let journal = appended_sidecar(&meta, ".journal");
+        let vector = unit_vector(DEFAULT_VECTOR_DIMENSIONS, 4);
+        {
+            let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+            engine.write("plain", b"one".to_vec()).unwrap();
+            engine
+                .write_with_vector("vector", b"two".to_vec(), vector.clone())
+                .unwrap();
+            // Simulate an abrupt process exit after journal fsync but before
+            // Drop compacts a full metadata snapshot.
+            engine.dirty = false;
+        }
+        assert!(!meta.exists());
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+            file.write_all(b"OXTA").unwrap();
+            file.sync_all().unwrap();
+        }
+        {
+            let engine = GeodesicEngine::new(&db, 2).unwrap();
+            assert_eq!(engine.read_latest("plain").unwrap().value, b"one");
+            assert_eq!(engine.read_latest("vector").unwrap().value, b"two");
+            let hits = engine.search_similar(vector, 1);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].value, b"two");
+        }
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+        let _ = std::fs::remove_file(journal);
+    }
+
+    #[test]
+    fn journal_checksum_corruption_is_rejected() {
+        let (db, meta) = test_paths("journal_checksum");
+        let journal = appended_sidecar(&meta, ".journal");
+        {
+            let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+            engine.write("k", b"value".to_vec()).unwrap();
+            engine.dirty = false;
+        }
+        let mut bytes = std::fs::read(&journal).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x5a;
+        std::fs::write(&journal, bytes).unwrap();
+        assert!(
+            GeodesicEngine::new(&db, 2).is_err(),
+            "silently corrupted journal payload must be rejected"
+        );
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+        let _ = std::fs::remove_file(journal);
+    }
+
+    #[test]
+    fn arena_rejects_a_second_process_handle() {
+        let (db, meta) = test_paths("exclusive");
+        let first = GeodesicEngine::new(&db, 2).unwrap();
+        assert!(
+            GeodesicEngine::new(&db, 2).is_err(),
+            "two independent writers must not mmap the same arena"
+        );
+        drop(first);
+        assert!(GeodesicEngine::new(&db, 2).is_ok());
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_file(meta);
     }

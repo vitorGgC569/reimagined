@@ -64,7 +64,7 @@ public:
     
     InferenceEngine() = default;
     bool load_model(const std::string& path, const ModelConfig& config = {});
-    std::string generate(const std::string& prompt, int max_tokens = 50, float temperature = 0.7f);
+    std::string generate(const std::string& prompt, int max_tokens = 512, float temperature = 0.7f);
     std::string generate(const std::string& prompt, const GenerationOptions& options);
     std::string generate_stream(const std::string& prompt,
                                 const GenerationOptions& options,
@@ -78,6 +78,9 @@ public:
     bool save_checkpoint(const std::string& path) const;
     bool save_model_pack(const std::string& directory) const;
     std::unique_ptr<InferenceEngine> clone_for_inference() const;
+    // Deep clone including optimizer/scheduler state. Used by administrative
+    // training endpoints to train transactionally and publish only success.
+    std::unique_ptr<InferenceEngine> clone_for_training() const;
     size_t get_memory_usage() const;
     std::vector<int> sanitize_token_ids(const std::vector<int>& ids) const;
     const GenerationMetrics& last_generation_metrics() const { return last_metrics_; }

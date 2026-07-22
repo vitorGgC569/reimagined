@@ -19,6 +19,8 @@ int main() {
     cfg.num_layers = 6;
     cfg.d_model = 64;
     cfg.vocab_size = 128;
+    cfg.n_heads = 8;
+    cfg.n_kv_heads = 4;
     cfg.use_moe = true;
     cfg.num_experts = 4;
     cfg.num_experts_per_token = 2;

@@ -17,6 +17,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #else
 using SOCKET = int;
@@ -37,7 +40,16 @@ struct HttpApiServerConfig {
     bool enable_admin_endpoints = false;
     int inference_replicas = 0;
     size_t rate_limit_requests_per_minute = 240;
+    // Hard bounds for attacker-controlled cardinality and streaming output.
+    // Both are independently configurable because request rate and memory
+    // pressure are different operational concerns.
+    size_t max_rate_limit_clients = 10000;
+    size_t max_stream_pending_bytes = 1024 * 1024;
     bool trust_proxy_headers = false;
+    // Exact peer IPs allowed to supply X-Forwarded-* headers. Empty is invalid
+    // when proxy trust is enabled, preventing direct clients from spoofing TLS
+    // or rate-limit identities.
+    std::vector<std::string> trusted_proxy_ips;
     bool require_tls_proxy_header = false;
     int socket_timeout_ms = 10000;
     int max_json_depth = 32;

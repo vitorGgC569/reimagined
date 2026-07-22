@@ -200,6 +200,53 @@ void test_bpe_efficient_matches_naive() {
   std::cout << "OK (500 random words up to len 300, byte-identical)" << std::endl;
 }
 
+void test_pack_roundtrip_preserves_bpe() {
+  std::cout << "Testing tokenizer pack preserves BPE semantics..." << std::endl;
+  Tokenizer original;
+  original.bpe_ranks[{"a", "b"}] = 0;
+  original.bpe_ranks[{"ab", "c"}] = 1;
+  original.token_to_id["ab"] = 256;
+  original.id_to_token[256] = "ab";
+  original.token_to_id["abc"] = 257;
+  original.id_to_token[257] = "abc";
+  original.vocab_size = 258;
+  original.add_special_tokens({"<|eos|>"});
+
+  const std::string text = "abc<|eos|>abc";
+  const auto expected = original.encode(text);
+  const auto path =
+      std::filesystem::temp_directory_path() / "nsos_tokenizer_v2_roundtrip.tok";
+  original.save_pack(path.string());
+
+  Tokenizer restored;
+  restored.load_pack(path.string());
+  assert(restored.bpe_ranks == original.bpe_ranks);
+  assert(restored.encode(text) == expected);
+  assert(restored.decode(expected) == text);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  std::cout << "OK" << std::endl;
+}
+
+void test_pack_rejects_invalid_in_memory_state() {
+  std::cout << "Testing tokenizer pack rejects invalid in-memory state..." << std::endl;
+  Tokenizer invalid;
+  invalid.bpe_ranks[{"a", "b"}] = 7;  // rank space must start at zero
+  const auto path =
+      std::filesystem::temp_directory_path() / "nsos_tokenizer_invalid_state.tok";
+  bool rejected = false;
+  try {
+    invalid.save_pack(path.string());
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  assert(rejected);
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  std::cout << "OK" << std::endl;
+}
+
 int main() {
   try {
     test_basic_encoding();
@@ -208,6 +255,8 @@ int main() {
     test_decode_sanitizes_invalid_utf8();
     test_utf8_word_merges();
     test_bpe_efficient_matches_naive();
+    test_pack_roundtrip_preserves_bpe();
+    test_pack_rejects_invalid_in_memory_state();
     std::cout << "\nAll Tokenizer tests passed!" << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "Test failed: " << e.what() << std::endl;

@@ -31,6 +31,11 @@ Pack loading rejects:
 - files over configured size limits
 - digest/checksum mismatches
 - malformed tokenizer packs
+- non-contiguous tokenizer ids or BPE merge ranks
+
+Pack children are written through unique temporary files, flushed to durable
+storage, and atomically replaced. The checksummed manifest is published last,
+so an interrupted save fails closed instead of accepting a partial generation.
 
 ## Release Expectations
 

@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -581,6 +582,21 @@ Tensor BitLinear::forward(const Tensor &input) {
   return output;
 }
 
+void BitLinear::discard_backward_state() {
+  saved_input = Tensor();
+  saved_linear_input = Tensor();
+  saved_pre_output = Tensor();
+  saved_x_norm = Tensor();
+  saved_x_quant = Tensor();
+  saved_act_scales.clear();
+  saved_qat_x_dq_ = Tensor();
+  saved_qat_pre_ = Tensor();
+  saved_qat_w_eff_ = Tensor();
+  saved_qat_scale_ = Tensor();
+  saved_qat_weight_version_ = 0;
+  qat_gpu_active_ = false;
+}
+
 void BitLinear::release_full_precision_weight() {
   weight.data = Tensor();
   invalidate_cached_materialized_weights();
@@ -621,6 +637,39 @@ BitLinearPackedState BitLinear::export_packed_state() const {
   state.flat_beta.assign(flat_beta_cpu.data(),
                          flat_beta_cpu.data() + flat_beta_cpu.size);
   return state;
+}
+
+size_t BitLinear::auxiliary_memory_usage_bytes() const {
+  size_t bytes = 0;
+  const auto add = [&](size_t amount) {
+    if (amount > (std::numeric_limits<size_t>::max)() - bytes) {
+      bytes = (std::numeric_limits<size_t>::max)();
+    } else {
+      bytes += amount;
+    }
+  };
+  const auto vector_bytes = [&](size_t capacity, size_t element_size) {
+    if (capacity > (std::numeric_limits<size_t>::max)() / element_size) {
+      add((std::numeric_limits<size_t>::max)());
+    } else {
+      add(capacity * element_size);
+    }
+  };
+  const auto tensor_bytes = [&](const Tensor& tensor) {
+    if (tensor.size > 0) {
+      const auto elements = static_cast<size_t>(tensor.size);
+      vector_bytes(elements, sizeof(float));
+    }
+  };
+
+  vector_bytes(packed_weights.capacity(), sizeof(uint32_t));
+  vector_bytes(unpacked_weights_i8.capacity(), sizeof(int8_t));
+  vector_bytes(unpacked_weight_row_sums.capacity(), sizeof(int32_t));
+  vector_bytes(cached_heat_map_.capacity(), sizeof(uint8_t));
+  tensor_bytes(cached_gpu_weight_);
+  tensor_bytes(cached_gpu_packed_weights_);
+  tensor_bytes(qat_inference_w_eff_);
+  return bytes;
 }
 
 void BitLinear::import_packed_state(const BitLinearPackedState& state,
@@ -1020,10 +1069,10 @@ Tensor BitLinear::quantize_weights(const Tensor &w_float) {
   return res;
 }
 
-void BitLinear::add_qat_regularization_grad(float regularization) {
+Tensor BitLinear::add_qat_regularization_grad(float regularization) {
   if (regularization <= 0.0f || quantization_sensitive_ ||
       weight.data.size == 0) {
-    return;
+    return Tensor();
   }
 
   Tensor ternary_target;
@@ -1042,6 +1091,7 @@ void BitLinear::add_qat_regularization_grad(float regularization) {
 
   Tensor penalty_grad = weight.data.sub(ternary_target).mul(regularization);
   weight.add_grad(penalty_grad);
+  return penalty_grad;
 }
 
 } // namespace nsos

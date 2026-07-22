@@ -170,6 +170,8 @@ int main() {
         config.num_layers = 1;
         config.d_model = 32;
         config.vocab_size = 256;
+        config.n_heads = 4;
+        config.n_kv_heads = 2;
         config.max_context_tokens = 64;
 
         InferenceEngine engine;
@@ -202,7 +204,11 @@ int main() {
 
         const std::string health = send_http_request("127.0.0.1", port, "GET", "/health");
         require(health.find("200 OK") != std::string::npos, "health endpoint failed");
-        require(health.find("\"status\":\"ok\"") != std::string::npos, "health body mismatch");
+        require(health.find("\"status\":\"alive\"") != std::string::npos, "health body mismatch");
+        const std::string ready = send_http_request("127.0.0.1", port, "GET", "/ready");
+        require(ready.find("200 OK") != std::string::npos &&
+                    ready.find("\"status\":\"ready\"") != std::string::npos,
+                "ready endpoint did not report the initialized model");
 
         const std::string unauthorized =
             send_http_request("127.0.0.1", port, "GET", "/metrics");
@@ -287,6 +293,31 @@ int main() {
             {"Authorization: Bearer test-secret", "Content-Length: 2x"});
         require(invalid_content_length.find("400 Bad Request") != std::string::npos,
                 "invalid content-length suffix should be rejected");
+        const std::string signed_content_length = send_http_request(
+            "127.0.0.1", port, "POST", "/generate", {},
+            {"Authorization: Bearer test-secret", "Content-Length: +0"});
+        require(signed_content_length.find("400 Bad Request") != std::string::npos,
+                "signed content-length should be rejected");
+        const std::string invalid_header_name = send_http_request(
+            "127.0.0.1", port, "GET", "/info", {},
+            {"Authorization: Bearer test-secret", "Bad@Header: value"});
+        require(invalid_header_name.find("400 Bad Request") != std::string::npos,
+                "non-token HTTP header name should be rejected");
+
+        const auto parameters_before_rejected_train = engine.model->parameters();
+        require(!parameters_before_rejected_train.empty(), "model has no parameters");
+        const float weight_before_rejected_train =
+            parameters_before_rejected_train.front()->data.data()[0];
+        const int step_before_rejected_train = engine.trainer->global_step_count;
+        const std::string rejected_train_batch = send_http_request(
+            "127.0.0.1", port, "POST", "/train-batch",
+            "{\"texts\":[\"01230123\",\"A\"],\"epochs\":1}", auth_headers);
+        require(rejected_train_batch.find("400 Bad Request") != std::string::npos,
+                "train-batch should reject samples shorter than two tokens");
+        require(engine.model->parameters().front()->data.data()[0] ==
+                    weight_before_rejected_train &&
+                    engine.trainer->global_step_count == step_before_rejected_train,
+                "rejected administrative training mutated live model state");
 
         std::atomic<int> concurrent_ok{0};
         std::vector<std::thread> clients;
@@ -322,6 +353,8 @@ int main() {
         strict_config.num_layers = 1;
         strict_config.d_model = 32;
         strict_config.vocab_size = 16;
+        strict_config.n_heads = 4;
+        strict_config.n_kv_heads = 2;
         strict_config.max_context_tokens = 32;
 
         InferenceEngine strict_engine;
@@ -380,6 +413,17 @@ int main() {
         unauth_config.port = 0;
         HttpApiServer unauth_server(unauth_engine, unauth_config);
         require(!unauth_server.start(), "server without token should fail unless explicitly allowed");
+
+        InferenceEngine untrusted_proxy_engine;
+        require(untrusted_proxy_engine.load_model("", config), "proxy load_model failed");
+        HttpApiServerConfig untrusted_proxy_config;
+        untrusted_proxy_config.host = "127.0.0.1";
+        untrusted_proxy_config.port = 0;
+        untrusted_proxy_config.auth_token = "proxy-secret";
+        untrusted_proxy_config.trust_proxy_headers = true;
+        HttpApiServer untrusted_proxy_server(untrusted_proxy_engine, untrusted_proxy_config);
+        require(!untrusted_proxy_server.start(),
+                "proxy-header trust without an exact peer allowlist should fail");
 
         InferenceEngine locked_engine;
         require(locked_engine.load_model("", config), "locked load_model failed");

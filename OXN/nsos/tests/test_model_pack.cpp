@@ -25,6 +25,8 @@ int main() {
     config.num_layers = 1;
     config.d_model = 32;
     config.vocab_size = 128;
+    config.n_heads = 4;
+    config.n_kv_heads = 2;
     config.max_context_tokens = 64;
 
     InferenceEngine engine;
@@ -149,6 +151,8 @@ int main() {
     partial_config.num_layers = 1;
     partial_config.d_model = 32;
     partial_config.vocab_size = 128;
+    partial_config.n_heads = 4;
+    partial_config.n_kv_heads = 2;
     partial_config.use_ttt = false;
     partial_config.use_moe = false;
     JambaModel partial_target(partial_config, Device::CPU);
@@ -172,6 +176,20 @@ int main() {
             "replica first parameter mismatch");
     const std::string replica_generated = replica->generate("321", options);
     (void)replica_generated;
+
+    std::cout << "[ModelPackTest] transactional training clone" << std::endl;
+    auto training_clone = engine.clone_for_training();
+    require(training_clone != nullptr && training_clone->trainer != nullptr,
+            "clone_for_training did not preserve trainer");
+    require(training_clone->trainer->global_step_count == engine.trainer->global_step_count,
+            "training clone scheduler step mismatch");
+    require(training_clone->trainer->m_state.size() == engine.trainer->m_state.size() &&
+                training_clone->trainer->v_state.size() == engine.trainer->v_state.size(),
+            "training clone optimizer state mismatch");
+    const float original_first_weight = engine.model->parameters().front()->data.data()[0];
+    training_clone->model->parameters().front()->data.data()[0] += 1.0f;
+    require(engine.model->parameters().front()->data.data()[0] == original_first_weight,
+            "training clone shares mutable parameter storage with source");
 
     std::cout << "Model pack test passed!" << std::endl;
     std::filesystem::remove_all(pack_dir);

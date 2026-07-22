@@ -177,6 +177,8 @@ int main() {
   model_cfg.num_layers = 1;
   model_cfg.d_model = 8;
   model_cfg.vocab_size = 16;
+  model_cfg.n_heads = 2;
+  model_cfg.n_kv_heads = 1;
   model_cfg.attention_period = 99;
   model_cfg.use_moe = false;
   model_cfg.use_kan = false;
