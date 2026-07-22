@@ -376,6 +376,63 @@ void test_learned_selection_vs_meankey() {
   std::cout << "SSA learned-selection beats mean-key (misleading-query) test passed!" << std::endl;
 }
 
+void test_sparse_backward_gradcheck() {
+  const int n = 6, d = 3;
+  Tensor Q = make(n, d, [](int i, int c) {
+    return 0.07f * static_cast<float>(1 + i * 3 + c);
+  });
+  Tensor K = make(n, d, [](int i, int c) {
+    return -0.11f + 0.04f * static_cast<float>(i + 2 * c);
+  });
+  Tensor V = make(n, d, [](int i, int c) {
+    return 0.09f * std::sin(static_cast<float>(i + c));
+  });
+  Tensor dOut = make(n, d, [](int i, int c) {
+    return 0.03f * static_cast<float>(1 + i - c);
+  });
+
+  SparseAttentionConfig cfg;
+  cfg.block_size = 2;
+  cfg.top_k_blocks = 0;  // deterministic sparse graph: sink + current block
+  cfg.local_blocks = 1;
+  cfg.sink_blocks = 1;
+
+  const auto objective = [&]() {
+    Tensor out = sparse_selective_attention(Q, K, V, cfg);
+    double value = 0.0;
+    for (int i = 0; i < out.size; ++i) {
+      value += static_cast<double>(out.data()[i]) * dOut.data()[i];
+    }
+    return static_cast<float>(value);
+  };
+
+  SparseAttentionBackwardResult analytic =
+      sparse_selective_attention_backward(Q, K, V, cfg, dOut);
+  const float eps = 1e-3f;
+  auto check = [&](Tensor& variable, const Tensor& expected,
+                   const std::string& name) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < variable.size; ++i) {
+      const float original = variable.data()[i];
+      variable.data()[i] = original + eps;
+      const float plus = objective();
+      variable.data()[i] = original - eps;
+      const float minus = objective();
+      variable.data()[i] = original;
+      const float numerical = (plus - minus) / (2.0f * eps);
+      max_abs = std::max(max_abs, std::abs(numerical - expected.data()[i]));
+    }
+    std::printf("[ssa] sparse backward %s max abs err = %.3e\n",
+                name.c_str(), max_abs);
+    require(max_abs < 3e-3f, "sparse backward gradcheck failed for " + name);
+  };
+
+  check(Q, analytic.dQ, "dQ");
+  check(K, analytic.dK, "dK");
+  check(V, analytic.dV, "dV");
+  std::cout << "SSA exact sparse-backward gradcheck passed!" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -388,6 +445,7 @@ int main() {
     test_learned_selection_gradcheck();
     test_learned_selector_distill_trains();
     test_learned_selection_vs_meankey();
+    test_sparse_backward_gradcheck();
     std::cout << "All SSA tests passed!" << std::endl;
     return 0;
   } catch (const std::exception& ex) {

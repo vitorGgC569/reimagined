@@ -376,6 +376,41 @@ void check_mamba2_faithful() {
                    loss_fn, "mamba2-faithful d/dt_bias", kTolScan);
 }
 
+void check_mamba2_extreme_decay_finiteness() {
+  const int D = 4, N = 3, L = 4;
+  MambaConfig cfg;
+  cfg.faithful_mamba2 = true;
+  cfg.expand = 2;
+  cfg.head_dim = 4;
+  cfg.n_groups = 1;
+  cfg.conv_kernel = 3;
+  Mamba2SSD layer(D, N, 1, cfg);
+  auto params = layer.parameters();
+  Parameter *A = find_param(params, "A");
+  Parameter *dt_bias = find_param(params, "dt_proj.bias");
+  assert(A && dt_bias);
+  std::fill_n(A->data.data(), A->data.size, 1000.0f);
+  std::fill_n(dt_bias->data.data(), dt_bias->data.size, -2.0f);
+  Tensor x({L, D});
+  fill_smooth(x, 0.4f, 0.31f);
+  zero_all_grads(params);
+  Tensor y = layer.forward(x);
+  Context ctx;
+  Tensor dx = layer.backward(Tensor::ones(y.shape.dims), ctx);
+  bool finite = true;
+  for (int i = 0; i < y.size; ++i) finite = finite && std::isfinite(y.data()[i]);
+  for (int i = 0; i < dx.size; ++i) finite = finite && std::isfinite(dx.data()[i]);
+  for (Parameter *p : params) {
+    if (!p || p->grad.size == 0) continue;
+    for (int i = 0; i < p->grad.size; ++i) {
+      finite = finite && std::isfinite(p->grad.data()[i]);
+    }
+  }
+  std::printf("[gradcheck] %-32s %s\n", "mamba2 extreme decay finite",
+              finite ? "OK" : "FAILED");
+  if (!finite) ++g_failures;
+}
+
 // ── Faithful model wrapper: learned residual/final RMSNorm scales ───────────
 // Mamba-2's mixer parity is insufficient if the residual wrapper silently uses
 // an unparameterized RMSNorm. Check the two gamma gradients through the complete
@@ -385,6 +420,9 @@ void check_mamba2_faithful_wrapper_norms() {
   cfg.num_layers = 1;
   cfg.d_model = 8;
   cfg.vocab_size = 7;
+  cfg.n_heads = 2;
+  cfg.n_kv_heads = 1;
+  cfg.mamba_head_dim = 4;
   cfg.attention_period = 99;
   cfg.use_moe = false;
   cfg.use_kan = false;
@@ -664,6 +702,7 @@ int main() {
   check_mamba2_proper();
   check_mamba2_nstate();
   check_mamba2_faithful();
+  check_mamba2_extreme_decay_finiteness();
   check_mamba2_faithful_wrapper_norms();
   check_proper_streaming_parity(false);
   check_proper_streaming_parity(true);

@@ -62,8 +62,9 @@ int main() {
     }
     constexpr int64_t header_bytes =
         sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t) +
-        sizeof(int64_t) + sizeof(uint64_t);
-    const int64_t second_offset = header_bytes + 1 + 1;
+        sizeof(int64_t) + sizeof(uint64_t) + sizeof(uint64_t);
+    constexpr int64_t footer_bytes = sizeof(uint32_t) + sizeof(uint64_t);
+    const int64_t second_offset = header_bytes + 1 + 1 + footer_bytes;
     {
       std::fstream file(corrupt_path,
                         std::ios::binary | std::ios::in | std::ios::out);
@@ -94,13 +95,74 @@ int main() {
     std::filesystem::remove(corrupt_path);
     require(rejected_empty_key, "causal store accepted an empty key");
 
+    const auto torn_path =
+        std::filesystem::temp_directory_path() / "nsos_memory_causal_torn.bin";
+    std::filesystem::remove(torn_path);
+    {
+      CausalMemoryStore store(torn_path.string());
+      store.append("k", {7, 8, 9});
+    }
+    {
+      std::ofstream tail(torn_path, std::ios::binary | std::ios::app);
+      const uint8_t partial[] = {0x32, 0x54, 0x53, 0x43, 1, 2, 3};
+      tail.write(reinterpret_cast<const char*>(partial), sizeof(partial));
+    }
+    {
+      CausalMemoryStore recovered(torn_path.string());
+      const auto latest = recovered.read_latest("k");
+      require(latest.has_value() && *latest == std::vector<uint8_t>({7, 8, 9}),
+              "causal store did not recover a torn final append");
+    }
+    std::filesystem::remove(torn_path);
+
+    const auto checksum_path =
+        std::filesystem::temp_directory_path() / "nsos_memory_causal_checksum.bin";
+    std::filesystem::remove(checksum_path);
+    {
+      CausalMemoryStore store(checksum_path.string());
+      store.append("k", {1, 2, 3});
+    }
+    {
+      std::fstream file(checksum_path,
+                        std::ios::binary | std::ios::in | std::ios::out);
+      file.seekp(header_bytes + 1);
+      const uint8_t corrupt = 0xff;
+      file.write(reinterpret_cast<const char*>(&corrupt), 1);
+    }
+    bool rejected_checksum = false;
+    try {
+      CausalMemoryStore corrupt(checksum_path.string());
+      (void)corrupt;
+    } catch (const std::runtime_error&) {
+      rejected_checksum = true;
+    }
+    require(rejected_checksum, "causal store accepted a checksum mismatch");
+    std::filesystem::remove(checksum_path);
+
+    const auto locked_path =
+        std::filesystem::temp_directory_path() / "nsos_memory_causal_locked.bin";
+    std::filesystem::remove(locked_path);
+    bool rejected_concurrent_open = false;
+    {
+      CausalMemoryStore first_handle(locked_path.string());
+      try {
+        CausalMemoryStore second_handle(locked_path.string());
+        (void)second_handle;
+      } catch (const std::runtime_error&) {
+        rejected_concurrent_open = true;
+      }
+    }
+    require(rejected_concurrent_open,
+            "causal store accepted two simultaneous writers");
+    std::filesystem::remove(locked_path);
+
     MemorySystem volatile_memory(4);
     volatile_memory.add_message(first);
     volatile_memory.add_message(second);
     const auto in_memory_history = volatile_memory.recall_recent_messages(2);
     require(in_memory_history.size() == 2, "in-memory recall_recent_messages fallback failed");
-    require(in_memory_history[0].content == "hello\nworld", "in-memory oldest message mismatch");
-    require(in_memory_history[1].content == "world", "in-memory latest message mismatch");
+    require(in_memory_history[0].content == "world", "in-memory latest message mismatch");
+    require(in_memory_history[1].content == "hello\nworld", "in-memory oldest message mismatch");
 
     std::cout << "Memory causal store test passed!" << std::endl;
     std::filesystem::remove(store_path);

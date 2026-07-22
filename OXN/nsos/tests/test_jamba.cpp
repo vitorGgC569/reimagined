@@ -322,6 +322,7 @@ void test_attention_batched_cache_growth() {
   config.num_layers = 1;
   config.d_model = 16;
   config.vocab_size = 80;
+  config.mamba_head_dim = 16;
   config.n_heads = 2;
   config.n_kv_heads = 1;
   config.attention_period = 1;
@@ -398,7 +399,10 @@ void test_dropout_backward_gradcheck() {
       false,  // exact attention training
       0.25f,  // dropout
       false,  // gradient checkpointing
-      16);    // compact FFN hidden size
+      16,     // compact FFN hidden size
+      false, 0.1f, 0u, false,
+      true, true, 4,
+      false); // non-faithful compact Mamba for this local VJP test
 
   Tensor x({1, 2, 8}, Device::CPU);
   Tensor dy({1, 2, 8}, Device::CPU);

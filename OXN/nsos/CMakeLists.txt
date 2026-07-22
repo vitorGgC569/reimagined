@@ -746,6 +746,9 @@ if (NSOS_BUILD_TESTS)
 endif()
 
 # Standalone repro for the TTT-in-model construction crash (debug diagnosis).
-# Built unconditionally so it can be produced with a minimal CPU-only config.
-add_executable(repro_ttt tests/repro_ttt.cpp)
-target_link_libraries(repro_ttt PRIVATE nsos_core)
+# Keep diagnostic binaries behind the test option so production/Python-only
+# configurations do not depend on files from the tests tree.
+if(NSOS_BUILD_TESTS)
+    add_executable(repro_ttt tests/repro_ttt.cpp)
+    target_link_libraries(repro_ttt PRIVATE nsos_core)
+endif()

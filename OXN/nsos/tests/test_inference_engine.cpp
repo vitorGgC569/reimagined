@@ -12,6 +12,8 @@ int main() {
     config.num_layers = 2;
     config.d_model = 32;
     config.vocab_size = 128;
+    config.n_heads = 4;
+    config.n_kv_heads = 2;
 
     InferenceEngine engine;
     std::cout << "[InferenceEngineTest] loading model..." << std::endl;
