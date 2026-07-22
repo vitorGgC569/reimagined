@@ -1,5 +1,6 @@
 use memmap2::MmapMut;
 use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::util::AlignedVec;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -337,7 +338,16 @@ impl GeodesicEngine {
             // Version-1 compatibility: legacy files were raw rkyv payloads.
             &bytes
         };
-        let metadata = rkyv::from_bytes::<EngineMetadata, rkyv::rancor::Error>(payload)
+        // rkyv validates the alignment of archived roots. Envelope payloads
+        // start 28 bytes into their backing allocation, so a plain subslice is
+        // not guaranteed to satisfy that contract on every allocator/platform.
+        // Copy into an explicitly aligned buffer before deserializing; this also
+        // keeps already-written stores readable without changing the file format.
+        let mut aligned_payload = AlignedVec::<16>::with_capacity(payload.len());
+        aligned_payload.extend_from_slice(payload);
+        let metadata = rkyv::from_bytes::<EngineMetadata, rkyv::rancor::Error>(
+            aligned_payload.as_slice(),
+        )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         if metadata.current_offset > self.mmap.len() as u64 {
@@ -472,7 +482,11 @@ impl GeodesicEngine {
                     "metadata journal checksum mismatch",
                 ));
             }
-            let entry = rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(payload)
+            let mut aligned_payload = AlignedVec::<16>::with_capacity(payload.len());
+            aligned_payload.extend_from_slice(payload);
+            let entry = rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(
+                aligned_payload.as_slice(),
+            )
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
             cursor = record_end;
             records = records.saturating_add(1);
@@ -753,7 +767,7 @@ impl GeodesicEngine {
             return Err("Vector must contain finite values and have non-zero norm".to_string());
         }
         // Enforce the same cap the restore path checks, atomically before writing
-        // anything — otherwise a store can accept vectors it can never reopen with.
+        // anything â€” otherwise a store can accept vectors it can never reopen with.
         if self.vector_records.len() >= MAX_VECTOR_RECORDS {
             return Err(format!(
                 "vector index is full: {MAX_VECTOR_RECORDS} records is the maximum the store can reopen with"
@@ -939,7 +953,12 @@ impl GeodesicEngine {
             bytes
         };
 
-        let node = rkyv::from_bytes::<Node, rkyv::rancor::Error>(payload).ok()?;
+        let mut aligned_payload = AlignedVec::<16>::with_capacity(payload.len());
+        aligned_payload.extend_from_slice(payload);
+        let node = rkyv::from_bytes::<Node, rkyv::rancor::Error>(
+            aligned_payload.as_slice(),
+        )
+        .ok()?;
         if node.value.len() > MAX_VALUE_BYTES || node.prev.is_some_and(|previous| previous >= addr)
         {
             return None;
@@ -1025,7 +1044,7 @@ impl GeodesicEngine {
 impl Drop for GeodesicEngine {
     fn drop(&mut self) {
         // Safety net for deferred (sync_on_write = false) writes: persist on a
-        // clean shutdown.  Best-effort — a failure here cannot be surfaced.
+        // clean shutdown.  Best-effort â€” a failure here cannot be surfaced.
         if self.dirty {
             let _ = self.persist_metadata();
         }
@@ -1100,6 +1119,44 @@ mod tests {
         v
     }
 
+    #[test]
+    fn node_deserialization_is_independent_of_record_alignment() {
+        let (db, meta) = test_paths("node_alignment");
+        let journal = appended_sidecar(&meta, ".journal");
+        {
+            let mut engine = GeodesicEngine::new(&db, 2).unwrap();
+            engine.set_sync_on_write(false);
+            for index in 0..10u8 {
+                let vector = unit_vector(DEFAULT_VECTOR_DIMENSIONS, index as usize);
+                engine
+                    .write_with_vector(&index.to_string(), vec![index], vector.clone())
+                    .unwrap();
+                assert_eq!(
+                    engine.read_latest(&index.to_string()).unwrap().value,
+                    vec![index],
+                    "record {index} must be readable at its physical offset"
+                );
+                let hit = engine.search_similar(vector, 1);
+                assert_eq!(hit.len(), 1);
+                assert_eq!(hit[0].value, vec![index]);
+            }
+            engine.flush().unwrap();
+        }
+        {
+            let engine = GeodesicEngine::new(&db, 2).unwrap();
+            for index in 0..10u8 {
+                assert_eq!(
+                    engine.read_latest(&index.to_string()).unwrap().value,
+                    vec![index],
+                    "record {index} must remain readable after reopen"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_file(meta);
+        let _ = std::fs::remove_file(journal);
+    }
+
     // Causal recall must return a key's history newest-first, honour the depth
     // bound, isolate keys from each other, and yield nothing for unknown keys.
     #[test]
@@ -1139,7 +1196,7 @@ mod tests {
     // A store must survive a restart: causal chains AND the vector index have to
     // come back.  This exercises the restore replay path that re-adds every
     // persisted vector to a fresh usearch index (regression guard for the
-    // missing-`reserve` crash — restore adds without a live write in between).
+    // missing-`reserve` crash â€” restore adds without a live write in between).
     #[test]
     fn persistence_roundtrip_recovers_chains_and_vectors() {
         let (db, meta) = test_paths("roundtrip");
@@ -1282,7 +1339,7 @@ mod tests {
         let _ = std::fs::remove_file(meta);
     }
 
-    // A torn or corrupt metadata file must be rejected on open — never a panic
+    // A torn or corrupt metadata file must be rejected on open â€” never a panic
     // and never a half-valid store.
     #[test]
     fn torn_metadata_is_rejected_on_open() {
@@ -1528,7 +1585,7 @@ mod tests {
     // OxtaMem Camada 0: isolated retrieval-primitive quality.
     // Stores N synthetic 128-dim unit vectors (value = item index), then queries
     // with clean and noisy versions of stored vectors and measures recall@k over
-    // the cosine/usearch(HNSW) index. No model involved — this validates the
+    // the cosine/usearch(HNSW) index. No model involved â€” this validates the
     // memory primitive alone: "given a store + a query embedding, does it return
     // the right item?".  Run with:
     //   cargo test -p oxta_mem --release -- --ignored --nocapture recall_at_k
@@ -1635,7 +1692,7 @@ mod tests {
             }
 
             // Sanity guard: clean (eps=0) queries must find the exact stored item
-            // in the top-k — otherwise the primitive is broken, not just approximate.
+            // in the top-k â€” otherwise the primitive is broken, not just approximate.
             assert!(
                 exact_recall_k >= 0.90,
                 "exact-query recall@{k} collapsed at N={n}: {exact_recall_k:.3} (< 0.90)"
@@ -1648,3 +1705,4 @@ mod tests {
         println!("=====================================================================\n");
     }
 }
+
