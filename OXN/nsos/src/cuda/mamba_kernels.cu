@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <math_constants.h>
 
 // =========================================================================
 // HPC Chunk-Parallel Mamba2 SSD Forward Kernel
@@ -33,7 +34,7 @@ __device__ __forceinline__ float softplus_device(float x) {
 // N1 (must match host nsos::mamba_a_eff in src/mamba2.cpp): A is stored in the
 // LOG domain; the effective decay rate is A_eff = exp(A_log) > 0, so the
 // recurrence is unconditionally stable and the gradient flows for every channel
-// (no 1e-3 clamp / mask).  A_log = 0 ⇒ A_eff = 1 (old A = ones default).
+// (no 1e-3 clamp / mask).  A_log = 0 â‡’ A_eff = 1 (old A = ones default).
 struct MambaDecayTermsDevice {
   float delta;
   float delta_grad;
@@ -66,15 +67,15 @@ __device__ __forceinline__ MambaDecayTermsDevice mamba_decay_terms_dev(
   return {delta, delta_grad, decay, dt_factor, q * decay};
 }
 
-// (mamba_ssd_forward_kernel chunked removido — carry inter-chunk quebrado,
+// (mamba_ssd_forward_kernel chunked removido â€” carry inter-chunk quebrado,
 // zero callers; os kernels vivos sao selective_scan_* e nstate_*.)
 
 namespace nsos {
 namespace cuda {
 
-// (mamba_simple_scan_forward_kernel/backward_kernel removidos — mortos; a
-// variante aplicava tanh DENTRO da recorrência, divergindo de todos os
-// caminhos vivos que carregam estado linear com tanh só no readout.)
+// (mamba_simple_scan_forward_kernel/backward_kernel removidos â€” mortos; a
+// variante aplicava tanh DENTRO da recorrÃªncia, divergindo de todos os
+// caminhos vivos que carregam estado linear com tanh sÃ³ no readout.)
 
 __global__ void mamba_single_token_update_kernel(
     const float *__restrict__ x, const float *__restrict__ dt,
@@ -99,8 +100,8 @@ __global__ void mamba_single_token_update_kernel(
 
 // (launch_mamba_ssd_forward [chunked, carry inter-chunk quebrado] e
 // launch_mamba_simple_scan_forward/backward [variante tanh-dentro-da-
-// recorrência, divergente do resto] removidos — zero callers; os caminhos
-// vivos são launch_mamba_selective_scan_* e launch_mamba_nstate_*.)
+// recorrÃªncia, divergente do resto] removidos â€” zero callers; os caminhos
+// vivos sÃ£o launch_mamba_selective_scan_* e launch_mamba_nstate_*.)
 
 void launch_mamba_single_token_update(const float *x, const float *dt,
                                       const float *A, float *state,
@@ -121,7 +122,7 @@ void launch_mamba_single_token_update(const float *x, const float *dt,
 }
 
 // =====================================================================
-// Selective scan with B/C gating — matches the CPU implementation in
+// Selective scan with B/C gating â€” matches the CPU implementation in
 // src/mamba2.cpp::Mamba2SSD::ssd_forward token-for-token.
 //
 // Parallelization: one CUDA thread per (batch, dim) channel processes
@@ -132,7 +133,7 @@ void launch_mamba_single_token_update(const float *x, const float *dt,
 // Compared to the simple_scan kernel above, this variant honors the
 // selective B and C parameters (per-token, per-channel gating) which
 // the v9-class hybrid models use.  Without these gates the model
-// computes a different function — see ssd_forward CPU loop for the
+// computes a different function â€” see ssd_forward CPU loop for the
 // authoritative recurrence.
 // =====================================================================
 
@@ -173,7 +174,7 @@ __global__ void mamba_selective_scan_forward_kernel(
 
 // Backward pass.  Mirrors the CPU loop in
 // src/mamba2.cpp::Mamba2SSD::ssd_backward exactly, including:
-//   * y_t  = tanh(h_t) * C_t   →   dC_t = grad_y_t * tanh(h_t)
+//   * y_t  = tanh(h_t) * C_t   â†’   dC_t = grad_y_t * tanh(h_t)
 //   * dh_t = grad_y_t * C_t * (1 - tanh(h_t)^2) + dh_next
 //   * h_t  = h_{t-1} * decay + softplus(dt_t) * B_t * x_t
 //       dx_t  = dh_t * softplus(dt_t) * B_t
@@ -246,7 +247,7 @@ __global__ void mamba_selective_scan_backward_kernel(
     grad_dt[idx] = grad_state * B_in[idx] * x[idx] * terms.delta_grad -
                    grad_decay * terms.decay_dt_factor;
 
-    // N1: dA_log += dDecay·decay·(-softplus(dt))·A_eff  (unconditional).
+    // N1: dA_log += dDecayÂ·decayÂ·(-softplus(dt))Â·A_eff  (unconditional).
     grad_a_local -= grad_decay * terms.decay_alog_factor;
   }
 
@@ -255,7 +256,7 @@ __global__ void mamba_selective_scan_backward_kernel(
   }
 }
 
-// ── Parallel-prefix (associative) selective scan ─────────────────────────────
+// â”€â”€ Parallel-prefix (associative) selective scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // The forward recurrence h_t = decay_t * h_{t-1}
 //                              + softplus(dt_t) * B_t * x_t
 // is a first-order AFFINE recurrence, i.e. an associative scan with operator
@@ -285,7 +286,7 @@ __global__ void mamba_selective_scan_forward_parallel_kernel(
   float *sb = smem + Seq;
 
   const int channel = blockIdx.x;   // one block per (batch,dim) channel
-  if (channel >= Batch * D) return; // whole block returns together — no divergence
+  if (channel >= Batch * D) return; // whole block returns together â€” no divergence
   const int b = channel / D;
   const int d = channel % D;
   const int t = threadIdx.x;        // blockDim.x == Seq, so t in [0,Seq)
@@ -388,7 +389,7 @@ void launch_mamba_selective_scan_backward(
       grad_B, grad_C, Batch, Seq, D, /*linear_readout=*/false);
 }
 
-// ── Proper diagonal SSM (linear readout y = h*C) ─────────────────────────────
+// â”€â”€ Proper diagonal SSM (linear readout y = h*C) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // GPU-resident path for Mamba2SSD::forward_proper/backward_proper.  Same affine
 // recurrence + state_history contract as the legacy selective scan, but with the
 // LINEAR readout (no tanh), so the corrected diagonal SSM runs on device instead
@@ -438,7 +439,7 @@ void launch_mamba_proper_scan_backward(
       grad_B, grad_C, Batch, Seq, D, /*linear_readout=*/true);
 }
 
-// ── Causal depthwise conv1d (proper path local token mixing) ─────────────────
+// â”€â”€ Causal depthwise conv1d (proper path local token mixing) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // in/out: [Batch, Seq, D] ; weight: [D, K].
 //   out[b,t,c] = sum_{j=0..K-1} weight[c,j] * in[b, t-(K-1)+j, c]   (in[<0]=0)
 __global__ void conv1d_causal_forward_kernel(
@@ -512,7 +513,7 @@ void launch_conv1d_causal_backward(const float *grad_out, const float *in,
       grad_out, in, weight, grad_in, grad_weight, batch, seq, dim, K);
 }
 
-// ── Full Mamba-2 SSD with N-dimensional state expansion ──────────────────────
+// â”€â”€ Full Mamba-2 SSD with N-dimensional state expansion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // One thread per (batch, head, p-channel); each carries an N-vector state in
 // registers and walks the sequence.  Layout matches the host path in
 // src/mamba2.cpp::forward_proper_nstate:
@@ -612,7 +613,7 @@ __global__ void mamba_nstate_backward_kernel(
     atomicAdd(&gDt[row * H + h],
               dinput_scale * terms.delta_grad -
                   ddecay * terms.decay_dt_factor);
-    // N1: per-head dA_log += dDecay·decay·(-sp)·A_eff (unconditional).
+    // N1: per-head dA_log += dDecayÂ·decayÂ·(-sp)Â·A_eff (unconditional).
     atomicAdd(&gA[h], -ddecay * terms.decay_alog_factor);
   }
 }
@@ -655,7 +656,7 @@ void launch_mamba_nstate_backward(const float *gy, const float *xc,
       H, P, N);
 }
 
-// ── Faithful Mamba-2: grouped B/C + per-head D skip ────────────────────────
+// â”€â”€ Faithful Mamba-2: grouped B/C + per-head D skip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 __global__ void mamba2_faithful_forward_kernel(
     const float *__restrict__ x, const float *__restrict__ dt,
     const float *__restrict__ A, const float *__restrict__ B_in,
@@ -990,3 +991,4 @@ void launch_mamba_nstate_step(const float *xv, const float *z,
 
 }  // namespace cuda
 }  // namespace nsos
+
