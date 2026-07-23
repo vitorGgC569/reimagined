@@ -74,7 +74,7 @@ Antes do benchmark:
 | Embedding/head compartilhados | sim |
 | Cache de geração | desativado no treino |
 | Precisão | FP32 |
-| Semente de inicialização | 0 |
+| Semente de inicialização | teste histórico usou 0; esse valor é sentinela não determinística no NSOS |
 
 A agenda 1:1 foi escolhida para isolar a implementação híbrida nas mesmas quatro camadas. Ela não reproduz a proporção 1:7 normalmente associada às configurações de produção do Jamba.
 
@@ -297,14 +297,14 @@ Este resultado não prova que:
 - a vantagem continuará em bilhões de parâmetros;
 - a vantagem continuará em linguagem natural;
 - o NSOS vencerá com o Jamba usando kernels fundidos em throughput ou latência;
-- uma única semente de treino representa toda a distribuição de inicializações;
+- as tabelas históricas das seções 8–10 usam uma execução nominalmente chamada seed 0; ela foi reclassificada como não determinística e não representa uma semente reproduzível;
 - o OxtaMem sempre terá retrieval perfeito em bases ruidosas ou semânticas;
 - MoE não funciona em escala; apenas não ajudou neste teste pequeno;
 - a agenda 1:1 usada aqui representa a configuração de produção 1:7 do Jamba.
 
 ## 15. Ameaças à validade
 
-- apenas uma semente de treino por braço;
+- o MQAR corrigido usa três sementes de treino por braço, mas o bAbI ainda tem apenas uma semente para os dois rivais;
 - tarefa sintética pequena;
 - avaliação multissemente, mas sem múltiplos treinos;
 - comparação em FP32 e sem quantização no caminho de treino;
@@ -314,7 +314,7 @@ Este resultado não prova que:
 - OxtaMem compara um sistema com memória externa contra modelos sem memória externa;
 - embeddings de retrieval foram produzidos pelo próprio NSOS;
 - nenhum teste de ruído, colisão semântica, atualização conflitante ou esquecimento;
-- nenhum benchmark de linguagem natural foi incluído.
+- o bAbI QA1 foi incluído, mas ainda não cobre linguagem aberta, pré-treino geral ou retrieval semântico livre.
 
 ## 16. Próximos experimentos necessários
 
@@ -335,7 +335,7 @@ Para elevar a alegação de “protótipo impressionante” para “arquitetura 
 
 ## 17. Veredito e nota
 
-**Nota atual do projeto: 9,0/10.**
+**Nota atual do projeto após a rodada ampliada: 9,1/10.**
 
 Justificativa:
 
@@ -348,7 +348,7 @@ Justificativa:
 - comparação realizada contra implementação oficial densa e com MoE;
 - reprodutibilidade por notebook e gates automáticos.
 
-O ponto que impede uma nota maior é evidência externa: múltiplas sementes de treino, linguagem natural, escalabilidade e benchmarks públicos ainda precisam ser demonstrados.
+A nota subiu porque agora há múltiplas sementes de treino, um benchmark público de linguagem natural e extrapolação até 64 pares. O que impede nota maior é a alta variância de otimização do NSOS, a ausência de múltiplas sementes dos rivais no bAbI, a falta de pré-treino/linguagem aberta e a necessidade de retrieval semântico não estruturado.
 
 Formulação segura:
 
@@ -357,3 +357,113 @@ Formulação segura:
 Formulação que ainda não é sustentada:
 
 > “O NSOS é melhor que o Jamba como modelo de linguagem geral.”
+
+
+---
+
+## 18. Errata de reprodutibilidade: seed 0
+
+A auditoria estática e duas repetições no mesmo runtime mostraram que seed 0 não é uma semente determinística no NSOS. Em OXN/nsos/src/tensor.cpp, o gerador só segue o caminho determinístico quando global_seed != 0; caso contrário, usa std::random_device. O próprio DeterminismManager informa que global_seed igual a zero pode representar modo não determinístico.
+
+Duas repetições nominais de seed 0 no mesmo runtime produziram trajetórias muito diferentes:
+
+| Repetição | Loss final aproximada | MQAR 8 pares |
+|---:|---:|---:|
+| A | 3,159 | falha de convergência; sanity inicial 0,277 |
+| B | 0,238 | sanity 0,920 |
+
+Consequência: os números históricos das seções 8–10 continuam válidos como uma execução observada, mas não como uma execução reproduzível de seed 0. A campanha estatística corrigida abaixo usa apenas sementes não nulas.
+
+## 19. MQAR com múltiplas sementes de treino corrigidas
+
+Protocolo:
+
+- sementes de treino: 1, 2 e 3;
+- mesmos dados por semente entre os três braços;
+- 2.500 passos, batch 32 e LR 0,002;
+- 600 exemplos fixos de avaliação por dificuldade;
+- dificuldades: 1, 4 e 8 pares;
+- NSOS com reduções determinísticas habilitadas;
+- média, desvio-padrão amostral e IC95% com t de Student (2 graus de liberdade).
+
+| Pares | Jamba denso | Jamba MoE 16/top-2 | NSOS |
+|---:|---:|---:|---:|
+| 1 | 0,999 ± 0,001 | 0,999 ± 0,001 | 1,000 ± 0,000 |
+| 4 | 0,301 ± 0,076 | 0,361 ± 0,137 | **0,846 ± 0,229** |
+| 8 | 0,146 ± 0,028 | 0,157 ± 0,054 | **0,694 ± 0,354** |
+
+Execuções individuais em 8 pares:
+
+| Braço | Semente 1 | Semente 2 | Semente 3 |
+|---|---:|---:|---:|
+| Jamba denso | 0,128 | 0,178 | 0,132 |
+| Jamba MoE | 0,132 | 0,120 | 0,218 |
+| NSOS | 0,288 | 0,937 | 0,858 |
+
+A média do NSOS permanece muito acima dos rivais, mas sua variância é alta. O IC95% com apenas três treinos é largo e não permite uma alegação estatística definitiva. A conclusão correta é vantagem forte e promissora em MQAR, acompanhada de instabilidade de otimização que precisa ser corrigida.
+
+Os tempos do NSOS nesta rodada (246,3 ± 26,0 s) não são comparáveis ao caminho rápido histórico, porque as reduções determinísticas usam um caminho mais lento. Jamba denso: 110,4 ± 0,2 s; Jamba MoE: 145,3 ± 0,3 s no fallback PyTorch.
+
+## 20. Benchmark público de linguagem natural: bAbI QA1
+
+Fonte: [dataset facebook/babi_qa](https://huggingface.co/datasets/facebook/babi_qa), configuração en-10k-qa1, revisão imutável 1d86ad39d1c3ea2ff4b77eeb85f7c6ebd622a95f. O bAbI foi apresentado em [Towards AI-Complete Question Answering](https://arxiv.org/abs/1502.05698). Licença CC BY 3.0.
+
+Integridade dos Parquets oficiais:
+
+| Split | Exemplos de pergunta | SHA-256 |
+|---|---:|---|
+| treino | 10.000 | f1d67aa230d7aba0ed310df0d696a3ba9a07270e1670fe64c6901c24e5016f3f |
+| teste | 1.000 | 9875dfad271cbfa5c49adb5809dd67be3826394a5d4d66dc74cab0c81483e2f8 |
+
+Pré-processamento:
+
+- tokenização por palavras e pontuação;
+- vocabulário criado somente com treino: 25 tokens;
+- zero tokens desconhecidos no teste;
+- comprimento máximo: 83;
+- história anterior completa mais pergunta;
+- padding à esquerda;
+- baseline majoritário: 18,7%.
+
+Configuração comparável: semente 11, 1.500 passos, batch 32, LR 0,002, quatro camadas [Mamba, Attention, Mamba, Attention], dimensão 128 e estado Mamba 64.
+
+| Braço | Parâmetros | Acurácia teste | Tempo T4 |
+|---|---:|---:|---:|
+| Jamba oficial denso | 1.196.048 | 49,3% | 1.590,6 s |
+| Jamba oficial MoE 16/top-2 | 7.098.384 | 27,1% | 1.619,8 s |
+| NSOS sem memória | 609.304 | **76,7%** | 93,7 s |
+| NSOS + OxtaMem | mesmo modelo | **100,0%** | avaliação |
+
+O OxtaMem atingiu retrieval@1 de 100,0% em 1.000 perguntas. A memória foi chaveada pela entidade extraída do texto, manteve a sentença mais recente por entidade e devolveu a sentença completa ao modelo. Não usou supporting_ids nem respostas de teste para recuperar. Este braço valida memória estruturada em texto público; não valida retrieval semântico livre.
+
+Sementes adicionais do NSOS no mesmo bAbI:
+
+| Semente | Acurácia |
+|---:|---:|
+| 11 | 76,7% |
+| 12 | 65,2% |
+| 13 | 63,7% |
+| Média ± DP amostral | **68,5% ± 7,1%** |
+
+Os rivais ainda têm apenas uma semente no bAbI, porque cada treino no fallback levou aproximadamente 27 minutos. Não se deve calcular significância entre arquiteturas com essa assimetria.
+
+## 21. Escala: extrapolação MQAR até 64 pares
+
+Rodada independente com semente 21. Todos os braços foram treinados apenas em 1–8 pares por 2.500 passos e avaliados em 400 exemplos fixos por comprimento.
+
+| Pares | Tokens | Jamba denso | Jamba MoE | NSOS |
+|---:|---:|---:|---:|---:|
+| 8 | 18 | 12,5% | 12,8% | **95,8%** |
+| 16 | 34 | 7,5% | 6,3% | **78,3%** |
+| 32 | 66 | 4,3% | 4,8% | **49,3%** |
+| 64 | 130 | 2,3% | 2,8% | **28,5%** |
+
+Chance aleatória: 1/64 = 1,56%. O NSOS degrada de forma clara fora da distribuição, mas permanece muito acima dos rivais e do acaso até 64 pares. Como esta curva usa uma única semente, ela é evidência preliminar de extrapolação, não uma curva estatística final.
+
+## 22. Veredito atualizado
+
+A formulação tecnicamente segura agora é:
+
+> O NSOS apresentou vantagem grande sobre Jamba oficial denso e MoE em MQAR com três sementes de treino, generalizou acima dos rivais até 64 pares e superou os rivais em uma rodada pública bAbI QA1. O NSOS+OxtaMem atingiu 100% quando recebeu uma chave de entidade estruturada. A arquitetura continua experimental: há alta variância entre sementes e ainda não foi validada como modelo de linguagem geral.
+
+Nota atual: **9,1/10**.
