@@ -8,7 +8,8 @@
 **Notebook reproduzível ampliado:** [bench_expanded_validation_t4_2026-07-22.ipynb](../../colab/bench_expanded_validation_t4_2026-07-22.ipynb)  
 **Notebook sintético original:** [bench_jamba_attention_vs_nsos_oxtamem_t4.ipynb](../../colab/bench_jamba_attention_vs_nsos_oxtamem_t4.ipynb)  
 **Commit que registrou o braço MoE:** [8eda86f](https://github.com/vitorGgC569/reimagined/commit/8eda86f730e68c956b62097a3f93cbe2d235b6ff)  
-**Abrir validação ampliada no Colab:** [executar notebook](https://colab.research.google.com/github/vitorGgC569/reimagined/blob/nsos-gpu-phases12/colab/bench_expanded_validation_t4_2026-07-22.ipynb)  
+**Execução salva no Drive (com outputs):** [abrir no Colab](https://colab.research.google.com/drive/1R4edoH9o_9sozOiBlbOV2AK-4t652W5n)  
+**Fonte versionada no Colab:** [abrir notebook do GitHub](https://colab.research.google.com/github/vitorGgC569/reimagined/blob/nsos-gpu-phases12/colab/bench_expanded_validation_t4_2026-07-22.ipynb) — como o repositório é privado, exige autorizar a API do GitHub no Colab.  
 **Resultados brutos ampliados:** [expanded_validation_t4_2026-07-22.json](results/expanded_validation_t4_2026-07-22.json)
 
 ## 1. Resumo executivo
