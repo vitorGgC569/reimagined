@@ -7,7 +7,8 @@
 **Código carregado no runtime:** `ec97b3e`  
 **Notebook reproduzível:** [bench_jamba_attention_vs_nsos_oxtamem_t4.ipynb](../../colab/bench_jamba_attention_vs_nsos_oxtamem_t4.ipynb)  
 **Commit que registrou o braço MoE:** [8eda86f](https://github.com/vitorGgC569/reimagined/commit/8eda86f730e68c956b62097a3f93cbe2d235b6ff)  
-**Abrir no Colab:** [executar benchmark](https://colab.research.google.com/github/vitorGgC569/reimagined/blob/nsos-gpu-phases12/colab/bench_jamba_attention_vs_nsos_oxtamem_t4.ipynb)
+**Abrir no Colab:** [executar benchmark](https://colab.research.google.com/github/vitorGgC569/reimagined/blob/nsos-gpu-phases12/colab/bench_jamba_attention_vs_nsos_oxtamem_t4.ipynb)  
+**Resultados brutos ampliados:** [expanded_validation_t4_2026-07-22.json](results/expanded_validation_t4_2026-07-22.json)
 
 ## 1. Resumo executivo
 
