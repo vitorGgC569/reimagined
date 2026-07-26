@@ -5,6 +5,7 @@
 #include "../include/tensor_iterator.h"
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
+#include "../include/cuda/device_buffer.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -134,32 +135,38 @@ void cublas_check(cublasStatus_t status, const char* op) {
 // handles are the vendored-recommended pattern; all still launch on the legacy
 // stream 0, so ordering semantics are unchanged for the single-threaded
 // training path (one handle, same behavior as before).
-int& gpu_blas_state() {
-    thread_local int state = -1;
+struct ThreadBlasState {
+    int availability = -1;
+    cublasHandle_t handle = nullptr;
+
+    ~ThreadBlasState() noexcept {
+        if (handle != nullptr) {
+            (void)cublasDestroy(handle);
+            handle = nullptr;
+        }
+    }
+};
+
+ThreadBlasState& gpu_blas_state() {
+    thread_local ThreadBlasState state;
     return state;
 }
 
-cublasHandle_t& gpu_blas_handle_storage() {
-    thread_local cublasHandle_t handle = nullptr;
-    return handle;
-}
-
 bool gpu_blas_supported() {
-    int& state = gpu_blas_state();
-    if (state != -1) {
-        return state == 1;
+    ThreadBlasState& state = gpu_blas_state();
+    if (state.availability != -1) {
+        return state.availability == 1;
     }
 
     const cudaError_t context_status = cudaFree(nullptr);
     if (context_status != cudaSuccess) {
-        state = 0;
+        state.availability = 0;
         return false;
     }
 
-    cublasHandle_t& handle = gpu_blas_handle_storage();
-    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
-        handle = nullptr;
-        state = 0;
+    if (cublasCreate(&state.handle) != CUBLAS_STATUS_SUCCESS) {
+        state.handle = nullptr;
+        state.availability = 0;
         return false;
     }
 
@@ -170,15 +177,16 @@ bool gpu_blas_supported() {
     // Pin the handle to the per-thread stream explicitly so GEMMs stay
     // ordered with the surrounding kernels — and get RECORDED when a decode
     // CUDA graph captures that stream.
-    if (cublasSetStream(handle, cudaStreamPerThread) != CUBLAS_STATUS_SUCCESS) {
-        cublasDestroy(handle);
-        handle = nullptr;
-        state = 0;
+    if (cublasSetStream(state.handle, cudaStreamPerThread) !=
+        CUBLAS_STATUS_SUCCESS) {
+        cublasDestroy(state.handle);
+        state.handle = nullptr;
+        state.availability = 0;
         return false;
     }
 #endif
 
-    state = 1;
+    state.availability = 1;
     return true;
 }
 
@@ -186,7 +194,7 @@ cublasHandle_t cublas_handle() {
     if (!gpu_blas_supported()) {
         return nullptr;
     }
-    return gpu_blas_handle_storage();
+    return gpu_blas_state().handle;
 }
 
 // AUDIT (post BATCH 4): the mixed-precision GEMM path used to do
@@ -207,6 +215,26 @@ struct GemmLowpWorkspace {
     void* b_ptr = nullptr;
     size_t a_capacity = 0;  // bytes
     size_t b_capacity = 0;  // bytes
+
+    GemmLowpWorkspace() = default;
+    GemmLowpWorkspace(const GemmLowpWorkspace&) = delete;
+    GemmLowpWorkspace& operator=(const GemmLowpWorkspace&) = delete;
+
+    ~GemmLowpWorkspace() noexcept {
+        if (a_ptr != nullptr) {
+            const cudaError_t status = cudaFree(a_ptr);
+            if (status != cudaSuccess) (void)cudaGetLastError();
+            a_ptr = nullptr;
+        }
+        if (b_ptr != nullptr) {
+            const cudaError_t status = cudaFree(b_ptr);
+            if (status != cudaSuccess) (void)cudaGetLastError();
+            b_ptr = nullptr;
+        }
+        a_capacity = 0;
+        b_capacity = 0;
+    }
+
     // Ensure both buffers hold at least the requested bytes.  Returns
     // false if cudaMalloc failed (caller should fall through to FP32
     // for this single call rather than crash).
@@ -238,9 +266,6 @@ struct GemmLowpWorkspace {
         return true;
     }
 };
-// We never free these on shutdown — CUDA context teardown reclaims
-// the memory, and freeing static buffers during destruction risks
-// touching an already-torn-down CUDA context.
 // thread_local (not a single static): the HTTP server runs concurrent
 // inference replicas, each on its own worker thread.  A shared static would let
 // two threads cudaFree/cudaMalloc/cast into the same staging buffers at once
@@ -365,16 +390,28 @@ T copy_scalar_from_device(const T*) {
 // guaranteed to finish before the copy reads it — without an explicit event.
 // On creation failure we fall back to the original blocking cudaMemcpy, so the
 // path is always correct even on a driver that refuses the stream.
-static cudaStream_t tensor_copy_stream() {
-    static cudaStream_t stream = [] {
-        cudaStream_t s = nullptr;
-        if (cudaStreamCreate(&s) != cudaSuccess) {
-            s = nullptr;
+struct TensorCopyStream {
+    cudaStream_t stream = nullptr;
+
+    TensorCopyStream() {
+        if (cudaStreamCreate(&stream) != cudaSuccess) {
+            stream = nullptr;
         }
         (void)cudaGetLastError();
-        return s;
-    }();
-    return stream;
+    }
+
+    ~TensorCopyStream() noexcept {
+        if (stream != nullptr) {
+            const cudaError_t status = cudaStreamDestroy(stream);
+            if (status != cudaSuccess) (void)cudaGetLastError();
+            stream = nullptr;
+        }
+    }
+};
+
+static cudaStream_t tensor_copy_stream() {
+    static TensorCopyStream owned_stream;
+    return owned_stream.stream;
 }
 
 // (movida p/ escopo de namespace — ver apos Tensor::uninitialized)
@@ -405,6 +442,27 @@ public:
     static ManagedPool& instance() {
         static ManagedPool pool;
         return pool;
+    }
+
+    ~ManagedPool() noexcept {
+        // live_ is the authoritative ownership registry and contains cached,
+        // quarantined, and checked-out blocks exactly once each.
+        for (const auto& entry : live_) {
+            if (entry.first != nullptr) {
+                const cudaError_t status = cudaFree(entry.first);
+                if (status != cudaSuccess) (void)cudaGetLastError();
+            }
+        }
+        live_.clear();
+        free_.clear();
+        captured_.clear();
+        quarantine_.clear();
+        cached_bytes_ = 0;
+        live_bytes_ = 0;
+    }
+
+    bool host_accessible() const noexcept {
+        return managed_memory_;
     }
 
     // Size-class binning (estilo PyTorch caching allocator).  Cachear por
@@ -482,6 +540,8 @@ public:
         if (p) {
             live_[p] = bytes;
             if (capturing_) captured_.insert(p);
+        } else {
+            live_bytes_ -= (live_bytes_ >= bytes ? bytes : live_bytes_);
         }
         return p;
     }
@@ -730,12 +790,14 @@ bool strict_gpu_execution() {
 }
 
 
-Tensor::Tensor() : size(0), device(Device::CPU) {
+Tensor::Tensor()
+    : size(0), device(Device::CPU), host_accessible_storage_(true) {
     shape = TensorShape(std::vector<int>{});
     data_ptr = nullptr;
 }
 
-Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
+Tensor::Tensor(std::vector<int> s, Device dev, float fill_value)
+    : device(dev), host_accessible_storage_(dev == Device::CPU) {
     shape = TensorShape(s);
     size = checked_tensor_size(shape);
     if (size == 0) {
@@ -749,8 +811,10 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
         // Strict GPU models use native device memory; explicitly fallback-
         // compatible callers may select managed memory. Both share the same
         // size-classed caching allocator and stable-address graph semantics.
+        ManagedPool& pool = ManagedPool::instance();
+        host_accessible_storage_ = pool.host_accessible();
         raw_ptr = static_cast<float*>(
-            ManagedPool::instance().allocate(static_cast<size_t>(size) * sizeof(float)));
+            pool.allocate(static_cast<size_t>(size) * sizeof(float)));
 #endif
     } else {
 #ifdef _WIN32
@@ -765,11 +829,13 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
     if (!raw_ptr) {
         throw std::runtime_error("Tensor allocation failed");
     }
+    // Install ownership before initialization so every CUDA initialization
+    // failure below releases the allocation during stack unwinding.
+    data_ptr = std::shared_ptr<float>(raw_ptr, TensorDeleter(device));
 
     if (tensor_skip_fill_flag()) {
         // Tensor::uninitialized: produtor garante sobrescrita total; pular o
         // memset economiza um kernel por alocação no hot path de treino.
-        data_ptr = std::shared_ptr<float>(raw_ptr, TensorDeleter(device));
         return;
     }
 
@@ -783,8 +849,13 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
             // cudaDeviceSynchronize() drained the WHOLE device on every
             // zero-filled GPU allocation -> dozens of pipeline stalls per train
             // step, a dominant cause of low GPU utilization.
-            cudaMemsetAsync(raw_ptr, 0, size * sizeof(float), 0);
-            (void)cudaGetLastError();
+            const cudaError_t status =
+                cudaMemsetAsync(raw_ptr, 0, size * sizeof(float), 0);
+            if (status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("CUDA tensor memset failed: ") +
+                    cudaGetErrorString(status));
+            }
 #endif
         } else {
             std::memset(raw_ptr, 0, size * sizeof(float));
@@ -796,18 +867,21 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value) : device(dev) {
             // until the copy completes, so host_values is safe to free on return
             // and no separate cudaDeviceSynchronize is required.
             std::vector<float> host_values(static_cast<size_t>(size), fill_value);
-            cudaMemcpy(raw_ptr,
-                       host_values.data(),
-                       static_cast<size_t>(size) * sizeof(float),
-                       cudaMemcpyHostToDevice);
-            (void)cudaGetLastError();
+            const cudaError_t status =
+                cudaMemcpy(raw_ptr,
+                           host_values.data(),
+                           static_cast<size_t>(size) * sizeof(float),
+                           cudaMemcpyHostToDevice);
+            if (status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("CUDA tensor fill copy failed: ") +
+                    cudaGetErrorString(status));
+            }
 #endif
         } else {
             std::fill_n(raw_ptr, size, fill_value);
         }
     }
-
-    data_ptr = std::shared_ptr<float>(raw_ptr, TensorDeleter(device));
 }
 
 // Flag thread-local lida pelo construtor: quando armada (via
@@ -1355,14 +1429,13 @@ Tensor Tensor::matmul(const Tensor& other) const {
         const float beta = 0.0f;
 
         // AUDIT #6 + LEARN B3 (2026-05-16): mixed-precision matmul
-        // dispatch via cublasGemmEx + Tensor Cores.  T4 (sm_75) and
-        // newer have hardware Tensor Cores for BF16 GEMM that runs
-        // ~4-8x faster than FP32 cublasSgemm.  When NSOS_MIXED_PRECISION
-        // is set to "bf16" or "fp16", we cast inputs to the lower
-        // precision, do the GEMM in Tensor Cores, and write FP32
-        // accumulated output.
+        // dispatch via cublasGemmEx + Tensor Cores. T4 (sm_75) supports
+        // Tensor-Core FP16; native BF16 requires Ampere (sm_80) or newer.
+        // When NSOS_MIXED_PRECISION is set to "bf16" or "fp16", the active
+        // device capability is checked before inputs are cast and the GEMM
+        // writes an FP32-accumulated output.
         //
-        // Why BF16 over FP16:
+        // Why BF16 over FP16 on sm_80+:
         //   BF16 has the same 8-bit exponent as FP32 (range ~1e-38 to
         //   ~3e38) — no underflow/overflow risk vs FP32 baselines.
         //   FP16 has only 5-bit exponent (range ~6e-5 to ~6e4) which
@@ -1467,9 +1540,14 @@ Tensor Tensor::matmul(const Tensor& other) const {
                 sync_cuda();
                 return result;
             }
-            // ws.ensure() failed (rare — only on cudaMalloc OOM).
-            // Fall through to the FP32 cublasSgemmStridedBatched path
-            // below; correctness preserved, just slower for this call.
+            // An explicitly requested precision mode is a compute contract,
+            // not a hint.  Falling through here used to execute FP32 after a
+            // low-precision workspace OOM while reporting a successful mixed
+            // precision step.  Fail closed so telemetry, loss-scaler tests and
+            // production policy cannot mistake a degraded run for FP16/BF16.
+            throw std::runtime_error(
+                "Mixed-precision CUDA workspace allocation failed; refusing "
+                "silent FP32 fallback");
         }
 
         // AUDIT #3 (2026-05-16): use cublasSgemmStridedBatched to fuse
@@ -1974,12 +2052,17 @@ void Tensor::sync_host_access() const {
         // of data() reads after a single kernel launch syncs once and
         // then no-ops, instead of bottlenecking on N cudaDeviceSync.
         const cudaError_t pending = cudaStreamQuery(0);
-        if (pending != cudaSuccess) {
-            // Drain the default stream and reset any sticky error state
-            // so a subsequent kernel launch isn't poisoned by the
-            // ErrorNotReady we just observed.
-            cudaDeviceSynchronize();
-            (void)cudaGetLastError();
+        if (pending == cudaErrorNotReady) {
+            const cudaError_t sync_status = cudaDeviceSynchronize();
+            if (sync_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("CUDA host-access synchronization failed: ") +
+                    cudaGetErrorString(sync_status));
+            }
+        } else if (pending != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("CUDA stream query failed before host access: ") +
+                cudaGetErrorString(pending));
         }
     }
 #endif
@@ -2004,11 +2087,27 @@ float* Tensor::data() {
     // do NOT need this safety should call raw_data() instead, which
     // returns the pointer with zero sync overhead — see callers in
     // jamba.cpp / mamba2.cpp / trainer.cpp etc.
+#ifdef USE_CUDA
+    if (device == Device::GPU && size > 0 &&
+        !host_accessible_storage_) {
+        throw std::runtime_error(
+            "Host access to a cudaMalloc-backed GPU Tensor is forbidden; "
+            "copy with cpu() or pass raw_data() to a CUDA API");
+    }
+#endif
     sync_host_access();
     return data_ptr.get();
 }
 
 const float* Tensor::data() const {
+#ifdef USE_CUDA
+    if (device == Device::GPU && size > 0 &&
+        !host_accessible_storage_) {
+        throw std::runtime_error(
+            "Host access to a cudaMalloc-backed GPU Tensor is forbidden; "
+            "copy with cpu() or pass raw_data() to a CUDA API");
+    }
+#endif
     sync_host_access();
     return data_ptr.get();
 }
@@ -2237,49 +2336,18 @@ Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm,
 // (all synchronizing) -> ~4*batch alloc syncs/step.  Reused buffers remove that.
 // Single-threaded training use (the only caller).
 static float* ce_loss_scratch() {
-    // thread_local: per-thread device scratch so concurrent callers never share
-    // the same buffer (matches gemm_lowp_workspace's replica-safety rationale).
-    thread_local float* p = [] {
-        float* q = nullptr;
-        if (cudaMalloc(&q, sizeof(float)) != cudaSuccess) {
-            q = nullptr;
-            (void)cudaGetLastError();
-        }
-        return q;
-    }();
-    return p;
+    thread_local cuda_detail::DeviceBuffer<float> buffer;
+    return buffer.ensure(1);
 }
 static int* ce_target_scratch(int rows) {
-    thread_local int* p = nullptr;
-    thread_local int cap = 0;
     if (rows <= 0) return nullptr;
-    if (rows > cap) {
-        if (p) cudaFree(p);
-        p = nullptr;
-        if (cudaMalloc(&p, static_cast<size_t>(rows) * sizeof(int)) != cudaSuccess) {
-            (void)cudaGetLastError();
-            cap = 0;
-            return nullptr;
-        }
-        cap = rows;
-    }
-    return p;
+    thread_local cuda_detail::DeviceBuffer<int> buffer;
+    return buffer.ensure(static_cast<size_t>(rows));
 }
 static float* ce_weight_scratch(int rows) {
-    thread_local float* p = nullptr;
-    thread_local int cap = 0;
     if (rows <= 0) return nullptr;
-    if (rows > cap) {
-        if (p) cudaFree(p);
-        p = nullptr;
-        if (cudaMalloc(&p, static_cast<size_t>(rows) * sizeof(float)) != cudaSuccess) {
-            (void)cudaGetLastError();
-            cap = 0;
-            return nullptr;
-        }
-        cap = rows;
-    }
-    return p;
+    thread_local cuda_detail::DeviceBuffer<float> buffer;
+    return buffer.ensure(static_cast<size_t>(rows));
 }
 #endif
 
@@ -2513,8 +2581,40 @@ Tensor Tensor::from_blob(void* ptr, std::vector<int> s, Device d, bool take_owne
     if (t.size > 0 && ptr == nullptr) {
         throw std::runtime_error("from_blob received null pointer for non-empty tensor");
     }
+    bool source_host_accessible = d == Device::CPU;
+    if (t.size > 0 && d == Device::GPU) {
+#ifdef USE_CUDA
+        cudaPointerAttributes attributes{};
+        const cudaError_t pointer_status =
+            cudaPointerGetAttributes(&attributes, ptr);
+        if (pointer_status != cudaSuccess) {
+            (void)cudaGetLastError();
+            throw std::invalid_argument(
+                "from_blob Device::GPU requires a CUDA device or managed pointer");
+        }
+#if CUDART_VERSION >= 10000
+        if (attributes.type != cudaMemoryTypeDevice &&
+            attributes.type != cudaMemoryTypeManaged) {
+            throw std::invalid_argument(
+                "from_blob Device::GPU rejects host-pointer storage");
+        }
+        source_host_accessible = attributes.type == cudaMemoryTypeManaged;
+#else
+        if (attributes.memoryType != cudaMemoryTypeDevice &&
+            attributes.isManaged == 0) {
+            throw std::invalid_argument(
+                "from_blob Device::GPU rejects host-pointer storage");
+        }
+        source_host_accessible = attributes.isManaged != 0;
+#endif
+#else
+        throw std::runtime_error(
+            "from_blob Device::GPU requires a CUDA-enabled build");
+#endif
+    }
     if (take_ownership) {
         t.data_ptr = std::shared_ptr<float>(static_cast<float*>(ptr), TensorDeleter(d));
+        t.host_accessible_storage_ = source_host_accessible;
     } else {
         t = Tensor(s, d);
         if (t.size > 0) {

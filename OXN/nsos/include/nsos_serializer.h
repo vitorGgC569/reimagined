@@ -3,7 +3,10 @@
 #include "tensor.h"
 #include "jamba.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -28,8 +31,73 @@ public:
         return fp;
     }
 
+    static uint64_t configuration_digest(const JambaModel* model) {
+        constexpr uint64_t kOffset = 1469598103934665603ull;
+        constexpr uint64_t kPrime = 1099511628211ull;
+        uint64_t hash = kOffset;
+        auto append = [&](const auto& value) {
+            const auto* bytes =
+                reinterpret_cast<const unsigned char*>(&value);
+            for (size_t i = 0; i < sizeof(value); ++i) {
+                hash ^= bytes[i];
+                hash *= kPrime;
+            }
+        };
+        const ModelConfig& c = model->model_config();
+        append(c.num_layers); append(c.d_model); append(c.vocab_size);
+        append(c.n_heads); append(c.n_kv_heads); append(c.sliding_window);
+        append(c.attention_period); append(c.attention_slot);
+        append(c.rope_theta); append(c.num_experts);
+        append(c.num_experts_per_token); append(c.use_moe);
+        append(c.moe_period); append(c.moe_slot);
+        append(c.moe_expert_hidden_dim); append(c.use_ttt);
+        append(c.ttt_period); append(c.ttt_slot); append(c.use_chrass);
+        append(c.chrass_density); append(c.chrass_seed);
+        append(c.logit_l2_beta); append(c.pantheon_vib_beta);
+        append(c.use_slender_embedding); append(c.use_kan);
+        append(c.mamba_proper_ssm); append(c.mamba_state_expansion);
+        append(c.mamba_d_state); append(c.mamba_conv_kernel);
+        append(c.mamba2_faithful); append(c.mamba_expand);
+        append(c.mamba_head_dim); append(c.mamba_n_groups);
+        append(c.tie_word_embeddings); append(c.use_gradient_checkpointing);
+        append(c.dropout); append(c.max_context_tokens);
+        append(c.use_exact_attention_training);
+        return hash;
+    }
+
+private:
+    static uint64_t hash_file_prefix(const std::filesystem::path& path,
+                                     uint64_t bytes_to_hash) {
+        constexpr uint64_t kOffset = 1469598103934665603ull;
+        constexpr uint64_t kPrime = 1099511628211ull;
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("Cannot hash checkpoint");
+        uint64_t hash = kOffset;
+        uint64_t consumed = 0;
+        std::array<char, 1 << 16> buffer{};
+        while (consumed < bytes_to_hash) {
+            const uint64_t remaining = bytes_to_hash - consumed;
+            const std::streamsize wanted = static_cast<std::streamsize>(
+                (std::min)(remaining,
+                           static_cast<uint64_t>(buffer.size())));
+            input.read(buffer.data(), wanted);
+            if (input.gcount() != wanted) {
+                throw std::runtime_error(
+                    "Checkpoint truncated while computing integrity checksum");
+            }
+            for (std::streamsize i = 0; i < wanted; ++i) {
+                hash ^= static_cast<unsigned char>(
+                    buffer[static_cast<size_t>(i)]);
+                hash *= kPrime;
+            }
+            consumed += static_cast<uint64_t>(wanted);
+        }
+        return hash;
+    }
+
+public:
     static void save(JambaModel* model, const std::string& filename) {
-        std::ofstream fs(filename, std::ios::binary);
+        std::ofstream fs(filename, std::ios::binary | std::ios::trunc);
         if (!fs) throw std::runtime_error("Cannot open file for writing");
 
         uint32_t magic = NSOS_MODEL_MAGIC;
@@ -39,6 +107,8 @@ public:
         // v2: architecture fingerprint right after the version.
         uint32_t fingerprint = architecture_fingerprint(model);
         fs.write((char*)&fingerprint, 4);
+        const uint64_t config_digest = configuration_digest(model);
+        fs.write((char*)&config_digest, 8);
 
         auto params = model->parameters();
         uint32_t count = (uint32_t)params.size();
@@ -97,6 +167,30 @@ public:
         if (!fs) {
             throw std::runtime_error("Checkpoint close failed");
         }
+
+        const uint64_t payload_bytes =
+            static_cast<uint64_t>(std::filesystem::file_size(filename));
+        const uint64_t payload_hash =
+            hash_file_prefix(filename, payload_bytes);
+        std::ofstream append(filename, std::ios::binary | std::ios::app);
+        if (!append) {
+            throw std::runtime_error(
+                "Cannot reopen checkpoint for integrity trailer");
+        }
+        const uint32_t integrity_magic = 0x4E534933u;  // NSI3
+        append.write(reinterpret_cast<const char*>(&integrity_magic), 4);
+        append.write(reinterpret_cast<const char*>(&payload_bytes), 8);
+        append.write(reinterpret_cast<const char*>(&payload_hash), 8);
+        append.flush();
+        if (!append) {
+            throw std::runtime_error(
+                "Checkpoint integrity trailer write failed");
+        }
+        append.close();
+        if (!append) {
+            throw std::runtime_error(
+                "Checkpoint integrity trailer close failed");
+        }
     }
 
     static void load(JambaModel* model, const std::string& filename, bool strict = true) {
@@ -107,8 +201,39 @@ public:
         fs.read((char*)&magic, 4);
         fs.read((char*)&version, 4);
 
+        if (!fs) throw std::runtime_error("Checkpoint truncated in header");
         if (magic != NSOS_MODEL_MAGIC) throw std::runtime_error("Security: Invalid Magic Number");
         if (version > NSOS_MODEL_VERSION) throw std::runtime_error("Security: Version Mismatch");
+
+        uint64_t validated_payload_bytes = 0;
+        if (version >= 3) {
+            constexpr uint64_t kIntegrityBytes = 20;
+            const uint64_t file_bytes =
+                static_cast<uint64_t>(std::filesystem::file_size(filename));
+            if (file_bytes < kIntegrityBytes + 16) {
+                throw std::runtime_error(
+                    "Checkpoint is too small for the v3 integrity trailer");
+            }
+            fs.seekg(static_cast<std::streamoff>(file_bytes - kIntegrityBytes));
+            uint32_t integrity_magic = 0;
+            uint64_t payload_bytes = 0;
+            uint64_t expected_hash = 0;
+            fs.read(reinterpret_cast<char*>(&integrity_magic), 4);
+            fs.read(reinterpret_cast<char*>(&payload_bytes), 8);
+            fs.read(reinterpret_cast<char*>(&expected_hash), 8);
+            if (!fs || integrity_magic != 0x4E534933u ||
+                payload_bytes != file_bytes - kIntegrityBytes) {
+                throw std::runtime_error(
+                    "Checkpoint integrity trailer is missing or corrupt");
+            }
+            if (hash_file_prefix(filename, payload_bytes) != expected_hash) {
+                throw std::runtime_error(
+                    "Checkpoint integrity checksum mismatch");
+            }
+            validated_payload_bytes = payload_bytes;
+            fs.clear();
+            fs.seekg(8, std::ios::beg);
+        }
 
         // ── v2 fingerprint check (actionable errors instead of cryptic
         // "parameter not found weight#N" when architectures diverge) ─────────
@@ -135,6 +260,21 @@ public:
             flag_mismatch(NSOS_FP_TIE_EMBEDDINGS, "tie_word_embeddings");
             flag_mismatch(NSOS_FP_MAMBA2_FAITHFUL, "mamba2_faithful");
             checkpoint_a_is_rate = (ckpt_fp & NSOS_FP_A_LOG_DOMAIN) == 0;
+            if (version >= 3) {
+                uint64_t checkpoint_config_digest = 0;
+                fs.read(reinterpret_cast<char*>(&checkpoint_config_digest), 8);
+                if (!fs) {
+                    throw std::runtime_error(
+                        "Checkpoint truncated reading configuration digest");
+                }
+                if (strict &&
+                    checkpoint_config_digest !=
+                        configuration_digest(model)) {
+                    throw std::runtime_error(
+                        "Checkpoint/architecture mismatch: complete "
+                        "ModelConfig digest differs");
+                }
+            }
         } else {
             // v1 predates the fingerprint AND the A log-domain reparameterization
             // (N1): its Mamba `A` values are decay RATES in (0, 1].  Loading them
@@ -185,6 +325,12 @@ public:
         uint32_t loaded_count = 0;
         uint32_t skipped_missing = 0;
         uint32_t skipped_shape = 0;
+        struct PendingParameterLoad {
+            Parameter* parameter = nullptr;
+            std::vector<float> values;
+        };
+        std::vector<PendingParameterLoad> pending_loads;
+        pending_loads.reserve(params.size());
 
         auto shape_to_string = [](const std::vector<int>& shape) {
             std::ostringstream out;
@@ -232,10 +378,12 @@ public:
                 read_field(&val, 4, "dim");
                 if (val < 0 || val > 1000000000) throw std::runtime_error("Security: Dimension invalid");
                 shape[j] = val;
-                total_elements *= static_cast<size_t>(val);
-                if (total_elements > kMaxElements) {
+                const size_t dimension = static_cast<size_t>(val);
+                if (dimension != 0 &&
+                    total_elements > kMaxElements / dimension) {
                     throw std::runtime_error("Security: Tensor element count exceeds limit");
                 }
+                total_elements *= dimension;
             }
 
             uint32_t bytes;
@@ -285,9 +433,8 @@ public:
                 continue;
             }
 
-            p->data.copy_from(
-                Tensor::from_blob(buffer.data(), shape, Device::CPU).to(p->data.device));
-            p->mark_updated();
+            pending_loads.push_back(
+                PendingParameterLoad{p, std::move(buffer)});
             ++loaded_count;
             const auto canonical_it = canonical_name_for_param.find(p);
             if (canonical_it != canonical_name_for_param.end()) {
@@ -302,19 +449,38 @@ public:
         // ocorrências da identidade primária silenciosamente).
         {
             uint32_t trailer_magic = 0;
-            if (fs.read((char*)&trailer_magic, 4) && trailer_magic == 0x4E534E32u) {
+            const bool has_name_trailer =
+                static_cast<bool>(fs.read((char*)&trailer_magic, 4));
+            if (has_name_trailer && trailer_magic == 0x4E534E32u) {
                 uint32_t tcount = 0;
-                fs.read((char*)&tcount, 4);
+                if (!fs.read((char*)&tcount, 4)) {
+                    throw std::runtime_error(
+                        "Checkpoint truncated in parameter-name trailer");
+                }
                 // Não confiar no campo: limita ao count já validado do corpo.
-                if (tcount > count) tcount = count;
+                if ((version >= 3 && tcount != count) || tcount > count) {
+                    throw std::runtime_error(
+                        "Checkpoint parameter-name trailer count mismatch");
+                }
                 size_t mismatches = 0;
                 std::string first_mismatch;
-                for (uint32_t i = 0; i < tcount && fs; ++i) {
+                for (uint32_t i = 0; i < tcount; ++i) {
                     uint32_t len = 0;
-                    if (!fs.read((char*)&len, 4)) break;
-                    if (len > 4096) break;
+                    if (!fs.read((char*)&len, 4)) {
+                        throw std::runtime_error(
+                            "Checkpoint truncated in parameter-name length");
+                    }
+                    if (len > 4096) {
+                        throw std::runtime_error(
+                            "Checkpoint absolute parameter name is too long");
+                    }
                     std::string abs_name(len, ' ');
-                    fs.read(&abs_name[0], len);
+                    if (len > 0 &&
+                        !fs.read(abs_name.data(),
+                                 static_cast<std::streamsize>(len))) {
+                        throw std::runtime_error(
+                            "Checkpoint truncated in absolute parameter name");
+                    }
                     if (i < params.size() && params[i] && params[i]->name != abs_name) {
                         ++mismatches;
                         if (first_mismatch.empty()) {
@@ -323,11 +489,29 @@ public:
                     }
                 }
                 if (mismatches > 0) {
+                    if (version >= 3 && strict) {
+                        throw std::runtime_error(
+                            "Checkpoint absolute parameter names do not match "
+                            "the runtime architecture: " + first_mismatch);
+                    }
                     std::cerr << "[ModelSerializer] AVISO: " << mismatches
                               << " nomes absolutos divergem do runtime (1o: "
                               << first_mismatch
                               << ") — possivel reordenacao de modulos.\n";
                 }
+                if (version >= 3) {
+                    const std::streampos payload_end = fs.tellg();
+                    if (payload_end < 0 ||
+                        static_cast<uint64_t>(payload_end) !=
+                            validated_payload_bytes) {
+                        throw std::runtime_error(
+                            "Checkpoint has unexpected bytes before the "
+                            "integrity trailer");
+                    }
+                }
+            } else if (version >= 3) {
+                throw std::runtime_error(
+                    "Checkpoint v3 parameter-name trailer is missing");
             }
             fs.clear();
         }
@@ -354,6 +538,18 @@ public:
                           << " missing and " << skipped_shape
                           << " shape-mismatched parameters.\n";
             }
+        }
+
+        // Commit only after every structural and semantic validation passes.
+        // Rejected checkpoints therefore cannot half-mutate a live model.
+        for (auto& pending : pending_loads) {
+            Parameter* parameter = pending.parameter;
+            parameter->data.copy_from(
+                Tensor::from_blob(pending.values.data(),
+                                  parameter->data.shape.dims,
+                                  Device::CPU)
+                    .to(parameter->data.device));
+            parameter->mark_updated();
         }
     }
 };

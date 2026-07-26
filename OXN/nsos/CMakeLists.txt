@@ -529,13 +529,14 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_layer_audit PRIVATE nsos_core)
     add_test(NAME test_layer_audit COMMAND test_layer_audit)
 
+    # GPU validation is registered only in CUDA builds. Every binary in this
+    # block is fail-closed when invoked without a selectable CUDA device.
+    if (CMAKE_CUDA_COMPILER)
     add_executable(test_gpu_parity tests/test_gpu_parity.cpp)
     target_link_libraries(test_gpu_parity PRIVATE nsos_core)
     add_test(NAME test_gpu_parity COMMAND test_gpu_parity)
 
     # Fase 2 gate: opt-in Mamba2 parallel-prefix scan vs sequential (1e-4).
-    # Skips when CUDA is off / no GPU; on a real GPU `ctest -R parallel_scan`
-    # is the gate that promotes NSOS_MAMBA_PARALLEL_SCAN to default.
     add_executable(test_mamba_parallel_scan_parity tests/test_mamba_parallel_scan_parity.cpp)
     target_link_libraries(test_mamba_parallel_scan_parity PRIVATE nsos_core)
     add_test(NAME test_mamba_parallel_scan_parity COMMAND test_mamba_parallel_scan_parity)
@@ -585,13 +586,12 @@ if (NSOS_BUILD_TESTS)
     target_include_directories(test_gpu_parity_mamba_nstate_stream PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_mamba_nstate_stream COMMAND test_gpu_parity_mamba_nstate_stream)
 
-    # CUDA-graph decode: graph token sequence == eager token sequence (the
-    # graph-frozen-argument failure class).  SKIPs on builds without
-    # NSOS_CUDA_PTDS — legacy default stream cannot be captured.
-    add_executable(test_gpu_parity_decode_graph tests/gpu/test_gpu_parity_decode_graph.cpp)
-    target_link_libraries(test_gpu_parity_decode_graph PRIVATE nsos_core)
-    target_include_directories(test_gpu_parity_decode_graph PRIVATE tests/gpu)
-    add_test(NAME test_gpu_parity_decode_graph COMMAND test_gpu_parity_decode_graph)
+    # Real hybrid Mamba + attention incremental decode.  Checks every CUDA
+    # token step against CPU streaming and a fresh full-prefix CPU forward.
+    add_executable(test_gpu_parity_decode_incremental tests/gpu/test_gpu_parity_decode_incremental.cpp)
+    target_link_libraries(test_gpu_parity_decode_incremental PRIVATE nsos_core)
+    target_include_directories(test_gpu_parity_decode_incremental PRIVATE tests/gpu)
+    add_test(NAME test_gpu_parity_decode_incremental COMMAND test_gpu_parity_decode_incremental)
 
     # Full Mamba-2 SSD with N-state expansion: mamba_nstate_* CUDA kernels
     # (per-head dt/A, N-dim B/C, h in R^{H*P*N}) vs the host reference.
@@ -653,6 +653,31 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gpu_parity_bitlinear_dp4a PRIVATE nsos_core)
     target_include_directories(test_gpu_parity_bitlinear_dp4a PRIVATE tests/gpu)
     add_test(NAME test_gpu_parity_bitlinear_dp4a COMMAND test_gpu_parity_bitlinear_dp4a)
+
+    # QAT pack load + serving clone must automatically preserve and execute
+    # packed DP4A inference.
+    add_executable(test_gpu_model_pack_dp4a_lifecycle tests/gpu/test_gpu_model_pack_dp4a_lifecycle.cpp)
+    target_link_libraries(test_gpu_model_pack_dp4a_lifecycle PRIVATE nsos_core)
+    target_include_directories(test_gpu_model_pack_dp4a_lifecycle PRIVATE tests/gpu)
+    add_test(NAME test_gpu_model_pack_dp4a_lifecycle COMMAND test_gpu_model_pack_dp4a_lifecycle)
+
+    # cudaMalloc storage can be passed to CUDA APIs only; host inspection must
+    # cross an explicit GPU->CPU copy boundary.
+    add_executable(test_gpu_device_memory_contract tests/gpu/test_gpu_device_memory_contract.cpp)
+    target_link_libraries(test_gpu_device_memory_contract PRIVATE nsos_core)
+    target_include_directories(test_gpu_device_memory_contract PRIVATE tests/gpu)
+    add_test(NAME test_gpu_device_memory_contract COMMAND test_gpu_device_memory_contract)
+
+    add_executable(test_gpu_checkpoint_v8_continuation tests/gpu/test_gpu_checkpoint_v8_continuation.cpp)
+    target_link_libraries(test_gpu_checkpoint_v8_continuation PRIVATE nsos_core)
+    target_include_directories(test_gpu_checkpoint_v8_continuation PRIVATE tests/gpu)
+    add_test(NAME test_gpu_checkpoint_v8_continuation COMMAND test_gpu_checkpoint_v8_continuation)
+
+    add_executable(test_gpu_mixed_precision_contract tests/gpu/test_gpu_mixed_precision_contract.cpp)
+    target_link_libraries(test_gpu_mixed_precision_contract PRIVATE nsos_core)
+    target_include_directories(test_gpu_mixed_precision_contract PRIVATE tests/gpu)
+    add_test(NAME test_gpu_mixed_precision_contract COMMAND test_gpu_mixed_precision_contract)
+    endif()
 
     # SmartLoader async semantics (real future-based wait, drain barrier,
     # concurrent producers, missing-file error path).  CPU-only, runs on
@@ -723,11 +748,24 @@ if (NSOS_BUILD_TESTS)
             test_gpu_parity_mamba_stream
             test_gpu_parity_mamba_proper_stream
             test_gpu_parity_mamba_scan
+            test_gpu_parity_mamba_proper
+            test_gpu_parity_mamba_nstate
+            test_gpu_parity_mamba_nstate_stream
+            test_gpu_parity_mamba_faithful
+            test_gpu_parity_decode_incremental
             test_gpu_parity_jamba
             test_gpu_parity_moe_router
             test_gpu_parity_moe_batched
             test_gpu_parity_bitnet_dispatch
             test_gpu_parity_bitlinear_dp4a
+            test_gpu_parity_kan
+            test_gpu_parity_sparse_attention
+            test_gpu_parity_jamba_sparse
+            test_gpu_model_pack_dp4a_lifecycle
+            test_gpu_device_memory_contract
+            test_gpu_checkpoint_v8_continuation
+            test_gpu_mixed_precision_contract
+            test_mamba_parallel_scan_parity
             test_smart_loader_async
             test_http_api
             test_circuit_api_pipeline
@@ -741,8 +779,10 @@ if (NSOS_BUILD_TESTS)
         endif()
         set_tests_properties(
             ${_NSOS_CUDA_SYNC_TESTS}
-            PROPERTIES ENVIRONMENT "NSOS_CUDA_SYNC=1")
+            PROPERTIES ENVIRONMENT
+                "NSOS_CUDA_SYNC=1;NSOS_REQUIRE_GPU_TESTS=1;NSOS_GPU_MEMORY=device;NSOS_NO_MEMADVISE=1")
     endif()
+
 endif()
 
 # Standalone repro for the TTT-in-model construction crash (debug diagnosis).

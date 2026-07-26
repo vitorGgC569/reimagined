@@ -2,8 +2,12 @@
 #include "autograd.h"
 #include "jamba.h"
 #include "optimizer_4bit.h"
+#include <cstdint>
 #include <vector>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace nsos {
@@ -16,7 +20,10 @@ struct TrainPhaseScheduler {
     bool progressive_qat_enabled = true;
     int semantic_warmup_steps = 100;
     int qat_start_step = 300;
+    // BitNet b1.58 weight precision is fixed at two packed ternary bits.
     int quantized_precision_bits = 2;
+    // Activations are independently quantized (int8 by default).
+    int activation_precision_bits = 8;
     float ternary_regularization = 1e-3f;
     bool auxiliary_stack_enabled = false;
     bool auxiliary_session_adapt_enabled = false;
@@ -29,6 +36,13 @@ struct TrainPhaseScheduler {
     int auxiliary_prompt_max_tokens = 96;
     int auxiliary_answer_max_tokens = 24;
     int auxiliary_memory_scope = 0;
+    // Optional durable OxtaMem backend for the auxiliary memory path. The
+    // store path is treated as a stable prefix; Trainer derives one arena per
+    // (scope, hidden dimension) to preserve backend file-lock semantics.
+    bool auxiliary_oxtamem_enabled = false;
+    std::string auxiliary_oxtamem_library_path;
+    std::string auxiliary_oxtamem_store_path;
+    uint64_t auxiliary_oxtamem_size_mb = 128;
 };
 
 struct AuxiliaryStackStats {
@@ -92,6 +106,23 @@ public:
     // FP32 path until the CUDA 4-bit kernel lands (Phase 2).
     int optimizer_state_bits = 32;
 
+    // Dynamic loss scaling is engaged only for FP16 GEMMs. Master weights,
+    // optimizer state, and stored gradients remain FP32.
+    bool dynamic_loss_scaling_enabled = true;
+    float loss_scale = 1024.0f;
+    float min_loss_scale = 1.0f;
+    float max_loss_scale = 65536.0f;
+    float loss_scale_growth_factor = 2.0f;
+    float loss_scale_backoff_factor = 0.5f;
+    int loss_scale_growth_interval = 2000;
+    int loss_scale_growth_tracker = 0;
+    bool last_optimizer_step_skipped = false;
+
+    // Auxiliary memory belongs to a Trainer run. It must never leak across
+    // models, A/B arms, tenants, or tests through process-static storage.
+    MemorySystem& auxiliary_memory_store(int dim, int scope);
+    void clear_auxiliary_memory();
+
     // Buffers de Memória AdamW (M = First Moment, V = Second Moment)
     std::unordered_map<Parameter*, Tensor> m_state;
     std::unordered_map<Parameter*, Tensor> v_state;
@@ -113,6 +144,14 @@ public:
     // optimizer accepts this effective scale directly and therefore remains on.
     std::unordered_map<Parameter*, float> external_lr_scale;
     std::unordered_map<Parameter*, float> criticality_lr_scale;
+    mutable std::mutex auxiliary_memory_mutex_;
+    std::unordered_map<long long, std::unique_ptr<MemorySystem>>
+        auxiliary_memory_stores_;
+    // A restored store keeps its in-memory clusters immediately, while its
+    // optional durable backend is attached lazily on first use. This avoids
+    // opening the same OxtaMem arena twice while replacing a checkpoint.
+    std::unordered_map<long long, bool> auxiliary_memory_backend_ready_;
+    std::string auxiliary_memory_signature_;
     float lr_scale_for(Parameter* p) const {
         const auto external = external_lr_scale.find(p);
         const auto criticality = criticality_lr_scale.find(p);
@@ -158,7 +197,8 @@ public:
                     int batch_size,
                     int seq_len,
                     std::function<void(int, float)> callback = nullptr,
-                    int max_steps = -1);
+                    int max_steps = -1,
+                    int start_step = 0);
 };
 
 } // namespace nsos

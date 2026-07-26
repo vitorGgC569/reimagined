@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 
 namespace nsos {
@@ -12,11 +13,14 @@ namespace nsos {
 namespace {
 
 constexpr std::array<char, 4> kMessageFormatMagic{{'N', 'S', 'M', '1'}};
+constexpr std::array<char, 4> kTensorFormatMagic{{'N', 'S', 'T', '1'}};
+constexpr size_t kOxtaVectorDimensions = 128;
 constexpr size_t kMaxMessageFieldBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxInstructionBytes = 1024 * 1024;
 constexpr size_t kMaxInstructions = 10000;
 constexpr size_t kMaxClusters = 4096;
 constexpr size_t kMaxItemsPerCluster = 1024;
+constexpr size_t kMaxRuntimeItems = 16384;
 constexpr float kClusterRadiusSquared = 10.0f;
 
 void append_u32(std::vector<uint8_t>& out, uint32_t value) {
@@ -112,7 +116,9 @@ std::vector<uint8_t> serialize_tensor_state(const Tensor& state) {
   const size_t header_bytes = sizeof(rank) + rank * sizeof(int32_t);
   const size_t data_bytes = static_cast<size_t>(host_state.size) * sizeof(float);
   std::vector<uint8_t> encoded;
-  encoded.reserve(header_bytes + data_bytes);
+  encoded.reserve(kTensorFormatMagic.size() + header_bytes + data_bytes);
+  encoded.insert(encoded.end(), kTensorFormatMagic.begin(),
+                 kTensorFormatMagic.end());
   append_u32(encoded, rank);
   for (int dim : host_state.shape.dims) {
     if (dim <= 0) throw std::invalid_argument("Memory tensor dimensions must be positive");
@@ -126,6 +132,78 @@ std::vector<uint8_t> serialize_tensor_state(const Tensor& state) {
     append_u32(encoded, bits);
   }
   return encoded;
+}
+
+Tensor deserialize_tensor_state(const std::vector<uint8_t>& encoded) {
+  if (encoded.size() < sizeof(uint32_t)) {
+    throw std::runtime_error("Corrupted episodic tensor payload");
+  }
+  size_t offset = 0;
+  if (encoded.size() >= kTensorFormatMagic.size() &&
+      std::equal(kTensorFormatMagic.begin(), kTensorFormatMagic.end(),
+                 encoded.begin())) {
+    offset = kTensorFormatMagic.size();
+  }
+  const uint32_t rank = read_u32(encoded, offset);
+  if (rank == 0 || rank > 8) {
+    throw std::runtime_error("Invalid episodic tensor rank");
+  }
+  std::vector<int> dimensions;
+  dimensions.reserve(rank);
+  size_t element_count = 1;
+  for (uint32_t axis = 0; axis < rank; ++axis) {
+    const uint32_t dimension = read_u32(encoded, offset);
+    if (dimension == 0 || dimension > 1'048'576 ||
+        element_count > 1'048'576 / dimension) {
+      throw std::runtime_error("Invalid episodic tensor dimensions");
+    }
+    element_count *= dimension;
+    dimensions.push_back(static_cast<int>(dimension));
+  }
+  const size_t expected_bytes =
+      element_count * sizeof(float);
+  if (expected_bytes != encoded.size() - offset) {
+    throw std::runtime_error("Corrupted episodic tensor data length");
+  }
+  Tensor tensor(dimensions, Device::CPU);
+  float* output = tensor.data();
+  for (size_t index = 0; index < element_count; ++index) {
+    const uint32_t bits = read_u32(encoded, offset);
+    std::memcpy(&output[index], &bits, sizeof(bits));
+    if (!std::isfinite(output[index])) {
+      throw std::runtime_error(
+          "Episodic tensor payload contains NaN or Inf");
+    }
+  }
+  return tensor;
+}
+
+std::vector<float> oxtamem_embedding(const Tensor& state) {
+  Tensor host = state.get_device() == Device::GPU ? state.cpu() : state;
+  std::vector<float> embedding(kOxtaVectorDimensions, 0.0f);
+  const float* values = host.data();
+  for (int64_t index = 0; index < host.size; ++index) {
+    const size_t bucket =
+        static_cast<size_t>(index) % kOxtaVectorDimensions;
+    // Feature hashing keeps the persistent index dimension fixed while
+    // preserving exact zero-padding for the common <=128-dimensional case.
+    const float sign =
+        index < static_cast<int64_t>(kOxtaVectorDimensions) ||
+                ((static_cast<uint64_t>(index) /
+                  kOxtaVectorDimensions) & 1u) == 0u
+            ? 1.0f
+            : -1.0f;
+    embedding[bucket] += values[index] * sign;
+  }
+  const float norm_squared =
+      std::inner_product(embedding.begin(), embedding.end(),
+                         embedding.begin(), 0.0f);
+  if (!std::isfinite(norm_squared) || norm_squared <= 1e-12f) {
+    // The Rust vector index rejects zero-norm vectors. A dedicated sentinel
+    // gives zero states deterministic, searchable semantics.
+    embedding.back() = 1.0f;
+  }
+  return embedding;
 }
 
 } // namespace
@@ -163,6 +241,7 @@ void MemorySystem::enable_causal_store(const std::string& path) {
   std::lock_guard<std::mutex> lock(memory_mutex);
   causal_store = std::move(backend);
   oxtamem_store.reset();
+  persistence_error.clear();
 }
 
 bool MemorySystem::enable_oxtamem_store(const std::string& library_path,
@@ -171,11 +250,18 @@ bool MemorySystem::enable_oxtamem_store(const std::string& library_path,
   std::lock_guard<std::mutex> lock(memory_mutex);
   auto backend = std::make_unique<OxtaMemFFI>();
   if (!backend->load(library_path) || !backend->open(store_path, size_mb)) {
+    persistence_error = backend->last_error();
     return false;
   }
   oxtamem_store = std::move(backend);
   causal_store.reset();
+  persistence_error.clear();
   return true;
+}
+
+std::string MemorySystem::last_persistence_error() const {
+  std::lock_guard<std::mutex> lock(memory_mutex);
+  return persistence_error;
 }
 
 void MemorySystem::store_episodic(const Tensor &state) {
@@ -189,12 +275,38 @@ void MemorySystem::store_episodic(const Tensor &state) {
   // memory that disappears after restart.
   if (causal_store) {
     causal_store->append("episodic", serialized);
-  } else if (oxtamem_store && !oxtamem_store->write("episodic", serialized)) {
-    throw std::runtime_error("OxtaMem episodic write failed");
+  } else if (oxtamem_store &&
+             !oxtamem_store->write_with_vector(
+                 "episodic", serialized, oxtamem_embedding(state_cpu))) {
+    throw std::runtime_error(
+        "OxtaMem episodic write failed: " +
+        oxtamem_store->last_error());
   }
 
   // Initialize cluster's access time
   auto now = std::chrono::system_clock::now();
+
+  // Bound the aggregate runtime footprint, not only each individual cluster.
+  // Without this cap, 4096 individually valid clusters could retain millions
+  // of tensors and make checkpoints or long training runs unbounded.
+  auto runtime_item_count = [&]() {
+    size_t count = 0;
+    for (const Cluster& cluster : clusters) {
+      count += cluster.items.size();
+      count += cluster.compressed_items.size();
+    }
+    return count;
+  };
+  while (!clusters.empty() &&
+         runtime_item_count() >= kMaxRuntimeItems) {
+    const auto oldest = std::min_element(
+        clusters.begin(), clusters.end(),
+        [](const Cluster& lhs, const Cluster& rhs) {
+          return lhs.last_access < rhs.last_access;
+        });
+    if (oldest == clusters.end()) break;
+    clusters.erase(oldest);
+  }
 
   // The centroid math below dereferences host pointers, so the incoming
   // state (which may live on GPU) must be materialized on the host first.
@@ -288,8 +400,51 @@ Tensor MemorySystem::retrieve(const Tensor &query) {
   std::lock_guard<std::mutex> lock(memory_mutex);
 
   const float *query_ptr = query_cpu.data();
-  if (clusters.empty() || query_cpu.size == 0) {
+  if (query_cpu.size == 0) {
     return Tensor::zeros(query_cpu.shape.dims, Device::CPU).to(query.get_device());
+  }
+  if (clusters.empty()) {
+    if (!oxtamem_store) {
+      return Tensor::zeros(query_cpu.shape.dims, Device::CPU)
+          .to(query.get_device());
+    }
+    Tensor context_cpu = Tensor::zeros(query_cpu.shape.dims, Device::CPU);
+    float total_weight = 0.0f;
+    float query_norm_sq = 0.0f;
+    for (int64_t index = 0; index < query_cpu.size; ++index) {
+      query_norm_sq += query_ptr[index] * query_ptr[index];
+    }
+    const float query_norm =
+        std::sqrt(std::max(query_norm_sq, 1e-8f));
+    const auto payloads = oxtamem_store->search_similar(
+        oxtamem_embedding(query_cpu), 8);
+    for (const auto& payload : payloads) {
+      Tensor memory = deserialize_tensor_state(payload);
+      if (memory.size != query_cpu.size) {
+        continue;
+      }
+      const float* memory_ptr = memory.data();
+      float dot = 0.0f;
+      float memory_norm_sq = 0.0f;
+      for (int64_t index = 0; index < query_cpu.size; ++index) {
+        dot += query_ptr[index] * memory_ptr[index];
+        memory_norm_sq += memory_ptr[index] * memory_ptr[index];
+      }
+      const float cosine =
+          dot / (query_norm *
+                 std::sqrt(std::max(memory_norm_sq, 1e-8f)));
+      const float weight = bounded_similarity_weight(cosine);
+      for (int64_t index = 0; index < query_cpu.size; ++index) {
+        context_cpu.data()[index] += memory_ptr[index] * weight;
+      }
+      total_weight += weight;
+    }
+    if (std::isfinite(total_weight) && total_weight > 1e-6f) {
+      for (int64_t index = 0; index < context_cpu.size; ++index) {
+        context_cpu.data()[index] /= total_weight;
+      }
+    }
+    return context_cpu.to(query.get_device());
   }
 
   std::vector<std::pair<float, int>> centroid_scores;
@@ -404,6 +559,20 @@ std::vector<Tensor> MemorySystem::retrieve(const Tensor &query, size_t top_k) {
   }
   Tensor query_cpu = query.get_device() == Device::GPU ? query.cpu() : query;
   std::lock_guard<std::mutex> lock(memory_mutex);
+  if (clusters.empty() && oxtamem_store && top_k > 0) {
+    std::vector<Tensor> results;
+    for (const auto& payload : oxtamem_store->search_similar(
+             oxtamem_embedding(query_cpu), top_k)) {
+      Tensor state = deserialize_tensor_state(payload);
+      if (state.size != query_cpu.size) {
+        continue;
+      }
+      results.push_back(query.get_device() == Device::GPU
+                            ? state.to(Device::GPU)
+                            : std::move(state));
+    }
+    return results;
+  }
   std::vector<std::pair<float, Tensor>> ranked;
   ranked.reserve(clusters.size());
 
@@ -511,7 +680,9 @@ void MemorySystem::add_message(const Message &msg) {
     if (causal_store) {
         causal_store->append("messages", serialized);
     } else if (oxtamem_store && !oxtamem_store->write("messages", serialized)) {
-        throw std::runtime_error("OxtaMem message write failed");
+        throw std::runtime_error(
+            "OxtaMem message write failed: " +
+            oxtamem_store->last_error());
     }
     conversation_history.push_back(msg);
     microcompact_messages_locked();
@@ -632,6 +803,117 @@ void MemorySystem::clear_runtime_state() {
     conversation_history.clear();
     instructional_memory.clear();
     tq_engine.reset();
+}
+
+std::vector<MemorySystem::Cluster>
+MemorySystem::snapshot_runtime_clusters() const {
+    std::lock_guard<std::mutex> lock(memory_mutex);
+    std::vector<Cluster> snapshot;
+    snapshot.reserve(clusters.size());
+    for (const Cluster& source : clusters) {
+        Cluster copy;
+        copy.centroid =
+            (source.centroid.get_device() == Device::GPU
+                 ? source.centroid.cpu()
+                 : source.centroid)
+                .clone();
+        copy.items.reserve(source.items.size());
+        for (const Tensor& item : source.items) {
+            copy.items.push_back(
+                (item.get_device() == Device::GPU ? item.cpu() : item)
+                    .clone());
+        }
+        copy.compressed_items = source.compressed_items;
+        copy.last_access = source.last_access;
+        snapshot.push_back(std::move(copy));
+    }
+    return snapshot;
+}
+
+void MemorySystem::restore_runtime_clusters(
+    const std::vector<Cluster>& snapshot) {
+    if (snapshot.size() > kMaxClusters) {
+        throw std::invalid_argument(
+            "Memory snapshot exceeds cluster limit");
+    }
+    std::vector<Cluster> staged;
+    staged.reserve(snapshot.size());
+    bool has_compressed = false;
+    size_t compressed_bytes = 0;
+    size_t aggregate_items = 0;
+    for (const Cluster& source : snapshot) {
+        validate_state_shape(source.centroid, "restore centroid");
+        if (source.items.size() > kMaxItemsPerCluster ||
+            source.compressed_items.size() > kMaxItemsPerCluster) {
+            throw std::invalid_argument(
+                "Memory snapshot exceeds per-cluster item limit");
+        }
+        if (source.items.size() >
+                kMaxRuntimeItems - aggregate_items) {
+            throw std::invalid_argument(
+                "Memory snapshot exceeds aggregate item limit");
+        }
+        aggregate_items += source.items.size();
+        if (source.compressed_items.size() >
+                kMaxRuntimeItems - aggregate_items) {
+            throw std::invalid_argument(
+                "Memory snapshot exceeds aggregate item limit");
+        }
+        aggregate_items += source.compressed_items.size();
+        Cluster copy;
+        copy.centroid =
+            (source.centroid.get_device() == Device::GPU
+                 ? source.centroid.cpu()
+                 : source.centroid)
+                .clone();
+        copy.items.reserve(source.items.size());
+        for (const Tensor& item : source.items) {
+            validate_state_shape(item, "restore item");
+            copy.items.push_back(
+                (item.get_device() == Device::GPU ? item.cpu() : item)
+                    .clone());
+        }
+        for (const auto& encoded : source.compressed_items) {
+            if (encoded.size() > 16ull * 1024ull * 1024ull ||
+                compressed_bytes >
+                    64ull * 1024ull * 1024ull - encoded.size()) {
+                throw std::invalid_argument(
+                    "Memory snapshot compressed payload exceeds limit");
+            }
+            compressed_bytes += encoded.size();
+        }
+        copy.compressed_items = source.compressed_items;
+        has_compressed =
+            has_compressed || !copy.compressed_items.empty();
+        copy.last_access = source.last_access;
+        staged.push_back(std::move(copy));
+    }
+
+    std::unique_ptr<tq::TurboQuantEngine> staged_quantizer;
+    if (has_compressed) {
+        staged_quantizer =
+            std::make_unique<tq::TurboQuantEngine>(chunk_size);
+        for (const Cluster& cluster : staged) {
+            for (const auto& encoded : cluster.compressed_items) {
+                const auto decoded = staged_quantizer->decode(encoded);
+                if (decoded.size() !=
+                        static_cast<size_t>(chunk_size) ||
+                    !std::all_of(
+                        decoded.begin(), decoded.end(),
+                        [](float value) {
+                            return std::isfinite(value);
+                        })) {
+                    throw std::invalid_argument(
+                        "Memory snapshot contains an invalid "
+                        "compressed item");
+                }
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(memory_mutex);
+    clusters = std::move(staged);
+    tq_engine = std::move(staged_quantizer);
 }
 
 } // namespace nsos

@@ -8,6 +8,7 @@
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
 #include "../include/cuda/sparse_attention_kernels.cuh"
+#include "../include/cuda/device_buffer.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -139,10 +140,24 @@ class GpuDeviceBuffer {
 //
 // One static instance; the training loop is single-threaded so no
 // concurrency guard needed.  Buffers grow geometrically (2×) when a
-// larger N_active comes through and never shrink — CUDA context
-// teardown reclaims them at process exit.
+// larger N_active comes through and never shrink during execution. The
+// thread-local destructor releases every allocation before context teardown.
 class MoeWorkspace {
  public:
+  ~MoeWorkspace() noexcept {
+    release(counts_);
+    release(offsets_);
+    release(work_);
+    release(perm_);
+    release(assign_);
+    release(scale_);
+    release(unit_);
+  }
+
+  MoeWorkspace() = default;
+  MoeWorkspace(const MoeWorkspace&) = delete;
+  MoeWorkspace& operator=(const MoeWorkspace&) = delete;
+
   // num_experts-sized buffers (counts, offsets+1, workspace_counters).
   // These rarely change shape (num_experts is a model constant), so the
   // allocation happens once and the buffers are reused forever.
@@ -187,6 +202,15 @@ class MoeWorkspace {
   }
 
  private:
+  template <typename T>
+  static void release(T*& pointer) noexcept {
+    if (pointer != nullptr) {
+      const cudaError_t status = cudaFree(pointer);
+      if (status != cudaSuccess) (void)cudaGetLastError();
+      pointer = nullptr;
+    }
+  }
+
   static void ensure_int(int*& ptr, int& cap, int requested) {
     if (requested <= cap && ptr != nullptr) return;
     if (ptr != nullptr) { cudaFree(ptr); ptr = nullptr; }
@@ -573,13 +597,15 @@ JambaModel::JambaModel(const ModelConfig& config, Device dev)
             // K1: corrected Mamba-2 SSD path, default ON via ModelConfig.
             model_config_.mamba_proper_ssm,
             model_config_.mamba_state_expansion,
+            model_config_.mamba_d_state,
             model_config_.mamba_conv_kernel,
             model_config_.mamba2_faithful,
             model_config_.mamba_expand,
             model_config_.mamba_head_dim,
             model_config_.mamba_n_groups,
             model_config_.rope_theta,
-            model_config_.sliding_window));
+            model_config_.sliding_window,
+            model_config_.max_context_tokens));
     }
 
     value_head = std::make_unique<BitLinear>(
@@ -653,8 +679,15 @@ void JambaModel::load(const std::string& filename, bool strict) {
 }
 
 Tensor JambaModel::forward(const Tensor& x, Context* ctx) {
+    std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
     if (ctx && ctx->abort_signal && ctx->abort_signal->load(std::memory_order_relaxed)) {
         throw AbortException();
+    }
+    if (x.size <= 0 || (x.shape.size() != 2 && x.shape.size() != 3) ||
+        x.shape.back() != d_model) {
+        throw std::invalid_argument(
+            "JambaModel::forward expects a non-empty [seq,d_model] or "
+            "[batch,seq,d_model] tensor");
     }
     Tensor hidden = x;
     const uint64_t stochastic_sequence =
@@ -1222,7 +1255,28 @@ RuntimeTelemetrySnapshot JambaModel::runtime_telemetry() const {
     return snapshot;
 }
 
+void JambaModel::validate_token_ids(const std::vector<int>& ids,
+                                    const char* operation) const {
+    if (ids.empty()) {
+        throw std::invalid_argument(std::string(operation) +
+                                    " requires at least one token");
+    }
+    if (ids.size() >
+        static_cast<size_t>(model_config_.max_context_tokens)) {
+        throw std::length_error(std::string(operation) +
+                                " exceeds max_context_tokens");
+    }
+    for (const int token : ids) {
+        if (token < 0 || token >= vocab_size) {
+            throw std::out_of_range(std::string(operation) +
+                                    " token id is outside the vocabulary");
+        }
+    }
+}
+
 Tensor JambaModel::forward_ids(const std::vector<int>& ids, Context* ctx) {
+    std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+    validate_token_ids(ids, "JambaModel::forward_ids");
     if (streaming_inference_enabled_ && !last_input_ids_.empty() && ids.size() == 1) {
         last_input_ids_.push_back(ids.front());
     } else {
@@ -1251,7 +1305,9 @@ Tensor JambaModel::forward_ids(const std::vector<int>& ids, Context* ctx) {
 // state and permanently disables the path for this model instance; the caller
 // falls back to the eager forward_ids with identical results.  The parity
 // contract (graph token sequence == eager token sequence) is enforced by
-// tests/gpu/test_gpu_parity_decode_graph.cpp on the target GPU.
+// tests/gpu/test_gpu_parity_decode_incremental.cpp validates the eager
+// incremental path on the target GPU; graph-specific promotion remains gated
+// separately until graph replay is re-enabled.
 // ═══════════════════════════════════════════════════════════════════════════
 #ifdef USE_CUDA
 struct JambaDecodeGraph {
@@ -1301,6 +1357,7 @@ bool JambaModel::decode_graph_active() const {
 std::string JambaModel::decode_graph_status() const { return decode_graph_status_; }
 
 Tensor JambaModel::forward_ids_decode_graph(int token) {
+    std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
 #if !defined(USE_CUDA)
     (void)token;
     decode_graph_status_ = "unavailable: CPU build";
@@ -1572,8 +1629,13 @@ Tensor JambaModel::forward_ids_decode_graph(int token) {
 }
 
 Tensor JambaModel::forward_ids_batch(const std::vector<std::vector<int>>& batch_ids, Context* ctx) {
+    std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
     if (batch_ids.empty()) {
-        return Tensor();
+        throw std::invalid_argument(
+            "JambaModel::forward_ids_batch requires a non-empty batch");
+    }
+    for (const auto& ids : batch_ids) {
+        validate_token_ids(ids, "JambaModel::forward_ids_batch");
     }
     if (streaming_inference_enabled_ &&
         !std::all_of(batch_ids.begin(), batch_ids.end(), [](const std::vector<int>& ids) {
@@ -1612,6 +1674,8 @@ Tensor JambaModel::forward_ids_batch(const std::vector<std::vector<int>>& batch_
 }
 
 Tensor JambaModel::forward_trunk(const std::vector<int>& ids, Context* ctx) {
+    std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
+    validate_token_ids(ids, "JambaModel::forward_trunk");
     last_input_ids_ = ids;
     last_input_batches_.clear();
     last_input_batch_lengths_.clear();
@@ -1630,8 +1694,13 @@ Tensor JambaModel::forward_trunk(const std::vector<int>& ids, Context* ctx) {
 
 Tensor JambaModel::forward_trunk_batch(const std::vector<std::vector<int>>& batch_ids,
                                        Context* ctx) {
+    std::lock_guard<std::recursive_mutex> execution_lock(execution_mutex_);
     if (batch_ids.empty()) {
-        return Tensor();
+        throw std::invalid_argument(
+            "JambaModel::forward_trunk_batch requires a non-empty batch");
+    }
+    for (const auto& ids : batch_ids) {
+        validate_token_ids(ids, "JambaModel::forward_trunk_batch");
     }
     int max_seq_len = 0;
     std::vector<std::vector<int>> padded_batch = batch_ids;
@@ -2058,13 +2127,15 @@ JambaBlock::JambaBlock(int dm,
                        bool use_kan,
                        bool mamba_proper_ssm,
                        bool mamba_state_expansion,
+                       int mamba_d_state,
                        int mamba_conv_kernel,
                        bool mamba2_faithful,
                        int mamba_expand,
                        int mamba_head_dim,
                        int mamba_n_groups,
                        float rope_theta,
-                       int sliding_window)
+                       int sliding_window,
+                       int max_context_tokens)
     : is_attention(is_attn),
       is_moe(is_moe_flag),
       is_ttt(is_ttt_layer),
@@ -2149,7 +2220,7 @@ JambaBlock::JambaBlock(int dm,
         MambaConfig config;
         config.recompute_ssd = use_gradient_checkpointing;
         config.save_intermediates = !use_gradient_checkpointing;
-        config.max_seq_for_storage = use_gradient_checkpointing ? 512 : 2048;
+        config.max_seq_for_storage = max_context_tokens;
         // K1: corrected selective SSM (independent delta/B/C/z projections +
         // causal conv1d + single-C linear readout + SiLU gate) is now the
         // DEFAULT, driven by ModelConfig (mamba_proper_ssm / state_expansion).
@@ -2173,7 +2244,6 @@ JambaBlock::JambaBlock(int dm,
         // fast path instead of the host fallback — critical now that the N-state
         // SSD is the default (K1).  64 is also the standard Mamba-2 head-state
         // size; the old dm/2 (e.g. 160) was both slower and non-standard.
-        const int mamba_d_state = std::min(std::max(dm / 2, 8), 64);
         mamba_layer = std::make_unique<Mamba2SSD>(dm, mamba_d_state,
                                                   std::max(dm / 16, 1), config);
     }
@@ -3733,20 +3803,9 @@ namespace {
 int* attn_valid_device_buffer(int count) {
     // K6: thread_local for replica safety (training is single-threaded today, but
     // this keeps every persistent device buffer race-free by construction).
-    thread_local int* buf = nullptr;
-    thread_local int cap = 0;
     if (count <= 0) return nullptr;
-    if (count > cap) {
-        if (buf) cudaFree(buf);
-        buf = nullptr;
-        if (cudaMalloc(&buf, static_cast<size_t>(count) * sizeof(int)) != cudaSuccess) {
-            (void)cudaGetLastError();
-            cap = 0;
-            return nullptr;
-        }
-        cap = count;
-    }
-    return buf;
+    thread_local cuda_detail::DeviceBuffer<int> buffer;
+    return buffer.ensure(static_cast<size_t>(count));
 }
 
 // NSOS_ATTN_BWD_HOST=1 forces the host exact-cache backward (the A/B parity arm
@@ -5000,40 +5059,68 @@ Tensor Attention::forward(const Tensor& input, Context* ctx) {
             return input.shape.size() == 1 ? projected.reshape({d_model}) : projected;
         }
 
-        if (!streaming_inference_) {
-        Tensor output_gpu({seq_len, d_model}, Device::GPU);
-        launch_gqa_causal_attention_kernel(
-            q_flat.raw_data(),
-            kv_flat.raw_data(),
-            output_gpu.raw_data(),
-            seq_len,
-            d_model,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_group_size,
-            theta,
-            sliding_window_);
+        if (!streaming_inference_ ||
+            (streaming_inference_ && seq_len > 1 && !sparse_enabled_)) {
+            Tensor output_gpu({seq_len, d_model}, Device::GPU);
 
-        cudaError_t status = cudaGetLastError();
-        if (status != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("GQA causal attention kernel launch failed: ") +
-                cudaGetErrorString(status));
-        }
-        if (const char* sync_env = std::getenv("NSOS_CUDA_SYNC")) {
-            if (std::string(sync_env) == "1") {
-                status = cudaDeviceSynchronize();
-                if (status != cudaSuccess) {
-                    throw std::runtime_error(
-                        std::string("GQA causal attention kernel sync failed: ") +
-                        cudaGetErrorString(status));
+            // A multi-token streaming call is a prefill: like the validated
+            // CPU path below, it starts a new session and leaves every
+            // RoPE-rotated K/V row resident on the compute device for the
+            // subsequent one-token decode calls.  Do not call
+            // clear_kv_cache() here because reserve_kv_cache() may already
+            // have provisioned the correctly sized device allocation.
+            if (streaming_inference_) {
+                cached_tokens_ = 0;
+                ensure_kv_cache_capacity(seq_len, Device::GPU);
+                for (int token_index = 0; token_index < seq_len; ++token_index) {
+                    launch_gqa_append_kv_cache_kernel(
+                        kv_flat.raw_data() +
+                            static_cast<size_t>(token_index) *
+                                static_cast<size_t>(2 * kv_dim),
+                        key_cache_buffer_.raw_data(),
+                        value_cache_buffer_.raw_data(),
+                        token_index,
+                        n_kv_heads,
+                        head_dim,
+                        theta);
                 }
             }
-        }
 
-        Tensor projected = out_proj->forward(output_gpu);
-        return input.shape.size() == 1 ? projected.reshape({d_model}) : projected;
+            launch_gqa_causal_attention_kernel(
+                q_flat.raw_data(),
+                kv_flat.raw_data(),
+                output_gpu.raw_data(),
+                seq_len,
+                d_model,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_group_size,
+                theta,
+                sliding_window_);
+
+            cudaError_t status = cudaGetLastError();
+            if (status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("GQA causal attention kernel launch failed: ") +
+                    cudaGetErrorString(status));
+            }
+            if (const char* sync_env = std::getenv("NSOS_CUDA_SYNC")) {
+                if (std::string(sync_env) == "1") {
+                    status = cudaDeviceSynchronize();
+                    if (status != cudaSuccess) {
+                        throw std::runtime_error(
+                            std::string("GQA causal attention kernel sync failed: ") +
+                            cudaGetErrorString(status));
+                    }
+                }
+            }
+            if (streaming_inference_) {
+                cached_tokens_ = seq_len;
+            }
+
+            Tensor projected = out_proj->forward(output_gpu);
+            return input.shape.size() == 1 ? projected.reshape({d_model}) : projected;
         }
     }
 #endif
@@ -6171,6 +6258,8 @@ void Attention::ensure_kv_cache_capacity(int required_tokens, Device device, int
         cached_batch_size_ == normalized_batch &&
         key_cache_buffer_.size > 0 &&
         value_cache_buffer_.size > 0 &&
+        key_cache_buffer_.get_device() == device &&
+        value_cache_buffer_.get_device() == device &&
         key_cache_buffer_.data_ptr.use_count() == 1 &&
         value_cache_buffer_.data_ptr.use_count() == 1) {
         return;
@@ -6197,10 +6286,10 @@ void Attention::ensure_kv_cache_capacity(int required_tokens, Device device, int
             static_cast<size_t>(target_capacity) * token_width;
         const size_t row_bytes = static_cast<size_t>(cached_tokens_) *
                                  static_cast<size_t>(token_width) * sizeof(float);
-        float* dst_key = next_key.data();
-        float* dst_value = next_value.data();
-        const float* src_key = key_cache_buffer_.data();
-        const float* src_value = value_cache_buffer_.data();
+        float* dst_key = next_key.raw_data();
+        float* dst_value = next_value.raw_data();
+        const float* src_key = key_cache_buffer_.raw_data();
+        const float* src_value = value_cache_buffer_.raw_data();
         for (int b = 0; b < copy_batch; ++b) {
             const size_t dst_off = static_cast<size_t>(b) * new_row_stride;
             const size_t src_off = static_cast<size_t>(b) * old_row_stride;
@@ -6235,13 +6324,13 @@ void Attention::append_kv_cache_token(const float* key_ptr,
     const size_t batch_stride =
         static_cast<size_t>(cache_capacity_tokens_) * static_cast<size_t>(token_width);
     float* key_dst =
-        key_cache_buffer_.data() + static_cast<size_t>(cached_tokens_) * token_width;
+        key_cache_buffer_.raw_data() + static_cast<size_t>(cached_tokens_) * token_width;
     float* value_dst =
-        value_cache_buffer_.data() + static_cast<size_t>(cached_tokens_) * token_width;
+        value_cache_buffer_.raw_data() + static_cast<size_t>(cached_tokens_) * token_width;
     if (cached_batch_size_ > 1) {
-        key_dst = key_cache_buffer_.data() + batch_stride +
+        key_dst = key_cache_buffer_.raw_data() + batch_stride +
                   static_cast<size_t>(cached_tokens_) * token_width;
-        value_dst = value_cache_buffer_.data() + batch_stride +
+        value_dst = value_cache_buffer_.raw_data() + batch_stride +
                     static_cast<size_t>(cached_tokens_) * token_width;
     }
     copy_float_bytes_device_safe(key_dst,
@@ -6276,10 +6365,10 @@ void Attention::append_kv_cache_batch_tokens(const float* key_ptr,
     const size_t dst_batch_stride =
         static_cast<size_t>(cache_capacity_tokens_) * static_cast<size_t>(token_width);
     for (int batch = 0; batch < normalized_batch; ++batch) {
-        float* key_dst = key_cache_buffer_.data() +
+        float* key_dst = key_cache_buffer_.raw_data() +
                          static_cast<size_t>(batch) * dst_batch_stride +
                          static_cast<size_t>(cached_tokens_) * static_cast<size_t>(token_width);
-        float* value_dst = value_cache_buffer_.data() +
+        float* value_dst = value_cache_buffer_.raw_data() +
                            static_cast<size_t>(batch) * dst_batch_stride +
                            static_cast<size_t>(cached_tokens_) * static_cast<size_t>(token_width);
         const float* key_src = key_ptr + static_cast<size_t>(batch) * src_stride;
@@ -6341,14 +6430,14 @@ AttentionCacheSnapshot Attention::snapshot_cache() const {
             Tensor({cache_capacity_tokens_, token_width}, value_cache_buffer_.get_device());
         const size_t bytes = static_cast<size_t>(cache_capacity_tokens_) *
                              static_cast<size_t>(token_width) * sizeof(float);
-        copy_float_bytes_device_safe(snapshot.key_cache.data(),
+        copy_float_bytes_device_safe(snapshot.key_cache.raw_data(),
                                      snapshot.key_cache.get_device(),
-                                     key_cache_buffer_.data(),
+                                     key_cache_buffer_.raw_data(),
                                      key_cache_buffer_.get_device(),
                                      bytes);
-        copy_float_bytes_device_safe(snapshot.value_cache.data(),
+        copy_float_bytes_device_safe(snapshot.value_cache.raw_data(),
                                      snapshot.value_cache.get_device(),
-                                     value_cache_buffer_.data(),
+                                     value_cache_buffer_.raw_data(),
                                      value_cache_buffer_.get_device(),
                                      bytes);
     }
@@ -6376,15 +6465,15 @@ std::vector<AttentionCacheSnapshot> Attention::snapshot_cache_batch() const {
             Tensor({cache_capacity_tokens_, token_width}, key_cache_buffer_.get_device());
         snapshot.value_cache =
             Tensor({cache_capacity_tokens_, token_width}, value_cache_buffer_.get_device());
-        copy_float_bytes_device_safe(snapshot.key_cache.data(),
+        copy_float_bytes_device_safe(snapshot.key_cache.raw_data(),
                                      snapshot.key_cache.get_device(),
-                                     key_cache_buffer_.data() +
+                                     key_cache_buffer_.raw_data() +
                                          static_cast<size_t>(batch) * batch_stride,
                                      key_cache_buffer_.get_device(),
                                      bytes);
-        copy_float_bytes_device_safe(snapshot.value_cache.data(),
+        copy_float_bytes_device_safe(snapshot.value_cache.raw_data(),
                                      snapshot.value_cache.get_device(),
-                                     value_cache_buffer_.data() +
+                                     value_cache_buffer_.raw_data() +
                                          static_cast<size_t>(batch) * batch_stride,
                                      value_cache_buffer_.get_device(),
                                      bytes);
@@ -6450,14 +6539,14 @@ void Attention::restore_cache_batch(const std::vector<AttentionCacheSnapshot>& s
     const size_t batch_stride =
         static_cast<size_t>(cache_capacity_tokens_) * static_cast<size_t>(token_width);
     for (size_t batch = 0; batch < snapshots.size(); ++batch) {
-        copy_float_bytes_device_safe(key_cache_buffer_.data() + batch * batch_stride,
+        copy_float_bytes_device_safe(key_cache_buffer_.raw_data() + batch * batch_stride,
                                      key_cache_buffer_.get_device(),
-                                     snapshots[batch].key_cache.data(),
+                                      snapshots[batch].key_cache.raw_data(),
                                      snapshots[batch].key_cache.get_device(),
                                      live_bytes);
-        copy_float_bytes_device_safe(value_cache_buffer_.data() + batch * batch_stride,
+        copy_float_bytes_device_safe(value_cache_buffer_.raw_data() + batch * batch_stride,
                                      value_cache_buffer_.get_device(),
-                                     snapshots[batch].value_cache.data(),
+                                      snapshots[batch].value_cache.raw_data(),
                                      snapshots[batch].value_cache.get_device(),
                                      live_bytes);
     }

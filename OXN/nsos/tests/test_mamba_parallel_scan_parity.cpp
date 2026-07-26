@@ -7,28 +7,36 @@
 // The parallel kernel reassociates the floating-point summation (Hillis-Steele
 // scan), so results must agree with the sequential reference within 1e-4.
 //
-// Skips cleanly (exit 0) when CUDA is disabled or no GPU is present, so it is
-// safe in the default CTest run; on a real GPU (Colab T4) it is the one-command
-// gate that promotes NSOS_MAMBA_PARALLEL_SCAN to default:  ctest -R parallel_scan
+// This binary is fail-closed: a non-CUDA build or missing device is a failure.
+// CPU-only CTest lanes must not register it as a GPU validation gate.
 #include "tensor.h"
 #include "cuda/mamba_kernels.cuh"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace nsos;
 
 int main() {
 #ifndef USE_CUDA
-  std::printf("[mamba_parallel_scan_parity] CUDA disabled at build time — skip\n");
-  return 0;
+  std::fprintf(
+      stderr,
+      "[mamba_parallel_scan_parity] CUDA required but disabled\n");
+  return 1;
 #else
   int dev_count = 0;
-  if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
-    std::printf("[mamba_parallel_scan_parity] no CUDA device — skip\n");
-    return 0;
+  const cudaError_t device_status = cudaGetDeviceCount(&dev_count);
+  if (device_status != cudaSuccess || dev_count == 0) {
+    std::fprintf(
+        stderr,
+        "[mamba_parallel_scan_parity] CUDA device required but unavailable "
+        "(cudaGetDeviceCount=%d)\n",
+        static_cast<int>(device_status));
+    return 1;
   }
 
   const int Batch = 2, Seq = 192, D = 48;
@@ -56,7 +64,12 @@ int main() {
   cuda::launch_mamba_selective_scan_forward(
       xg.raw_data(), dtg.raw_data(), Ag.raw_data(), Bg.raw_data(), Cg.raw_data(),
       y_seq.raw_data(), nullptr, Batch, Seq, D);
-  cudaDeviceSynchronize();
+  cudaError_t sync_status = cudaDeviceSynchronize();
+  if (sync_status != cudaSuccess) {
+    std::fprintf(stderr, "[mamba_parallel_scan_parity] sequential sync failed: %s\n",
+                 cudaGetErrorString(sync_status));
+    return 1;
+  }
   Tensor y_seq_h = y_seq.to(Device::CPU);
 
   // Parallel-prefix path under test.
@@ -64,7 +77,12 @@ int main() {
   cuda::launch_mamba_selective_scan_forward(
       xg.raw_data(), dtg.raw_data(), Ag.raw_data(), Bg.raw_data(), Cg.raw_data(),
       y_par.raw_data(), nullptr, Batch, Seq, D);
-  cudaDeviceSynchronize();
+  sync_status = cudaDeviceSynchronize();
+  if (sync_status != cudaSuccess) {
+    std::fprintf(stderr, "[mamba_parallel_scan_parity] parallel sync failed: %s\n",
+                 cudaGetErrorString(sync_status));
+    return 1;
+  }
   Tensor y_par_h = y_par.to(Device::CPU);
   cuda::set_mamba_parallel_scan(false);  // restore default
 

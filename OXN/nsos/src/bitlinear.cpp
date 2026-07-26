@@ -122,6 +122,10 @@ void BitLinear::repack_weights() {
 void BitLinear::pack_weights(const Tensor &w_float) {
   int K = in_features;
   int N = out_features;
+  // Packing is host-side preparation. Native device storage crosses an
+  // explicit D2H boundary; host code never dereferences a cudaMalloc pointer.
+  const Tensor w_pack_source =
+      w_float.get_device() == Device::GPU ? w_float.cpu() : w_float;
   
   // Use Microsoft style packing for BitNet kernels
   // bitnet.cpp packs 4 values per byte
@@ -137,7 +141,7 @@ void BitLinear::pack_weights(const Tensor &w_float) {
   // so the ternary came out sparser than the recipe proven at 2B/4T scale —
   // and inconsistent with the rest of this codebase (Slender embedding eq.8
   // and the OXTA-CRIT branch-gain rule both already use absmean).
-  this->weight_scale = tensor_abs_mean(w_float) + 1e-8f;
+  this->weight_scale = tensor_abs_mean(w_pack_source) + 1e-8f;
 
   // Canonical NSOS ternary rule — single source of truth.  Quantize with
   // quantize_weights() (t = clamp(round(W / scale), -1, +1), scale =
@@ -145,7 +149,7 @@ void BitLinear::pack_weights(const Tensor &w_float) {
   // the packed weights identical to quantize_weights() and to the QAT
   // regularizer target, so quantized training (STE) and packed inference
   // share exactly one quantization rule.
-  Tensor ternary_codes = quantize_weights(w_float);
+  Tensor ternary_codes = quantize_weights(w_pack_source);
 
   // Pack the {-1,0,+1} codes.  The adapter's +-0.25 raw threshold maps the
   // exact integer codes to their 2-bit values losslessly.
@@ -467,10 +471,11 @@ Tensor BitLinear::forward(const Tensor &input) {
     // computation, so training gradients are byte-identical to the
     // pre-Phase-5b implementation.
     const bool dp4a_eligible =
-        gpu_packed_inference_enabled_ && packed_weight_valid &&
+        !training_mode_ && gpu_packed_inference_enabled_ && packed_weight_valid &&
         !loqa.active && M > 0 && in_features > 0 && out_features > 0 &&
         (in_features % 16 == 0);
     if (dp4a_eligible) {
+      gpu_packed_dispatch_count_.fetch_add(1, std::memory_order_relaxed);
       // Refresh GPU packed-weights cache when the underlying weights
       // have changed since the last upload.  The buffer is sized in
       // float-words because Tensor today only knows the float type;
@@ -728,43 +733,24 @@ void BitLinear::import_packed_state(const BitLinearPackedState& state,
   }
 }
 
-void BitLinear::apply_flatquant(float *data, int M, int K, bool incoming) {
-  // SOTA FlatQuant: Learnable affine transform x' = alpha * x + beta
-  // This flattens the distribution for optimal quantization
-
-  const float *alpha = flat_alpha.data.data();
-  const float *beta = flat_beta.data.data();
-
-  if (incoming) {
-    // Forward transform
-#pragma omp parallel for
-    for (int i = 0; i < M; ++i) {
-      for (int j = 0; j < K; ++j) {
-        data[i * K + j] = data[i * K + j] * alpha[j] + beta[j];
-      }
-    }
-  } else {
-// Not used in backward directly (handled by gradients), kept for
-// completeness/inverse Inverse: x = (x' - beta) / alpha
-#pragma omp parallel for
-    for (int i = 0; i < M; ++i) {
-      for (int j = 0; j < K; ++j) {
-        data[i * K + j] = (data[i * K + j] - beta[j]) / (alpha[j] + 1e-8f);
-      }
-    }
-  }
-}
-
 void BitLinear::to(Device dev) {
-  if (weight.data.size > 0) {
-    weight.data = weight.data.to(dev);
-  }
-  bias.data = bias.data.to(dev);
-  magnitude.data = magnitude.data.to(dev);
-  flat_alpha.data = flat_alpha.data.to(dev);
-  flat_beta.data = flat_beta.data.to(dev);
-  loqa.A.data = loqa.A.data.to(dev);
-  loqa.B.data = loqa.B.data.to(dev);
+  auto move_parameter = [dev](Parameter& parameter) {
+    if (parameter.data.size > 0 &&
+        parameter.data.get_device() != dev) {
+      parameter.data = parameter.data.to(dev);
+    }
+    if (parameter.grad.size > 0 &&
+        parameter.grad.get_device() != dev) {
+      parameter.grad = parameter.grad.to(dev);
+    }
+  };
+  move_parameter(weight);
+  move_parameter(bias);
+  move_parameter(magnitude);
+  move_parameter(flat_alpha);
+  move_parameter(flat_beta);
+  move_parameter(loqa.A);
+  move_parameter(loqa.B);
   invalidate_cached_materialized_weights();
 }
 
@@ -775,10 +761,11 @@ std::vector<Parameter *> BitLinear::parameters() {
     res.push_back(&magnitude);
   if (use_bias)
     res.push_back(&bias);
-  if (use_flatquant) {
-    res.push_back(&flat_alpha);
-    res.push_back(&flat_beta);
-  }
+  // Kept in the model parameter registry for checkpoint compatibility only.
+  // Trainer explicitly filters these fixed legacy identity buffers out of
+  // gradient, optimizer, and Trainer-sidecar state.
+  res.push_back(&flat_alpha);
+  res.push_back(&flat_beta);
   if (loqa.active) {
     res.push_back(&loqa.A);
     res.push_back(&loqa.B);
@@ -1051,13 +1038,16 @@ Tensor BitLinear::backward(const Tensor &grad) {
 }
 
 Tensor BitLinear::quantize_weights(const Tensor &w_float) {
-  Tensor res(w_float.shape.dims, w_float.get_device());
+  const Device original_device = w_float.get_device();
+  const Tensor source =
+      original_device == Device::GPU ? w_float.cpu() : w_float;
+  Tensor res(source.shape.dims, Device::CPU);
   // Absmean scale (BitNet b1.58) — must match pack_weights / the QAT forward.
-  float scale = tensor_abs_mean(w_float) + 1e-8f;
-  const float *src = w_float.data();
+  float scale = tensor_abs_mean(source) + 1e-8f;
+  const float *src = source.data();
   float *dst = res.data();
 #pragma omp parallel for
-  for (int i = 0; i < w_float.size; ++i) {
+  for (int i = 0; i < source.size; ++i) {
     float val = src[i] / (scale + 1e-8f);
     if (val > 0.5f)
       dst[i] = 1.0f;
@@ -1066,7 +1056,7 @@ Tensor BitLinear::quantize_weights(const Tensor &w_float) {
     else
       dst[i] = 0.0f;
   }
-  return res;
+  return original_device == Device::GPU ? res.to(Device::GPU) : res;
 }
 
 Tensor BitLinear::add_qat_regularization_grad(float regularization) {

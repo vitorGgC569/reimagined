@@ -1,6 +1,7 @@
 #include "../include/trainer.h"
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
+#include "../include/cuda/device_buffer.h"
 #include "../include/layer_audit.h"
 #include "../include/nsos_serializer.h"
 #include "../include/nsos/determinism.h"  // K4: ordered reductions under NSOS_DETERMINISTIC
@@ -35,8 +36,17 @@ namespace nsos {
 namespace {
 
 constexpr uint32_t kTrainingStateMagic = 0x4E535452u;  // NSTR
-constexpr uint32_t kTrainingStateVersion = 2u;
+constexpr uint32_t kTrainingStateVersion = 8u;
 constexpr uint32_t kTrainingStateLegacyVersion = 1u;
+constexpr uint32_t kTrainingStateTrailerMagic = 0x3553544Eu;  // NTS5
+constexpr uint64_t kTrainingStateTrailerBytes =
+    sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t);
+constexpr uint32_t kMaxTrainingMemoryStores = 4096u;
+constexpr uint32_t kMaxTrainingMemoryClusters = 4096u;
+constexpr uint32_t kMaxTrainingMemoryItemsPerCluster = 1024u;
+constexpr uint64_t kMaxTrainingMemoryItems = 16384u;
+constexpr uint64_t kMaxTrainingMemoryCompressedBytes =
+    64ull * 1024ull * 1024ull;
 
 template <typename T>
 void write_training_pod(std::ostream& output, const T& value,
@@ -62,8 +72,8 @@ T read_training_pod(std::istream& input, const char* label) {
 }
 
 void write_training_string(std::ostream& output, const std::string& value) {
-    if (value.size() > 4096) {
-        throw std::runtime_error("Training-state parameter name is too long");
+    if (value.size() > 32768) {
+        throw std::runtime_error("Training-state string is too long");
     }
     write_training_pod(output, static_cast<uint32_t>(value.size()),
                        "string length");
@@ -73,8 +83,8 @@ void write_training_string(std::ostream& output, const std::string& value) {
 
 std::string read_training_string(std::istream& input) {
     const uint32_t length = read_training_pod<uint32_t>(input, "string length");
-    if (length > 4096) {
-        throw std::runtime_error("Training-state parameter name exceeds limit");
+    if (length > 32768) {
+        throw std::runtime_error("Training-state string exceeds limit");
     }
     std::string value(length, '\0');
     if (length > 0) {
@@ -110,6 +120,69 @@ uint64_t training_state_file_hash(const std::filesystem::path& path,
     return hash;
 }
 
+uint64_t training_state_prefix_hash(const std::filesystem::path& path,
+                                    uint64_t byte_limit) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(
+            "Cannot hash training-state payload: " + path.string());
+    }
+    constexpr uint64_t kOffset = 1469598103934665603ull;
+    constexpr uint64_t kPrime = 1099511628211ull;
+    uint64_t hash = kOffset;
+    uint64_t consumed = 0;
+    std::array<char, 1 << 16> buffer{};
+    while (consumed < byte_limit) {
+        const uint64_t remaining = byte_limit - consumed;
+        const std::streamsize wanted = static_cast<std::streamsize>(
+            std::min<uint64_t>(remaining, buffer.size()));
+        input.read(buffer.data(), wanted);
+        const std::streamsize count = input.gcount();
+        if (count != wanted) {
+            throw std::runtime_error(
+                "Training-state payload is truncated while hashing");
+        }
+        consumed += static_cast<uint64_t>(count);
+        for (std::streamsize index = 0; index < count; ++index) {
+            hash ^= static_cast<unsigned char>(
+                buffer[static_cast<size_t>(index)]);
+            hash *= kPrime;
+        }
+    }
+    return hash;
+}
+
+void verify_training_state_integrity(
+    const std::filesystem::path& path, uint32_t version) {
+    if (version < 5u) {
+        return;
+    }
+    const uint64_t total_bytes = std::filesystem::file_size(path);
+    if (total_bytes < kTrainingStateTrailerBytes) {
+        throw std::runtime_error("Training-state integrity trailer is missing");
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Cannot open training-state integrity trailer");
+    }
+    input.seekg(
+        static_cast<std::streamoff>(total_bytes -
+                                    kTrainingStateTrailerBytes),
+        std::ios::beg);
+    const uint32_t magic =
+        read_training_pod<uint32_t>(input, "integrity magic");
+    const uint64_t payload_bytes =
+        read_training_pod<uint64_t>(input, "integrity payload bytes");
+    const uint64_t expected_hash =
+        read_training_pod<uint64_t>(input, "integrity hash");
+    if (magic != kTrainingStateTrailerMagic ||
+        payload_bytes != total_bytes - kTrainingStateTrailerBytes ||
+        training_state_prefix_hash(path, payload_bytes) != expected_hash) {
+        throw std::runtime_error(
+            "Training-state checksum validation failed");
+    }
+}
+
 void replace_training_state_file(const std::filesystem::path& temporary,
                                  const std::filesystem::path& destination) {
 #ifdef _WIN32
@@ -132,12 +205,34 @@ void replace_training_state_file(const std::filesystem::path& temporary,
 #endif
 }
 
+bool is_legacy_fixed_parameter(const Parameter* parameter) {
+    if (!parameter) return false;
+    const std::string& identity =
+        !parameter->base_name.empty() ? parameter->base_name
+                                      : parameter->name;
+    return identity == "flat_alpha" || identity == "flat_beta";
+}
+
+std::vector<Parameter*> trainable_model_parameters(JambaModel* model) {
+    std::vector<Parameter*> result;
+    for (Parameter* parameter : model->parameters()) {
+        if (parameter && !is_legacy_fixed_parameter(parameter)) {
+            result.push_back(parameter);
+        }
+    }
+    return result;
+}
+
 std::vector<std::pair<Parameter*, std::string>> stable_training_parameters(
-    JambaModel* model) {
+    JambaModel* model, bool include_legacy_fixed = false) {
     std::vector<std::pair<Parameter*, std::string>> result;
     std::unordered_map<std::string, size_t> counts;
     for (Parameter* parameter : model->parameters()) {
-        if (!parameter) continue;
+        if (!parameter ||
+            (!include_legacy_fixed &&
+             is_legacy_fixed_parameter(parameter))) {
+            continue;
+        }
         const std::string identity = !parameter->base_name.empty()
                                          ? parameter->base_name
                                          : parameter->name;
@@ -167,6 +262,14 @@ struct TrainingStateMetadata {
     int32_t total_training_steps = 0;
     int32_t eos_token_id = 0;
     int32_t optimizer_state_bits = 32;
+    bool dynamic_loss_scaling_enabled = true;
+    float loss_scale = 1024.0f;
+    float min_loss_scale = 1.0f;
+    float max_loss_scale = 65536.0f;
+    float loss_scale_growth_factor = 2.0f;
+    float loss_scale_backoff_factor = 0.5f;
+    int32_t loss_scale_growth_interval = 2000;
+    int32_t loss_scale_growth_tracker = 0;
     TrainPhaseScheduler phase_scheduler;
 };
 
@@ -182,6 +285,62 @@ struct TrainingParameterRecord {
     float external_lr_scale = 1.0f;
     float criticality_lr_scale = 1.0f;
 };
+
+struct TrainingMemoryRecord {
+    int64_t key = 0;
+    int32_t dimension = 0;
+    std::vector<MemorySystem::Cluster> clusters;
+};
+
+void write_training_memory_tensor(std::ostream& output,
+                                  const Tensor& tensor,
+                                  int32_t expected_dimension) {
+    Tensor host =
+        tensor.get_device() == Device::GPU ? tensor.cpu() : tensor;
+    if (host.size != expected_dimension || host.shape.size() == 0) {
+        throw std::runtime_error(
+            "Auxiliary-memory tensor shape mismatch");
+    }
+    const float* values = host.data();
+    for (int32_t index = 0; index < expected_dimension; ++index) {
+        if (!std::isfinite(values[index])) {
+            throw std::runtime_error(
+                "Auxiliary-memory tensor contains NaN or Inf");
+        }
+    }
+    output.write(
+        reinterpret_cast<const char*>(values),
+        static_cast<std::streamsize>(
+            static_cast<uint64_t>(expected_dimension) * sizeof(float)));
+    if (!output) {
+        throw std::runtime_error(
+            "Training-state auxiliary-memory tensor write failed");
+    }
+}
+
+Tensor read_training_memory_tensor(std::istream& input,
+                                   int32_t dimension) {
+    if (dimension <= 0 || dimension > 1'048'576) {
+        throw std::runtime_error(
+            "Invalid auxiliary-memory tensor dimension");
+    }
+    Tensor tensor({dimension}, Device::CPU);
+    input.read(
+        reinterpret_cast<char*>(tensor.data()),
+        static_cast<std::streamsize>(
+            static_cast<uint64_t>(dimension) * sizeof(float)));
+    if (!input) {
+        throw std::runtime_error(
+            "Training-state truncated in auxiliary-memory tensor");
+    }
+    for (int32_t index = 0; index < dimension; ++index) {
+        if (!std::isfinite(tensor.data()[index])) {
+            throw std::runtime_error(
+                "Invalid auxiliary-memory tensor value");
+        }
+    }
+    return tensor;
+}
 
 #ifdef USE_CUDA
 bool trainer_force_cuda_sync() {
@@ -409,21 +568,6 @@ void finalize_auxiliary_stats(AuxiliaryStackStats& stats) {
     }
 }
 
-MemorySystem& shared_training_memory_store(int dim, int scope) {
-    static std::mutex store_mutex;
-    static std::unordered_map<long long, std::unique_ptr<MemorySystem>> stores;
-    const int resolved_dim = std::max(dim, 1);
-    const long long resolved_scope = static_cast<long long>(std::max(scope, 0));
-    const long long key =
-        (resolved_scope << 32) ^ static_cast<unsigned long long>(resolved_dim);
-    std::lock_guard<std::mutex> lock(store_mutex);
-    auto& slot = stores[key];
-    if (!slot) {
-        slot = std::make_unique<MemorySystem>(resolved_dim);
-    }
-    return *slot;
-}
-
 Tensor extract_last_token_states(const Tensor& trunk, const std::vector<int>& valid_lengths) {
     if (trunk.shape.size() != 3) {
         throw std::runtime_error("extract_last_token_states expects [batch, seq, dim]");
@@ -487,6 +631,37 @@ Tensor blend_state_tensors(const Tensor& base, const Tensor& aux, float aux_mix)
     return base.get_device() == Device::GPU ? blended.to(Device::GPU) : blended;
 }
 
+class ModelTrainingModeGuard {
+public:
+    ModelTrainingModeGuard(JambaModel* model, bool temporary_mode)
+        : model_(model),
+          previous_(model ? model->training_mode() : false) {
+        if (model_) model_->set_training_mode(temporary_mode);
+    }
+    ModelTrainingModeGuard(const ModelTrainingModeGuard&) = delete;
+    ModelTrainingModeGuard& operator=(
+        const ModelTrainingModeGuard&) = delete;
+    ~ModelTrainingModeGuard() {
+        if (!restored_ && model_) {
+            try {
+                model_->set_training_mode(previous_);
+            } catch (...) {
+            }
+        }
+    }
+    void restore() {
+        if (!restored_ && model_) {
+            model_->set_training_mode(previous_);
+            restored_ = true;
+        }
+    }
+
+private:
+    JambaModel* model_ = nullptr;
+    bool previous_ = false;
+    bool restored_ = false;
+};
+
 Tensor reason_state_batch(Trainer& trainer, const Tensor& states) {
     if (!trainer.model || states.size == 0 || states.shape.size() != 2) {
         return states.clone();
@@ -520,14 +695,16 @@ Tensor reason_state_batch(Trainer& trainer, const Tensor& states) {
     return refined;
 }
 
-Tensor recall_memory_batch(const Tensor& states, int memory_scope) {
+Tensor recall_memory_batch(Trainer& trainer, const Tensor& states,
+                           int memory_scope) {
     if (states.size == 0 || states.shape.size() != 2) {
         return states.clone();
     }
 
     const int batch = states.shape[0];
     const int dim = states.shape[1];
-    MemorySystem& memory = shared_training_memory_store(dim, memory_scope);
+    MemorySystem& memory =
+        trainer.auxiliary_memory_store(dim, memory_scope);
     Tensor recalled({batch, dim}, states.get_device());
     float* recalled_ptr = recalled.data();
     const float* states_ptr = states.data();
@@ -548,13 +725,15 @@ Tensor recall_memory_batch(const Tensor& states, int memory_scope) {
     return recalled;
 }
 
-void store_memory_batch(const Tensor& states, int memory_scope) {
+void store_memory_batch(Trainer& trainer, const Tensor& states,
+                        int memory_scope) {
     if (states.size == 0 || states.shape.size() != 2) {
         return;
     }
     const int batch = states.shape[0];
     const int dim = states.shape[1];
-    MemorySystem& memory = shared_training_memory_store(dim, memory_scope);
+    MemorySystem& memory =
+        trainer.auxiliary_memory_store(dim, memory_scope);
     const float* states_ptr = states.data();
     for (int row = 0; row < batch; ++row) {
         Tensor value({dim}, states.get_device());
@@ -609,8 +788,7 @@ AuxiliaryStackStats apply_auxiliary_stack_before_forward(
         stats.answer_tokens += static_cast<int>(trimmed_answers.back().size());
     }
 
-    const bool previous_training_mode = model->training_mode();
-    model->set_training_mode(false);
+    ModelTrainingModeGuard training_mode_guard(model, false);
     Context aux_ctx;
     Tensor prompt_trunk = model->forward_trunk_batch(trimmed_prompts, &aux_ctx);
     Tensor answer_trunk = model->forward_trunk_batch(trimmed_answers, &aux_ctx);
@@ -634,16 +812,18 @@ AuxiliaryStackStats apply_auxiliary_stack_before_forward(
         stats.memory_count = 1;
         Tensor target_before_memory = target_states.clone();
         Tensor recalled_states =
-            recall_memory_batch(prompt_states, trainer.phase_scheduler.auxiliary_memory_scope);
+            recall_memory_batch(trainer, prompt_states,
+                                trainer.phase_scheduler.auxiliary_memory_scope);
         stats.memory_cosine = tensor_mean_row_cosine(prompt_states, recalled_states);
         target_states = blend_state_tensors(
             target_states, recalled_states, trainer.phase_scheduler.auxiliary_memory_blend);
         stats.memory_delta_norm = tensor_mean_row_delta_norm(target_before_memory, target_states);
-        store_memory_batch(prompt_states, trainer.phase_scheduler.auxiliary_memory_scope);
+        store_memory_batch(trainer, prompt_states,
+                           trainer.phase_scheduler.auxiliary_memory_scope);
     }
     stats.final_target_delta_norm = tensor_mean_row_delta_norm(original_target_states, target_states);
 
-    model->set_training_mode(previous_training_mode);
+    training_mode_guard.restore();
     if (trainer.phase_scheduler.auxiliary_session_adapt_enabled && config.use_ttt) {
         stats.session_adapt_count = 1;
         model->session_adapt(prompt_states, target_states);
@@ -708,31 +888,17 @@ float* clip_norm_accumulator() {
     // thread_local: per-thread device scalar so concurrent optimizer/clip paths
     // never share one accumulator (replica-safety; matches the tensor.cpp
     // gemm/CE scratch rationale).
-    thread_local float* d_accum = [] {
-        float* p = nullptr;
-        if (cudaMalloc(&p, sizeof(float)) != cudaSuccess) {
-            p = nullptr;
-        }
-        (void)cudaGetLastError();
-        return p;
-    }();
-    return d_accum;
+    thread_local cuda_detail::DeviceBuffer<float> buffer;
+    return buffer.ensure(1);
 }
 
 int* finite_issue_accumulator() {
-    thread_local int* device_flag = [] {
-        int* value = nullptr;
-        if (cudaMalloc(&value, sizeof(int)) != cudaSuccess) {
-            value = nullptr;
-            (void)cudaGetLastError();
-        }
-        return value;
-    }();
-    return device_flag;
+    thread_local cuda_detail::DeviceBuffer<int> buffer;
+    return buffer.ensure(1);
 }
 #endif
 
-void ensure_finite_optimizer_inputs(const std::vector<Parameter*>& params) {
+bool optimizer_inputs_are_finite(const std::vector<Parameter*>& params) {
     bool host_issue = false;
 #ifdef USE_CUDA
     int* device_issue =
@@ -772,10 +938,60 @@ void ensure_finite_optimizer_inputs(const std::vector<Parameter*>& params) {
         host_issue = host_issue || gpu_issue != 0;
     }
 #endif
-    if (host_issue) {
-        throw std::runtime_error(
-            "optimizer step rejected: a parameter or gradient contains NaN/Inf");
+    return !host_issue;
+}
+
+float active_loss_scale(const Trainer& trainer) {
+    if (!trainer.dynamic_loss_scaling_enabled ||
+        matmul_precision_mode() != 2) {
+        return 1.0f;
     }
+    if (!std::isfinite(trainer.loss_scale) ||
+        !std::isfinite(trainer.min_loss_scale) ||
+        !std::isfinite(trainer.max_loss_scale) ||
+        trainer.min_loss_scale < 1.0f ||
+        trainer.max_loss_scale < trainer.min_loss_scale ||
+        trainer.loss_scale < trainer.min_loss_scale ||
+        trainer.loss_scale > trainer.max_loss_scale) {
+        throw std::invalid_argument(
+            "Trainer dynamic loss-scale bounds are invalid");
+    }
+    return trainer.loss_scale;
+}
+
+void record_loss_scale_success(Trainer& trainer) {
+    trainer.last_optimizer_step_skipped = false;
+    if (active_loss_scale(trainer) == 1.0f) return;
+    if (!std::isfinite(trainer.loss_scale_growth_factor) ||
+        trainer.loss_scale_growth_factor < 1.0f ||
+        trainer.loss_scale_growth_interval <= 0) {
+        throw std::invalid_argument(
+            "Trainer loss-scale growth policy is invalid");
+    }
+    ++trainer.loss_scale_growth_tracker;
+    if (trainer.loss_scale_growth_tracker >=
+        trainer.loss_scale_growth_interval) {
+        trainer.loss_scale = std::min(
+            trainer.max_loss_scale,
+            trainer.loss_scale * trainer.loss_scale_growth_factor);
+        trainer.loss_scale_growth_tracker = 0;
+    }
+}
+
+void record_loss_scale_overflow(Trainer& trainer,
+                                const std::vector<Parameter*>& params) {
+    if (!std::isfinite(trainer.loss_scale_backoff_factor) ||
+        trainer.loss_scale_backoff_factor <= 0.0f ||
+        trainer.loss_scale_backoff_factor >= 1.0f) {
+        throw std::invalid_argument(
+            "Trainer loss-scale backoff policy is invalid");
+    }
+    trainer.loss_scale = std::max(
+        trainer.min_loss_scale,
+        trainer.loss_scale * trainer.loss_scale_backoff_factor);
+    trainer.loss_scale_growth_tracker = 0;
+    trainer.last_optimizer_step_skipped = true;
+    zero_model_gradients(params);
 }
 
 float clip_gradients(const std::vector<Parameter*>& params, float max_norm) {
@@ -890,7 +1106,8 @@ void apply_progressive_qat_phase(Trainer& trainer) {
         // inference uses 8-bit, so quantized training must too (train ==
         // inference numerics).  Weights are ternary via the packed kernel
         // regardless of this value.
-        layer->set_precision_mode(8);
+        layer->set_precision_mode(
+            trainer.phase_scheduler.activation_precision_bits);
 
         // True quantized training: once the quantized phase is active, route
         // the forward through the REAL packed ternary kernel and back-propagate
@@ -1094,17 +1311,8 @@ float apply_moe_aux_regularization(Trainer& trainer, int accumulation_steps) {
                                     layer->router->aux_loss_coef *
                                     effective_aux_scale;
             }
-            thread_local float* d_imb = nullptr;   // K6: race-free persistent buffer
-            thread_local size_t d_imb_cap = 0;
-            if (loads.size() > d_imb_cap) {
-                if (d_imb) cudaFree(d_imb);
-                d_imb = nullptr;
-                if (cudaMalloc(&d_imb, loads.size() * sizeof(float)) != cudaSuccess) {
-                    (void)cudaGetLastError();
-                    d_imb_cap = 0;
-                }
-                else { d_imb_cap = loads.size(); }
-            }
+            thread_local cuda_detail::DeviceBuffer<float> imbalance_buffer;
+            float* d_imb = imbalance_buffer.ensure(loads.size());
             if (d_imb) {
                 cudaMemcpy(d_imb, imbalance.data(), loads.size() * sizeof(float),
                            cudaMemcpyHostToDevice);
@@ -1294,21 +1502,9 @@ std::vector<Parameter*> active_ternary_weights(Trainer& trainer) {
 
 #ifdef USE_CUDA
 unsigned char* criticality_device_buffer(size_t bytes) {
-    thread_local unsigned char* buffer = nullptr;
-    thread_local size_t capacity = 0;
     if (bytes == 0) return nullptr;
-    if (bytes > capacity) {
-        if (buffer) cudaFree(buffer);
-        buffer = nullptr;
-        const cudaError_t status = cudaMalloc(&buffer, bytes);
-        if (status != cudaSuccess) {
-            (void)cudaGetLastError();
-            capacity = 0;
-            return nullptr;
-        }
-        capacity = bytes;
-    }
-    return buffer;
+    thread_local cuda_detail::DeviceBuffer<unsigned char> buffer;
+    return buffer.ensure(bytes);
 }
 
 size_t align_buffer_offset(size_t value, size_t alignment) {
@@ -1590,20 +1786,9 @@ bool fused_optimizer_enabled() {
 // re-upload por step é obrigatório porque add_grad recria o tensor de grad
 // (ponteiro muda a cada backward) — ~30 KB H2D, custo ~µs.
 unsigned char* fused_opt_meta_buffer(size_t bytes) {
-    thread_local unsigned char* buf = nullptr;
-    thread_local size_t cap = 0;
     if (bytes == 0) return nullptr;
-    if (bytes > cap) {
-        if (buf) cudaFree(buf);
-        buf = nullptr;
-        if (cudaMalloc(&buf, bytes) != cudaSuccess) {
-            (void)cudaGetLastError();
-            cap = 0;
-            return nullptr;
-        }
-        cap = bytes;
-    }
-    return buf;
+    thread_local cuda_detail::DeviceBuffer<unsigned char> buffer;
+    return buffer.ensure(bytes);
 }
 
 }  // namespace
@@ -1766,6 +1951,19 @@ float apply_optimizer_step(Trainer& trainer,
         !std::isfinite(trainer.max_grad_norm) || trainer.max_grad_norm <= 0.0f) {
         throw std::invalid_argument("Trainer optimizer hyperparameters are invalid");
     }
+    trainer.last_optimizer_step_skipped = false;
+    if (!optimizer_inputs_are_finite(params)) {
+        if (active_loss_scale(trainer) > 1.0f) {
+            record_loss_scale_overflow(trainer, params);
+            if (grad_norm_out) {
+                *grad_norm_out =
+                    std::numeric_limits<float>::infinity();
+            }
+            return 0.0f;
+        }
+        throw std::runtime_error(
+            "optimizer step rejected: a parameter or gradient contains NaN/Inf");
+    }
     std::vector<CriticalityMetric> criticality_metrics;
     if (criticality_regularizer_enabled() || criticality_lr_enabled()) {
         criticality_metrics = measure_active_criticality(trainer);
@@ -1782,10 +1980,10 @@ float apply_optimizer_step(Trainer& trainer,
                 "Effective per-parameter learning-rate scale is invalid");
         }
     }
-    ensure_finite_optimizer_inputs(params);
 #ifdef USE_CUDA
     if (apply_optimizer_step_fused(trainer, params, accumulation_steps,
                                    grad_norm_out)) {
+        record_loss_scale_success(trainer);
         return criticality_loss;
     }
 #endif
@@ -1888,6 +2086,7 @@ float apply_optimizer_step(Trainer& trainer,
         p->mark_updated();
     }
 
+    record_loss_scale_success(trainer);
     return criticality_loss;
 }
 
@@ -1922,32 +2121,14 @@ bool rul_force_host() {
 // so the GPU loss-adjustment path never cudaMalloc's per call.
 int* loss_token_device_buffer(int count) {
     // K6: thread_local persistent device buffer (race-free by construction).
-    thread_local int* buf = nullptr;
-    thread_local int cap = 0;
     if (count <= 0) return nullptr;
-    if (count > cap) {
-        if (buf) cudaFree(buf);
-        buf = nullptr;
-        if (cudaMalloc(&buf, static_cast<size_t>(count) * sizeof(int)) != cudaSuccess) {
-            (void)cudaGetLastError();
-            cap = 0;
-            return nullptr;
-        }
-        cap = count;
-    }
-    return buf;
+    thread_local cuda_detail::DeviceBuffer<int> buffer;
+    return buffer.ensure(static_cast<size_t>(count));
 }
 
 float* repetition_loss_device_buffer() {
-    thread_local float* buffer = [] {
-        float* value = nullptr;
-        if (cudaMalloc(&value, sizeof(float)) != cudaSuccess) {
-            value = nullptr;
-            (void)cudaGetLastError();
-        }
-        return value;
-    }();
-    return buffer;
+    thread_local cuda_detail::DeviceBuffer<float> buffer;
+    return buffer.ensure(1);
 }
 #endif
 
@@ -2294,7 +2475,8 @@ float train_supervised_batch_impl(Trainer& trainer,
     // chamador Python e este wall expõe o custo de binding/conversão de listas.
     const auto tm_call0 = std::chrono::steady_clock::now();
 
-    auto params = trainer.model->parameters();
+    auto params = trainable_model_parameters(trainer.model);
+    const float loss_scale = active_loss_scale(trainer);
     apply_progressive_qat_phase(trainer);
     zero_model_gradients(params);
     begin_moe_aux_accumulation(trainer);
@@ -2421,7 +2603,7 @@ float train_supervised_batch_impl(Trainer& trainer,
         // attention is enabled and per-head Q/K were saved by the exact path).
         const float selector_loss =
             trainer.model->accumulate_sparse_selector_grads(
-                static_cast<float>(grouped_inputs.size()));
+                static_cast<float>(grouped_inputs.size()) * loss_scale);
         sparse_selector_weighted_sum +=
             static_cast<double>(selector_loss) * grouped_inputs.size();
 
@@ -2490,12 +2672,14 @@ float train_supervised_batch_impl(Trainer& trainer,
 
         const auto _tm_loss1 = tm_now();
         tm_loss += tm_ms(_tm_loss1 - _tm_fwd1).count();
+        scale_tensor_inplace(full_grad, loss_scale);
         trainer.model->backward_external(full_grad, ctx);
         const auto _tm_bwd1 = tm_now();
         tm_bwd += tm_ms(_tm_bwd1 - _tm_loss1).count();
         tm_last = _tm_bwd1;
     }
 
+    scale_gradients(params, 1.0f / loss_scale);
     const int objective_samples = std::max(sample_count, 1);
     const float qat_loss =
         apply_qat_regularization(trainer, objective_samples);
@@ -2554,6 +2738,66 @@ Trainer::Trainer(JambaModel* m, float lr) : model(m), learning_rate(lr) {
 
 Trainer::~Trainer() = default;
 
+MemorySystem& Trainer::auxiliary_memory_store(int dim, int scope) {
+    if (dim <= 0 || dim > 1'048'576) {
+        throw std::invalid_argument(
+            "Auxiliary memory dimension must be in [1, 1048576]");
+    }
+    const uint64_t resolved_scope =
+        static_cast<uint64_t>(std::max(scope, 0));
+    const uint64_t key =
+        (resolved_scope << 32) ^ static_cast<uint32_t>(dim);
+    std::lock_guard<std::mutex> lock(auxiliary_memory_mutex_);
+    const std::string backend_signature =
+        std::string(phase_scheduler.auxiliary_oxtamem_enabled ? "1|" : "0|") +
+        phase_scheduler.auxiliary_oxtamem_library_path + "|" +
+        phase_scheduler.auxiliary_oxtamem_store_path + "|" +
+        std::to_string(phase_scheduler.auxiliary_oxtamem_size_mb);
+    if (backend_signature != auxiliary_memory_signature_) {
+        auxiliary_memory_stores_.clear();
+        auxiliary_memory_backend_ready_.clear();
+        auxiliary_memory_signature_ = backend_signature;
+    }
+    const long long signed_key = static_cast<long long>(key);
+    auto& slot = auxiliary_memory_stores_[signed_key];
+    auto& backend_ready =
+        auxiliary_memory_backend_ready_[signed_key];
+    if (!slot) {
+        slot = std::make_unique<MemorySystem>(dim);
+        backend_ready =
+            !phase_scheduler.auxiliary_oxtamem_enabled;
+    }
+    if (!backend_ready &&
+        phase_scheduler.auxiliary_oxtamem_enabled) {
+        if (phase_scheduler.auxiliary_oxtamem_store_path.empty()) {
+            throw std::invalid_argument(
+                "Auxiliary OxtaMem requires a non-empty store path");
+        }
+        const std::string derived_store =
+            phase_scheduler.auxiliary_oxtamem_store_path +
+            ".scope-" + std::to_string(resolved_scope) +
+            ".dim-" + std::to_string(dim);
+        if (!slot->enable_oxtamem_store(
+                phase_scheduler.auxiliary_oxtamem_library_path,
+                derived_store,
+                phase_scheduler.auxiliary_oxtamem_size_mb)) {
+            const std::string detail = slot->last_persistence_error();
+            throw std::runtime_error(
+                "Could not enable auxiliary OxtaMem backend" +
+                (detail.empty() ? std::string{} : ": " + detail));
+        }
+        backend_ready = true;
+    }
+    return *slot;
+}
+
+void Trainer::clear_auxiliary_memory() {
+    std::lock_guard<std::mutex> lock(auxiliary_memory_mutex_);
+    auxiliary_memory_stores_.clear();
+    auxiliary_memory_backend_ready_.clear();
+    auxiliary_memory_signature_.clear();
+}
+
 void Trainer::save_training_state(const std::string& state_path,
                                   const std::string& model_path) const {
     if (!model) throw std::runtime_error("Trainer has no model");
@@ -2599,6 +2843,25 @@ void Trainer::save_training_state(const std::string& state_path,
                               optimizer_state_bits}) {
             write_training_pod(output, value, "trainer integer");
         }
+        write_training_pod(
+            output,
+            static_cast<uint8_t>(
+                dynamic_loss_scaling_enabled ? 1 : 0),
+            "dynamic loss scaling enabled");
+        for (float value : {
+                 loss_scale, min_loss_scale, max_loss_scale,
+                 loss_scale_growth_factor,
+                 loss_scale_backoff_factor}) {
+            write_training_pod(output, value, "loss-scale float");
+        }
+        write_training_pod(
+            output,
+            static_cast<int32_t>(loss_scale_growth_interval),
+            "loss-scale growth interval");
+        write_training_pod(
+            output,
+            static_cast<int32_t>(loss_scale_growth_tracker),
+            "loss-scale growth tracker");
 
         auto write_bool = [&](bool value) {
             write_training_pod(output, static_cast<uint8_t>(value ? 1 : 0),
@@ -2615,6 +2878,9 @@ void Trainer::save_training_state(const std::string& state_path,
         write_training_pod(
             output, static_cast<int32_t>(scheduler.quantized_precision_bits),
             "QAT precision");
+        write_training_pod(
+            output, static_cast<int32_t>(scheduler.activation_precision_bits),
+            "QAT activation precision");
         write_training_pod(output, scheduler.ternary_regularization,
                            "ternary regularization");
         write_bool(scheduler.auxiliary_stack_enabled);
@@ -2635,6 +2901,14 @@ void Trainer::save_training_state(const std::string& state_path,
                  scheduler.auxiliary_memory_scope}) {
             write_training_pod(output, value, "auxiliary scheduler integer");
         }
+        write_bool(scheduler.auxiliary_oxtamem_enabled);
+        write_training_pod(
+            output, scheduler.auxiliary_oxtamem_size_mb,
+            "auxiliary OxtaMem size");
+        write_training_string(
+            output, scheduler.auxiliary_oxtamem_library_path);
+        write_training_string(
+            output, scheduler.auxiliary_oxtamem_store_path);
 
         const auto parameters = stable_training_parameters(model);
         write_training_pod(output, static_cast<uint32_t>(parameters.size()),
@@ -2733,10 +3007,163 @@ void Trainer::save_training_state(const std::string& state_path,
                 }
             }
         }
+
+        std::vector<std::pair<int64_t, const MemorySystem*>>
+            memory_stores;
+        {
+            std::lock_guard<std::mutex> memory_lock(
+                auxiliary_memory_mutex_);
+            if (auxiliary_memory_stores_.size() >
+                kMaxTrainingMemoryStores) {
+                throw std::runtime_error(
+                    "Too many auxiliary memory stores to checkpoint");
+            }
+            memory_stores.reserve(auxiliary_memory_stores_.size());
+            for (const auto& [key, store] :
+                 auxiliary_memory_stores_) {
+                if (store) {
+                    memory_stores.emplace_back(
+                        static_cast<int64_t>(key), store.get());
+                }
+            }
+            std::sort(
+                memory_stores.begin(), memory_stores.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.first < rhs.first;
+                });
+            write_training_pod(
+                output,
+                static_cast<uint32_t>(memory_stores.size()),
+                "auxiliary memory store count");
+            uint64_t aggregate_items = 0;
+            uint64_t aggregate_compressed_bytes = 0;
+            for (const auto& [key, store] : memory_stores) {
+                const int32_t dimension =
+                    store->chunk_dimension();
+                write_training_pod(
+                    output, key, "auxiliary memory key");
+                write_training_pod(
+                    output, dimension,
+                    "auxiliary memory dimension");
+                const auto clusters =
+                    store->snapshot_runtime_clusters();
+                if (clusters.size() >
+                    kMaxTrainingMemoryClusters) {
+                    throw std::runtime_error(
+                        "Auxiliary memory exceeds checkpoint "
+                        "cluster limit");
+                }
+                write_training_pod(
+                    output,
+                    static_cast<uint32_t>(clusters.size()),
+                    "auxiliary memory cluster count");
+                for (const auto& cluster : clusters) {
+                    const uint64_t cluster_items =
+                        static_cast<uint64_t>(
+                            cluster.items.size()) +
+                        static_cast<uint64_t>(
+                            cluster.compressed_items.size());
+                    if (cluster.items.size() >
+                            kMaxTrainingMemoryItemsPerCluster ||
+                        cluster.compressed_items.size() >
+                            kMaxTrainingMemoryItemsPerCluster ||
+                        aggregate_items >
+                            kMaxTrainingMemoryItems -
+                                cluster_items) {
+                        throw std::runtime_error(
+                            "Auxiliary memory exceeds checkpoint "
+                            "item limit");
+                    }
+                    aggregate_items += cluster_items;
+                    const int64_t access_ns =
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                            cluster.last_access.time_since_epoch())
+                            .count();
+                    write_training_pod(
+                        output, access_ns,
+                        "auxiliary memory access time");
+                    write_training_memory_tensor(
+                        output, cluster.centroid, dimension);
+                    write_training_pod(
+                        output,
+                        static_cast<uint32_t>(
+                            cluster.items.size()),
+                        "auxiliary memory item count");
+                    for (const Tensor& item : cluster.items) {
+                        write_training_memory_tensor(
+                            output, item, dimension);
+                    }
+                    write_training_pod(
+                        output,
+                        static_cast<uint32_t>(
+                            cluster.compressed_items.size()),
+                        "auxiliary compressed item count");
+                    for (const auto& encoded :
+                         cluster.compressed_items) {
+                        if (encoded.size() >
+                            16ull * 1024ull * 1024ull) {
+                            throw std::runtime_error(
+                                "Auxiliary compressed item exceeds "
+                                "checkpoint limit");
+                        }
+                        if (aggregate_compressed_bytes >
+                            kMaxTrainingMemoryCompressedBytes -
+                                encoded.size()) {
+                            throw std::runtime_error(
+                                "Auxiliary compressed payload exceeds "
+                                "checkpoint limit");
+                        }
+                        aggregate_compressed_bytes +=
+                            encoded.size();
+                        write_training_pod(
+                            output,
+                            static_cast<uint32_t>(encoded.size()),
+                            "auxiliary compressed item bytes");
+                        output.write(
+                            reinterpret_cast<const char*>(
+                                encoded.data()),
+                            static_cast<std::streamsize>(
+                                encoded.size()));
+                        if (!output) {
+                            throw std::runtime_error(
+                                "Auxiliary compressed item write "
+                                "failed");
+                        }
+                    }
+                }
+            }
+        }
         output.flush();
         if (!output) throw std::runtime_error("Training-state flush failed");
         output.close();
         if (!output) throw std::runtime_error("Training-state close failed");
+
+        const uint64_t payload_bytes =
+            std::filesystem::file_size(temporary);
+        const uint64_t payload_hash =
+            training_state_prefix_hash(temporary, payload_bytes);
+        std::ofstream trailer(temporary,
+                              std::ios::binary | std::ios::app);
+        if (!trailer) {
+            throw std::runtime_error(
+                "Cannot append training-state integrity trailer");
+        }
+        write_training_pod(trailer, kTrainingStateTrailerMagic,
+                           "integrity magic");
+        write_training_pod(trailer, payload_bytes,
+                           "integrity payload bytes");
+        write_training_pod(trailer, payload_hash, "integrity hash");
+        trailer.flush();
+        if (!trailer) {
+            throw std::runtime_error(
+                "Training-state integrity trailer flush failed");
+        }
+        trailer.close();
+        if (!trailer) {
+            throw std::runtime_error(
+                "Training-state integrity trailer close failed");
+        }
         replace_training_state_file(temporary, destination);
     } catch (...) {
         std::error_code ignored;
@@ -2757,10 +3184,12 @@ void Trainer::load_training_state(const std::string& state_path,
     const uint32_t magic = read_training_pod<uint32_t>(input, "magic");
     const uint32_t version = read_training_pod<uint32_t>(input, "version");
     if (magic != kTrainingStateMagic ||
-        (version != kTrainingStateVersion &&
-         version != kTrainingStateLegacyVersion)) {
+        version < kTrainingStateLegacyVersion ||
+        version > kTrainingStateVersion) {
         throw std::runtime_error("Unsupported or corrupt training-state header");
     }
+    verify_training_state_integrity(
+        std::filesystem::path(state_path), version);
     const uint32_t fingerprint =
         read_training_pod<uint32_t>(input, "architecture fingerprint");
     if (fingerprint != ModelSerializer::architecture_fingerprint(model)) {
@@ -2810,10 +3239,51 @@ void Trainer::load_training_state(const std::string& state_path,
         read_training_pod<int32_t>(input, "EOS token");
     metadata.optimizer_state_bits =
         read_training_pod<int32_t>(input, "optimizer state bits");
+    if (version >= 4u) {
+        const uint8_t enabled = read_training_pod<uint8_t>(
+            input, "dynamic loss scaling enabled");
+        if (enabled > 1) {
+            throw std::runtime_error(
+                "Invalid dynamic loss-scaling boolean");
+        }
+        metadata.dynamic_loss_scaling_enabled = enabled != 0;
+        metadata.loss_scale =
+            read_training_pod<float>(input, "loss scale");
+        metadata.min_loss_scale =
+            read_training_pod<float>(input, "minimum loss scale");
+        metadata.max_loss_scale =
+            read_training_pod<float>(input, "maximum loss scale");
+        metadata.loss_scale_growth_factor =
+            read_training_pod<float>(input, "loss-scale growth factor");
+        metadata.loss_scale_backoff_factor =
+            read_training_pod<float>(input, "loss-scale backoff factor");
+        metadata.loss_scale_growth_interval =
+            read_training_pod<int32_t>(
+                input, "loss-scale growth interval");
+        metadata.loss_scale_growth_tracker =
+            read_training_pod<int32_t>(
+                input, "loss-scale growth tracker");
+    }
     if (metadata.global_step_count < 0 || metadata.warmup_steps < 0 ||
         metadata.total_training_steps < 0 ||
         (metadata.optimizer_state_bits != 4 &&
-         metadata.optimizer_state_bits != 32)) {
+         metadata.optimizer_state_bits != 32) ||
+        !std::isfinite(metadata.loss_scale) ||
+        !std::isfinite(metadata.min_loss_scale) ||
+        !std::isfinite(metadata.max_loss_scale) ||
+        !std::isfinite(metadata.loss_scale_growth_factor) ||
+        !std::isfinite(metadata.loss_scale_backoff_factor) ||
+        metadata.min_loss_scale < 1.0f ||
+        metadata.max_loss_scale < metadata.min_loss_scale ||
+        metadata.loss_scale < metadata.min_loss_scale ||
+        metadata.loss_scale > metadata.max_loss_scale ||
+        metadata.loss_scale_growth_factor < 1.0f ||
+        metadata.loss_scale_backoff_factor <= 0.0f ||
+        metadata.loss_scale_backoff_factor >= 1.0f ||
+        metadata.loss_scale_growth_interval <= 0 ||
+        metadata.loss_scale_growth_tracker < 0 ||
+        metadata.loss_scale_growth_tracker >=
+            metadata.loss_scale_growth_interval) {
         throw std::runtime_error("Invalid trainer integer metadata");
     }
 
@@ -2831,6 +3301,10 @@ void Trainer::load_training_state(const std::string& state_path,
         read_training_pod<int32_t>(input, "QAT start");
     scheduler.quantized_precision_bits =
         read_training_pod<int32_t>(input, "QAT precision");
+    scheduler.activation_precision_bits =
+        version >= 3u
+            ? read_training_pod<int32_t>(input, "QAT activation precision")
+            : 8;
     scheduler.ternary_regularization =
         read_training_pod<float>(input, "ternary regularization");
     scheduler.auxiliary_stack_enabled = read_bool();
@@ -2851,14 +3325,32 @@ void Trainer::load_training_state(const std::string& state_path,
         read_training_pod<int32_t>(input, "auxiliary answer limit");
     scheduler.auxiliary_memory_scope =
         read_training_pod<int32_t>(input, "auxiliary memory scope");
+    if (version >= 6u) {
+        scheduler.auxiliary_oxtamem_enabled = read_bool();
+        scheduler.auxiliary_oxtamem_size_mb =
+            read_training_pod<uint64_t>(
+                input, "auxiliary OxtaMem size");
+        scheduler.auxiliary_oxtamem_library_path =
+            read_training_string(input);
+        scheduler.auxiliary_oxtamem_store_path =
+            read_training_string(input);
+    }
     if (!std::isfinite(scheduler.ternary_regularization) ||
         !std::isfinite(scheduler.auxiliary_memory_blend) ||
         scheduler.semantic_warmup_steps < 0 || scheduler.qat_start_step < 0 ||
-        scheduler.auxiliary_every_steps <= 0) {
+        scheduler.quantized_precision_bits != 2 ||
+        scheduler.activation_precision_bits < 2 ||
+        scheduler.activation_precision_bits > 8 ||
+        scheduler.auxiliary_every_steps <= 0 ||
+        scheduler.auxiliary_oxtamem_size_mb < 1 ||
+        scheduler.auxiliary_oxtamem_size_mb > 32768 ||
+        (scheduler.auxiliary_oxtamem_enabled &&
+         scheduler.auxiliary_oxtamem_store_path.empty())) {
         throw std::runtime_error("Invalid phase scheduler metadata");
     }
 
-    const auto parameters = stable_training_parameters(model);
+    const auto parameters =
+        stable_training_parameters(model, version < 7u);
     std::unordered_map<std::string, Parameter*> parameter_by_name;
     parameter_by_name.reserve(parameters.size());
     for (const auto& [parameter, stable_name] : parameters) {
@@ -2942,12 +3434,176 @@ void Trainer::load_training_state(const std::string& state_path,
         }
         records.push_back(std::move(record));
     }
+    std::vector<TrainingMemoryRecord> memory_records;
+    if (version >= 8u) {
+        const uint32_t store_count =
+            read_training_pod<uint32_t>(
+                input, "auxiliary memory store count");
+        if (store_count > kMaxTrainingMemoryStores) {
+            throw std::runtime_error(
+                "Training state exceeds auxiliary-memory store limit");
+        }
+        memory_records.reserve(store_count);
+        std::unordered_map<int64_t, bool> seen_memory_keys;
+        uint64_t aggregate_items = 0;
+        uint64_t aggregate_compressed_bytes = 0;
+        for (uint32_t store_index = 0;
+             store_index < store_count; ++store_index) {
+            TrainingMemoryRecord record;
+            record.key = read_training_pod<int64_t>(
+                input, "auxiliary memory key");
+            record.dimension = read_training_pod<int32_t>(
+                input, "auxiliary memory dimension");
+            if (record.key < 0 || record.dimension <= 0 ||
+                record.dimension > 1'048'576 ||
+                static_cast<uint32_t>(
+                    static_cast<uint64_t>(record.key)) !=
+                    static_cast<uint32_t>(record.dimension) ||
+                (static_cast<uint64_t>(record.key) >> 32) >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int32_t>::max())) {
+                throw std::runtime_error(
+                    "Invalid auxiliary-memory store identity");
+            }
+            if (!seen_memory_keys.emplace(record.key, true).second) {
+                throw std::runtime_error(
+                    "Duplicate auxiliary-memory store identity");
+            }
+            const uint32_t cluster_count =
+                read_training_pod<uint32_t>(
+                    input, "auxiliary memory cluster count");
+            if (cluster_count > kMaxTrainingMemoryClusters) {
+                throw std::runtime_error(
+                    "Training state exceeds auxiliary-memory cluster limit");
+            }
+            record.clusters.reserve(cluster_count);
+            for (uint32_t cluster_index = 0;
+                 cluster_index < cluster_count; ++cluster_index) {
+                MemorySystem::Cluster cluster;
+                const int64_t access_ns =
+                    read_training_pod<int64_t>(
+                        input, "auxiliary memory access time");
+                cluster.last_access =
+                    std::chrono::system_clock::time_point(
+                        std::chrono::duration_cast<
+                            std::chrono::system_clock::duration>(
+                            std::chrono::nanoseconds(access_ns)));
+                cluster.centroid =
+                    read_training_memory_tensor(
+                        input, record.dimension);
+                const uint32_t item_count =
+                    read_training_pod<uint32_t>(
+                        input, "auxiliary memory item count");
+                if (item_count >
+                        kMaxTrainingMemoryItemsPerCluster ||
+                    aggregate_items >
+                        kMaxTrainingMemoryItems - item_count) {
+                    throw std::runtime_error(
+                        "Training state exceeds auxiliary-memory item limit");
+                }
+                aggregate_items += item_count;
+                cluster.items.reserve(item_count);
+                for (uint32_t item_index = 0;
+                     item_index < item_count; ++item_index) {
+                    cluster.items.push_back(
+                        read_training_memory_tensor(
+                            input, record.dimension));
+                }
+                const uint32_t compressed_count =
+                    read_training_pod<uint32_t>(
+                        input,
+                        "auxiliary compressed item count");
+                if (compressed_count >
+                        kMaxTrainingMemoryItemsPerCluster ||
+                    aggregate_items >
+                        kMaxTrainingMemoryItems -
+                            compressed_count) {
+                    throw std::runtime_error(
+                        "Training state exceeds auxiliary-memory item limit");
+                }
+                aggregate_items += compressed_count;
+                cluster.compressed_items.reserve(
+                    compressed_count);
+                for (uint32_t item_index = 0;
+                     item_index < compressed_count; ++item_index) {
+                    const uint32_t byte_count =
+                        read_training_pod<uint32_t>(
+                            input,
+                            "auxiliary compressed item bytes");
+                    if (byte_count >
+                            16ull * 1024ull * 1024ull ||
+                        aggregate_compressed_bytes >
+                            kMaxTrainingMemoryCompressedBytes -
+                                byte_count) {
+                        throw std::runtime_error(
+                            "Training state exceeds auxiliary-memory "
+                            "compressed payload limit");
+                    }
+                    aggregate_compressed_bytes += byte_count;
+                    std::vector<uint8_t> encoded(byte_count);
+                    if (byte_count > 0) {
+                        input.read(
+                            reinterpret_cast<char*>(
+                                encoded.data()),
+                            static_cast<std::streamsize>(
+                                byte_count));
+                        if (!input) {
+                            throw std::runtime_error(
+                                "Training-state truncated in "
+                                "auxiliary compressed item");
+                        }
+                    }
+                    cluster.compressed_items.push_back(
+                        std::move(encoded));
+                }
+                record.clusters.push_back(std::move(cluster));
+            }
+            memory_records.push_back(std::move(record));
+        }
+    }
+    if (version >= 5u) {
+        const uint32_t trailer_magic =
+            read_training_pod<uint32_t>(input, "integrity magic");
+        const uint64_t payload_bytes =
+            read_training_pod<uint64_t>(
+                input, "integrity payload bytes");
+        const uint64_t payload_hash =
+            read_training_pod<uint64_t>(input, "integrity hash");
+        const uint64_t total_bytes =
+            std::filesystem::file_size(state_path);
+        if (trailer_magic != kTrainingStateTrailerMagic ||
+            payload_bytes != total_bytes - kTrainingStateTrailerBytes ||
+            training_state_prefix_hash(state_path, payload_bytes) !=
+                payload_hash) {
+            throw std::runtime_error(
+                "Training-state integrity trailer mismatch");
+        }
+    }
     char trailing = 0;
     if (input.read(&trailing, 1)) {
-        throw std::runtime_error("Training state has trailing payload");
+        throw std::runtime_error(
+            "Training state has trailing payload");
     }
     if (!input.eof()) {
         throw std::runtime_error("Training-state read failed before EOF");
+    }
+
+    std::unordered_map<long long, std::unique_ptr<MemorySystem>>
+        staged_memory_stores;
+    std::unordered_map<long long, bool>
+        staged_memory_backend_ready;
+    staged_memory_stores.reserve(memory_records.size());
+    staged_memory_backend_ready.reserve(memory_records.size());
+    for (const TrainingMemoryRecord& record : memory_records) {
+        auto store =
+            std::make_unique<MemorySystem>(record.dimension);
+        store->restore_runtime_clusters(record.clusters);
+        const long long key =
+            static_cast<long long>(record.key);
+        staged_memory_stores.emplace(key, std::move(store));
+        staged_memory_backend_ready.emplace(
+            key,
+            !metadata.phase_scheduler.auxiliary_oxtamem_enabled);
     }
 
     // Commit only after the whole sidecar, model digest, and every tensor have
@@ -2970,7 +3626,38 @@ void Trainer::load_training_state(const std::string& state_path,
     total_training_steps = metadata.total_training_steps;
     eos_token_id = metadata.eos_token_id;
     optimizer_state_bits = metadata.optimizer_state_bits;
+    dynamic_loss_scaling_enabled =
+        metadata.dynamic_loss_scaling_enabled;
+    loss_scale = metadata.loss_scale;
+    min_loss_scale = metadata.min_loss_scale;
+    max_loss_scale = metadata.max_loss_scale;
+    loss_scale_growth_factor =
+        metadata.loss_scale_growth_factor;
+    loss_scale_backoff_factor =
+        metadata.loss_scale_backoff_factor;
+    loss_scale_growth_interval =
+        metadata.loss_scale_growth_interval;
+    loss_scale_growth_tracker =
+        metadata.loss_scale_growth_tracker;
+    last_optimizer_step_skipped = false;
     phase_scheduler = metadata.phase_scheduler;
+    {
+        std::lock_guard<std::mutex> memory_lock(
+            auxiliary_memory_mutex_);
+        auxiliary_memory_stores_ =
+            std::move(staged_memory_stores);
+        auxiliary_memory_backend_ready_ =
+            std::move(staged_memory_backend_ready);
+        auxiliary_memory_signature_ =
+            std::string(
+                phase_scheduler.auxiliary_oxtamem_enabled
+                    ? "1|"
+                    : "0|") +
+            phase_scheduler.auxiliary_oxtamem_library_path + "|" +
+            phase_scheduler.auxiliary_oxtamem_store_path + "|" +
+            std::to_string(
+                phase_scheduler.auxiliary_oxtamem_size_mb);
+    }
     m_state.clear();
     v_state.clear();
     quant_state.clear();
@@ -3023,6 +3710,21 @@ void Trainer::load_training_state(const std::string& state_path,
 }
 
 void Trainer::configure_progressive_qat(const TrainPhaseScheduler& scheduler) {
+    if (scheduler.semantic_warmup_steps < 0 || scheduler.qat_start_step < 0 ||
+        scheduler.quantized_precision_bits != 2 ||
+        scheduler.activation_precision_bits < 2 ||
+        scheduler.activation_precision_bits > 8 ||
+        !std::isfinite(scheduler.ternary_regularization) ||
+        scheduler.ternary_regularization < 0.0f ||
+        scheduler.auxiliary_oxtamem_size_mb < 1 ||
+        scheduler.auxiliary_oxtamem_size_mb > 32768 ||
+        (scheduler.auxiliary_oxtamem_enabled &&
+         scheduler.auxiliary_oxtamem_store_path.empty())) {
+        throw std::invalid_argument(
+            "Invalid QAT schedule: ternary weights require 2 bits, activation "
+            "precision must be in [2, 8], OxtaMem requires a store path and "
+            "size in [1, 32768] MiB, and schedule values must be valid");
+    }
     phase_scheduler = scheduler;
     apply_progressive_qat_phase(*this);
 }
@@ -3040,7 +3742,7 @@ void Trainer::set_lr_scale_by_name(const std::string& name, float scale) {
             "Parameter LR scale requires a non-empty name and finite scale > 0");
     }
     bool matched = false;
-    for (auto* p : model->parameters()) {
+    for (auto* p : trainable_model_parameters(model)) {
         if (p && p->name == name) {
             external_lr_scale[p] = scale;
             matched = true;
@@ -3059,7 +3761,8 @@ float Trainer::accumulate_gradients(const std::vector<int>& tokens,
     const std::vector<int> inputs = make_inputs(tokens, targets);
     const std::vector<int> resolved_targets = make_targets(tokens, targets);
 
-    auto params = model->parameters();
+    auto params = trainable_model_parameters(model);
+    const float loss_scale = active_loss_scale(*this);
     apply_progressive_qat_phase(*this);
     zero_model_gradients(params);
     begin_moe_aux_accumulation(*this);
@@ -3068,7 +3771,8 @@ float Trainer::accumulate_gradients(const std::vector<int>& tokens,
     Context ctx;
     Tensor logits = model->forward_ids(inputs, &ctx);
     // SSA learned block-selector distillation (no-op unless sparse attention is on).
-    const float selector_loss = model->accumulate_sparse_selector_grads(1.0f);
+    const float selector_loss =
+        model->accumulate_sparse_selector_grads(loss_scale);
     auto [supervised_loss, grad] = logits.cross_entropy(resolved_targets);
 
     // ── Pantheon VIB-style L2 regularizer on logits ──────────────────────
@@ -3079,7 +3783,9 @@ float Trainer::accumulate_gradients(const std::vector<int>& tokens,
     // still pulls them toward correct targets.  See PANTHEON_VALIDATION_REPORT.
     const float logit_l2_loss = add_logit_l2_objective(
         logits, effective_logit_l2_beta(*this), grad);
+    scale_tensor_inplace(grad, loss_scale);
     model->backward_external(grad, ctx);
+    scale_gradients(params, 1.0f / loss_scale);
     const float qat_loss = apply_qat_regularization(*this, 1);
     const float moe_aux_loss = apply_moe_aux_regularization(*this, 1);
     last_objective_stats = TrainingObjectiveStats{};
@@ -3100,7 +3806,7 @@ float Trainer::train_step(const std::vector<int>& tokens,
     // mutating weights (Trainer::accumulate_gradients).  Behavior identical
     // to the previous monolithic train_step.
     (void)accumulate_gradients(tokens, targets);
-    auto params = model->parameters();
+    auto params = trainable_model_parameters(model);
     float grad_norm = 0.0f;
     const float criticality_loss =
         apply_optimizer_step(*this, params, 1, &grad_norm);
@@ -3124,7 +3830,15 @@ float Trainer::train_supervised_batch(
 
 void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_size,
                          int seq_len, std::function<void(int, float)> callback,
-                         int max_steps) {
+                         int max_steps, int start_step) {
+    if (epochs <= 0 || batch_size <= 0 || seq_len <= 0) {
+        throw std::invalid_argument(
+            "train_loop requires positive epochs, batch_size, and seq_len");
+    }
+    if (start_step < 0 || (max_steps > 0 && start_step > max_steps)) {
+        throw std::invalid_argument(
+            "train_loop start_step must be in [0, max_steps]");
+    }
     if (tokens.size() <= static_cast<size_t>(seq_len)) {
         throw std::runtime_error("Dataset small");
     }
@@ -3138,12 +3852,18 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
         total_training_steps = std::max(total_training_steps, desired_total_steps);
     }
 
-    int internal_global_step = 0;
-    auto params = model->parameters();
+    int internal_global_step = start_step;
+    int encountered_step = 0;
+    auto params = trainable_model_parameters(model);
+    const float loss_scale = active_loss_scale(*this);
 
     for (int epoch = 0; epoch < epochs; ++epoch) {
         for (size_t start = 0; start + seq_len < tokens.size();
              start += static_cast<size_t>(seq_len * effective_batch)) {
+            ++encountered_step;
+            if (encountered_step <= start_step) {
+                continue;
+            }
             apply_progressive_qat_phase(*this);
             zero_model_gradients(params);
             begin_moe_aux_accumulation(*this);
@@ -3250,7 +3970,8 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
                     static_cast<float>(chunk_samples) /
                     static_cast<float>(std::max(samples, 1));
                 const float selector_loss =
-                    model->accumulate_sparse_selector_grads(chunk_weight);
+                    model->accumulate_sparse_selector_grads(
+                        chunk_weight * loss_scale);
                 auto [supervised_loss, grad] = logits.cross_entropy(chunk_targets);
                 const float repetition_loss = apply_repetition_unlikelihood_batch(
                     *this, chunk_target_batch, logits, grad);
@@ -3259,7 +3980,8 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
                 // cross_entropy returns a mean over the chunk's token rows.
                 // Weight each chunk by its sample fraction so accumulated
                 // gradients equal the full-batch mean regardless of chunking.
-                scale_tensor_inplace(grad, chunk_weight);
+                scale_tensor_inplace(
+                    grad, chunk_weight * loss_scale);
                 model->backward_external(grad, ctx);
 
                 aggregate_supervised_loss +=
@@ -3273,6 +3995,7 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
                 aggregate_samples += chunk_samples;
             }
 
+            scale_gradients(params, 1.0f / loss_scale);
             const int objective_samples = std::max(aggregate_samples, 1);
             const float qat_loss = apply_qat_regularization(*this, 1);
             const float moe_aux_loss = apply_moe_aux_regularization(*this, 1);

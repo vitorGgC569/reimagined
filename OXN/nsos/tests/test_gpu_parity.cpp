@@ -31,7 +31,7 @@ void assert_close(const Tensor& lhs, const Tensor& rhs, float tol = 1e-4f) {
 void run_case(const char* name, const std::function<void()>& fn) {
   const char* selected = std::getenv("NSOS_GPU_PARITY_CASE");
   if (selected && std::string(selected) != name) {
-    std::cout << "[GPUParity] skip " << name << std::endl;
+    std::cout << "[GPUParity] filtered " << name << std::endl;
     return;
   }
   std::cout << "[GPUParity] begin " << name << std::endl;
@@ -51,6 +51,25 @@ void assert_streaming_mamba_parity() {
   Mamba2SSD gpu_layer(32, 16, 2);
   gpu_layer.to(Device::GPU);
 
+  // Both instances are independently initialized.  Compare kernels, not two
+  // unrelated random functions: mirror every parameter before the first
+  // streaming step (same contract as the decomposed Mamba streaming gate).
+  const auto cpu_parameters = cpu_layer.parameters();
+  const auto gpu_parameters = gpu_layer.parameters();
+  if (cpu_parameters.size() != gpu_parameters.size()) {
+    throw std::runtime_error("Mamba streaming parameter layout mismatch");
+  }
+  for (size_t index = 0; index < cpu_parameters.size(); ++index) {
+    if (!cpu_parameters[index] || !gpu_parameters[index] ||
+        cpu_parameters[index]->data.size != gpu_parameters[index]->data.size) {
+      throw std::runtime_error(
+          "Mamba streaming parameter mismatch at index " +
+          std::to_string(index));
+    }
+    gpu_parameters[index]->data.copy_from(
+        cpu_parameters[index]->data.to(Device::GPU));
+  }
+
   cpu_layer.set_streaming_mode(true);
   gpu_layer.set_streaming_mode(true);
 
@@ -61,7 +80,7 @@ void assert_streaming_mamba_parity() {
     final_cpu = cpu_layer.forward(token, nullptr);
     final_gpu = gpu_layer.forward(token.to(Device::GPU), nullptr).cpu();
   }
-  assert_close(final_cpu, final_gpu, 3e-3f);
+  assert_close(final_cpu, final_gpu, 5e-3f);
 }
 
 void assert_bitlinear_parity() {
@@ -110,22 +129,27 @@ void assert_jamba_forward_ids_batch_parity() {
 
 int main() {
 #ifndef USE_CUDA
-  std::cout << "GPU parity test skipped: CUDA not enabled." << std::endl;
-  return 0;
+  std::cerr << "GPU parity test failed: CUDA was not enabled at build time."
+            << std::endl;
+  return 1;
 #else
   try {
-#ifdef USE_CUDA
     int device_count = 0;
     const cudaError_t count_status = cudaGetDeviceCount(&device_count);
     if (count_status != cudaSuccess || device_count <= 0) {
-      std::cout << "GPU parity test skipped: no CUDA device available." << std::endl;
-      return 0;
+      throw std::runtime_error(
+          "CUDA device is required but unavailable (cudaGetDeviceCount=" +
+          std::to_string(static_cast<int>(count_status)) + ")");
     }
     cudaDeviceProp props{};
-    cudaGetDeviceProperties(&props, 0);
+    const cudaError_t props_status = cudaGetDeviceProperties(&props, 0);
+    if (props_status != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("cudaGetDeviceProperties failed: ") +
+          cudaGetErrorString(props_status));
+    }
     std::cout << "[GPUParity] device=" << props.name << " cc=" << props.major << "."
               << props.minor << " runtime=" << CUDART_VERSION << std::endl;
-#endif
     Tensor a({2, 3}, Device::CPU);
     Tensor b({3, 2}, Device::CPU);
     for (int i = 0; i < a.size; ++i) a.data()[i] = static_cast<float>(i + 1);

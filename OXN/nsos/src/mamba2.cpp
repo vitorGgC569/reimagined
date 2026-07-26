@@ -2689,6 +2689,16 @@ void Mamba2SSD::reset_runtime_telemetry() {
 }
 
 void Mamba2SSD::to(Device dev) {
+    auto move_parameter = [dev](Parameter& parameter) {
+        if (parameter.data.size > 0 &&
+            parameter.data.get_device() != dev) {
+            parameter.data = parameter.data.to(dev);
+        }
+        if (parameter.grad.size > 0 &&
+            parameter.grad.get_device() != dev) {
+            parameter.grad = parameter.grad.to(dev);
+        }
+    };
     if (config_.proper_selective_ssm || config_.faithful_mamba2) {
         // GPU-first: move ALL proper-path components onto the device so the
         // forward/backward run fully on-device (conv1d + linear-readout scan
@@ -2700,17 +2710,11 @@ void Mamba2SSD::to(Device dev) {
         if (C_proj_) C_proj_->to(dev);
         if (dt_proj_) dt_proj_->to(dev);
         out_proj.to(dev);
-        if (conv_weight_.data.size > 0) {
-            conv_weight_.data = conv_weight_.data.to(dev);
-        }
-        if (conv_bias_.data.size > 0) {
-            conv_bias_.data = conv_bias_.data.to(dev);
-        }
-        if (norm_weight_.data.size > 0) {
-            norm_weight_.data = norm_weight_.data.to(dev);
-        }
-        A.data = A.data.to(dev);
-        D.data = D.data.to(dev);
+        move_parameter(conv_weight_);
+        move_parameter(conv_bias_);
+        move_parameter(norm_weight_);
+        move_parameter(A);
+        move_parameter(D);
         pp_stream_h_dev_ = Tensor();
         pp_stream_ring_dev_ = Tensor();
         pp_stream_dev_live_ = false;
@@ -2719,8 +2723,8 @@ void Mamba2SSD::to(Device dev) {
     in_proj_robust->to(dev);
     in_proj_sensitive->to(dev);
     out_proj.to(dev);
-    A.data = A.data.to(dev);
-    D.data = D.data.to(dev);
+    move_parameter(A);
+    move_parameter(D);
 }
 
 std::vector<Parameter*> Mamba2SSD::parameters() {

@@ -108,7 +108,10 @@ fallback eager permanente com razão em `decode_graph_status()`.
 (argmax greedy on-device) e `NSOS_CUDA_GRAPH_DECODE` (em builds PTDS) são
 **default ON**; `=0` desliga cada um. Declina apenas: TTT (adaptação host por
 token), MoE com num_experts>32 (cai no dispatch batched host-synced),
-`NSOS_CUDA_SYNC=1` e builds sem PTDS. Gates: `test_gpu_parity_decode_graph`
-(arquitetura completa: N-state+atenção+MoE; sequência graph == eager
-token-a-token). Medição: pinned vs pageable D2H via `nsos.bench_d2h_copy` +
+`NSOS_CUDA_SYNC=1` e builds sem PTDS. O gate suportado hoje é
+`test_gpu_parity_decode_incremental`: prefill + decode token-a-token em modelo
+híbrido Mamba/atenção, comparado contra streaming CPU e recomputação integral
+do prefixo. A reprodução específica de CUDA Graph continua não promovida até
+existir um gate de replay real; não há mais teste “SHELVED” que retorne sucesso.
+Medição: pinned vs pageable D2H via `nsos.bench_d2h_copy` +
 `NSOS_D2H_TIMING=1` no sampler; notebook `colab/bench_decode_graph_t4.ipynb`.

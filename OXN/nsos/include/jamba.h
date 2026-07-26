@@ -15,6 +15,7 @@
 #include "ttt_layer.h"
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -305,6 +306,7 @@ public:
              // N-dimensional SSD state.  Env vars still override per build.
              bool mamba_proper_ssm = true,
              bool mamba_state_expansion = true,
+             int mamba_d_state = 64,
              int mamba_conv_kernel = 4,
              bool mamba2_faithful = true,
              int mamba_expand = 2,
@@ -314,7 +316,8 @@ public:
              // position-invariant (content-recall) dims.  Env NSOS_ROPE_THETA
              // still overrides per construction.
              float rope_theta = 10000.0f,
-             int sliding_window = 4096);
+             int sliding_window = 4096,
+             int max_context_tokens = 4096);
   ~JambaBlock();
   Tensor forward(const Tensor &x, Context *ctx);
   Tensor backward(const Tensor &dy, Context *ctx);
@@ -576,6 +579,14 @@ public:
                                   int context_limit,
                                   bool truncated);
 private:
+  // A model owns mutable forward state (training RNG sequence, saved
+  // activations, streaming caches and audit context).  Concurrent callers of
+  // one model instance therefore execute atomically.  A recursive mutex is
+  // intentional: convenience entry points such as forward_ids() delegate to
+  // forward().  Throughput-oriented serving should use the native batch API;
+  // this lock provides a correctness guarantee for accidental shared-model
+  // concurrency instead of exposing data races.
+  mutable std::recursive_mutex execution_mutex_;
   int num_layers, d_model, vocab_size;
   Device device;
   ModelConfig model_config_;
@@ -595,6 +606,8 @@ private:
   bool weight_tied_ = false;
   Parameter final_norm_weight_;
   void apply_weight_tying_();
+  void validate_token_ids(const std::vector<int>& ids,
+                          const char* operation) const;
   bool streaming_inference_enabled_ = false;
   bool training_mode_ = true;
   // Monotonic training-forward id used by stochastic layers.  Session resets

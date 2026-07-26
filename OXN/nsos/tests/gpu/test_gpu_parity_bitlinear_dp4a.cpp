@@ -84,6 +84,8 @@ int main() {
     // numerical contract on both sides.
     cpu_layer.set_reference_path(false);
     gpu_layer.set_reference_path(false);
+    cpu_layer.set_training_mode(false);
+    gpu_layer.set_training_mode(false);
 
     // Force packed-weight materialization on both sides so the GPU
     // dispatch sees a valid packed buffer.

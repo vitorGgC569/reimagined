@@ -108,6 +108,7 @@ public:
   // Accessors
   const std::string &get_layer_name() const { return layer_name; }
   void set_layer_name(const std::string &name) { layer_name = name; }
+  int state_size() const { return d_state; }
 
 private:
   // Forward SSM core logic

@@ -23,6 +23,7 @@ clone URLs.
 | [`jamba_vs_nsos_oxtamem_t4_2026-07-22.md`](jamba_vs_nsos_oxtamem_t4_2026-07-22.md) | Full protocol, environment, metrics, errata, limitations and verdict |
 | [`../../colab/bench_expanded_validation_t4_2026-07-22.ipynb`](../../colab/bench_expanded_validation_t4_2026-07-22.ipynb) | Executed notebook with the successful empirical outputs |
 | [`results/expanded_validation_t4_2026-07-22.json`](results/expanded_validation_t4_2026-07-22.json) | Machine-readable raw results and immutable dataset checksums |
+| [`results/expanded_validation_t4_2026-07-22.provenance.json`](results/expanded_validation_t4_2026-07-22.provenance.json) | Artifact-set commit, runtime commits, Git blob IDs and SHA-256 integrity hashes |
 
 The notebook downloads the public bAbI data from its pinned upstream revision;
 the dataset itself is intentionally not committed. Its train and test SHA-256
@@ -36,7 +37,7 @@ notebook is optional evidence, not a dependency for reproduction.
 - corrected MQAR comparison with non-zero training seeds 1, 2 and 3;
 - public `facebook/babi_qa`, configuration `en-10k-qa1`;
 - NSOS plus structured entity-keyed OxtaMem on all 1,000 bAbI test questions;
-- length extrapolation from training on 1â€“8 pairs to evaluation at 64 pairs;
+- length extrapolation from training on 1–8 pairs to evaluation at 64 pairs;
 - raw results, environment versions and dataset integrity hashes.
 
 ## Remaining scientific gates
@@ -56,5 +57,4 @@ the published benchmark:
 
 Until those gates are complete, the supported conclusion is that NSOS and
 OxtaMem are exceptionally promising on the tested memory and reasoning
-protocolsâ€”not that NSOS is already a generally superior language model.
-
+protocols—not that NSOS is already a generally superior language model.

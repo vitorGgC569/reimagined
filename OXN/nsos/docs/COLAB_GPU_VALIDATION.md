@@ -1,13 +1,13 @@
 # Colab GPU Validation — NSOS Fases 1 & 2
 
 Guia copy-paste para validar **em GPU de verdade (T4/A100/L4)** o trabalho GPU-first:
-o caching allocator (pool, ~3.9× medido na 1050 Ti), o BF16 mixed-precision, os
+o caching allocator (pool, ~3.9× medido na 1050 Ti), a precisão mista por arquitetura, os
 gates da Fase 1, e o **loop de paridade 1e-4** que destrava qualquer kernel novo
 de Fase 2 (parallel-prefix scan etc.) no padrão ouro.
 
 > Por que Colab: o 1050 Ti/4GB valida correção, **não escala** (e trava o desktop
 > sob pressão de UM). Em T4/A100 os batches grandes cabem, a ocupação sobe e o
-> BF16 (Tensor Cores) entra — é onde os ganhos aparecem de fato.
+> FP16 entra em V100/T4; BF16 entra em A100/L4/H100.
 
 Runtime recomendado: **A100** (40 GB) ou **T4** (16 GB). `Runtime → Change runtime
 type → GPU`.
@@ -72,12 +72,13 @@ a GPU enche (sem o thrash de UM de 4 GB). `mem ON MB` deve ficar dentro do devic
 
 ---
 
-## Célula 4 — BF16 mixed-precision (Tensor Cores): FP32 vs BF16
+## Célula 4 — precisão mista (Tensor Cores): FP32 vs formato nativo
 
 ```python
 import os
 os.environ["NSOS_GPU_POOL"] = "1"            # pool sempre ON aqui
-for prec in ("fp32", "bf16"):
+precision = "bf16" if int(info["arch"]) >= 80 else "fp16"
+for prec in ("fp32", precision):
     os.environ["NSOS_MIXED_PRECISION"] = prec  # lido na 1a alocação; processo separado por isso
     print(f"\n===== precision = {prec} =====")
     !NSOS_MIXED_PRECISION={prec} python {REPO}/OXN/nsos/scripts/profile_bottlenecks.py \
@@ -85,10 +86,9 @@ for prec in ("fp32", "bf16"):
         --steps 10 --skip-forward --configs baseline,full
 ```
 
-> BF16 também pode ser ligado em runtime no Python: `import nsos_ext;
-> nsos_ext.set_matmul_precision("bf16")`. Em sm_75+ espere **2-4×** no GEMM.
-> BF16 tem o expoente de 8 bits do FP32 (sem loss-scaling); pesos-mestre seguem
-> FP32. Compare a **curva de loss** alguns passos: deve acompanhar o FP32.
+> Selecione em runtime com `nsos_ext.set_matmul_precision("fp16")` na T4/V100
+> ou `"bf16"` em sm_80+. Pesos-mestre e otimizador seguem FP32. FP16 usa o
+> scaler dinâmico do `Trainer`; BF16 dispensa scaling por ter expoente de 8 bits.
 
 ---
 

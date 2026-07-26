@@ -38,6 +38,7 @@ public:
   bool enable_oxtamem_store(const std::string& library_path,
                             const std::string& store_path,
                             uint64_t size_mb = 128);
+  std::string last_persistence_error() const;
   std::vector<Message> recall_recent_messages(size_t depth) const;
 
   // Retrieve relevant memory based on query state (Soft Attention simulation)
@@ -51,6 +52,9 @@ public:
   void run_ultra_compact();
   void microcompact_messages();
   void clear_runtime_state();
+  int chunk_dimension() const { return chunk_size; }
+  std::vector<Cluster> snapshot_runtime_clusters() const;
+  void restore_runtime_clusters(const std::vector<Cluster>& snapshot);
 
 private:
   void microcompact_messages_locked();
@@ -63,6 +67,7 @@ private:
   std::unique_ptr<tq::TurboQuantEngine> tq_engine;
   std::unique_ptr<CausalMemoryStore> causal_store;
   std::unique_ptr<OxtaMemFFI> oxtamem_store;
+  std::string persistence_error;
   std::vector<std::string> instructional_memory;
   int chunk_size;
 };

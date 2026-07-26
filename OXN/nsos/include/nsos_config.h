@@ -10,13 +10,14 @@ namespace nsos {
 
 // Magic Numbers & Constants
 constexpr uint32_t NSOS_MODEL_MAGIC = 0x4E534F53; // "NSOS" in ASCII
-// v2 (2026-07): header carries an architecture FINGERPRINT (proper-SSM /
+// v3 (2026-07): retains the v2 feature fingerprint and adds a complete
+// configuration digest plus an end-to-end payload checksum.
 // state-expansion / weight-tying flags + A-domain marker) so loading a
 // checkpoint into a mismatched architecture fails with an ACTIONABLE message
 // instead of a cryptic "parameter not found", and v1 checkpoints (whose Mamba
 // `A` values are decay RATES, not log-rates) are migrated exactly
 // (A_log = log(max(A, 1e-3))) instead of being silently misread as log-domain.
-constexpr uint32_t NSOS_MODEL_VERSION = 2;
+constexpr uint32_t NSOS_MODEL_VERSION = 3;
 // Fingerprint bits (v2+ header, uint32 after version):
 constexpr uint32_t NSOS_FP_MAMBA_PROPER    = 1u << 0;
 constexpr uint32_t NSOS_FP_STATE_EXPANSION = 1u << 1;
@@ -123,6 +124,9 @@ struct ModelConfig {
     // checkpoint that was trained on the legacy path.
     bool mamba_proper_ssm = true;
     bool mamba_state_expansion = true;
+    // Number of SSM states per Mamba head. This is an architectural field,
+    // not a boolean feature toggle. CUDA kernels currently support up to 64.
+    int  mamba_d_state = 64;
     int  mamba_conv_kernel = 4;
     // Exact state-spaces/mamba Mamba2 graph.  Pure Mamba layers omit the
     // historical dense FFN; set false to load/use the pre-faithful layout.
@@ -208,6 +212,7 @@ inline void validate_model_config(const ModelConfig& config) {
         throw std::invalid_argument(
             "ModelConfig.moe_expert_hidden_dim cannot be negative");
     }
+    require_range(config.mamba_d_state, 1, 64, "mamba_d_state");
     require_range(config.mamba_conv_kernel, 1, 16, "mamba_conv_kernel");
     require_range(config.mamba_expand, 1, 8, "mamba_expand");
     if (config.mamba2_faithful) {

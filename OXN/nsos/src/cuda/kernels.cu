@@ -1,4 +1,5 @@
-#include "cuda/bitnet_math.cuh"
+#include "cuda/kernels.cuh"
+
 #include <cmath>
 #include <cstdio>
 #include <cuda_runtime.h>

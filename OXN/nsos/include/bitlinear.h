@@ -3,6 +3,7 @@
 
 #include "autograd.h"
 #include "tensor.h"
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -69,7 +70,6 @@ public:
   void set_exact_linear_mode(bool enabled) {
     exact_linear_mode_ = enabled;
     norm_strategy = enabled ? NormStrategy::NONE : NormStrategy::RMS_PERI;
-    use_flatquant = !enabled;
   }
   bool exact_linear_mode() const { return exact_linear_mode_; }
 
@@ -94,6 +94,12 @@ public:
   }
   bool gpu_packed_inference_enabled() const {
     return gpu_packed_inference_enabled_;
+  }
+  uint64_t gpu_packed_dispatch_count() const {
+    return gpu_packed_dispatch_count_.load(std::memory_order_relaxed);
+  }
+  void reset_gpu_packed_dispatch_count() {
+    gpu_packed_dispatch_count_.store(0, std::memory_order_relaxed);
   }
 
   // Inference fast path.  When false, forward() skips the clone-heavy
@@ -155,14 +161,11 @@ private:
   const Tensor& materialize_weight_for_device(Device dev);
   void invalidate_cached_materialized_weights();
 
-  void apply_flatquant(float *data, int M, int K, bool incoming);
-
   int in_features;
   int out_features;
   bool use_bias;
   bool use_hadamard = false;
   bool use_tequila = false;
-  bool use_flatquant = true;
   bool use_reference_path = true;
   bool quantization_sensitive_ = false;
   bool exact_linear_mode_ = false;
@@ -183,7 +186,9 @@ public:
   Parameter magnitude;
   Parameter bias;
 
-  // Learnable affine parameters for FlatQuant
+  // Legacy identity buffers retained only for edge-pack compatibility.
+  // FlatQuant is not part of any forward path and these are intentionally
+  // excluded from parameters(), optimizer state, and training checkpoints.
   Parameter flat_alpha;
   Parameter flat_beta;
 
@@ -233,6 +238,7 @@ private:
   Tensor cached_gpu_packed_weights_;
   uint64_t cached_gpu_packed_version_ = 0;
   bool gpu_packed_inference_enabled_ = false;
+  std::atomic<uint64_t> gpu_packed_dispatch_count_{0};
   bool training_mode_ = true;
 
   // T-MAC block-sparse heat map, lazily computed on first opt-in use.

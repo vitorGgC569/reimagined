@@ -80,6 +80,27 @@ bool parse_bool(const std::string& value, bool fallback = false) {
     return fallback;
 }
 
+bool environment_flag(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw) {
+        return false;
+    }
+    std::string value = trim_copy(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    if (value == "1" || value == "true" || value == "yes" ||
+        value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" ||
+        value == "off" || value.empty()) {
+        return false;
+    }
+    throw std::runtime_error(std::string("Invalid boolean value for ") + name);
+}
+
 constexpr uintmax_t kMaxConfigFileBytes = 1024 * 1024;
 constexpr uintmax_t kMaxTokenizerPackBytes = 256ull * 1024ull * 1024ull;
 constexpr uintmax_t kMaxEdgePackBytes = 2ull * 1024ull * 1024ull * 1024ull;
@@ -531,6 +552,7 @@ void write_model_config(const std::filesystem::path& path, const ModelConfig& co
             {"use_slender_embedding", config.use_slender_embedding ? "true" : "false"},
             {"mamba_proper_ssm", config.mamba_proper_ssm ? "true" : "false"},
             {"mamba_state_expansion", config.mamba_state_expansion ? "true" : "false"},
+            {"mamba_d_state", std::to_string(config.mamba_d_state)},
             {"mamba_conv_kernel", std::to_string(config.mamba_conv_kernel)},
             {"mamba2_faithful", config.mamba2_faithful ? "true" : "false"},
             {"mamba_expand", std::to_string(config.mamba_expand)},
@@ -643,6 +665,7 @@ ModelConfig read_model_config(const std::filesystem::path& path) {
     config.mamba_proper_ssm = get_bool("mamba_proper_ssm", config.mamba_proper_ssm);
     config.mamba_state_expansion =
         get_bool("mamba_state_expansion", config.mamba_state_expansion);
+    config.mamba_d_state = get_int("mamba_d_state", config.mamba_d_state);
     config.mamba_conv_kernel = get_int("mamba_conv_kernel", config.mamba_conv_kernel);
     // Packs written before the faithful block existed must keep the old
     // parameter layout even though new ModelConfig instances default to it.
@@ -1450,6 +1473,16 @@ bool InferenceEngine::try_load_model_pack(const std::string& path,
     const fs::path tokenizer_path = pack_child_path(pack_root, get_value("tokenizer"), "tokenizer");
     const fs::path weights_path = pack_child_path(pack_root, get_value("weights"), "weights");
     const bool has_edge_linear = manifest.count("edge_linear") > 0;
+    bool quantization_ready = false;
+    if (const auto ready_it = manifest.find("quantization_ready");
+        ready_it != manifest.end()) {
+        if (ready_it->second == "1" || ready_it->second == "true") {
+            quantization_ready = true;
+        } else if (ready_it->second != "0" && ready_it->second != "false") {
+            throw std::runtime_error(
+                "Model pack manifest has an invalid quantization_ready value");
+        }
+    }
     const fs::path edge_linear_path =
         has_edge_linear ? pack_child_path(pack_root, get_value("edge_linear"), "edge_linear")
                         : fs::path{};
@@ -1487,34 +1520,32 @@ bool InferenceEngine::try_load_model_pack(const std::string& path,
     this->tokenizer.load(tokenizer_path.string());
     this->model->load(weights_path.string());
     if (has_edge_linear) {
-        // VISION #3 (Quantized Inference): when an edge_linear pack is
-        // available in the bundle, the WHOLE POINT of the project is to
-        // serve from 1.58-bit packed weights at inference, not from
-        // residual FP32 weights.  The historical default here was
-        // `false` (keep FP32 alongside the edge pack, use FP32 in
-        // forward, treat edge pack as a reference for the audit hook),
-        // which meant the 1.58-bit edge claim was a memory format
-        // statement only — actual serving still cost FP32 RAM + bandwidth.
-        //
-        // The right default is to RELEASE FP32 after loading the edge
-        // pack, so the runtime is genuinely operating in ternary.  Users
-        // who need the FP32 reference path for parity testing can opt
-        // back in by setting NSOS_KEEP_FP32_WEIGHTS=1 in the environment.
-        bool keep_fp32 = false;
-        if (const char* env = std::getenv("NSOS_KEEP_FP32_WEIGHTS")) {
-            std::string s(env);
-            keep_fp32 = (s == "1" || s == "true" || s == "TRUE" || s == "yes");
+        // A packed payload alone does not prove that the model was trained in
+        // QAT. Post-training ternarization can cause a severe quality cliff.
+        // Release FP32 automatically only when the producer recorded an
+        // active quantized phase. Audits may force packed mode explicitly.
+        const bool keep_fp32 =
+            environment_flag("NSOS_KEEP_FP32_WEIGHTS");
+        const bool force_packed =
+            environment_flag("NSOS_FORCE_PACKED_WEIGHTS");
+        if (keep_fp32 && force_packed) {
+            throw std::runtime_error(
+                "NSOS_KEEP_FP32_WEIGHTS and NSOS_FORCE_PACKED_WEIGHTS "
+                "cannot both be enabled");
         }
-        const bool release_fp32 = !keep_fp32;
+        const bool release_fp32 =
+            !keep_fp32 && (quantization_ready || force_packed);
         this->model->load_edge_linear_pack(edge_linear_path.string(), release_fp32);
+        this->model->set_gpu_packed_inference(
+            device == Device::GPU && release_fp32);
         if (release_fp32) {
             std::cerr << "[InferenceEngine] edge pack loaded; FP32 linear weights "
-                      << "released (1.58-bit inference mode).  Set "
-                      << "NSOS_KEEP_FP32_WEIGHTS=1 to keep both."
+                      << "released (1.58-bit inference mode)."
                       << std::endl;
         } else {
             std::cerr << "[InferenceEngine] edge pack loaded; FP32 weights retained "
-                      << "(reference mode, opt-in via NSOS_KEEP_FP32_WEIGHTS=1)."
+                      << "(reference mode: pack is not QAT-ready or retention "
+                      << "was explicitly requested)."
                       << std::endl;
         }
     }
@@ -2462,6 +2493,22 @@ bool InferenceEngine::save_model_pack(const std::string& directory) const {
         const fs::path config_path = pack_root / "config.nsos";
         const fs::path edge_linear_path = pack_root / "edge_linear.nsos";
         const fs::path manifest_path = pack_root / "manifest.nsos";
+        bool quantization_ready =
+            this->trainer != nullptr &&
+            this->trainer->phase_scheduler.progressive_qat_enabled &&
+            this->trainer->global_step_count > 0;
+        bool saw_quantizable_layer = false;
+        for (const BitLinear* layer : this->model->collect_bitlinear_layers()) {
+            if (!layer || layer->quantization_sensitive()) {
+                continue;
+            }
+            saw_quantizable_layer = true;
+            if (layer->reference_path_enabled()) {
+                quantization_ready = false;
+                break;
+            }
+        }
+        quantization_ready = quantization_ready && saw_quantizable_layer;
 
         const fs::path weights_temp = atomic_temp_path(weights_path);
         const fs::path edge_linear_temp = atomic_temp_path(edge_linear_path);
@@ -2483,6 +2530,7 @@ bool InferenceEngine::save_model_pack(const std::string& directory) const {
                 {
                     {"format", "nsos-pack-v2"},
                     {"version", "2"},
+                    {"quantization_ready", quantization_ready ? "1" : "0"},
                     {"weights", weights_path.filename().string()},
                     {"edge_linear", edge_linear_path.filename().string()},
                     {"tokenizer", tokenizer_path.filename().string()},
@@ -2571,6 +2619,7 @@ std::unique_ptr<InferenceEngine> InferenceEngine::clone_for_inference() const {
         const BitLinearPackedState state = src->export_packed_state();
         dst->import_packed_state(state, device, !src->has_full_precision_weight());
         dst->set_reference_path(src->reference_path_enabled());
+        dst->set_gpu_packed_inference(src->gpu_packed_inference_enabled());
     }
 
     replica->last_metrics_ = this->last_metrics_;
