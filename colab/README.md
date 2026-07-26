@@ -18,6 +18,9 @@ The source notebook can be opened directly in
 Because the repository is private, Colab must be authorized to read it.
 No secret is stored in the notebook or repository.
 
+The federated v11 instructions below are a separate, older workflow. They are
+not required to reproduce the July 2026 benchmark.
+
 ## Architecture
 
 ```
