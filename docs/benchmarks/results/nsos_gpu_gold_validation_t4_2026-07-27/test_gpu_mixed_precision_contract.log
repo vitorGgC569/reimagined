@@ -1,0 +1,7 @@
+$ /content/nsos-build-gpu-gold-sm75/test_gpu_mixed_precision_contract
+[GPUParity:mixed_precision_contract] device=Tesla T4 cc=7.5 runtime=12080
+[GPUParity:mixed_precision_contract] begin
+[GPUParity:mixed_precision_contract] active_sm=75
+[GPUParity:mixed_precision_contract] fp16=executed loss_scale=2048
+[GPUParity:mixed_precision_contract] bf16=rejected_as_unsupported
+[GPUParity:mixed_precision_contract] PASS

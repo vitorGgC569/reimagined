@@ -1,0 +1,28 @@
+$ cmake -S /content/reimagined-gpu-gold/OXN/nsos -B /content/nsos-build-gpu-gold-sm75 -G 'Unix Makefiles' -DCMAKE_BUILD_TYPE=Release -DNSOS_BUILD_TESTS=ON -DNSOS_BUILD_PYTHON=OFF -DNSOS_BUILD_API=OFF -DNSOS_BUILD_CLI=OFF -DNSOS_BUILD_OXTAMEM=OFF -DNSOS_ENABLE_CUDA=ON -DNSOS_ENABLE_NATIVE_OPTIMIZATIONS=OFF -DNSOS_CUDA_ARCHITECTURES=75
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5")
+-- TurboQuant external library not configured; using built-in fallback implementation.
+-- Looking for a CUDA compiler
+-- Looking for a CUDA compiler - /usr/local/cuda/bin/nvcc
+-- The CUDA compiler identification is NVIDIA 12.8.93 with host compiler GNU 11.4.0
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/local/cuda/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found CUDAToolkit: /usr/local/cuda/targets/x86_64-linux/include (found version "12.8.93")
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Using CUDA toolkit: /usr/local/cuda/bin
+-- Using CUDA toolkit version: 12.8.93
+-- Using CUDA architectures: 75
+-- Configuring done (6.6s)
+-- Generating done (0.2s)
+-- Build files have been written to: /content/nsos-build-gpu-gold-sm75

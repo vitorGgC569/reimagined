@@ -1,0 +1,151 @@
+$ cmake --build /content/nsos-build-gpu-gold-sm75 --parallel 2 --target test_gpu_parity test_mamba_parallel_scan_parity test_gpu_parity_basic test_gpu_parity_bitlinear test_gpu_parity_mamba_stream test_gpu_parity_mamba_scan test_gpu_parity_mamba_proper test_gpu_parity_mamba_proper_stream test_gpu_parity_mamba_nstate_stream test_gpu_parity_decode_incremental test_gpu_parity_mamba_nstate test_gpu_parity_mamba_faithful test_gpu_parity_jamba test_gpu_parity_moe_router test_gpu_parity_moe_batched test_gpu_parity_bitnet_dispatch test_gpu_parity_kan test_gpu_parity_sparse_attention test_gpu_parity_jamba_sparse test_gpu_parity_bitlinear_dp4a test_gpu_model_pack_dp4a_lifecycle test_gpu_device_memory_contract test_gpu_checkpoint_v8_continuation test_gpu_mixed_precision_contract bench_gpu_vs_cpu
+[  0%] Building CXX object CMakeFiles/nsos_core.dir/src/tensor.cpp.o
+[  3%] Building CXX object CMakeFiles/nsos_core.dir/src/nsos_math.cpp.o
+[  3%] Building CXX object CMakeFiles/nsos_core.dir/src/jamba.cpp.o
+[  7%] Building CXX object CMakeFiles/nsos_core.dir/src/jamba_utils.cpp.o
+[ 10%] Building CXX object CMakeFiles/nsos_core.dir/src/mamba2.cpp.o
+[ 10%] Building CXX object CMakeFiles/nsos_core.dir/src/bitlinear.cpp.o
+[ 14%] Building CXX object CMakeFiles/nsos_core.dir/src/bitnet_adapter.cpp.o
+[ 14%] Building CXX object CMakeFiles/nsos_core.dir/src/lut_tmac.cpp.o
+[ 17%] Building CXX object CMakeFiles/nsos_core.dir/src/lut_cas.cpp.o
+[ 17%] Building CXX object CMakeFiles/nsos_core.dir/src/embedding.cpp.o
+[ 21%] Building CXX object CMakeFiles/nsos_core.dir/src/kan.cpp.o
+[ 21%] Building CXX object CMakeFiles/nsos_core.dir/src/ttt_layer.cpp.o
+[ 25%] Building CXX object CMakeFiles/nsos_core.dir/src/trainer.cpp.o
+[ 25%] Building CXX object CMakeFiles/nsos_core.dir/src/optimizer_4bit.cpp.o
+[ 28%] Building CXX object CMakeFiles/nsos_core.dir/src/layer_audit.cpp.o
+[ 32%] Building CXX object CMakeFiles/nsos_core.dir/src/tokenizer.cpp.o
+[ 32%] Building CXX object CMakeFiles/nsos_core.dir/src/nsos_sdk.cpp.o
+[ 35%] Building CXX object CMakeFiles/nsos_core.dir/src/nsos_mpi.cpp.o
+[ 35%] Building CXX object CMakeFiles/nsos_core.dir/src/globals.cpp.o
+[ 39%] Building CXX object CMakeFiles/nsos_core.dir/src/holographic.cpp.o
+[ 39%] Building CXX object CMakeFiles/nsos_core.dir/src/chrass_layer_v2.cpp.o
+[ 42%] Building CXX object CMakeFiles/nsos_core.dir/src/mcts_reasoning.cpp.o
+[ 42%] Building CXX object CMakeFiles/nsos_core.dir/src/causal_memory_store.cpp.o
+[ 46%] Building CXX object CMakeFiles/nsos_core.dir/src/oxtamem_ffi.cpp.o
+[ 46%] Building CXX object CMakeFiles/nsos_core.dir/src/http_api_server.cpp.o
+[ 50%] Building CXX object CMakeFiles/nsos_core.dir/src/determinism.cpp.o
+[ 53%] Building CXX object CMakeFiles/nsos_core.dir/src/components.cpp.o
+[ 53%] Building CXX object CMakeFiles/nsos_core.dir/src/memory_system.cpp.o
+[ 57%] Building CXX object CMakeFiles/nsos_core.dir/src/dataloader_v2.cpp.o
+[ 57%] Building CXX object CMakeFiles/nsos_core.dir/src/fabric_v2.cpp.o
+[ 60%] Building CXX object CMakeFiles/nsos_core.dir/src/smart_loader.cpp.o
+[ 60%] Building CXX object CMakeFiles/nsos_core.dir/src/sprecher_kan.cpp.o
+[ 64%] Building CXX object CMakeFiles/nsos_core.dir/src/simd/hadamard.cpp.o
+[ 64%] Building CXX object CMakeFiles/nsos_core.dir/src/coordinator.cpp.o
+[ 67%] Building CXX object CMakeFiles/nsos_core.dir/src/self_healer.cpp.o
+[ 67%] Building CXX object CMakeFiles/nsos_core.dir/src/numerical_guard.cpp.o
+[ 71%] Building CXX object CMakeFiles/nsos_core.dir/src/turboquant_fallback.cpp.o
+[ 75%] Building CXX object CMakeFiles/nsos_core.dir/src/bitnet_gpu_dispatch.cpp.o
+[ 75%] Building CXX object CMakeFiles/nsos_core.dir/src/sparse_attention.cpp.o
+[ 78%] Building CXX object CMakeFiles/nsos_core.dir/src/bitnet_adapter_avx2.cpp.o
+[ 78%] Building CXX object CMakeFiles/nsos_core.dir/src/bitlinear_quantize_avx2.cpp.o
+[ 82%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/kernels.cu.o
+[ 82%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/mamba_kernels.cu.o
+[ 85%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/moe_kernels.cu.o
+[ 85%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/bitnet_kernels.cu.o
+[ 89%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/kan_kernels.cu.o
+[ 89%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/sparse_attention_kernels.cu.o
+[ 92%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/attention_train_kernels.cu.o
+[ 92%] Building CUDA object CMakeFiles/nsos_core.dir/src/cuda/fused_optimizer_kernels.cu.o
+[ 96%] Linking CXX static library libnsos_core.a
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity.dir/tests/test_gpu_parity.cpp.o
+[100%] Linking CXX executable test_gpu_parity
+[100%] Built target test_gpu_parity
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_mamba_parallel_scan_parity.dir/tests/test_mamba_parallel_scan_parity.cpp.o
+[100%] Linking CXX executable test_mamba_parallel_scan_parity
+[100%] Built target test_mamba_parallel_scan_parity
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_basic.dir/tests/gpu/test_gpu_parity_basic.cpp.o
+[100%] Linking CXX executable test_gpu_parity_basic
+[100%] Built target test_gpu_parity_basic
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_bitlinear.dir/tests/gpu/test_gpu_parity_bitlinear.cpp.o
+[100%] Linking CXX executable test_gpu_parity_bitlinear
+[100%] Built target test_gpu_parity_bitlinear
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_mamba_stream.dir/tests/gpu/test_gpu_parity_mamba_stream.cpp.o
+[100%] Linking CXX executable test_gpu_parity_mamba_stream
+[100%] Built target test_gpu_parity_mamba_stream
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_mamba_scan.dir/tests/gpu/test_gpu_parity_mamba_scan.cpp.o
+[100%] Linking CXX executable test_gpu_parity_mamba_scan
+[100%] Built target test_gpu_parity_mamba_scan
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_mamba_proper.dir/tests/gpu/test_gpu_parity_mamba_proper.cpp.o
+[100%] Linking CXX executable test_gpu_parity_mamba_proper
+[100%] Built target test_gpu_parity_mamba_proper
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_mamba_proper_stream.dir/tests/gpu/test_gpu_parity_mamba_proper_stream.cpp.o
+[100%] Linking CXX executable test_gpu_parity_mamba_proper_stream
+[100%] Built target test_gpu_parity_mamba_proper_stream
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_mamba_nstate_stream.dir/tests/gpu/test_gpu_parity_mamba_nstate_stream.cpp.o
+[100%] Linking CXX executable test_gpu_parity_mamba_nstate_stream
+[100%] Built target test_gpu_parity_mamba_nstate_stream
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_decode_incremental.dir/tests/gpu/test_gpu_parity_decode_incremental.cpp.o
+[100%] Linking CXX executable test_gpu_parity_decode_incremental
+[100%] Built target test_gpu_parity_decode_incremental
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_mamba_nstate.dir/tests/gpu/test_gpu_parity_mamba_nstate.cpp.o
+[100%] Linking CXX executable test_gpu_parity_mamba_nstate
+[100%] Built target test_gpu_parity_mamba_nstate
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_mamba_faithful.dir/tests/gpu/test_gpu_parity_mamba_faithful.cpp.o
+[100%] Linking CXX executable test_gpu_parity_mamba_faithful
+[100%] Built target test_gpu_parity_mamba_faithful
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_jamba.dir/tests/gpu/test_gpu_parity_jamba.cpp.o
+[100%] Linking CXX executable test_gpu_parity_jamba
+[100%] Built target test_gpu_parity_jamba
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_moe_router.dir/tests/gpu/test_gpu_parity_moe_router.cpp.o
+[100%] Linking CXX executable test_gpu_parity_moe_router
+[100%] Built target test_gpu_parity_moe_router
+[ 93%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_moe_batched.dir/tests/gpu/test_gpu_parity_moe_batched.cpp.o
+[100%] Linking CXX executable test_gpu_parity_moe_batched
+[100%] Built target test_gpu_parity_moe_batched
+[ 93%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_bitnet_dispatch.dir/tests/gpu/test_gpu_parity_bitnet_dispatch.cpp.o
+[100%] Linking CXX executable test_gpu_parity_bitnet_dispatch
+[100%] Built target test_gpu_parity_bitnet_dispatch
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_kan.dir/tests/gpu/test_gpu_parity_kan.cpp.o
+[100%] Linking CXX executable test_gpu_parity_kan
+[100%] Built target test_gpu_parity_kan
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_sparse_attention.dir/tests/gpu/test_gpu_parity_sparse_attention.cpp.o
+[100%] Linking CXX executable test_gpu_parity_sparse_attention
+[100%] Built target test_gpu_parity_sparse_attention
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_parity_jamba_sparse.dir/tests/gpu/test_gpu_parity_jamba_sparse.cpp.o
+[100%] Linking CXX executable test_gpu_parity_jamba_sparse
+[100%] Built target test_gpu_parity_jamba_sparse
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_parity_bitlinear_dp4a.dir/tests/gpu/test_gpu_parity_bitlinear_dp4a.cpp.o
+[100%] Linking CXX executable test_gpu_parity_bitlinear_dp4a
+[100%] Built target test_gpu_parity_bitlinear_dp4a
+[ 96%] Built target nsos_core
+[100%] Building CXX object CMakeFiles/test_gpu_model_pack_dp4a_lifecycle.dir/tests/gpu/test_gpu_model_pack_dp4a_lifecycle.cpp.o
+[100%] Linking CXX executable test_gpu_model_pack_dp4a_lifecycle
+[100%] Built target test_gpu_model_pack_dp4a_lifecycle
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_device_memory_contract.dir/tests/gpu/test_gpu_device_memory_contract.cpp.o
+[100%] Linking CXX executable test_gpu_device_memory_contract
+[100%] Built target test_gpu_device_memory_contract
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_checkpoint_v8_continuation.dir/tests/gpu/test_gpu_checkpoint_v8_continuation.cpp.o
+[100%] Linking CXX executable test_gpu_checkpoint_v8_continuation
+[100%] Built target test_gpu_checkpoint_v8_continuation
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/test_gpu_mixed_precision_contract.dir/tests/gpu/test_gpu_mixed_precision_contract.cpp.o
+[100%] Linking CXX executable test_gpu_mixed_precision_contract
+[100%] Built target test_gpu_mixed_precision_contract
+[ 96%] Built target nsos_core
+[ 96%] Building CXX object CMakeFiles/bench_gpu_vs_cpu.dir/tests/bench_gpu_vs_cpu.cpp.o
+[100%] Linking CXX executable bench_gpu_vs_cpu
+[100%] Built target bench_gpu_vs_cpu

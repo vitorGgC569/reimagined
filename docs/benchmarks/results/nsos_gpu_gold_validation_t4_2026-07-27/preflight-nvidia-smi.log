@@ -1,0 +1,2 @@
+$ nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader,nounits
+Tesla T4, 7.5, 580.82.07

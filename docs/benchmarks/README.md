@@ -24,6 +24,11 @@ clone URLs.
 | [`../../colab/bench_expanded_validation_t4_2026-07-22.ipynb`](../../colab/bench_expanded_validation_t4_2026-07-22.ipynb) | Executed notebook with the successful empirical outputs |
 | [`results/expanded_validation_t4_2026-07-22.json`](results/expanded_validation_t4_2026-07-22.json) | Machine-readable raw results and immutable dataset checksums |
 | [`results/expanded_validation_t4_2026-07-22.provenance.json`](results/expanded_validation_t4_2026-07-22.provenance.json) | Artifact-set commit, runtime commits, Git blob IDs and SHA-256 integrity hashes |
+| [`results/nsos_gpu_gold_validation_t4_2026-07-27/report.md`](results/nsos_gpu_gold_validation_t4_2026-07-27/report.md) | Fail-closed GPU release-gate report from the Tesla T4 run |
+| [`results/nsos_gpu_gold_validation_t4_2026-07-27/result.json`](results/nsos_gpu_gold_validation_t4_2026-07-27/result.json) | Machine-readable GPU test, DP4A, checkpoint, mixed-precision and sanitizer results |
+| [`results/nsos_gpu_gold_validation_t4_2026-07-27/SHA256SUMS`](results/nsos_gpu_gold_validation_t4_2026-07-27/SHA256SUMS) | SHA-256 manifest for every generated validation artifact |
+| [`results/nsos_gpu_gold_validation_t4_2026-07-27/PROVENANCE.json`](results/nsos_gpu_gold_validation_t4_2026-07-27/PROVENANCE.json) | Exact source commit, environment, gate summary and downloaded-bundle hash |
+| [`results/nsos_gpu_gold_validation_t4_2026-07-27.zip`](results/nsos_gpu_gold_validation_t4_2026-07-27.zip) | Byte-exact evidence bundle downloaded from the successful Colab runtime |
 
 The notebook downloads the public bAbI data from its pinned upstream revision;
 the dataset itself is intentionally not committed. Its train and test SHA-256
@@ -33,6 +38,11 @@ notebook is optional evidence, not a dependency for reproduction.
 ## What has been validated
 
 - native NSOS CUDA build for `sm_75`;
+- fail-closed GPU CTest gate: 24/24 passed, with zero disabled or skipped;
+- Compute Sanitizer memcheck: 5/5 critical targets, zero errors and zero leaked bytes;
+- DP4A dispatch propagation through model-pack load and clones;
+- checkpoint v8 exact continuation and mixed-precision FP16 execution on Tesla T4;
+- real four-step incremental decode parity against CPU streaming and full decode;
 - native Rust/Python OxtaMem build and tests;
 - corrected MQAR comparison with non-zero training seeds 1, 2 and 3;
 - public `facebook/babi_qa`, configuration `en-10k-qa1`;

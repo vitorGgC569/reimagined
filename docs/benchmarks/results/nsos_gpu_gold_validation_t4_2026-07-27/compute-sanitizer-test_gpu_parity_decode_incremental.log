@@ -1,0 +1,22 @@
+$ /usr/local/cuda/bin/compute-sanitizer --tool memcheck --leak-check full --error-exitcode 99 --print-session-details /content/nsos-build-gpu-gold-sm75/test_gpu_parity_decode_incremental
+========= COMPUTE-SANITIZER
+========= Process ID:             3485
+========= Created:                2026-Jul-27 13:03:22
+========= System OS:              Linux
+========= OS build:               #1 SMP Thu Apr 30 18:17:14 UTC 2026
+========= System CPU:             Intel(R) Xeon(R) CPU @ 2.00GHz
+========= CPU architecture:       x86_64
+========= Computer Name:          d3b79d301386
+========= Target application:     /content/nsos-build-gpu-gold-sm75/test_gpu_parity_decode_incremental
+========= CUDA version:           13.0
+========= Display Driver version: 580.82.07
+========= 
+[GPUParity:decode_incremental] device=Tesla T4 cc=7.5 runtime=12080
+[GPUParity:decode_incremental] begin
+[GPUParity:decode_incremental] step=0 token=9 compared=cpu_stream+cpu_full
+[GPUParity:decode_incremental] step=1 token=11 compared=cpu_stream+cpu_full
+[GPUParity:decode_incremental] step=2 token=2 compared=cpu_stream+cpu_full
+[GPUParity:decode_incremental] step=3 token=13 compared=cpu_stream+cpu_full
+[GPUParity:decode_incremental] PASS
+========= LEAK SUMMARY: 0 bytes leaked in 0 allocations
+========= ERROR SUMMARY: 0 errors

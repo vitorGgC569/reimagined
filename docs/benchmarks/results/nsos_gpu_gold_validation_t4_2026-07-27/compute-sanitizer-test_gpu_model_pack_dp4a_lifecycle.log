@@ -1,0 +1,22 @@
+$ /usr/local/cuda/bin/compute-sanitizer --tool memcheck --leak-check full --error-exitcode 99 --print-session-details /content/nsos-build-gpu-gold-sm75/test_gpu_model_pack_dp4a_lifecycle
+========= COMPUTE-SANITIZER
+========= Process ID:             3464
+========= Created:                2026-Jul-27 13:03:21
+========= System OS:              Linux
+========= OS build:               #1 SMP Thu Apr 30 18:17:14 UTC 2026
+========= System CPU:             Intel(R) Xeon(R) CPU @ 2.00GHz
+========= CPU architecture:       x86_64
+========= Computer Name:          d3b79d301386
+========= Target application:     /content/nsos-build-gpu-gold-sm75/test_gpu_model_pack_dp4a_lifecycle
+========= CUDA version:           13.0
+========= Display Driver version: 580.82.07
+========= 
+[GPUParity:model_pack_dp4a_lifecycle] device=Tesla T4 cc=7.5 runtime=12080
+[GPUParity:model_pack_dp4a_lifecycle] begin
+[Tokenizer] Loading BPE model from /tmp/nsos_gpu_dp4a_lifecycle_pack/tokenizer.nsos...
+[Tokenizer] Loaded vocab size: 256
+[InferenceEngine] edge pack loaded; FP32 linear weights released (1.58-bit inference mode).
+[GPUParity:model_pack_dp4a_lifecycle] layer=0 load_dispatches=1 clone_dispatches=1
+[GPUParity:model_pack_dp4a_lifecycle] PASS
+========= LEAK SUMMARY: 0 bytes leaked in 0 allocations
+========= ERROR SUMMARY: 0 errors
