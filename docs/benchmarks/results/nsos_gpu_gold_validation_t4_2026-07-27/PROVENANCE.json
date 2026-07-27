@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "artifact_set_commit": "068a190a92d3add615bae088fe5448dc3ef0e8a8",
   "execution_date": "2026-07-27",
   "started_at": "2026-07-27T12:59:54.302744Z",
   "finished_at": "2026-07-27T13:03:24.728132Z",
@@ -44,19 +45,23 @@
   "downloaded_bundle": {
     "repository_path": "docs/benchmarks/results/nsos_gpu_gold_validation_t4_2026-07-27.zip",
     "bytes": 15023,
+    "git_blob_sha1": "dbfa510b38b8cfe00e573c015a14cb4310cb1844",
     "sha256": "1a2872a76c901b7e778e354724ece2544a4f289cd5ae0d0812f43ec69a0c76e7"
   },
   "core_artifacts": {
     "report.md": {
       "bytes": 2307,
+      "git_blob_sha1": "5d0d875550674ce79b2ec7ad658b01010414b5ac",
       "sha256": "2918cb0083c6f5fe653f28086328caa85562f772e13d2488d0a9efc1b109ef70"
     },
     "result.json": {
       "bytes": 6772,
+      "git_blob_sha1": "c4393f090eed83785320ac4919ab46e7029f2bf2",
       "sha256": "e4586d7ad01e699166323a701622eff31c2ababc3fddc55eafea16afe4c313f7"
     },
     "SHA256SUMS": {
       "bytes": 1769,
+      "git_blob_sha1": "c8e953aeca5c73b15ac2de9004c7748102918722",
       "sha256": "1ff6b4b72f12bd114066f583e4418fc804cd5a8f738485d3bf51a9b2ee63e638"
     }
   },
