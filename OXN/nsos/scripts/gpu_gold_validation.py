@@ -99,6 +99,18 @@ def require_tool(name: str) -> str:
     return resolved
 
 
+def select_cmake_generator() -> str:
+    """Select a deterministic, supported CMake backend without installing tools."""
+    if shutil.which("ninja"):
+        return "Ninja"
+    if shutil.which("make"):
+        return "Unix Makefiles"
+    raise ValidationFailure(
+        "no supported CMake build backend is available; "
+        "expected either ninja or make"
+    )
+
+
 def run_capture(
     command: Sequence[str],
     *,
@@ -185,8 +197,9 @@ def collect_preflight(
             f"gold GPU validation requires Linux, active platform is {sys.platform}"
         )
 
-    for tool in ("git", "cmake", "ninja", "nvcc", "nvidia-smi"):
+    for tool in ("git", "cmake", "nvcc", "nvidia-smi"):
         require_tool(tool)
+    cmake_generator = select_cmake_generator()
     sanitizer_path = require_tool("compute-sanitizer")
 
     _, gpu_csv = run_capture(
@@ -270,6 +283,7 @@ def collect_preflight(
         "software": {
             "python": sys.version.splitlines()[0],
             "cmake": cmake_version.splitlines()[0],
+            "cmake_generator": cmake_generator,
             "nvcc": nvcc_version.strip(),
             "compute_sanitizer": sanitizer_version.strip(),
             "compute_sanitizer_path": sanitizer_path,
@@ -285,6 +299,7 @@ def configure_and_build(
     *,
     jobs: int,
     architecture: str,
+    generator: str,
 ) -> None:
     configure_command = [
         "cmake",
@@ -293,7 +308,7 @@ def configure_and_build(
         "-B",
         str(build_dir),
         "-G",
-        "Ninja",
+        generator,
         "-DCMAKE_BUILD_TYPE=Release",
         "-DNSOS_BUILD_TESTS=ON",
         "-DNSOS_BUILD_PYTHON=OFF",
@@ -654,6 +669,7 @@ def main(argv: Iterable[str] = ()) -> int:
                 env,
                 jobs=args.jobs,
                 architecture=args.cuda_architecture,
+                generator=state["preflight"]["software"]["cmake_generator"],
             )
         state["gpu_ctest"], state["contract_outputs"] = run_gpu_suite(
             source_dir, build_dir, output_dir, env
