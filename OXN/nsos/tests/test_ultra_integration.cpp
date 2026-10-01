@@ -20,7 +20,7 @@ float ultra_evaluator(const Tensor &state) {
 void test_autodream_compression() {
     std::cout << "[UltraTest] Testing AutoDream (TurboQuant) Compression..." << std::endl;
     
-    MemorySystem mem;
+    MemorySystem mem(128);
     
     // Add 10 clusters to trigger background compression (threshold is 5)
     for (int i = 0; i < 10; ++i) {

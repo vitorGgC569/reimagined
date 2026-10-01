@@ -8,7 +8,11 @@ namespace nsos {
 #if defined(__aarch64__) || defined(__ARM_NEON)
     #define NSOS_ARCH_ARM
     #include <arm_neon.h>
-#elif defined(__x86_64__) || defined(_M_X64)
+// Use the AVX (__m256) packet path only when AVX is actually enabled (-mavx
+// defines __AVX__).  Keep the x86 path on MSVC (its build relies on it).  A
+// baseline build (-DNSOS_BASELINE_X86=ON, no -mavx) falls back to the scalar
+// GENERIC path below so the binary runs on pre-Haswell CPUs.
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__AVX__) || defined(_MSC_VER))
     #define NSOS_ARCH_X86
     #include <immintrin.h>
 #else
@@ -28,11 +32,19 @@ struct alignas(2) bfloat16 {
     bfloat16(float f) {
         // IEEE-754 float: Sign(1) | Exponent(8) | Mantissa(23)
         // BFloat16:       Sign(1) | Exponent(8) | Mantissa(7)
-        // Truncate mantissa (fastest) or Round (better)
-        // Rounding: add 0x8000 to round to nearest even
         union { float f; uint32_t i; } u = {f};
-        uint32_t rounded = u.i + 0x8000; // Rounding bias
-        bits = (rounded >> 16);
+        if (f != f) {
+            // NaN -> canonical bf16 quiet NaN, preserving the sign bit.  The
+            // previous fixed +0x8000 add could turn a NaN into Inf.
+            bits = static_cast<uint16_t>((u.i >> 16) | 0x0040u);
+            return;
+        }
+        // Round half to even (the previous fixed +0x8000 bias was half-up, not
+        // the "nearest even" the old comment claimed): the bias depends on the
+        // resulting LSB.
+        const uint32_t lsb = (u.i >> 16) & 1u;
+        const uint32_t rounding_bias = 0x7FFFu + lsb;
+        bits = static_cast<uint16_t>((u.i + rounding_bias) >> 16);
     }
 
     operator float() const {

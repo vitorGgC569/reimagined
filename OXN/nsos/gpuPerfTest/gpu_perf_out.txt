@@ -1,0 +1,10 @@
+=====================================================================
+ NSOS training throughput: GPU vs CPU (real JambaModel)
+=====================================================================
+ CUDA build. GPU runs use the cuBLAS matmul path.
+
+ config               | tok/step | CPU ms/step | GPU ms/step | GPU speedup | GPU tok/s
+ tiny  1L d64  v64    |     256  |      87.94  |      20.39  |      4.31x  |     12556
+ small 2L d256 v4k    |     512  |    2061.30  |     200.33  |     10.29x  |      2556
+ med   4L d512 v8k    |    1024  |   10985.32  |     833.90  |     13.17x  |      1228
+=====================================================================

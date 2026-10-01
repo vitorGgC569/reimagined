@@ -1,0 +1,21 @@
+$ /usr/local/cuda/bin/compute-sanitizer --tool memcheck --leak-check full --error-exitcode 99 --print-session-details /content/nsos-build-gpu-gold-sm75/test_gpu_mixed_precision_contract
+========= COMPUTE-SANITIZER
+========= Process ID:             3526
+========= Created:                2026-Jul-27 13:03:23
+========= System OS:              Linux
+========= OS build:               #1 SMP Thu Apr 30 18:17:14 UTC 2026
+========= System CPU:             Intel(R) Xeon(R) CPU @ 2.00GHz
+========= CPU architecture:       x86_64
+========= Computer Name:          d3b79d301386
+========= Target application:     /content/nsos-build-gpu-gold-sm75/test_gpu_mixed_precision_contract
+========= CUDA version:           13.0
+========= Display Driver version: 580.82.07
+========= 
+[GPUParity:mixed_precision_contract] device=Tesla T4 cc=7.5 runtime=12080
+[GPUParity:mixed_precision_contract] begin
+[GPUParity:mixed_precision_contract] active_sm=75
+[GPUParity:mixed_precision_contract] fp16=executed loss_scale=2048
+[GPUParity:mixed_precision_contract] bf16=rejected_as_unsupported
+[GPUParity:mixed_precision_contract] PASS
+========= LEAK SUMMARY: 0 bytes leaked in 0 allocations
+========= ERROR SUMMARY: 0 errors

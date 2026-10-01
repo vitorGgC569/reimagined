@@ -1,6 +1,22 @@
 #ifndef KERNEL_REFLECTION_H
 #define KERNEL_REFLECTION_H
 
+// ===========================================================================
+// DEMONSTRATION HEADER — NOT PRODUCTION CODE, AND UNSAFE IF INSTALLED.
+//
+// crash_handler() prints a HARDCODED, FABRICATED stack trace (it does not
+// unwind anything) and then throws from inside a signal handler, which is
+// undefined behaviour. Installing it would make real crashes report invented
+// locations while corrupting the failure path.
+//
+// Reachable only from tests/verify_roadmap.cpp, a standalone diagnostic that
+// is not a CMake target. Including this header without opting in is a hard
+// build error by design.
+// ===========================================================================
+#if !defined(NSOS_ALLOW_DEMONSTRATION_HEADERS)
+#error "kernel_reflection.h is demonstration-only scaffolding and installs an unsafe signal handler. Define NSOS_ALLOW_DEMONSTRATION_HEADERS to include it from a diagnostic target."
+#endif
+
 #include <iostream>
 #include <fstream>
 #include <string>

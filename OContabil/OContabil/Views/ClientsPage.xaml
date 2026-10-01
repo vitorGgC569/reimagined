@@ -1,0 +1,101 @@
+﻿<UserControl x:Class="OContabil.Views.ClientsPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:iconPacks="http://metro.mahapps.com/winfx/xaml/iconpacks"
+             FontFamily="Segoe UI" Loaded="OnLoaded">
+    <UserControl.Resources>
+        <ContextMenu x:Key="RowMenu" FontFamily="Segoe UI" FontSize="12">
+            <MenuItem Header="Excluir Cliente" Foreground="Red" Click="OnDeleteClient"/>
+        </ContextMenu>
+    </UserControl.Resources>
+
+    <StackPanel>
+        <!-- Toolbar -->
+        <DockPanel Margin="0,0,0,20">
+            <TextBox x:Name="txtSearch" Style="{DynamicResource InputBox}" Width="280"
+                     TextChanged="OnSearch" FontSize="11.5"/>
+            <Button DockPanel.Dock="Right" Style="{DynamicResource BtnPrimary}"
+                    Content="Novo Cliente" Click="OnAdd" HorizontalAlignment="Right"/>
+        </DockPanel>
+
+        <!-- Table -->
+        <Border Style="{DynamicResource Card}" Padding="0">
+            <DataGrid x:Name="gridClients" AutoGenerateColumns="False" IsReadOnly="True"
+                      Background="Transparent" BorderThickness="0"
+                      Foreground="{DynamicResource TextPrimary}"
+                      FontSize="12" RowBackground="Transparent" AlternatingRowBackground="Transparent"
+                      GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="{DynamicResource Border}"
+                      HeadersVisibility="Column" CanUserResizeRows="False" CanUserSortColumns="True">
+                <DataGrid.ColumnHeaderStyle>
+                    <Style TargetType="DataGridColumnHeader">
+                        <Setter Property="Background" Value="{DynamicResource BgElevated}"/>
+                        <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
+                        <Setter Property="FontSize" Value="10"/>
+                        <Setter Property="FontWeight" Value="SemiBold"/>
+                        <Setter Property="Padding" Value="14,10"/>
+                        <Setter Property="BorderThickness" Value="0"/>
+                    </Style>
+                </DataGrid.ColumnHeaderStyle>
+                <DataGrid.CellStyle>
+                    <Style TargetType="DataGridCell">
+                        <Setter Property="BorderThickness" Value="0"/>
+                        <Setter Property="Padding" Value="14,8"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="DataGridCell">
+                                    <Border Padding="{TemplateBinding Padding}" Background="Transparent">
+                                        <ContentPresenter VerticalAlignment="Center"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </DataGrid.CellStyle>
+                <DataGrid.RowStyle>
+                    <Style TargetType="DataGridRow">
+                        <Setter Property="Background" Value="Transparent"/>
+                        <Setter Property="ContextMenu" Value="{StaticResource RowMenu}"/>
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="{DynamicResource BgHover}"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </DataGrid.RowStyle>
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="EMPRESA" Binding="{Binding Name, Mode=OneWay}" Width="*"/>
+                    <DataGridTextColumn Header="CNPJ" Binding="{Binding Cnpj, Mode=OneWay}" Width="170">
+                        <DataGridTextColumn.ElementStyle>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="FontFamily" Value="Consolas"/>
+                                <Setter Property="FontSize" Value="11"/>
+                                <Setter Property="VerticalAlignment" Value="Center"/>
+                            </Style>
+                        </DataGridTextColumn.ElementStyle>
+                    </DataGridTextColumn>
+                    <DataGridTextColumn Header="EMAIL" Binding="{Binding Email, Mode=OneWay}" Width="200"/>
+                    <DataGridTextColumn Header="REGIME" Binding="{Binding TaxRegime, Mode=OneWay}" Width="140"/>
+                    <DataGridTextColumn Header="DOCS" Binding="{Binding DocumentCount, Mode=OneWay}" Width="60"/>
+                    <DataGridTextColumn Header="PENDENTES" Binding="{Binding PendingCount, Mode=OneWay}" Width="90"/>
+                    
+                    <DataGridTemplateColumn Header="AÇÕES" Width="50">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <Button Click="OnDeleteClient" 
+                                            Background="Transparent" BorderThickness="0" 
+                                            Foreground="IndianRed" 
+                                            Cursor="Hand" ToolTip="Excluir">
+                                        <iconPacks:PackIconMaterial Kind="DeleteOutline" Width="14" Height="14" IsHitTestVisible="False"/>
+                                    </Button>
+                                </StackPanel>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+        </Border>
+
+        <TextBlock x:Name="txtCount" Text="" FontSize="11" Foreground="{DynamicResource TextMuted}" Margin="0,10,0,0"/>
+    </StackPanel>
+</UserControl>

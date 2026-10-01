@@ -30,7 +30,7 @@ enum class CtxKey : int {
 class AbortException : public std::exception {
 public:
     const char* what() const noexcept override {
-        return "Inferência abortada via AbortController (Signal Atômico marcado como false/true)";
+        return "NSOS operation cancelled at a safe point";
     }
 };
 

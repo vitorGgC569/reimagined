@@ -42,6 +42,15 @@ void require(bool condition, const std::string& message) {
     }
 }
 
+void set_ipv4_address(sockaddr_in& address, const std::string& host) {
+#ifdef _WIN32
+    const int status = InetPtonA(AF_INET, host.c_str(), &address.sin_addr);
+#else
+    const int status = inet_pton(AF_INET, host.c_str(), &address.sin_addr);
+#endif
+    require(status == 1, "invalid IPv4 address: " + host);
+}
+
 void send_all_or_throw(SOCKET socket_fd, const std::string& bytes) {
     size_t sent_total = 0;
     while (sent_total < bytes.size()) {
@@ -66,7 +75,7 @@ std::string send_http_request(const std::string& host, int port, const std::stri
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
-    address.sin_addr.s_addr = inet_addr(host.c_str());
+    set_ipv4_address(address, host);
     require(connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
             "connect failed");
 
@@ -119,7 +128,7 @@ std::string send_chunked_http_request(const std::string& host, int port, const s
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
-    address.sin_addr.s_addr = inet_addr(host.c_str());
+    set_ipv4_address(address, host);
     require(connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
             "connect failed");
 
@@ -170,6 +179,8 @@ int main() {
         config.num_layers = 1;
         config.d_model = 32;
         config.vocab_size = 256;
+        config.n_heads = 4;
+        config.n_kv_heads = 2;
         config.max_context_tokens = 64;
 
         InferenceEngine engine;
@@ -188,7 +199,11 @@ int main() {
         server_config.max_train_steps = 8;
 
         HttpApiServer server(engine, server_config);
+        engine.request_training_cancellation();
         require(server.start(), "server.start failed");
+        require(!engine.training_cancellation_requested(),
+                "server.start retained a cancellation request from an old "
+                "lifecycle");
 
         std::thread server_thread([&]() { server.serve_forever(); });
         ServerThreadGuard server_thread_guard{&server, &server_thread};
@@ -202,7 +217,11 @@ int main() {
 
         const std::string health = send_http_request("127.0.0.1", port, "GET", "/health");
         require(health.find("200 OK") != std::string::npos, "health endpoint failed");
-        require(health.find("\"status\":\"ok\"") != std::string::npos, "health body mismatch");
+        require(health.find("\"status\":\"alive\"") != std::string::npos, "health body mismatch");
+        const std::string ready = send_http_request("127.0.0.1", port, "GET", "/ready");
+        require(ready.find("200 OK") != std::string::npos &&
+                    ready.find("\"status\":\"ready\"") != std::string::npos,
+                "ready endpoint did not report the initialized model");
 
         const std::string unauthorized =
             send_http_request("127.0.0.1", port, "GET", "/metrics");
@@ -226,6 +245,12 @@ int main() {
         require(generate.find("200 OK") != std::string::npos, "generate endpoint failed");
         require(generate.find("\"text\":") != std::string::npos,
                 "generate response missing text");
+
+        const std::string generate_with_server_default = send_http_request(
+            "127.0.0.1", port, "POST", "/generate",
+            "{\"prompt\":\"0123\",\"temperature\":0.0}", auth_headers);
+        require(generate_with_server_default.find("200 OK") != std::string::npos,
+                "generate without max_tokens must use the server-side cap");
 
         const std::string unicode_generate = send_http_request(
             "127.0.0.1", port, "POST", "/generate",
@@ -254,7 +279,7 @@ int main() {
 
         const std::string batch = send_http_request(
             "127.0.0.1", port, "POST", "/generate_batch",
-            "{\"prompts\":[\"01\",\"12\"],\"max_tokens\":2}", auth_headers);
+            "{\"prompts\":[\"01\",\"1234\"],\"max_tokens\":2}", auth_headers);
         require(batch.find("200 OK") != std::string::npos, "generate_batch endpoint failed");
         require(batch.find("\"outputs\":") != std::string::npos,
                 "generate_batch missing outputs");
@@ -265,6 +290,47 @@ int main() {
         require(stream.find("200 OK") != std::string::npos, "generate_stream endpoint failed");
         require(stream.find("event: done") != std::string::npos,
                 "generate_stream missing done event");
+        const size_t stream_headers_end = stream.find("\r\n\r\n");
+        require(stream_headers_end != std::string::npos,
+                "generate_stream response missing header terminator");
+        require(stream.substr(0, stream_headers_end).find("Content-Length:") ==
+                    std::string::npos,
+                "generate_stream must not declare a fixed content length");
+        const size_t done_pos = stream.find("event: done");
+        const size_t last_chunk_pos = stream.rfind("event: chunk");
+        require(last_chunk_pos == std::string::npos || last_chunk_pos < done_pos,
+                "generate_stream emitted a chunk after the done event");
+
+        const std::string invalid_content_length = send_http_request(
+            "127.0.0.1", port, "POST", "/generate", {},
+            {"Authorization: Bearer test-secret", "Content-Length: 2x"});
+        require(invalid_content_length.find("400 Bad Request") != std::string::npos,
+                "invalid content-length suffix should be rejected");
+        const std::string signed_content_length = send_http_request(
+            "127.0.0.1", port, "POST", "/generate", {},
+            {"Authorization: Bearer test-secret", "Content-Length: +0"});
+        require(signed_content_length.find("400 Bad Request") != std::string::npos,
+                "signed content-length should be rejected");
+        const std::string invalid_header_name = send_http_request(
+            "127.0.0.1", port, "GET", "/info", {},
+            {"Authorization: Bearer test-secret", "Bad@Header: value"});
+        require(invalid_header_name.find("400 Bad Request") != std::string::npos,
+                "non-token HTTP header name should be rejected");
+
+        const auto parameters_before_rejected_train = engine.model->parameters();
+        require(!parameters_before_rejected_train.empty(), "model has no parameters");
+        const float weight_before_rejected_train =
+            parameters_before_rejected_train.front()->data.data()[0];
+        const int step_before_rejected_train = engine.trainer->global_step_count;
+        const std::string rejected_train_batch = send_http_request(
+            "127.0.0.1", port, "POST", "/train-batch",
+            "{\"texts\":[\"01230123\",\"A\"],\"epochs\":1}", auth_headers);
+        require(rejected_train_batch.find("400 Bad Request") != std::string::npos,
+                "train-batch should reject samples shorter than two tokens");
+        require(engine.model->parameters().front()->data.data()[0] ==
+                    weight_before_rejected_train &&
+                    engine.trainer->global_step_count == step_before_rejected_train,
+                "rejected administrative training mutated live model state");
 
         std::atomic<int> concurrent_ok{0};
         std::vector<std::thread> clients;
@@ -300,6 +366,8 @@ int main() {
         strict_config.num_layers = 1;
         strict_config.d_model = 32;
         strict_config.vocab_size = 16;
+        strict_config.n_heads = 4;
+        strict_config.n_kv_heads = 2;
         strict_config.max_context_tokens = 32;
 
         InferenceEngine strict_engine;
@@ -332,10 +400,11 @@ int main() {
             "127.0.0.1", strict_port, "POST", "/train-corpus",
             "{\"corpus\":\"A\",\"epochs\":1,\"batch_size\":1,\"seq_len\":4}",
             strict_auth_headers);
-        require(strict_train_corpus.find("400 Bad Request") != std::string::npos,
-                "train-corpus should fail on tokenizer/model vocab mismatch");
-        require(strict_train_corpus.find("Tokenizer/model vocabulary mismatch") != std::string::npos,
-                "train-corpus should surface explicit vocab mismatch");
+        require(strict_train_corpus.find("500 Internal Server Error") != std::string::npos,
+                "train-corpus internal model mismatch should return HTTP 500");
+        require(strict_train_corpus.find("Tokenizer/model vocabulary mismatch") ==
+                    std::string::npos,
+                "train-corpus must not leak internal model details");
 
         const std::string info_one =
             send_http_request("127.0.0.1", strict_port, "GET", "/info", {}, strict_auth_headers);
@@ -358,6 +427,17 @@ int main() {
         HttpApiServer unauth_server(unauth_engine, unauth_config);
         require(!unauth_server.start(), "server without token should fail unless explicitly allowed");
 
+        InferenceEngine untrusted_proxy_engine;
+        require(untrusted_proxy_engine.load_model("", config), "proxy load_model failed");
+        HttpApiServerConfig untrusted_proxy_config;
+        untrusted_proxy_config.host = "127.0.0.1";
+        untrusted_proxy_config.port = 0;
+        untrusted_proxy_config.auth_token = "proxy-secret";
+        untrusted_proxy_config.trust_proxy_headers = true;
+        HttpApiServer untrusted_proxy_server(untrusted_proxy_engine, untrusted_proxy_config);
+        require(!untrusted_proxy_server.start(),
+                "proxy-header trust without an exact peer allowlist should fail");
+
         InferenceEngine locked_engine;
         require(locked_engine.load_model("", config), "locked load_model failed");
         HttpApiServerConfig locked_config;
@@ -379,6 +459,33 @@ int main() {
         require(disabled_train.find("403 Forbidden") != std::string::npos,
                 "train-text should be disabled without admin flag");
         locked_server.stop();
+
+        HttpApiServerConfig tls_config = locked_config;
+        tls_config.auth_token = "container-health-secret";
+        tls_config.allow_unauthenticated_health = false;
+        tls_config.trust_proxy_headers = true;
+        tls_config.require_tls_proxy_header = true;
+        tls_config.trusted_proxy_ips = {"127.0.0.2"};
+        HttpApiServer tls_server(locked_engine, tls_config);
+        require(tls_server.start(), "TLS proxy server did not start");
+        std::thread tls_thread([&]() { tls_server.serve_forever(); });
+        ServerThreadGuard tls_guard{&tls_server, &tls_thread};
+        const std::vector<std::string> tls_auth = {
+            "Authorization: Bearer container-health-secret"};
+        const auto local_ready = send_http_request("127.0.0.1", tls_server.port(),
+            "GET", "/ready", {}, tls_auth);
+        require(local_ready.find("200 OK") != std::string::npos,
+                "authenticated loopback readiness must not require a proxy header");
+        const auto no_auth_ready = send_http_request("127.0.0.1", tls_server.port(),
+            "GET", "/ready", {}, {});
+        require(no_auth_ready.find("401 Unauthorized") != std::string::npos,
+                "loopback readiness must still require authentication");
+        const auto insecure_info = send_http_request("127.0.0.1", tls_server.port(),
+            "GET", "/info", {}, tls_auth);
+        require(insecure_info.find("426 Upgrade Required") != std::string::npos &&
+                    insecure_info.find("https_required") != std::string::npos,
+                "health exception must not bypass TLS enforcement on other routes");
+        tls_server.stop();
 
         std::cout << "HTTP API hardening test passed!" << std::endl;
         return 0;

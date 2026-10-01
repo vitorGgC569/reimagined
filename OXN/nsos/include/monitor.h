@@ -2,10 +2,12 @@
 #define MONITOR_H
 
 #include "tensor.h"
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace nsos {
 
@@ -16,35 +18,32 @@ public:
     return inst;
   }
 
-  bool enabled = false;
-  bool verbose = false;
+  std::atomic<bool> enabled{false};
+  std::atomic<bool> verbose{false};
 
-  void enable() { enabled = true; }
-  void disable() { enabled = false; }
-  void set_verbose(bool v) { verbose = v; }
+  void enable() { enabled.store(true, std::memory_order_release); }
+  void disable() { enabled.store(false, std::memory_order_release); }
+  void set_verbose(bool v) {
+    verbose.store(v, std::memory_order_release);
+  }
 
   void check(const Tensor &t, const std::string &tag) {
-    if (!enabled)
+    if (!enabled.load(std::memory_order_acquire))
       return;
+    const bool verbose_now = verbose.load(std::memory_order_acquire);
 
-    // Use sanitize logic but just logging
-    // Note: Accessing data requires device check to avoid crash
-    if (t.get_device() == Device::GPU) {
-      // Todo: GPU Kernel for IsNan/IsInf
-      if (verbose) {
-        // std::cout << "[MONITOR] " << tag << " (GPU - Check Skipped)" <<
-        // std::endl;
-      }
-      return;
-    }
-
-    const float *d = t.data();
-    int nan_cnt = 0;
-    int inf_cnt = 0;
+    // Monitoring is explicitly opt-in, so a synchronous diagnostic copy is
+    // preferable to silently skipping GPU tensors. Tensor::to propagates copy
+    // and backend failures; a failed health check therefore cannot look clean.
+    Tensor inspected =
+        t.get_device() == Device::GPU ? t.to(Device::CPU) : t;
+    const float *d = inspected.data();
+    std::int64_t nan_cnt = 0;
+    std::int64_t inf_cnt = 0;
     float max_val = 0.0f;
-    float sum = 0.0f;
+    double sum = 0.0;
 
-    for (int i = 0; i < t.size; ++i) {
+    for (std::int64_t i = 0; i < inspected.size; ++i) {
       float val = d[i];
       if (std::isnan(val))
         nan_cnt++;
@@ -53,7 +52,7 @@ public:
       else {
         if (std::abs(val) > max_val)
           max_val = std::abs(val);
-        if (verbose)
+        if (verbose_now)
           sum += val;
       }
     }
@@ -62,11 +61,13 @@ public:
       std::cerr << "[MONITOR] 🚨 HEALTH ALERT at " << tag << ": " << nan_cnt
                 << " NaNs, " << inf_cnt << " Infs. MaxVal=" << max_val
                 << std::endl;
-      // throw std::runtime_error("Numerical instability detected"); // Optional
-      // strict mode
+      throw std::runtime_error(
+          "Monitor detected non-finite values in tensor '" + tag + "'");
     } else {
-      if (verbose) {
-        float mean = sum / (t.size + 1e-6);
+      if (verbose_now) {
+        const double mean = inspected.size == 0
+                                ? 0.0
+                                : sum / static_cast<double>(inspected.size);
         std::cout << "[MONITOR] " << tag << " OK. Max=" << max_val
                   << " Mean=" << mean << std::endl;
       }

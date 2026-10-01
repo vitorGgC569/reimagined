@@ -122,3 +122,11 @@ OXN/nsos/artifacts/bench_*.json
 # Test results
 OXN/nsos/scripts/test_v10_results.log
 OXN/nsos/cpp_cuda_log.txt
+artifacts/
+
+# Agent state & external folders
+.maestri/
+.oma/
+QwenImages/
+benchmark_results/
+*.state

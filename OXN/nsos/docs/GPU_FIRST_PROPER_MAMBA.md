@@ -1,0 +1,117 @@
+# GPU-first: proper selective SSM (revisão de implementação)
+
+Status: implementado e revisado (2026-06-14). A via corrigida do Mamba
+(`NSOS_MAMBA_PROPER_SSM`) deixou de ser host-only e agora é **GPU-residente**.
+
+## O que foi tornado GPU-first
+
+`Mamba2SSD::forward_proper` / `backward_proper` (src/mamba2.cpp) agora são
+**device-aware**: ficam no device do input, sem round-trip para o host.
+
+- **Projeções** δ/B/C/z + out_proj: caminho GPU do `BitLinear` (já existente).
+- **conv1d causal depthwise**: novos kernels CUDA
+  `launch_conv1d_causal_forward` / `_backward` (src/cuda/mamba_kernels.cu).
+- **Scan diagonal (readout linear `y=h*C`)**: novos launchers
+  `launch_mamba_proper_scan_forward` / `_backward`, implementados como o flag
+  `linear_readout` dos kernels de scan seletivo já validados (mesma recorrência
+  afim; o readout linear preserva a validade do prefix-scan).
+- **silu(conv)**, **gate `y·silu(z)`**, **skip `u·D`**, **grad_D**: ops `Tensor`
+  device-agnósticas (já têm fast-path GPU).
+- `Mamba2SSD::to(GPU)` move TODOS os componentes da via proper para o device.
+
+Caminho host preservado como fallback (CPU) — mesma matemática.
+
+## Validação
+
+- **CPU**: `test_gradcheck` (build local MSVC) — `mamba2-proper` d/input 6.2e-3,
+  d/A 1.9e-3, d/conv1d 3.5e-3, todos < 1e-1. **Verde, reprodutível.**
+- **GPU/T4**: `tests/gpu/test_gpu_parity_mamba_proper.cpp` (registrado no CTest)
+  compara forward + grad-de-input CPU vs GPU dentro de 1e-3. Rodar no T4.
+
+## Oportunidades de melhoria (revisão — itens honestos, rastreados)
+
+1. **Parallel-prefix para o scan proper — FEITO.** O kernel Hillis-Steele afim já
+   validado ganhou o readout linear (flag `linear_readout`) e
+   `launch_mamba_proper_scan_forward` roteia para ele sob `NSOS_MAMBA_PARALLEL_SCAN`
+   (Seq≤1024): forward `O(log Seq)` para a via diagonal proper. Default OFF mantém
+   o kernel sequencial como referência; validar paridade no T4. (Backward proper
+   segue sequencial — paraleliza sobre B·D canais, que satura no treino.)
+2. **Kernel fundido de SiLU/dSiLU — micro-opt documentada.** silu e sua derivada
+   usam ops `Tensor` elementwise (já GPU). Fundir num kernel único cortaria
+   ~poucas launches por silo; ganho marginal, deixado como opt futura (não vale
+   CUDA adicional não-testável localmente para ganho negligível).
+3. **Determinismo na via proper-GPU.** A conv1d-backward (`grad_in`/`grad_weight`)
+   e o `grad_A` do scan usam `atomicAdd` (não-determinístico). `NSOS_DETERMINISTIC`
+   AINDA NÃO roteia a via proper-GPU para host (o caminho host já é determinístico).
+   Refinamento rastreado: sob o flag, computar conv/scan-backward em host (cópias)
+   mesmo em modelo GPU. Não foi adicionado às cegas (sem nvcc local) para não
+   introduzir código GPU não-validado.
+4. **Decode incremental.** `forward()` na via proper recomputa o scan inteiro a
+   cada chamada (sem cache de streaming) → decode autoregressivo é O(n²). Um
+   caminho single-token com estado persistente (como o legado) é otimização futura.
+5. **N-state (Mamba-2 completo) — #13 — FEITO.** Implementado sob
+   `MambaConfig::proper_state_expansion`: estado h ∈ R^{H×P×N}, dt/A por-cabeça,
+   B/C por-cabeça N-dim, readout linear y=Σ_n h·C. CPU forward+backward (BPTT com
+   reduções cross-p/cross-n) gradcheck-ado (mamba2-nstate d/input 1.19e-2, d/A
+   5.9e-4, d/conv1d 1.5e-2). Kernels CUDA GPU-residentes `mamba_nstate_forward/
+   backward` (estado em registradores, atomicAdd onde há contenção entre canais p;
+   fallback host se N>MAX_N=64), com paridade `test_gpu_parity_mamba_nstate`
+   (validar no T4). NOTA: o `mamba_ssd_forward_kernel` chunked legado segue
+   presente mas o caminho novo usa kernels próprios casados 1:1 com o host.
+
+## Oportunidades GPU-first pré-existentes (fora desta entrega)
+
+Do `docs/GPU_OPTIMIZATION_ANALYSIS.md`: MoE top-k via `std::partial_sort` no host;
+ausência de pinned memory para H2D; CUDA Graphs para shapes estáticos weight-tied;
+`persistent_kernel` stub a remover. Rastreados para PRs próprios.
+
+## CUDA-graph decode fim-a-fim — ARQUIVADO (2026-07-03)
+
+O decode via CUDA graph fim-a-fim foi **arquivado** (`forward_ids_decode_graph`
+desabilitado por padrão → fallback eager; kernels de atenção revertidos à forma
+sem `pos_dev`).  Ao validá-lo no T4 (e reproduzido localmente no sm_61 sob
+`compute-sanitizer`), a falha foi rastreada a um **bug PRÉ-EXISTENTE fora do
+código do graph**: o decode single-token *streaming* de um híbrido (mixer Mamba
++ atenção GQA) lê posição/contagem de KV **lixo** nos kernels de append/decode
+da atenção — OOB válido sob `-O0`/instrumentado, lixo sob `-O3` (heisenbug de UB
+dependente do otimizador).  Reproduz com o graph revertido, com `NSOS_MAMBA_
+GPU_STEP=0`, com MoE off e com N-state off → **independente de toda mudança
+GPU-first deste branch**; afeta só o decode de INFERÊNCIA de híbridos (TREINO
+não é afetado).  Conserto exige debugger no binário que falha — rastreado como
+bug separado.  **Os ganhos GPU-first VALIDADOS por paridade (T4 + sm_61 local)
+permanecem**: passo Mamba diagonal E N-state device-resident
+(`test_gpu_parity_mamba_proper_stream`, `_nstate_stream`), MoE device
+(`test_gpu_parity_moe_router`), medição D2H pinned vs pageable.
+
+### (histórico) CUDA-graph decode fim-a-fim — mecanismo implementado
+
+`JambaModel::forward_ids_decode_graph` captura UM forward single-token num
+CUDA graph e o replay-a por token: a cascata de launches por token vira 1
+`cudaGraphLaunch`. Peças: (a) build `-DNSOS_CUDA_PTDS=ON` (per-thread default
+stream — a legacy stream não é capturável; muda semântica global, então a
+suíte inteira de gates roda sob ela no notebook); (b) token+posição entram por
+staging PINNED relido pelos nós memcpy capturados a cada replay; (c) kernels
+de decode da atenção ganharam variante device-pos (`pos_dev`) + shared scratch
+dimensionado pela CAPACIDADE do cache (args host congelam na captura);
+(d) passo Mamba device-resident cobre a via diagonal E a N-state
+(`mamba_nstate_step_kernel`, gate `test_gpu_parity_mamba_nstate_stream`);
+(e) MoE decode single-row roda o caminho DENSO device-resident (todos os
+experts na linha + acumulação com peso lido da GPU — pesos não-selecionados
+são 0.0f pós-mask/renorm device, soma bit-igual ao dispatch top-k, mesma ordem
+de acumulação) → zero D2H por token e capturável; router não faz mais D2H de
+saved_probs_/loads na inferência (só treino lê); (f) BitLinear com cache de
+inferência do ternário (a absmean por-forward fazia D2H síncrono);
+(g) adoção GUARDADA: warm-up eager → captura com snapshot/restore em falha →
+fallback eager permanente com razão em `decode_graph_status()`.
+
+**Defaults GPU-first:** `NSOS_MAMBA_GPU_STEP` (passo device), `NSOS_GPU_SAMPLER`
+(argmax greedy on-device) e `NSOS_CUDA_GRAPH_DECODE` (em builds PTDS) são
+**default ON**; `=0` desliga cada um. Declina apenas: TTT (adaptação host por
+token), MoE com num_experts>32 (cai no dispatch batched host-synced),
+`NSOS_CUDA_SYNC=1` e builds sem PTDS. O gate suportado hoje é
+`test_gpu_parity_decode_incremental`: prefill + decode token-a-token em modelo
+híbrido Mamba/atenção, comparado contra streaming CPU e recomputação integral
+do prefixo. A reprodução específica de CUDA Graph continua não promovida até
+existir um gate de replay real; não há mais teste “SHELVED” que retorne sucesso.
+Medição: pinned vs pageable D2H via `nsos.bench_d2h_copy` +
+`NSOS_D2H_TIMING=1` no sampler; notebook `colab/bench_decode_graph_t4.ipynb`.

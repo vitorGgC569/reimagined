@@ -8,9 +8,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nsos::lut_cas {
 
@@ -19,6 +22,135 @@ namespace {
 // FNV-1a 64-bit checksum used at end of file format.
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr uint64_t kFnvPrime  = 1099511628211ull;
+constexpr uint64_t kMaxCasFileBytes = 512ull * 1024ull * 1024ull;
+constexpr uint32_t kMaxMatrices = 100'000u;
+constexpr uint64_t kSingleHeaderBytes = 25u;
+constexpr uint64_t kMultiHeaderBytes = 17u;
+constexpr uint64_t kChecksumBytes = sizeof(uint64_t);
+
+bool valid_tile_k(TileK k) {
+    return k == TileK::K4 || k == TileK::K8;
+}
+
+uint32_t max_patterns(TileK k) {
+    return k == TileK::K4 ? 81u : (k == TileK::K8 ? 6561u : 0u);
+}
+
+bool checked_add(uint64_t lhs, uint64_t rhs, uint64_t& out) {
+    if (lhs > (std::numeric_limits<uint64_t>::max)() - rhs) return false;
+    out = lhs + rhs;
+    return true;
+}
+
+bool checked_mul(uint64_t lhs, uint64_t rhs, uint64_t& out) {
+    if (lhs != 0 && rhs > (std::numeric_limits<uint64_t>::max)() / lhs) {
+        return false;
+    }
+    out = lhs * rhs;
+    return true;
+}
+
+bool expected_layout(int rows, int cols, TileK k, uint64_t& tiles,
+                     uint64_t& packed_bytes) {
+    if (rows <= 0 || cols <= 0 || !valid_tile_k(k)) return false;
+    const uint64_t k_value = static_cast<uint64_t>(static_cast<int>(k));
+    if ((static_cast<uint64_t>(cols) % k_value) != 0) return false;
+    if (!checked_mul(static_cast<uint64_t>(rows),
+                     static_cast<uint64_t>(cols) / k_value, tiles)) {
+        return false;
+    }
+    if (!checked_mul(tiles, k_value / 4u, packed_bytes)) return false;
+    return tiles <= static_cast<uint64_t>((std::numeric_limits<int>::max)()) &&
+           packed_bytes <= kMaxCasFileBytes;
+}
+
+bool validate_dictionary(const std::vector<DictEntry>& dictionary, TileK k,
+                         uint64_t expected_occurrences) {
+    const uint32_t pattern_cap = max_patterns(k);
+    if (pattern_cap == 0 || dictionary.empty() ||
+        dictionary.size() > pattern_cap ||
+        dictionary.size() >
+            static_cast<size_t>((std::numeric_limits<uint16_t>::max)())) {
+        return false;
+    }
+    uint64_t occurrences = 0;
+    std::unordered_set<uint32_t> seen;
+    seen.reserve(dictionary.size());
+    for (const auto& entry : dictionary) {
+        if (entry.pattern >= pattern_cap || entry.count == 0 ||
+            !seen.insert(entry.pattern).second ||
+            !checked_add(occurrences, entry.count, occurrences)) {
+            return false;
+        }
+    }
+    return occurrences == expected_occurrences;
+}
+
+bool validate_pack(const CasPack& pack,
+                   const std::vector<DictEntry>& dictionary) {
+    uint64_t expected_tiles = 0;
+    uint64_t packed_bytes = 0;
+    if (!expected_layout(pack.rows, pack.cols, pack.k, expected_tiles,
+                         packed_bytes) ||
+        static_cast<uint64_t>(pack.total_tiles) != expected_tiles ||
+        pack.tile_indices.size() != expected_tiles ||
+        pack.unique_tiles != static_cast<int>(dictionary.size()) ||
+        !validate_dictionary(dictionary, pack.k, expected_tiles)) {
+        return false;
+    }
+    for (uint16_t index : pack.tile_indices) {
+        if (static_cast<size_t>(index) >= dictionary.size()) return false;
+    }
+    return true;
+}
+
+bool validate_multi_pack(const CasMultiPack& multi, uint64_t* serialized_bytes) {
+    if (!valid_tile_k(multi.k) || multi.matrices.empty() ||
+        multi.matrices.size() > kMaxMatrices ||
+        multi.total_matrices != multi.matrices.size()) {
+        return false;
+    }
+    uint64_t aggregate_tiles = 0;
+    uint64_t file_bytes = kMultiHeaderBytes;
+    uint64_t dictionary_bytes = 0;
+    if (!checked_mul(multi.shared_dictionary.size(), sizeof(DictEntry),
+                     dictionary_bytes) ||
+        !checked_add(file_bytes, dictionary_bytes, file_bytes)) {
+        return false;
+    }
+    for (const auto& pack : multi.matrices) {
+        uint64_t expected_tiles = 0;
+        uint64_t expected_bytes = 0;
+        uint64_t index_bytes = 0;
+        if (pack.k != multi.k ||
+            !expected_layout(pack.rows, pack.cols, pack.k, expected_tiles,
+                             expected_bytes) ||
+            static_cast<uint64_t>(pack.total_tiles) != expected_tiles ||
+            pack.tile_indices.size() != expected_tiles ||
+            pack.unique_tiles !=
+                static_cast<int>(multi.shared_dictionary.size()) ||
+            !checked_add(aggregate_tiles, expected_tiles, aggregate_tiles) ||
+            !checked_mul(expected_tiles, sizeof(uint16_t), index_bytes) ||
+            !checked_add(file_bytes, 12u, file_bytes) ||
+            !checked_add(file_bytes, index_bytes, file_bytes)) {
+            return false;
+        }
+        for (uint16_t index : pack.tile_indices) {
+            if (static_cast<size_t>(index) >= multi.shared_dictionary.size()) {
+                return false;
+            }
+        }
+    }
+    if (aggregate_tiles != multi.total_tiles_all ||
+        !validate_dictionary(multi.shared_dictionary, multi.k,
+                             aggregate_tiles) ||
+        !checked_add(file_bytes, kChecksumBytes, file_bytes) ||
+        file_bytes > kMaxCasFileBytes) {
+        return false;
+    }
+    if (serialized_bytes) *serialized_bytes = file_bytes;
+    return true;
+}
 
 static uint64_t fnv1a_update(uint64_t h, const void* data, size_t n) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -115,18 +247,20 @@ static void unpack_key_k8(uint32_t key, uint8_t* dst_two_bytes) {
 // ── Single-matrix encode ────────────────────────────────────────────
 
 CasPack encode(const std::vector<uint8_t>& packed, int rows, int cols, TileK k) {
+    uint64_t total_tiles_u64 = 0;
+    uint64_t expected_bytes = 0;
+    if (!expected_layout(rows, cols, k, total_tiles_u64, expected_bytes)) {
+        throw std::runtime_error("lut_cas::encode: invalid or oversized dimensions");
+    }
+    if (packed.size() != expected_bytes) {
+        throw std::runtime_error("lut_cas::encode: packed payload size mismatch");
+    }
     CasPack out;
     out.k = k;
     out.rows = rows;
     out.cols = cols;
 
-    const int total_weights = rows * cols;
-    const int k_int = static_cast<int>(k);
-    if (cols % k_int != 0) {
-        throw std::runtime_error("lut_cas::encode: cols must be divisible by k");
-    }
-    const int tiles_per_row = cols / k_int;
-    out.total_tiles = rows * tiles_per_row;
+    out.total_tiles = static_cast<int>(total_tiles_u64);
     out.tile_indices.reserve(static_cast<size_t>(out.total_tiles));
 
     std::unordered_map<uint32_t, uint32_t> pattern_to_dict_idx;
@@ -176,11 +310,16 @@ CasPack encode(const std::vector<uint8_t>& packed, int rows, int cols, TileK k) 
 // ── Single-matrix decode ────────────────────────────────────────────
 
 std::vector<uint8_t> decode(const CasPack& pack) {
+    if (!validate_pack(pack, pack.dictionary)) {
+        throw std::runtime_error("lut_cas::decode: invalid pack");
+    }
     const int k_int = static_cast<int>(pack.k);
     const int bytes_per_tile = k_int / 4;     // K4 = 1 byte; K8 = 2 bytes
-    const int total_bytes = pack.total_tiles * bytes_per_tile;
+    const size_t total_bytes =
+        static_cast<size_t>(pack.total_tiles) *
+        static_cast<size_t>(bytes_per_tile);
 
-    std::vector<uint8_t> out(static_cast<size_t>(total_bytes), 0);
+    std::vector<uint8_t> out(total_bytes, 0);
     for (int t = 0; t < pack.total_tiles; ++t) {
         const uint16_t dict_idx = pack.tile_indices[static_cast<size_t>(t)];
         const uint32_t key = pack.dictionary[dict_idx].pattern;
@@ -202,21 +341,35 @@ CasMultiPack encode_multi(
     if (matrices.size() != rows_cols.size()) {
         throw std::runtime_error("encode_multi: matrices and rows_cols mismatch");
     }
+    if (matrices.size() > kMaxMatrices || !valid_tile_k(k)) {
+        throw std::runtime_error("encode_multi: invalid tile width or too many matrices");
+    }
+    uint64_t aggregate_input_bytes = 0;
+    for (const auto& matrix : matrices) {
+        if (!checked_add(aggregate_input_bytes, matrix.size(),
+                         aggregate_input_bytes) ||
+            aggregate_input_bytes > kMaxCasFileBytes) {
+            throw std::runtime_error("encode_multi: aggregate payload is too large");
+        }
+    }
+
     CasMultiPack out;
     out.k = k;
     out.total_matrices = matrices.size();
 
     std::unordered_map<uint32_t, uint32_t> global_pattern_to_dict;
 
-    const int k_int = static_cast<int>(k);
     for (size_t m = 0; m < matrices.size(); ++m) {
         const int rows = rows_cols[m].first;
         const int cols = rows_cols[m].second;
-        if (cols % k_int != 0) {
-            throw std::runtime_error("encode_multi: matrix cols must be divisible by k");
+        uint64_t total_tiles_u64 = 0;
+        uint64_t expected_bytes = 0;
+        if (!expected_layout(rows, cols, k, total_tiles_u64, expected_bytes) ||
+            matrices[m].size() != expected_bytes) {
+            throw std::runtime_error(
+                "encode_multi: invalid dimensions or packed payload size");
         }
-        const int tiles_per_row = cols / k_int;
-        const int total_tiles = rows * tiles_per_row;
+        const int total_tiles = static_cast<int>(total_tiles_u64);
 
         CasPack pack;
         pack.k = k;
@@ -247,10 +400,10 @@ CasMultiPack encode_multi(
         out.total_tiles_all += static_cast<size_t>(total_tiles);
     }
 
-    // Stamp each per-matrix pack with a reference to the shared dictionary
-    // for convenience (so single-matrix API works on them too).
+    // Matrix packs intentionally do not duplicate the shared dictionary.
+    // decode_multi supplies it by reference, keeping memory proportional to
+    // one dictionary instead of matrices * dictionary.
     for (auto& pack : out.matrices) {
-        pack.dictionary = out.shared_dictionary;
         pack.unique_tiles = static_cast<int>(out.shared_dictionary.size());
     }
 
@@ -271,10 +424,56 @@ CasMultiPack encode_multi(
 }
 
 std::vector<std::vector<uint8_t>> decode_multi(const CasMultiPack& multi) {
+    if (!valid_tile_k(multi.k) || multi.matrices.size() > kMaxMatrices) {
+        throw std::runtime_error("decode_multi: invalid multi-pack");
+    }
+    uint64_t aggregate_tiles = 0;
+    for (const auto& pack : multi.matrices) {
+        if (pack.k != multi.k) {
+            throw std::runtime_error("decode_multi: mixed tile widths");
+        }
+        uint64_t expected_tiles = 0;
+        uint64_t expected_bytes = 0;
+        if (!expected_layout(pack.rows, pack.cols, pack.k, expected_tiles,
+                             expected_bytes) ||
+            static_cast<uint64_t>(pack.total_tiles) != expected_tiles ||
+            pack.tile_indices.size() != expected_tiles ||
+            pack.unique_tiles !=
+                static_cast<int>(multi.shared_dictionary.size()) ||
+            !checked_add(aggregate_tiles, expected_tiles, aggregate_tiles)) {
+            throw std::runtime_error("decode_multi: invalid matrix metadata");
+        }
+        for (uint16_t index : pack.tile_indices) {
+            if (static_cast<size_t>(index) >= multi.shared_dictionary.size()) {
+                throw std::runtime_error("decode_multi: dictionary index out of range");
+            }
+        }
+    }
+    if (!validate_dictionary(multi.shared_dictionary, multi.k,
+                             aggregate_tiles)) {
+        throw std::runtime_error("decode_multi: invalid shared dictionary");
+    }
     std::vector<std::vector<uint8_t>> out;
     out.reserve(multi.matrices.size());
     for (const auto& pack : multi.matrices) {
-        out.push_back(decode(pack));
+        const int bytes_per_tile = static_cast<int>(pack.k) / 4;
+        std::vector<uint8_t> decoded(
+            static_cast<size_t>(pack.total_tiles) *
+                static_cast<size_t>(bytes_per_tile),
+            0);
+        for (int tile = 0; tile < pack.total_tiles; ++tile) {
+            const uint16_t dictionary_index =
+                pack.tile_indices[static_cast<size_t>(tile)];
+            const uint32_t key =
+                multi.shared_dictionary[static_cast<size_t>(dictionary_index)]
+                    .pattern;
+            if (pack.k == TileK::K4) {
+                unpack_key_k4(key, &decoded[static_cast<size_t>(tile)]);
+            } else {
+                unpack_key_k8(key, &decoded[static_cast<size_t>(tile) * 2]);
+            }
+        }
+        out.push_back(std::move(decoded));
     }
     return out;
 }
@@ -282,6 +481,19 @@ std::vector<std::vector<uint8_t>> decode_multi(const CasMultiPack& multi) {
 // ── File I/O (single) ───────────────────────────────────────────────
 
 bool write_to_file(const CasPack& pack, const std::string& path) {
+    uint64_t dictionary_bytes = 0;
+    uint64_t index_bytes = 0;
+    uint64_t serialized_bytes = kSingleHeaderBytes;
+    if (!validate_pack(pack, pack.dictionary) ||
+        !checked_mul(pack.dictionary.size(), sizeof(DictEntry),
+                     dictionary_bytes) ||
+        !checked_mul(pack.tile_indices.size(), sizeof(uint16_t), index_bytes) ||
+        !checked_add(serialized_bytes, dictionary_bytes, serialized_bytes) ||
+        !checked_add(serialized_bytes, index_bytes, serialized_bytes) ||
+        !checked_add(serialized_bytes, kChecksumBytes, serialized_bytes) ||
+        serialized_bytes > kMaxCasFileBytes) {
+        return false;
+    }
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
 
@@ -317,6 +529,12 @@ bool write_to_file(const CasPack& pack, const std::string& path) {
 }
 
 bool read_from_file(const std::string& path, CasPack& out) {
+    std::error_code file_error;
+    const uint64_t file_size = std::filesystem::file_size(path, file_error);
+    if (file_error || file_size < kSingleHeaderBytes + kChecksumBytes ||
+        file_size > kMaxCasFileBytes) {
+        return false;
+    }
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
 
@@ -337,34 +555,61 @@ bool read_from_file(const std::string& path, CasPack& out) {
     if (version != 1) return false;
     uint8_t k; if (!read(&k, sizeof(k))) return false;
     if (k != 4 && k != 8) return false;
-    out.k = static_cast<TileK>(k);
+    CasPack parsed;
+    parsed.k = static_cast<TileK>(k);
     uint32_t rows, cols, total, uniq;
     if (!read(&rows, sizeof(rows))) return false;
     if (!read(&cols, sizeof(cols))) return false;
     if (!read(&total, sizeof(total))) return false;
     if (!read(&uniq, sizeof(uniq))) return false;
-    out.rows = static_cast<int>(rows);
-    out.cols = static_cast<int>(cols);
-    out.total_tiles = static_cast<int>(total);
-    out.unique_tiles = static_cast<int>(uniq);
-
-    out.dictionary.assign(static_cast<size_t>(uniq), DictEntry{});
-    for (uint32_t i = 0; i < uniq; ++i) {
-        if (!read(&out.dictionary[i].pattern, sizeof(uint32_t))) return false;
-        if (!read(&out.dictionary[i].count, sizeof(uint32_t))) return false;
+    if (rows > static_cast<uint32_t>((std::numeric_limits<int>::max)()) ||
+        cols > static_cast<uint32_t>((std::numeric_limits<int>::max)()) ||
+        total > static_cast<uint32_t>((std::numeric_limits<int>::max)()) ||
+        uniq == 0 || uniq > max_patterns(parsed.k)) {
+        return false;
     }
-    out.tile_indices.assign(static_cast<size_t>(total), 0);
-    if (!read(out.tile_indices.data(), total * sizeof(uint16_t))) return false;
+    parsed.rows = static_cast<int>(rows);
+    parsed.cols = static_cast<int>(cols);
+    parsed.total_tiles = static_cast<int>(total);
+    parsed.unique_tiles = static_cast<int>(uniq);
+
+    uint64_t expected_size = kSingleHeaderBytes;
+    uint64_t dictionary_bytes = 0;
+    uint64_t index_bytes = 0;
+    if (!checked_mul(uniq, sizeof(DictEntry), dictionary_bytes) ||
+        !checked_mul(total, sizeof(uint16_t), index_bytes) ||
+        !checked_add(expected_size, dictionary_bytes, expected_size) ||
+        !checked_add(expected_size, index_bytes, expected_size) ||
+        !checked_add(expected_size, kChecksumBytes, expected_size) ||
+        expected_size != file_size) {
+        return false;
+    }
+
+    parsed.dictionary.assign(static_cast<size_t>(uniq), DictEntry{});
+    for (uint32_t i = 0; i < uniq; ++i) {
+        if (!read(&parsed.dictionary[i].pattern, sizeof(uint32_t))) return false;
+        if (!read(&parsed.dictionary[i].count, sizeof(uint32_t))) return false;
+    }
+    parsed.tile_indices.assign(static_cast<size_t>(total), 0);
+    if (!read(parsed.tile_indices.data(),
+              static_cast<size_t>(total) * sizeof(uint16_t))) return false;
 
     uint64_t expected_checksum;
     f.read(reinterpret_cast<char*>(&expected_checksum), sizeof(expected_checksum));
-    if (!f) return false;
-    return expected_checksum == checksum_running;
+    if (!f || expected_checksum != checksum_running ||
+        !validate_pack(parsed, parsed.dictionary)) {
+        return false;
+    }
+    out = std::move(parsed);
+    return true;
 }
 
 // ── File I/O (multi) ────────────────────────────────────────────────
 
 bool write_multi_to_file(const CasMultiPack& multi, const std::string& path) {
+    if (!validate_multi_pack(multi, nullptr)) {
+        return false;
+    }
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
 
@@ -403,14 +648,23 @@ bool write_multi_to_file(const CasMultiPack& multi, const std::string& path) {
 }
 
 bool read_multi_from_file(const std::string& path, CasMultiPack& out) {
+    std::error_code file_error;
+    const uint64_t file_size = std::filesystem::file_size(path, file_error);
+    if (file_error || file_size < kMultiHeaderBytes + kChecksumBytes ||
+        file_size > kMaxCasFileBytes) {
+        return false;
+    }
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
 
     uint64_t checksum_running = kFnvOffset;
+    uint64_t consumed = 0;
     auto read = [&](void* data, size_t n) -> bool {
+        if (static_cast<uint64_t>(n) > file_size - consumed) return false;
         f.read(static_cast<char*>(data), static_cast<std::streamsize>(n));
         if (!f) return false;
         checksum_running = fnv1a_update(checksum_running, data, n);
+        consumed += static_cast<uint64_t>(n);
         return true;
     };
 
@@ -420,42 +674,89 @@ bool read_multi_from_file(const std::string& path, CasMultiPack& out) {
     uint32_t version; if (!read(&version, sizeof(version))) return false;
     if (version != 1) return false;
     uint8_t k; if (!read(&k, sizeof(k))) return false;
-    out.k = static_cast<TileK>(k);
+    if (k != 4 && k != 8) return false;
+    CasMultiPack parsed;
+    parsed.k = static_cast<TileK>(k);
     uint32_t n_matrices, dict_size;
     if (!read(&n_matrices, sizeof(n_matrices))) return false;
     if (!read(&dict_size, sizeof(dict_size))) return false;
-    out.total_matrices = n_matrices;
-
-    out.shared_dictionary.assign(dict_size, DictEntry{});
-    for (uint32_t i = 0; i < dict_size; ++i) {
-        if (!read(&out.shared_dictionary[i].pattern, sizeof(uint32_t))) return false;
-        if (!read(&out.shared_dictionary[i].count, sizeof(uint32_t))) return false;
+    if (n_matrices == 0 || n_matrices > kMaxMatrices ||
+        dict_size == 0 || dict_size > max_patterns(parsed.k)) {
+        return false;
     }
-    out.matrices.clear();
-    out.matrices.reserve(n_matrices);
-    out.total_tiles_all = 0;
+    uint64_t minimum_size = kMultiHeaderBytes;
+    uint64_t dictionary_bytes = 0;
+    uint64_t matrix_headers = 0;
+    if (!checked_mul(dict_size, sizeof(DictEntry), dictionary_bytes) ||
+        !checked_mul(n_matrices, 12u, matrix_headers) ||
+        !checked_add(minimum_size, dictionary_bytes, minimum_size) ||
+        !checked_add(minimum_size, matrix_headers, minimum_size) ||
+        !checked_add(minimum_size, kChecksumBytes, minimum_size) ||
+        minimum_size > file_size) {
+        return false;
+    }
+    parsed.total_matrices = n_matrices;
+
+    parsed.shared_dictionary.assign(dict_size, DictEntry{});
+    for (uint32_t i = 0; i < dict_size; ++i) {
+        if (!read(&parsed.shared_dictionary[i].pattern, sizeof(uint32_t))) return false;
+        if (!read(&parsed.shared_dictionary[i].count, sizeof(uint32_t))) return false;
+    }
+    parsed.matrices.reserve(n_matrices);
+    parsed.total_tiles_all = 0;
     for (uint32_t m = 0; m < n_matrices; ++m) {
         CasPack pack;
-        pack.k = out.k;
+        pack.k = parsed.k;
         uint32_t rows, cols, total;
         if (!read(&rows, sizeof(rows))) return false;
         if (!read(&cols, sizeof(cols))) return false;
         if (!read(&total, sizeof(total))) return false;
+        if (rows > static_cast<uint32_t>((std::numeric_limits<int>::max)()) ||
+            cols > static_cast<uint32_t>((std::numeric_limits<int>::max)()) ||
+            total > static_cast<uint32_t>((std::numeric_limits<int>::max)())) {
+            return false;
+        }
         pack.rows = static_cast<int>(rows);
         pack.cols = static_cast<int>(cols);
         pack.total_tiles = static_cast<int>(total);
         pack.unique_tiles = static_cast<int>(dict_size);
-        pack.dictionary = out.shared_dictionary;
+        uint64_t expected_tiles = 0;
+        uint64_t expected_bytes = 0;
+        uint64_t index_bytes = 0;
+        if (!expected_layout(pack.rows, pack.cols, pack.k, expected_tiles,
+                             expected_bytes) ||
+            expected_tiles != total ||
+            !checked_mul(total, sizeof(uint16_t), index_bytes)) {
+            return false;
+        }
+        const uint64_t remaining_headers =
+            static_cast<uint64_t>(n_matrices - m - 1) * 12u;
+        uint64_t required_tail = 0;
+        if (!checked_add(index_bytes, remaining_headers, required_tail) ||
+            !checked_add(required_tail, kChecksumBytes, required_tail) ||
+            required_tail > file_size - consumed) {
+            return false;
+        }
         pack.tile_indices.assign(total, 0);
-        if (!read(pack.tile_indices.data(), total * sizeof(uint16_t))) return false;
-        out.matrices.push_back(std::move(pack));
-        out.total_tiles_all += total;
+        if (!read(pack.tile_indices.data(),
+                  static_cast<size_t>(total) * sizeof(uint16_t))) return false;
+        parsed.matrices.push_back(std::move(pack));
+        if (parsed.total_tiles_all >
+            (std::numeric_limits<size_t>::max)() - total) {
+            return false;
+        }
+        parsed.total_tiles_all += total;
     }
 
     uint64_t expected;
     f.read(reinterpret_cast<char*>(&expected), sizeof(expected));
-    if (!f) return false;
-    return expected == checksum_running;
+    if (!f || consumed + kChecksumBytes != file_size ||
+        expected != checksum_running ||
+        !validate_multi_pack(parsed, nullptr)) {
+        return false;
+    }
+    out = std::move(parsed);
+    return true;
 }
 
 // ── Stats ───────────────────────────────────────────────────────────

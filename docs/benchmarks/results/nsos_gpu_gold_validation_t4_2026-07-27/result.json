@@ -1,0 +1,171 @@
+{
+  "artifacts": [
+    {
+      "bytes": 10903,
+      "path": "cmake-build.log",
+      "sha256": "4f93ea520feab765fecbaa75fdb669d47756f0f82f9f3c8f65c51201f02eea71"
+    },
+    {
+      "bytes": 1628,
+      "path": "cmake-configure.log",
+      "sha256": "be04bdf8f4323979afda46a915a8a867084aceb2756a74ab9d70426c2d9a6f03"
+    },
+    {
+      "bytes": 1150,
+      "path": "compute-sanitizer-test_gpu_checkpoint_v8_continuation.log",
+      "sha256": "79e4e85af23308de1e62abb7d1f01dcdbd642d5577ca48f241517af588c8c827"
+    },
+    {
+      "bytes": 1006,
+      "path": "compute-sanitizer-test_gpu_device_memory_contract.log",
+      "sha256": "aad7538882ba24c0b7f619337ecc8adaede2d9ff13c2dcc1e5b56b17d440feab"
+    },
+    {
+      "bytes": 1199,
+      "path": "compute-sanitizer-test_gpu_mixed_precision_contract.log",
+      "sha256": "38ef38976817de24a1896ce9b59ed8521a7a8ea3b0a848aaa9818cf62e686ab2"
+    },
+    {
+      "bytes": 1318,
+      "path": "compute-sanitizer-test_gpu_model_pack_dp4a_lifecycle.log",
+      "sha256": "a4d9ae03b16f7f2661143442a6c09735cdcbf5b65a484f06fcaf59cf8fe28771"
+    },
+    {
+      "bytes": 1302,
+      "path": "compute-sanitizer-test_gpu_parity_decode_incremental.log",
+      "sha256": "3829971ff85b3ed1d64cbff39bbce3e27411f4f02e21fd5566b7b0d7e69b1801"
+    },
+    {
+      "bytes": 3327,
+      "path": "gpu-ctest.log",
+      "sha256": "4136c960dc0bbaa46f0967a3a749e35ec944e89d7b23233e86dafd9608983daf"
+    },
+    {
+      "bytes": 8762,
+      "path": "gpu-ctest.xml",
+      "sha256": "445b19a5d71e7aefd25333f3563041c85d81944056265eb1f6b2e63a74bf9a2e"
+    },
+    {
+      "bytes": 110,
+      "path": "preflight-cmake.log",
+      "sha256": "ad300cbddcd5ce0191023daeceae0b045d6a08f1d1b5df089f8d1c6bcaaad203"
+    },
+    {
+      "bytes": 175,
+      "path": "preflight-compute-sanitizer.log",
+      "sha256": "1a97a905dc5ad2b1de705d5655963464d6d200e2ef5b46f9776eef01cf926c22"
+    },
+    {
+      "bytes": 225,
+      "path": "preflight-nvcc.log",
+      "sha256": "7665bd15fcd06506c52a5d04eee5de90155154bae8b6d47be529739c301865fe"
+    },
+    {
+      "bytes": 112,
+      "path": "preflight-nvidia-smi.log",
+      "sha256": "711b650ad5f37dd98f2f3d970839a6c242c29f97fd75139cb296d41153fdd67d"
+    },
+    {
+      "bytes": 361,
+      "path": "test_gpu_checkpoint_v8_continuation.log",
+      "sha256": "0a3c62e488f58dc0000f633e7ede5a4a9b2464d934cd665611570adadda1fba6"
+    },
+    {
+      "bytes": 412,
+      "path": "test_gpu_mixed_precision_contract.log",
+      "sha256": "94a27c5d05e26e00cacb471756ada6c6cb5e1f35acfc8714928b96862d2f5744"
+    },
+    {
+      "bytes": 530,
+      "path": "test_gpu_model_pack_dp4a_lifecycle.log",
+      "sha256": "d8bb442e4e66a9192e91373436ea72e0105a7e25896405842645b120975806c9"
+    }
+  ],
+  "compute_sanitizer": {
+    "test_gpu_checkpoint_v8_continuation": {
+      "error_count": 0,
+      "leaked_bytes": 0,
+      "log": "compute-sanitizer-test_gpu_checkpoint_v8_continuation.log",
+      "return_code": 0
+    },
+    "test_gpu_device_memory_contract": {
+      "error_count": 0,
+      "leaked_bytes": 0,
+      "log": "compute-sanitizer-test_gpu_device_memory_contract.log",
+      "return_code": 0
+    },
+    "test_gpu_mixed_precision_contract": {
+      "error_count": 0,
+      "leaked_bytes": 0,
+      "log": "compute-sanitizer-test_gpu_mixed_precision_contract.log",
+      "return_code": 0
+    },
+    "test_gpu_model_pack_dp4a_lifecycle": {
+      "error_count": 0,
+      "leaked_bytes": 0,
+      "log": "compute-sanitizer-test_gpu_model_pack_dp4a_lifecycle.log",
+      "return_code": 0
+    },
+    "test_gpu_parity_decode_incremental": {
+      "error_count": 0,
+      "leaked_bytes": 0,
+      "log": "compute-sanitizer-test_gpu_parity_decode_incremental.log",
+      "return_code": 0
+    }
+  },
+  "contract_outputs": {
+    "test_gpu_checkpoint_v8_continuation": "[GPUParity:checkpoint_v8_continuation] device=Tesla T4 cc=7.5 runtime=12080\n[GPUParity:checkpoint_v8_continuation] begin\n[GPUParity:checkpoint_v8_continuation] version=8 round_trip_param_diff=0 continuation_loss_diff=0 continuation_param_diff=0\n[GPUParity:checkpoint_v8_continuation] PASS\n",
+    "test_gpu_mixed_precision_contract": "[GPUParity:mixed_precision_contract] device=Tesla T4 cc=7.5 runtime=12080\n[GPUParity:mixed_precision_contract] begin\n[GPUParity:mixed_precision_contract] active_sm=75\n[GPUParity:mixed_precision_contract] fp16=executed loss_scale=2048\n[GPUParity:mixed_precision_contract] bf16=rejected_as_unsupported\n[GPUParity:mixed_precision_contract] PASS\n",
+    "test_gpu_model_pack_dp4a_lifecycle": "[GPUParity:model_pack_dp4a_lifecycle] device=Tesla T4 cc=7.5 runtime=12080\n[GPUParity:model_pack_dp4a_lifecycle] begin\n[Tokenizer] Loading BPE model from /tmp/nsos_gpu_dp4a_lifecycle_pack/tokenizer.nsos...\n[Tokenizer] Loaded vocab size: 256\n[InferenceEngine] edge pack loaded; FP32 linear weights released (1.58-bit inference mode).\n[GPUParity:model_pack_dp4a_lifecycle] layer=0 load_dispatches=1 clone_dispatches=1\n[GPUParity:model_pack_dp4a_lifecycle] PASS\n"
+  },
+  "finished_at": "2026-07-27T13:03:24.728132Z",
+  "gpu_ctest": {
+    "disabled": 0,
+    "failures": 0,
+    "skipped": 0,
+    "tests": 24
+  },
+  "preflight": {
+    "git": {
+      "branch": "codex-gpu-gold-validation",
+      "commit": "42f8b09f66944644d30bd95a98ea568498e77cf2",
+      "tracked_tree_clean": true
+    },
+    "gpu": {
+      "compute_capability": "7.5",
+      "count": 1,
+      "driver_version": "580.82.07",
+      "name": "Tesla T4"
+    },
+    "software": {
+      "cmake": "cmake version 3.31.10",
+      "cmake_generator": "Unix Makefiles",
+      "compute_sanitizer": "NVIDIA (R) Compute Sanitizer\nCopyright (c) 2020-2025 NVIDIA Corporation\nVersion 2025.1.0.0 (build 35583870) (public-release)",
+      "compute_sanitizer_path": "/usr/local/cuda/bin/compute-sanitizer",
+      "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Fri_Feb_21_20:23:50_PST_2025\nCuda compilation tools, release 12.8, V12.8.93\nBuild cuda_12.8.r12.8/compiler.35583870_0",
+      "python": "3.12.13 (main, Mar  4 2026, 09:23:07) [GCC 11.4.0]"
+    }
+  },
+  "requirements": {
+    "cuda_architecture": "75",
+    "expected_gpu_tests": 24,
+    "expected_sanitizer_targets": [
+      "test_gpu_device_memory_contract",
+      "test_gpu_model_pack_dp4a_lifecycle",
+      "test_gpu_parity_decode_incremental",
+      "test_gpu_checkpoint_v8_continuation",
+      "test_gpu_mixed_precision_contract"
+    ],
+    "minimum_compute_capability": "7.5",
+    "required_gpu_name": "Tesla T4",
+    "strict_gpu_environment": {
+      "NSOS_CUDA_SYNC": "1",
+      "NSOS_GPU_MEMORY": "device",
+      "NSOS_NO_MEMADVISE": "1",
+      "NSOS_REQUIRE_GPU_TESTS": "1"
+    }
+  },
+  "schema_version": 1,
+  "started_at": "2026-07-27T12:59:54.302744Z",
+  "status": "pass"
+}

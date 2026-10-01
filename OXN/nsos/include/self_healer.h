@@ -108,4 +108,14 @@ private:
     bool check_json_structure(const std::vector<int>& tokens) const;
 };
 
+// Model-level entry point: wire the self-healer onto a JambaModel (logits
+// extractor + D2FDecoder token decoder) and generate with active confidence/
+// consistency/structure correction.  This makes the healer reachable from real
+// inference, not just ad-hoc in tests.
+std::vector<int> generate_with_self_healing(JambaModel& model,
+                                            const std::vector<int>& prompt,
+                                            int max_tokens,
+                                            HealingReport& report,
+                                            const HealingConfig& cfg = {});
+
 } // namespace nsos

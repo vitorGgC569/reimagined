@@ -1,6 +1,21 @@
 #ifndef NSOS_BOOT_H
 #define NSOS_BOOT_H
 
+// ===========================================================================
+// DEMONSTRATION HEADER — NOT PRODUCTION CODE.
+//
+// NeuralScheduler schedules nothing. Its own comment calls the setup "mock",
+// and priority classification is a substring match on the intent string. The
+// real training and serving paths use Trainer, InferenceEngine and the swarm
+// Coordinator; none of them reference this file.
+//
+// Reachable only from tests/verify_roadmap.cpp, a standalone diagnostic that
+// is not a CMake target.
+// ===========================================================================
+#if !defined(NSOS_ALLOW_DEMONSTRATION_HEADERS)
+#error "nsos_boot.h is demonstration-only scaffolding. Define NSOS_ALLOW_DEMONSTRATION_HEADERS to include it from a diagnostic target."
+#endif
+
 #include <vector>
 #include <string>
 #include <map>

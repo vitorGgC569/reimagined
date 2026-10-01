@@ -1,0 +1,19 @@
+$ /usr/local/cuda/bin/compute-sanitizer --tool memcheck --leak-check full --error-exitcode 99 --print-session-details /content/nsos-build-gpu-gold-sm75/test_gpu_checkpoint_v8_continuation
+========= COMPUTE-SANITIZER
+========= Process ID:             3505
+========= Created:                2026-Jul-27 13:03:23
+========= System OS:              Linux
+========= OS build:               #1 SMP Thu Apr 30 18:17:14 UTC 2026
+========= System CPU:             Intel(R) Xeon(R) CPU @ 2.00GHz
+========= CPU architecture:       x86_64
+========= Computer Name:          d3b79d301386
+========= Target application:     /content/nsos-build-gpu-gold-sm75/test_gpu_checkpoint_v8_continuation
+========= CUDA version:           13.0
+========= Display Driver version: 580.82.07
+========= 
+[GPUParity:checkpoint_v8_continuation] device=Tesla T4 cc=7.5 runtime=12080
+[GPUParity:checkpoint_v8_continuation] begin
+[GPUParity:checkpoint_v8_continuation] version=8 round_trip_param_diff=0 continuation_loss_diff=0 continuation_param_diff=0
+[GPUParity:checkpoint_v8_continuation] PASS
+========= LEAK SUMMARY: 0 bytes leaked in 0 allocations
+========= ERROR SUMMARY: 0 errors

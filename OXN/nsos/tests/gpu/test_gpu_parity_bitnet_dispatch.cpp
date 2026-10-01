@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>  // std::memcpy (GCC does not pull it in transitively)
 #include <stdexcept>
 #include <string>
 #include <vector>

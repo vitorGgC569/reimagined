@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "executed_at": "2026-07-22",
+  "environment": {
+    "gpu": "NVIDIA Tesla T4",
+    "cuda_toolkit": "12.8.93",
+    "python": "3.12.13",
+    "nsos_build": "Release CUDA sm_75, Ninja --parallel 2",
+    "repository_commit_in_runtime": "4462b62",
+    "oxtamem": "native Rust wheel; 19 passed, 0 failed, 2 ignored; persistence/alignment gate 10/10"
+  },
+  "seed_zero_audit": {
+    "finding": "NSOS seed 0 is a nondeterministic sentinel; tensor RNG falls back to std::random_device",
+    "same_runtime_repetitions": [
+      {
+        "final_loss_window": 3.159,
+        "sanity_mqar_pairs8": 0.277
+      },
+      {
+        "final_loss_window": 0.238,
+        "sanity_mqar_pairs8": 0.92
+      }
+    ]
+  },
+  "mqar_multitrain": {
+    "protocol": {
+      "train_seeds": [
+        1,
+        2,
+        3
+      ],
+      "steps": 2500,
+      "batch": 32,
+      "lr": 0.002,
+      "eval_examples_per_difficulty": 600,
+      "nsos_deterministic_reductions": true
+    },
+    "results": {
+      "hf_dense": {
+        "params": 1354896,
+        "seconds": [
+          110.47886419296265,
+          110.13601660728455,
+          110.50092315673828
+        ],
+        "accuracy": {
+          "pairs1": [
+            0.9983333333333333,
+            1,
+            0.9983333333333333
+          ],
+          "pairs4": [
+            0.25166666666666665,
+            0.3883333333333333,
+            0.2633333333333333
+          ],
+          "pairs8": [
+            0.12833333333333333,
+            0.17833333333333334,
+            0.13166666666666665
+          ]
+        }
+      },
+      "hf_moe": {
+        "params": 7257232,
+        "experts": 16,
+        "top_k": 2,
+        "seconds": [
+          145.5970618724823,
+          145.1834819316864,
+          145.0860059261322
+        ],
+        "accuracy": {
+          "pairs1": [
+            0.9983333333333333,
+            0.9983333333333333,
+            1
+          ],
+          "pairs4": [
+            0.2783333333333333,
+            0.285,
+            0.5183333333333333
+          ],
+          "pairs8": [
+            0.13166666666666665,
+            0.12,
+            0.21833333333333332
+          ]
+        }
+      },
+      "nsos": {
+        "params": 768152,
+        "seconds": [
+          275.83758759498596,
+          227.04513931274414,
+          235.98522567749023
+        ],
+        "accuracy": {
+          "pairs1": [
+            1,
+            1,
+            1
+          ],
+          "pairs4": [
+            0.5816666666666667,
+            0.9883333333333333,
+            0.9683333333333334
+          ],
+          "pairs8": [
+            0.28833333333333333,
+            0.9366666666666666,
+            0.8583333333333333
+          ]
+        }
+      }
+    }
+  },
+  "babi_qa1": {
+    "source": {
+      "dataset": "facebook/babi_qa",
+      "config": "en-10k-qa1",
+      "revision": "1d86ad39d1c3ea2ff4b77eeb85f7c6ebd622a95f",
+      "license": "CC BY 3.0",
+      "train_sha256": "f1d67aa230d7aba0ed310df0d696a3ba9a07270e1670fe64c6901c24e5016f3f",
+      "test_sha256": "9875dfad271cbfa5c49adb5809dd67be3826394a5d4d66dc74cab0c81483e2f8"
+    },
+    "protocol": {
+      "train_questions": 10000,
+      "test_questions": 1000,
+      "vocab": 25,
+      "max_length": 83,
+      "majority_baseline": 0.187,
+      "steps": 1500,
+      "batch": 32,
+      "lr": 0.002,
+      "seed": 11
+    },
+    "results": {
+      "hf_dense": {
+        "params": 1196048,
+        "accuracy": 0.493,
+        "seconds": 1590.5745222568512
+      },
+      "hf_moe": {
+        "params": 7098384,
+        "experts": 16,
+        "top_k": 2,
+        "accuracy": 0.271,
+        "seconds": 1619.802460193634
+      },
+      "nsos": {
+        "params": 609304,
+        "accuracy": 0.767,
+        "seconds": 93.6502742767334
+      },
+      "nsos_oxtamem": {
+        "accuracy": 1,
+        "retrieval_at_1": 1,
+        "retrieval": "entity-keyed deterministic vectors; latest sentence per entity",
+        "uses_supporting_ids": false,
+        "uses_test_answer_for_retrieval": false
+      }
+    },
+    "nsos_additional_seeds": {
+      "seeds": [
+        11,
+        12,
+        13
+      ],
+      "accuracy": [
+        0.767,
+        0.652,
+        0.637
+      ],
+      "mean": 0.6853333333333333,
+      "std_sample": 0.07112196097783956
+    }
+  },
+  "mqar_scale": {
+    "protocol": {
+      "seed": 21,
+      "train_pairs_min": 1,
+      "train_pairs_max": 8,
+      "steps": 2500,
+      "eval_examples_each": 400
+    },
+    "results": [
+      {
+        "pairs": 8,
+        "tokens": 18,
+        "nsos": 0.9575,
+        "hf_dense": 0.125,
+        "hf_moe": 0.1275
+      },
+      {
+        "pairs": 16,
+        "tokens": 34,
+        "nsos": 0.7825,
+        "hf_dense": 0.075,
+        "hf_moe": 0.0625
+      },
+      {
+        "pairs": 32,
+        "tokens": 66,
+        "nsos": 0.4925,
+        "hf_dense": 0.0425,
+        "hf_moe": 0.0475
+      },
+      {
+        "pairs": 64,
+        "tokens": 130,
+        "nsos": 0.285,
+        "hf_dense": 0.0225,
+        "hf_moe": 0.0275
+      }
+    ],
+    "seconds": {
+      "nsos": 34.626384973526,
+      "hf_dense": 115.24491763114929,
+      "hf_moe": 155.472491979599
+    }
+  }
+}

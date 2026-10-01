@@ -146,8 +146,12 @@ def _shp_iter(max_rows: int) -> Iterator[Dict]:
             ratio = float(row.get("score_ratio", 1.0))
             if ratio < 2.0:
                 continue
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            print(
+                f"[shp] invalid score_ratio; row skipped: {exc}",
+                file=sys.stderr,
+            )
+            continue
         if label == 0:
             chosen, rejected = ref_a, ref_b
         else:

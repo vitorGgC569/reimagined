@@ -1,6 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 pub struct ConsistentHasher {
     nodes: Vec<String>,
     #[allow(dead_code)]
@@ -8,8 +5,14 @@ pub struct ConsistentHasher {
 }
 
 impl ConsistentHasher {
-    pub fn new(nodes: Vec<String>, vnodes: usize) -> Self {
-        Self { nodes, vnodes }
+    pub fn new(mut nodes: Vec<String>, vnodes: usize) -> Self {
+        nodes.retain(|node| !node.is_empty());
+        nodes.sort();
+        nodes.dedup();
+        Self {
+            nodes,
+            vnodes: vnodes.clamp(1, 1024),
+        }
     }
 
     pub fn get_shard(&self, key: &str) -> String {
@@ -23,12 +26,8 @@ impl ConsistentHasher {
         for node in &self.nodes {
             let replicas = self.vnodes.max(1);
             for vnode in 0..replicas {
-                let mut hasher = DefaultHasher::new();
-                key.hash(&mut hasher);
-                node.hash(&mut hasher);
-                vnode.hash(&mut hasher);
-                let score = hasher.finish();
-                if score > best_score {
+                let score = stable_score(key, node, vnode);
+                if score > best_score || (score == best_score && node < &best_node) {
                     best_score = score;
                     best_node = node.clone();
                 }
@@ -37,6 +36,28 @@ impl ConsistentHasher {
 
         best_node
     }
+}
+
+fn stable_score(key: &str, node: &str, vnode: usize) -> u64 {
+    let mut hash = 1469598103934665603u64;
+    for byte in key
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain([0xff])
+        .chain(node.as_bytes().iter().copied())
+        .chain([0xfe])
+        .chain((vnode as u64).to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(1099511628211u64);
+    }
+    // SplitMix64 avalanche makes the rendezvous score uniform while retaining
+    // a fully specified cross-process/cross-version hash contract.
+    let mut value = hash;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 #[cfg(test)]

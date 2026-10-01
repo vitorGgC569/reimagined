@@ -1,3 +1,10 @@
+// Standalone diagnostic over the demonstration headers. It is deliberately
+// not a CMake target (see docs/TESTING.md) and asserts nothing about the
+// product: the headers it exercises print narration instead of implementing
+// the behaviour their names suggest. The opt-in below is what allows those
+// headers to be included at all.
+#define NSOS_ALLOW_DEMONSTRATION_HEADERS 1
+
 #include <iostream>
 #include <vector>
 #include <map>

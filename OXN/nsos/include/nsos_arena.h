@@ -8,9 +8,12 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "gpu_backend.h"
 #endif
 
 namespace nsos {
@@ -20,15 +23,22 @@ namespace nsos {
 // ============================================================================
 
 struct ArenaBlock {
-    uint8_t* ptr;
+    uint8_t* ptr = nullptr;
     size_t size;
     size_t offset;
     
     ArenaBlock(size_t s) : size(s), offset(0) {
+        if (size == 0) {
+            throw std::invalid_argument(
+                "Arena block size must be positive");
+        }
         #ifdef _WIN32
         ptr = (uint8_t*)_aligned_malloc(size, 64);
         #else
-        posix_memalign((void**)&ptr, 64, size);
+        if (posix_memalign(
+                reinterpret_cast<void**>(&ptr), 64, size) != 0) {
+            ptr = nullptr;
+        }
         #endif
         if (!ptr) throw std::runtime_error("Arena Block OOM");
     }
@@ -54,16 +64,27 @@ public:
     }
 
     void* alloc(size_t bytes, Device dev) {
+        if (bytes == 0) {
+            return nullptr;
+        }
         if (dev == Device::GPU) {
             #ifdef USE_CUDA
-            void* ptr; cudaMalloc(&ptr, bytes); return ptr;
+            void* ptr = nullptr;
+            if (cudaMalloc(&ptr, bytes) != cudaSuccess) {
+                return nullptr;  // caller must handle null (return was unchecked)
+            }
+            return ptr;
             #else
             return nullptr;
             #endif
         }
 
         // CPU Arena
-        size_t padded = (bytes + 63) & ~63;
+        if (bytes > std::numeric_limits<size_t>::max() - 63U) {
+            throw std::overflow_error(
+                "Arena allocation size overflows alignment");
+        }
+        size_t padded = (bytes + 63U) & ~size_t{63U};
         ArenaBlock* block = get_thread_block();
         
         if (block->offset + padded > block->size) {
@@ -99,8 +120,20 @@ private:
     ArenaBlock* get_thread_block() {
         static thread_local std::unique_ptr<ArenaBlock> t_block = nullptr;
         if (!t_block) {
-            // Memory is automatically released upon thread destruction
-            t_block = std::make_unique<ArenaBlock>(512 * 1024 * 1024); // 512MB per thread
+            // Edge-friendly default.  Was a flat 512MB/thread -> N*512MB
+            // resident under OpenMP, contradicting the edge-first story.
+            // Overridable via NSOS_ARENA_MB.  Overflow beyond this size is
+            // handled by fallback blocks in alloc(), so a smaller arena only
+            // trades a few extra allocations for much lower RSS.
+            size_t arena_bytes = static_cast<size_t>(64) * 1024 * 1024;
+            if (const char* e = std::getenv("NSOS_ARENA_MB")) {
+                const long mb = std::atol(e);
+                if (mb > 0) {
+                    arena_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+                }
+            }
+            // Memory is automatically released upon thread destruction.
+            t_block = std::make_unique<ArenaBlock>(arena_bytes);
         }
         return t_block.get();
     }

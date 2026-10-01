@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "artifact_set_commit": "068a190a92d3add615bae088fe5448dc3ef0e8a8",
+  "execution_date": "2026-07-27",
+  "started_at": "2026-07-27T12:59:54.302744Z",
+  "finished_at": "2026-07-27T13:03:24.728132Z",
+  "validation_source": {
+    "repository": "https://github.com/vitorGgC569/reimagined.git",
+    "branch": "codex-gpu-gold-validation",
+    "commit": "42f8b09f66944644d30bd95a98ea568498e77cf2",
+    "tracked_tree_clean": true
+  },
+  "notebook": {
+    "repository_path": "colab/nsos_gpu_gold_validation_t4.ipynb",
+    "executed_copy": "https://colab.research.google.com/drive/1wbNdMvR053YmRxQLdHtXZVE465dLwNoj"
+  },
+  "environment": {
+    "gpu": "Tesla T4",
+    "compute_capability": "7.5",
+    "driver": "580.82.07",
+    "cuda_compiler": "Cuda compilation tools, release 12.8, V12.8.93",
+    "compute_sanitizer": "Compute Sanitizer 2025.1.0.0",
+    "cmake": "cmake version 3.31.10",
+    "cmake_generator": "Unix Makefiles",
+    "cuda_architecture": "75"
+  },
+  "gates": {
+    "gpu_ctest": {
+      "tests": 24,
+      "failures": 0,
+      "disabled": 0,
+      "skipped": 0
+    },
+    "compute_sanitizer": {
+      "targets": 5,
+      "nonzero_return_codes": 0,
+      "errors": 0,
+      "leaked_bytes": 0
+    },
+    "dp4a": "load_dispatches=1 clone_dispatches=1",
+    "checkpoint": "version=8 round_trip_param_diff=0 continuation_loss_diff=0 continuation_param_diff=0",
+    "mixed_precision": "fp16=executed loss_scale=2048",
+    "incremental_decode_steps": 4
+  },
+  "downloaded_bundle": {
+    "repository_path": "docs/benchmarks/results/nsos_gpu_gold_validation_t4_2026-07-27.zip",
+    "bytes": 15023,
+    "git_blob_sha1": "dbfa510b38b8cfe00e573c015a14cb4310cb1844",
+    "sha256": "1a2872a76c901b7e778e354724ece2544a4f289cd5ae0d0812f43ec69a0c76e7"
+  },
+  "core_artifacts": {
+    "report.md": {
+      "bytes": 2307,
+      "git_blob_sha1": "5d0d875550674ce79b2ec7ad658b01010414b5ac",
+      "sha256": "2918cb0083c6f5fe653f28086328caa85562f772e13d2488d0a9efc1b109ef70"
+    },
+    "result.json": {
+      "bytes": 6772,
+      "git_blob_sha1": "c4393f090eed83785320ac4919ab46e7029f2bf2",
+      "sha256": "e4586d7ad01e699166323a701622eff31c2ababc3fddc55eafea16afe4c313f7"
+    },
+    "SHA256SUMS": {
+      "bytes": 1769,
+      "git_blob_sha1": "c8e953aeca5c73b15ac2de9004c7748102918722",
+      "sha256": "1ff6b4b72f12bd114066f583e4418fc804cd5a8f738485d3bf51a9b2ee63e638"
+    }
+  },
+  "integrity_verification": {
+    "all_sha256sums_recomputed_after_download": true,
+    "archive_entries_checked_for_path_traversal": true,
+    "result_contract_rechecked_after_extraction": true
+  }
+}

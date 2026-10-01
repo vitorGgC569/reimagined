@@ -1,0 +1,62 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: OContabil.API/Dockerfile
+    image: ocontabil-api:latest
+    container_name: ocontabil-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__Default=Data Source=/data/ocontabil.db
+      - Jwt__Key=${JWT_KEY:-TROQUE-ESTA-CHAVE-EM-PRODUCAO-USE-32-CHARS-NO-MINIMO!!}
+      - Jwt__Issuer=OContabil
+      - Jwt__Audience=OContabilClients
+    volumes:
+      - api-data:/data
+      - api-logs:/app/logs
+    depends_on:
+      gliner:
+        condition: service_started
+    networks:
+      - ocontabil
+
+  gliner:
+    build:
+      context: ./gliner2-service
+      dockerfile: Dockerfile
+    image: ocontabil-gliner:latest
+    container_name: ocontabil-gliner
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - OCONTABIL_MODEL=${OCONTABIL_MODEL:-fastino/gliner2-base-v1}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    networks:
+      - ocontabil
+
+  nginx:
+    image: nginx:alpine
+    container_name: ocontabil-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+    networks:
+      - ocontabil
+
+volumes:
+  api-data:
+  api-logs:
+  hf-cache:
+
+networks:
+  ocontabil:
+    driver: bridge

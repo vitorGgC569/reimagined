@@ -1,0 +1,254 @@
+<UserControl x:Class="ContaDocAI.Views.UploadView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Loaded="OnLoaded">
+    <StackPanel>
+        <!-- ═══ Drop Zone ═══ -->
+        <Border x:Name="dropZone" Style="{StaticResource CardStyle}" Padding="50,40"
+                AllowDrop="True" Drop="OnDrop" DragOver="OnDragOver" DragLeave="OnDragLeave"
+                Cursor="Hand" MouseLeftButtonUp="OnBrowseClick"
+                BorderBrush="#336366f1" BorderThickness="2">
+            <StackPanel HorizontalAlignment="Center">
+                <TextBlock Text="📤" FontSize="48" HorizontalAlignment="Center"/>
+                <TextBlock Text="Arraste e solte documentos aqui" FontSize="18" FontWeight="SemiBold"
+                           Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center" Margin="0,12,0,4"/>
+                <TextBlock Text="ou clique para selecionar · PDF, JPG, PNG, ZIP · Ate 50 MB" FontSize="12"
+                           Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,20,0,0">
+                    <Button Style="{StaticResource BtnPrimary}" Content="📂  Selecionar Arquivos" Margin="0,0,8,0"
+                            Click="OnBrowseClick"/>
+                </StackPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- ═══ Schema Selection ═══ -->
+        <Border Style="{StaticResource CardStyle}" Margin="0,16,0,0">
+            <StackPanel>
+                <DockPanel Margin="0,0,0,16">
+                    <StackPanel>
+                        <TextBlock Text="⚙️  Schema de Extracao GLiNER 2" FontSize="14" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextPrimaryBrush}"/>
+                        <TextBlock Text="Tipo de documento para extracao" FontSize="12"
+                                   Foreground="{StaticResource TextTertiaryBrush}"/>
+                    </StackPanel>
+                    <Border DockPanel.Dock="Right" Background="{StaticResource InfoBgBrush}" CornerRadius="10"
+                            Padding="10,4" VerticalAlignment="Center" BorderBrush="#4D3b82f6" BorderThickness="1">
+                        <TextBlock Text="Zero-Shot" FontSize="10" FontWeight="SemiBold" Foreground="{StaticResource InfoBrush}"/>
+                    </Border>
+                </DockPanel>
+                <UniformGrid Columns="5" Margin="0">
+                    <RadioButton x:Name="schemaAuto" GroupName="Schema" IsChecked="True" Cursor="Hand" Margin="0,0,8,0">
+                        <RadioButton.Template>
+                            <ControlTemplate TargetType="RadioButton">
+                                <Border x:Name="bd" CornerRadius="8" Padding="16,14"
+                                        Background="{StaticResource AccentGlowBrush}"
+                                        BorderBrush="{StaticResource AccentBrush}" BorderThickness="2">
+                                    <StackPanel HorizontalAlignment="Center">
+                                        <TextBlock Text="🤖" FontSize="22" HorizontalAlignment="Center"/>
+                                        <TextBlock Text="Deteccao Auto" FontSize="11" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center" Margin="0,6,0,0"/>
+                                        <TextBlock Text="IA identifica" FontSize="9" Foreground="{StaticResource TextTertiaryBrush}"
+                                                   HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsChecked" Value="False">
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource CardBrush}"/>
+                                        <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+                                    </Trigger>
+                                    <MultiTrigger>
+                                        <MultiTrigger.Conditions>
+                                            <Condition Property="IsMouseOver" Value="True"/>
+                                            <Condition Property="IsChecked" Value="False"/>
+                                        </MultiTrigger.Conditions>
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource CardHoverBrush}"/>
+                                        <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource BorderHoverBrush}"/>
+                                    </MultiTrigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </RadioButton.Template>
+                    </RadioButton>
+
+                    <RadioButton GroupName="Schema" Cursor="Hand" Margin="4,0">
+                        <RadioButton.Template>
+                            <ControlTemplate TargetType="RadioButton">
+                                <Border x:Name="bd" CornerRadius="8" Padding="16,14"
+                                        Background="{StaticResource CardBrush}"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="2">
+                                    <StackPanel HorizontalAlignment="Center">
+                                        <TextBlock Text="📃" FontSize="22" HorizontalAlignment="Center"/>
+                                        <TextBlock Text="Nota Fiscal" FontSize="11" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center" Margin="0,6,0,0"/>
+                                        <TextBlock Text="8 campos" FontSize="9" Foreground="{StaticResource TextTertiaryBrush}"
+                                                   HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsChecked" Value="True">
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentGlowBrush}"/>
+                                        <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                                    </Trigger>
+                                    <MultiTrigger>
+                                        <MultiTrigger.Conditions>
+                                            <Condition Property="IsMouseOver" Value="True"/>
+                                            <Condition Property="IsChecked" Value="False"/>
+                                        </MultiTrigger.Conditions>
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource CardHoverBrush}"/>
+                                    </MultiTrigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </RadioButton.Template>
+                    </RadioButton>
+
+                    <RadioButton GroupName="Schema" Cursor="Hand" Margin="4,0">
+                        <RadioButton.Template>
+                            <ControlTemplate TargetType="RadioButton">
+                                <Border x:Name="bd" CornerRadius="8" Padding="16,14"
+                                        Background="{StaticResource CardBrush}"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="2">
+                                    <StackPanel HorizontalAlignment="Center">
+                                        <TextBlock Text="🏦" FontSize="22" HorizontalAlignment="Center"/>
+                                        <TextBlock Text="Boleto" FontSize="11" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center" Margin="0,6,0,0"/>
+                                        <TextBlock Text="6 campos" FontSize="9" Foreground="{StaticResource TextTertiaryBrush}"
+                                                   HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsChecked" Value="True">
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentGlowBrush}"/>
+                                        <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                                    </Trigger>
+                                    <MultiTrigger>
+                                        <MultiTrigger.Conditions>
+                                            <Condition Property="IsMouseOver" Value="True"/>
+                                            <Condition Property="IsChecked" Value="False"/>
+                                        </MultiTrigger.Conditions>
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource CardHoverBrush}"/>
+                                    </MultiTrigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </RadioButton.Template>
+                    </RadioButton>
+
+                    <RadioButton GroupName="Schema" Cursor="Hand" Margin="4,0">
+                        <RadioButton.Template>
+                            <ControlTemplate TargetType="RadioButton">
+                                <Border x:Name="bd" CornerRadius="8" Padding="16,14"
+                                        Background="{StaticResource CardBrush}"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="2">
+                                    <StackPanel HorizontalAlignment="Center">
+                                        <TextBlock Text="💸" FontSize="22" HorizontalAlignment="Center"/>
+                                        <TextBlock Text="Comp. PIX" FontSize="11" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center" Margin="0,6,0,0"/>
+                                        <TextBlock Text="5 campos" FontSize="9" Foreground="{StaticResource TextTertiaryBrush}"
+                                                   HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsChecked" Value="True">
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentGlowBrush}"/>
+                                        <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                                    </Trigger>
+                                    <MultiTrigger>
+                                        <MultiTrigger.Conditions>
+                                            <Condition Property="IsMouseOver" Value="True"/>
+                                            <Condition Property="IsChecked" Value="False"/>
+                                        </MultiTrigger.Conditions>
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource CardHoverBrush}"/>
+                                    </MultiTrigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </RadioButton.Template>
+                    </RadioButton>
+
+                    <RadioButton GroupName="Schema" Cursor="Hand" Margin="8,0,0,0">
+                        <RadioButton.Template>
+                            <ControlTemplate TargetType="RadioButton">
+                                <Border x:Name="bd" CornerRadius="8" Padding="16,14"
+                                        Background="{StaticResource CardBrush}"
+                                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="2">
+                                    <StackPanel HorizontalAlignment="Center">
+                                        <TextBlock Text="📋" FontSize="22" HorizontalAlignment="Center"/>
+                                        <TextBlock Text="Guia DARF" FontSize="11" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center" Margin="0,6,0,0"/>
+                                        <TextBlock Text="7 campos" FontSize="9" Foreground="{StaticResource TextTertiaryBrush}"
+                                                   HorizontalAlignment="Center"/>
+                                    </StackPanel>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsChecked" Value="True">
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentGlowBrush}"/>
+                                        <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                                    </Trigger>
+                                    <MultiTrigger>
+                                        <MultiTrigger.Conditions>
+                                            <Condition Property="IsMouseOver" Value="True"/>
+                                            <Condition Property="IsChecked" Value="False"/>
+                                        </MultiTrigger.Conditions>
+                                        <Setter TargetName="bd" Property="Background" Value="{StaticResource CardHoverBrush}"/>
+                                    </MultiTrigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </RadioButton.Template>
+                    </RadioButton>
+                </UniformGrid>
+            </StackPanel>
+        </Border>
+
+        <!-- ═══ Processing Queue ═══ -->
+        <Border Style="{StaticResource CardStyle}" Margin="0,16,0,0">
+            <StackPanel>
+                <DockPanel Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Text="📋  Fila de Processamento" FontSize="14" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextPrimaryBrush}"/>
+                        <TextBlock x:Name="queueSubtitle" Text="2 itens em processamento" FontSize="12"
+                                   Foreground="{StaticResource TextTertiaryBrush}"/>
+                    </StackPanel>
+                </DockPanel>
+                <ItemsControl x:Name="queueList">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Padding="12,10" CornerRadius="6" Margin="0,2"
+                                    Background="{StaticResource ElevatedBrush}"
+                                    BorderBrush="{StaticResource BorderBrush}" BorderThickness="1">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding Icon}" FontSize="18" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding Filename}" FontSize="13" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}"/>
+                                        <TextBlock FontSize="11" Foreground="{StaticResource TextTertiaryBrush}">
+                                            <Run Text="{Binding Size}"/><Run Text=" · "/><Run Text="{Binding FilesText}"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                    <Border Grid.Column="2" CornerRadius="10" Padding="10,3" Margin="8,0"
+                                            VerticalAlignment="Center"
+                                            Background="{Binding BadgeBg}">
+                                        <TextBlock Text="{Binding Label}" FontSize="10" FontWeight="SemiBold"
+                                                   Foreground="{Binding BadgeFg}"/>
+                                    </Border>
+                                    <Grid Grid.Column="3" VerticalAlignment="Center" Width="160"
+                                          Visibility="{Binding ShowProgress}">
+                                        <Border Height="4" CornerRadius="2" Background="{StaticResource ElevatedBrush}"/>
+                                        <Border Height="4" CornerRadius="2" HorizontalAlignment="Left"
+                                                Width="{Binding ProgressWidth}" Background="{StaticResource AccentBrush}"/>
+                                        <TextBlock Text="{Binding ProgressStr}" FontSize="10" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                                   HorizontalAlignment="Right" Margin="0,-14,0,0"/>
+                                    </Grid>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </Border>
+    </StackPanel>
+</UserControl>

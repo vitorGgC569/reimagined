@@ -1,0 +1,60 @@
+<Window x:Class="OContabil.Views.LoginView"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="OContabil — Entrar"
+        Height="560" Width="420"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        Background="{DynamicResource BgPrimary}"
+        Icon="/Assets/logo.png">
+    <Grid>
+        <!-- Centered Login Card -->
+        <Border VerticalAlignment="Center" HorizontalAlignment="Center"
+                Width="340" Background="{DynamicResource BgCard}"
+                CornerRadius="10" BorderBrush="{DynamicResource Border}"
+                BorderThickness="1" Padding="32,36">
+            <StackPanel>
+                <!-- Logo -->
+                <Image Source="/Assets/logo.png" Width="48" Height="48"
+                       HorizontalAlignment="Center" Margin="0,0,0,12"/>
+                <TextBlock Text="OContabil"
+                           FontSize="26" FontWeight="Bold" FontFamily="Segoe UI"
+                           Foreground="{DynamicResource TextPrimary}"
+                           HorizontalAlignment="Center"/>
+                <TextBlock Text="Gestao de Documentos Fiscais"
+                           FontSize="11" Foreground="{DynamicResource TextMuted}"
+                           HorizontalAlignment="Center" Margin="0,4,0,0"/>
+
+                <!-- Divider -->
+                <Border Height="1" Background="{DynamicResource Border}" Margin="0,28,0,24"/>
+
+                <!-- Username -->
+                <TextBlock Text="Usuario" FontSize="11.5" FontWeight="Medium"
+                           Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,6"/>
+                <TextBox x:Name="txtUser" Style="{DynamicResource InputBox}"
+                         Text="admin" Margin="0,0,0,16"/>
+
+                <!-- Password -->
+                <TextBlock Text="Senha" FontSize="11.5" FontWeight="Medium"
+                           Foreground="{DynamicResource TextSecondary}" Margin="0,0,0,6"/>
+                <PasswordBox x:Name="txtPass" Style="{DynamicResource InputPassword}"
+                             Margin="0,0,0,8"/>
+
+                <!-- Error -->
+                <TextBlock x:Name="txtError" Text="" FontSize="11"
+                           Foreground="{DynamicResource Error}" Margin="0,0,0,8"
+                           TextAlignment="Center" Visibility="Collapsed"/>
+
+                <!-- Login Button -->
+                <Button Style="{DynamicResource BtnPrimary}" Content="Entrar"
+                        Click="OnLogin" Margin="0,12,0,0"
+                        HorizontalAlignment="Stretch"/>
+
+                <!-- Info -->
+                <TextBlock Text="admin / admin" FontSize="10"
+                           Foreground="{DynamicResource TextMuted}"
+                           HorizontalAlignment="Center" Margin="0,16,0,0"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

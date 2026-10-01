@@ -1,0 +1,4 @@
+# Artefatos gerados por build_installer.ps1 — não versionar (grandes/derivados)
+publish/
+redist/
+Output/

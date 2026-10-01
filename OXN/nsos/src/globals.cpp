@@ -1,45 +1,40 @@
 #include "inspector.h"
+#include "nsos/determinism.h"
+
 #include <csignal>
 #include <cstdlib>
-#include <iostream>
 
-#ifdef __linux__
-#include <execinfo.h>
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 
-// Global Signal Handler for Segfaults
-void signal_handler(int signal) {
-  std::cerr << "\n\n💥 CRITICAL KERNEL PANIC: Signal " << signal
-            << " (SIGSEGV/SIGBUS)" << std::endl;
-  std::cerr << "   The Engine has encountered a fatal memory error."
-            << std::endl;
-  std::cerr << "   Dumping Stack Trace:" << std::endl;
-
-#ifdef __linux__
-  void *array[20];
-  size_t size = backtrace(array, 20);
-  backtrace_symbols_fd(array, size, STDERR_FILENO);
-#else
-  std::cerr << "   [Stack Trace not available on this platform]" << std::endl;
+// Fatal-signal handling is deliberately opt-in. A library must not replace
+// Python's or its host application's process-wide handlers merely by being
+// loaded. The handler itself performs only fixed-buffer writes and signal
+// primitives; allocation, iostreams, locks and normal process teardown are
+// forbidden in this context.
+void signal_handler(int signal_number) {
+#ifndef _WIN32
+  static constexpr char message[] =
+      "NSOS fatal signal; restoring the default handler\n";
+  (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
 #endif
-
-  std::cerr << "\n   Aborting Process safely..." << std::endl;
-  std::exit(signal);
+  (void)std::signal(signal_number, SIG_DFL);
+  (void)std::raise(signal_number);
+#ifndef _WIN32
+  ::_exit(128 + signal_number);
+#else
+  std::_Exit(128 + signal_number);
+#endif
 }
 
-#include "nsos/determinism.h"
+void install_crash_handler() {
+  (void)std::signal(SIGSEGV, signal_handler);
+  (void)std::signal(SIGABRT, signal_handler);
+}
 
 namespace nsos {
-// Install Crash Handler on Init
-struct CrashHandlerInstaller {
-  CrashHandlerInstaller() {
-    std::signal(SIGSEGV, signal_handler);
-    std::signal(SIGABRT, signal_handler);
-  }
-} _installer;
 
-// Definition of global configuration variable
 bool GLOBAL_DETERMINISTIC_MODE = true;
 
 void set_global_seed(int seed) {
@@ -56,4 +51,5 @@ std::mt19937_64 get_rng() {
   return determinism::DeterminismManager::instance().get_rng_for_operation(
       "global", "generic", 0);
 }
-} // namespace nsos
+
+}  // namespace nsos

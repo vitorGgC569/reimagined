@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import re
 import struct
@@ -108,6 +109,7 @@ DEFAULT_PHASE_SIZES_V11 = {
 }
 
 COUNT_LABELS = ["ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN"]
+COUNT_LABELS_PT = ["ZERO", "UM", "DOIS", "TRES", "QUATRO", "CINCO", "SEIS", "SETE"]
 TOKENIZER_PHASE_TEXT_CAPS = {
     "phase1_algorithms": 160,
     "phase2_structured": 160,
@@ -277,6 +279,39 @@ def _boolean_gate(op: str, a: int, b: int) -> int:
     raise ValueError(f"Unknown gate: {op}")
 
 
+def _split_is_train(key: str, train_fraction: float) -> bool:
+    """Deterministic, seed-independent train/eval assignment for one item.
+
+    The split MUST be a pure function of the item's content so that the
+    train-split call and the eval-split call agree on which side every item
+    belongs to.  build_curriculum invokes the phase builders with DIFFERENT
+    seeds for train vs eval; the previous shuffle-then-slice partition used the
+    per-call RNG, so train and eval sliced different permutations of the same
+    corpus and the same source row/chunk could leak into BOTH sides.  Bucketing
+    by a content hash removes that coupling: a given item always lands on
+    exactly one side regardless of seed or iteration order, so train and eval
+    are provably disjoint.
+    """
+    fraction = max(0.0, min(1.0, train_fraction))
+    cut = int(round(fraction * 1000.0))
+    return (int(stable_hash(key), 16) % 1000) < cut
+
+
+def _row_split_key(row: Dict) -> str:
+    """Stable, content-addressed identity for a dataset row.
+
+    IDs and source labels are metadata, not semantic identity: two rows with
+    different IDs but identical content must never land on opposite sides of
+    the train/eval boundary.
+    """
+    content = {
+        key: value
+        for key, value in row.items()
+        if key not in {"id", "source", "split"}
+    }
+    return json.dumps(content, sort_keys=True, ensure_ascii=False)
+
+
 def _pick_split_subset(
     items: Sequence[Tuple[str, str, str]],
     split: str,
@@ -285,13 +320,19 @@ def _pick_split_subset(
 ) -> List[Tuple[str, str, str]]:
     if not items:
         return []
-    shuffled = list(items)
-    rng.shuffle(shuffled)
-    if len(shuffled) == 1:
-        return shuffled
-    cut = max(1, min(len(shuffled) - 1, int(round(len(shuffled) * train_fraction))))
-    chosen = shuffled[:cut] if split == "train" else shuffled[cut:]
-    return chosen or shuffled
+    want_train = split == "train"
+    # Partition by CONTENT (seed-independent) so the train and eval calls — made
+    # by build_curriculum with different seeds — stay provably disjoint.
+    chosen = [
+        item
+        for item in items
+        if _split_is_train("\x1f".join(str(part) for part in item), train_fraction)
+        == want_train
+    ]
+    # The RNG only orders WITHIN the already-disjoint side (determinism / any
+    # downstream truncation); it never moves the train/eval boundary.
+    rng.shuffle(chosen)
+    return chosen
 
 
 def _real_dataset_dir(repo_root: Path) -> Path:
@@ -324,15 +365,17 @@ def _pick_split_rows(
 ) -> List[Dict]:
     if not rows:
         return []
-    shuffled = list(rows)
-    rng.shuffle(shuffled)
-    if len(shuffled) == 1:
-        chosen = shuffled
-    else:
-        cut = max(1, min(len(shuffled) - 1, int(round(len(shuffled) * train_fraction))))
-        chosen = shuffled[:cut] if split == "train" else shuffled[cut:]
-        if not chosen:
-            chosen = shuffled
+    want_train = split == "train"
+    # Content-addressed partition (seed-independent) -> train and eval are
+    # disjoint even though build_curriculum passes different per-split seeds.
+    chosen = [
+        row
+        for row in rows
+        if _split_is_train(_row_split_key(row), train_fraction) == want_train
+    ]
+    # Order within the disjoint side with the per-call RNG; max_rows truncation
+    # therefore varies by seed but never crosses the train/eval boundary.
+    rng.shuffle(chosen)
     if max_rows is not None:
         return chosen[:max_rows]
     return chosen
@@ -343,17 +386,14 @@ def _normalize_inline_text(text: str) -> str:
 
 
 def _expand_records(records: List[Dict], count: int, rng: random.Random) -> List[Dict]:
-    if len(records) >= count:
-        rng.shuffle(records)
-        return records[:count]
-    expanded = list(records)
-    cursor = 0
-    while records and len(expanded) < count:
-        template = records[cursor % len(records)]
-        duplicate = dict(template)
-        duplicate["id"] = stable_hash(f"{template['id']}:{len(expanded)}")
-        expanded.append(duplicate)
-        cursor += 1
+    # Never manufacture sample count by copying content under a new ID. That
+    # inflated dataset-size telemetry and could put semantically identical
+    # rows into evaluation after later repartitioning. A smaller honest corpus
+    # is preferable to duplicated supervision.
+    unique: Dict[str, Dict] = {}
+    for record in records:
+        unique.setdefault(_row_split_key(record), record)
+    expanded = list(unique.values())
     rng.shuffle(expanded)
     return expanded[:count]
 
@@ -370,30 +410,44 @@ def build_phase1_algorithms(count: int, seed: int, split: str) -> List[Dict]:
         + ["count_label"] * 1
     )
 
+    pt = os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt"
     for _ in range(count):
         mode = rng.choice(weighted_modes)
         if mode == "copy_short":
             value = _random_token_string(rng, 4, 8)
-            prompt = f"Copy exactly this token stream: {value}"
+            prompt = (f"Copie exatamente esta sequencia: {value}" if pt
+                      else f"Copy exactly this token stream: {value}")
             answer = value
         elif mode == "reverse_short":
             value = _random_token_string(rng, 4, 8)
-            prompt = f"Reverse this token stream: {value}"
+            prompt = (f"Inverta esta sequencia: {value}" if pt
+                      else f"Reverse this token stream: {value}")
             answer = value[::-1]
         elif mode == "parity_label":
             bits = "".join(rng.choice("01") for _ in range(rng.randint(5, 9)))
-            prompt = f"Parity for {bits}. Answer with EVEN or ODD."
-            answer = "EVEN" if sum(bit == "1" for bit in bits) % 2 == 0 else "ODD"
+            even = sum(bit == "1" for bit in bits) % 2 == 0
+            if pt:
+                prompt = f"Paridade de {bits}. Responda PAR ou IMPAR."
+                answer = "PAR" if even else "IMPAR"
+            else:
+                prompt = f"Parity for {bits}. Answer with EVEN or ODD."
+                answer = "EVEN" if even else "ODD"
         elif mode == "binary_add":
             a = rng.randint(0, 15)
             b = rng.randint(0, 15)
-            prompt = f"Add the binary values {a:b} + {b:b}. Answer in binary only."
+            prompt = (f"Some os valores binarios {a:b} + {b:b}. Responda somente em binario."
+                      if pt else
+                      f"Add the binary values {a:b} + {b:b}. Answer in binary only.")
             answer = format(a + b, "b")
         elif mode == "compare_label":
             a = rng.randint(-20, 20)
             b = rng.randint(-20, 20)
-            prompt = f"Compare {a} and {b}. Answer with one label from LT, GT, EQ."
-            answer = "LT" if a < b else "GT" if a > b else "EQ"
+            if pt:
+                prompt = f"Compare {a} e {b}. Responda com um rotulo: MENOR, MAIOR ou IGUAL."
+                answer = "MENOR" if a < b else "MAIOR" if a > b else "IGUAL"
+            else:
+                prompt = f"Compare {a} and {b}. Answer with one label from LT, GT, EQ."
+                answer = "LT" if a < b else "GT" if a > b else "EQ"
         else:
             target = rng.choice("abcxyz012")
             base = _random_token_string(rng, 6, 10)
@@ -402,11 +456,16 @@ def build_phase1_algorithms(count: int, seed: int, split: str) -> List[Dict]:
             rng.shuffle(chars)
             shuffled = "".join(chars)
             count_value = min(shuffled.count(target), len(COUNT_LABELS) - 1)
-            prompt = (
-                f"Count how many times '{target}' appears in: {shuffled}. "
-                "Answer with one label from ZERO to SEVEN."
-            )
-            answer = COUNT_LABELS[count_value]
+            if pt:
+                prompt = (f"Conte quantas vezes '{target}' aparece em: {shuffled}. "
+                          "Responda com um rotulo de ZERO a SETE.")
+                answer = COUNT_LABELS_PT[count_value]
+            else:
+                prompt = (
+                    f"Count how many times '{target}' appears in: {shuffled}. "
+                    "Answer with one label from ZERO to SEVEN."
+                )
+                answer = COUNT_LABELS[count_value]
 
         rows.append(_make_record("phase1_algorithms", mode, prompt, answer, f"{split}_synthetic"))
     return rows
@@ -538,7 +597,8 @@ def _phase1_real_rows(repo_root: Path, split: str, seed: int) -> List[Dict]:
 
 def build_phase1_algorithms_v2(repo_root: Path, count: int, seed: int, split: str) -> List[Dict]:
     rng = random.Random(seed)
-    rows = list(_phase1_real_rows(repo_root, split, seed))
+    rows = ([] if os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt"
+            else list(_phase1_real_rows(repo_root, split, seed)))
     rng.shuffle(rows)
     real_target = min(len(rows), max(count // 2, int(count * 0.7)))
     mixed = rows[:real_target]
@@ -738,8 +798,36 @@ def _phase3_real_documents(repo_root: Path, split: str, seed: int) -> List[Tuple
     Per-source row limits scale with the v11 phase budget — when the
     caller wants 30,000 phase-3 rows (DEFAULT_PHASE_SIZES_V11), we pull
     more aggressively from the larger sources.  The split parameter
-    'train' vs 'eval' is honored by _pick_split_rows; each source uses
-    a different RNG offset to avoid correlation."""
+    'train' vs 'eval' is honored by _pick_split_rows, which assigns each item
+    to exactly one side by a content hash — so train and eval stay disjoint
+    even though build_curriculum calls the builders with different per-split
+    seeds (no train/eval leakage)."""
+    # NSOS_CURRICULUM_LANG=pt: modo PT-first — o produto fala portugues; corta
+    # ingles e codigo da fase de texto (o raio-x G6 + o teste qualitativo
+    # mostraram a "moda codigo": pool unico ~6:1 codigo:texto real).
+    if os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt":
+        dataset_specs = [
+            ("wikipedia_pt", 620, 72, 24000, 1200),
+        ]
+        docs: List[Tuple[str, str, str]] = []
+        for offset, (dataset_name, chunk_chars, overlap_chars,
+                     max_rows_train, max_rows_eval) in enumerate(dataset_specs):
+            max_rows = max_rows_train if split == "train" else max_rows_eval
+            rows = _pick_split_rows(
+                _load_real_dataset_rows(repo_root, dataset_name),
+                split,
+                random.Random(seed + 101 + offset * 17),
+                max_rows=max_rows,
+            )
+            for row_index, row in enumerate(rows):
+                text = str(row.get("text", "") or "")
+                for ci, chunk in enumerate(
+                        chunk_text(text, chunk_chars=chunk_chars,
+                                   overlap_chars=overlap_chars)):
+                    docs.append((f"{dataset_name} r{row_index} #{ci + 1}",
+                                 chunk, dataset_name))
+        return docs
+
     dataset_specs = [
         # (dataset_name, chunk_chars, overlap_chars, max_rows_train, max_rows_eval)
         # ── v10 baseline (always pulled) ─────────────────────────────────
@@ -1078,133 +1166,6 @@ def _phase3_reference_documents(split: str) -> List[Tuple[str, str, str]]:
 def build_phase3_curated_text(repo_root: Path, count: int, seed: int, split: str) -> List[Dict]:
     return build_phase3_curated_text_v2(repo_root, count, seed, split)
 
-    rng = random.Random(seed)
-    docs: List[Dict] = []
-
-    for title, body, source in _phase3_reference_documents(split):
-        for index, chunk in enumerate(chunk_text(body, chunk_chars=360, overlap_chars=48)):
-            docs.append(_make_doc_record("phase3_curated_text", f"{title} #{index + 1}", chunk, source))
-
-    prose_chunks: List[Tuple[str, str, str]] = []
-    for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        for index, chunk in enumerate(chunk_text(raw, chunk_chars=560, overlap_chars=64)):
-            prose_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    code_chunks: List[Tuple[str, str, str]] = []
-    for title, path in _repo_code_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        tagged = f"File: {path.name}\n\n{raw}"
-        for index, chunk in enumerate(chunk_text(tagged, chunk_chars=420, overlap_chars=56)):
-            code_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    selected_prose = _pick_split_subset(prose_chunks, split, random.Random(seed + 17))
-    selected_code = _pick_split_subset(code_chunks, split, random.Random(seed + 31))
-
-    for title, chunk, source in selected_prose:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    code_limit = max(1, count // 4)
-    for title, chunk, source in selected_code[:code_limit]:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    return _expand_records(docs, count, rng)
-
-    for title, body, source in _phase3_reference_documents(split):
-        for index, chunk in enumerate(chunk_text(body, chunk_chars=320, overlap_chars=48)):
-            docs.append(
-                _make_doc_record(
-                    "phase3_curated_text",
-                    f"{title} #{index + 1}",
-                    chunk,
-                    source,
-                )
-            )
-
-    prose_paths = [
-        ("NSOS README prose", repo_root / "OXN" / "nsos" / "README.md"),
-        ("NSOS plan prose", repo_root / "OXN" / "nsos" / "docs" / "NSOS_LLM_SMALL_PLAN.md"),
-        ("NSOS validation prose", repo_root / "OXN" / "nsos" / "docs" / "NSOS_VALIDATION_STATUS.md"),
-        ("OxtaMem notes prose", repo_root / "modules" / "oxtamem" / "README_NSOS.md"),
-    ]
-    prose_chunks: List[Tuple[str, str, str]] = []
-    for title, path in prose_paths:
-        if not path.exists():
-            continue
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        for index, chunk in enumerate(chunk_text(raw, chunk_chars=420, overlap_chars=56)):
-            prose_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    harvested: List[Tuple[str, str, str]] = []
-    for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        tagged = f"File: {path.name}\n\n{raw}"
-        for index, chunk in enumerate(chunk_text(tagged, chunk_chars=480, overlap_chars=72)):
-            harvested.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    for title, chunk, source in prose_chunks:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    rng.shuffle(harvested)
-    split_index = max(len(harvested) * 3 // 4, 1)
-    selected = harvested[:split_index] if split == "train" else harvested[split_index:]
-    if not selected:
-        selected = harvested
-    for title, chunk, source in selected:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    rng.shuffle(docs)
-    if len(docs) >= count:
-        return docs[:count]
-
-    expanded = list(docs)
-    while docs and len(expanded) < count:
-        template = docs[len(expanded) % len(docs)]
-        expanded.append({**template, "id": stable_hash(f"{template['id']}:{len(expanded)}")})
-    return expanded[:count]
-
-    bilingual_notes = [
-        (
-            "NSOS identity",
-            "NSOS is a compact neural runtime that combines BitLinear, memory, reasoning, and edge-oriented deployment. "
-            "O NSOS busca unir treino verificável, inferência eficiente e memória persistente.",
-            "handwritten",
-        ),
-        (
-            "Edge model focus",
-            "A small specialized model should prefer structured tasks, technical text, code, and exact answers over noisy generic web text. "
-            "Um modelo pequeno forte precisa ter identidade e métricas honestas.",
-            "handwritten",
-        ),
-        (
-            "Ternary inference",
-            "Packed ternary inference only becomes real when export, runtime layout, and decode path all agree. "
-            "Quantizar embeddings com mais cuidado costuma preservar mais qualidade.",
-            "handwritten",
-        ),
-    ]
-
-    selected_notes = bilingual_notes[:2] if split == "train" else bilingual_notes[2:]
-    for title, body, source in selected_notes:
-        docs.append(_make_doc_record("phase3_curated_text", title, body, source))
-
-    harvested: List[Tuple[str, str, str]] = []
-    for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-        tagged = f"File: {path.name}\n\n{raw}"
-        for index, chunk in enumerate(chunk_text(tagged)):
-            harvested.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
-
-    rng.shuffle(harvested)
-    split_index = max(len(harvested) * 3 // 4, 1)
-    selected = harvested[:split_index] if split == "train" else harvested[split_index:]
-    if not selected:
-        selected = harvested
-    for title, chunk, source in selected[: max(count, 1)]:
-        docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
-
-    return docs[:count]
-
 
 def build_phase4_instructions(count: int, seed: int, split: str) -> List[Dict]:
     rng = random.Random(seed)
@@ -1313,163 +1274,6 @@ def build_phase4_instructions(count: int, seed: int, split: str) -> List[Dict]:
         rows.append(_make_record("phase4_instructions", mode, prompt, answer, f"{split}_synthetic"))
     return rows
 
-    summary_pairs = [
-        (
-            "NSOS trains on structured tasks before broad language data. This improves stability and exactness.",
-            "NSOS starts with structured tasks to improve stability and exactness.",
-        ),
-        (
-            "Packed ternary inference reduces memory traffic, but it only works well when export and runtime agree on layout.",
-            "Packed ternary inference needs matching export and runtime layouts.",
-        ),
-        (
-            "A small bilingual technical model should preserve commands, identifiers, and key names across Portuguese and English.",
-            "A bilingual technical model should preserve commands and key names across PT and EN.",
-        ),
-    ]
-    json_pairs = [
-        {"name": "nsos", "mode": "api", "lang": "pt", "tier": "small"},
-        {"name": "oxtamem", "mode": "edge", "lang": "en", "tier": "core"},
-        {"name": "bitnet", "mode": "train", "lang": "en", "tier": "qat"},
-    ]
-    classify_pairs = [
-        ("error: cuda synchronize failed after kernel launch", "error"),
-        ("warning: using fallback tokenizer bundle", "warning"),
-        ("status: all tests passed and checkpoint saved", "status"),
-    ]
-    rewrite_pairs = [
-        (
-            "The runtime is very, very fast and kind of stable but maybe still a bit rough in places.",
-            "The runtime is fast and fairly stable, but it still needs polish.",
-        ),
-        (
-            "We want a response that is short, exact, and easy to verify.",
-            "Respond briefly, exactly, and in a verifiable format.",
-        ),
-    ]
-    translate_pairs = [
-        ("The session stores facts and recalls them later.", "A sessao guarda fatos e os recupera depois."),
-        ("Edge inference needs compact weights and predictable latency.", "Inferencia em edge precisa de pesos compactos e latencia previsivel."),
-        ("The verifier should answer with a short exact label.", "O verificador deve responder com um rotulo curto e exato."),
-    ]
-    explain_pairs = [
-        (
-            "int acc = 0; for (int i = 0; i < n; ++i) acc += values[i]; return acc;",
-            "This loop sums all values and returns the accumulated total.",
-        ),
-        (
-            "if (token == eos) break; output.push_back(token);",
-            "The code stops at eos and otherwise appends the token to the output.",
-        ),
-        (
-            "x = x.rmsnorm(); y = proj.forward(x); return y.relu();",
-            "The snippet normalizes the input, projects it, and applies ReLU.",
-        ),
-    ]
-
-    for _ in range(count):
-        mode = rng.choice(
-            ["summarize", "convert_json", "classify", "rewrite", "translate", "explain_code"]
-        )
-        if mode == "summarize":
-            source, answer = rng.choice(summary_pairs)
-            prompt = f"Write one short summary sentence for this text:\n{source}"
-        elif mode == "convert_json":
-            payload = dict(rng.choice(json_pairs))
-            prompt = (
-                "Convert these key=value pairs to compact JSON with keys ordered as "
-                "name,mode,lang,tier: "
-                f"name={payload['name']} mode={payload['mode']} lang={payload['lang']} tier={payload['tier']}"
-            )
-            answer = json.dumps(payload, separators=(",", ":"))
-        elif mode == "classify":
-            text, answer = rng.choice(classify_pairs)
-            prompt = (
-                "Classify the log line with one label from {status,warning,error}:\n"
-                f"{text}"
-            )
-        elif mode == "rewrite":
-            source, answer = rng.choice(rewrite_pairs)
-            prompt = f"Rewrite this sentence to be cleaner and more technical:\n{source}"
-        elif mode == "translate":
-            source, answer = rng.choice(translate_pairs)
-            prompt = f"Translate to Portuguese:\n{source}"
-        else:
-            code, answer = rng.choice(explain_pairs)
-            prompt = f"Explain in one sentence what this code does:\n{code}"
-
-        rows.append(_make_record("phase4_instructions", mode, prompt, answer, f"{split}_synthetic"))
-    return rows
-
-    templates = [
-        (
-            "summarize",
-            "Resuma em uma frase curta: {text}",
-            lambda value: f"Resumo: {value.split('.')[0].strip()}.",
-        ),
-        (
-            "convert_json",
-            "Converta para JSON compacto: name={name} mode={mode} lang={lang}",
-            lambda value: json.dumps(value, separators=(",", ":")),
-        ),
-        (
-            "explain_code",
-            "Explique em uma frase o que este trecho faz:\n{code}",
-            lambda value: value,
-        ),
-        (
-            "translate",
-            "Translate to Portuguese: {text}",
-            lambda value: value,
-        ),
-    ]
-
-    explanation_bank = [
-        "This loop accumulates a running sum and returns the final value.",
-        "Este trecho aplica uma multiplicacao simples e devolve o resultado.",
-        "The function normalizes input values before the projection step.",
-    ]
-    translate_bank = [
-        ("The model stores session facts and recalls them later.", "O modelo armazena fatos da sessao e os recupera depois."),
-        ("Edge inference needs compact weights and predictable latency.", "Inferencia em edge precisa de pesos compactos e latencia previsivel."),
-    ]
-    summarize_bank = [
-        "NSOS trains on structured tasks before broad language data. This improves stability and exactness.",
-        "BitNet style inference reduces memory usage with packed ternary weights. It still needs a careful export path.",
-    ]
-
-    for _ in range(count):
-        mode, prompt_template, answer_builder = rng.choice(templates)
-        if mode == "summarize":
-            value = rng.choice(summarize_bank)
-            prompt = prompt_template.format(text=value)
-            answer = answer_builder(value)
-        elif mode == "convert_json":
-            value = {
-                "name": rng.choice(["nsos", "oxtamem", "bitnet"]),
-                "mode": rng.choice(["edge", "train", "api"]),
-                "lang": rng.choice(["pt", "en"]),
-            }
-            prompt = prompt_template.format(**value)
-            answer = answer_builder(value)
-        elif mode == "explain_code":
-            code = rng.choice(
-                [
-                    "int acc = 0; for (int i = 0; i < n; ++i) acc += values[i]; return acc;",
-                    "x = x.rmsnorm(); y = proj.forward(x); return y.relu();",
-                    "if (token == eos) break; output.push_back(token);",
-                ]
-            )
-            prompt = prompt_template.format(code=code)
-            answer = rng.choice(explanation_bank)
-        else:
-            src, dst = rng.choice(translate_bank)
-            prompt = prompt_template.format(text=src)
-            answer = dst
-
-        rows.append(_make_record("phase4_instructions", mode, prompt, answer, f"{split}_synthetic"))
-    return rows
-
 
 def build_phase5_verifier(count: int, seed: int, split: str) -> List[Dict]:
     rng = random.Random(seed)
@@ -1514,284 +1318,9 @@ def build_phase5_verifier(count: int, seed: int, split: str) -> List[Dict]:
         rows.append(_make_record("phase5_verifier", mode, prompt, answer, f"{split}_synthetic"))
     return rows
 
-    for _ in range(count):
-        mode = rng.choice(["math_small", "compare", "boolean_gate", "parity", "code_output"])
-        if mode == "math_small":
-            a = rng.randint(0, 24)
-            b = rng.randint(0, 24)
-            op = rng.choice(["+", "-"])
-            prompt = f"Compute exactly and answer with one integer: {a} {op} {b}"
-            answer = str(a + b if op == "+" else a - b)
-        elif mode == "compare":
-            a = rng.randint(-20, 20)
-            b = rng.randint(-20, 20)
-            prompt = f"Compare {a} and {b}. Answer with one token from <, >, =."
-            answer = "<" if a < b else ">" if a > b else "="
-        elif mode == "boolean_gate":
-            op = rng.choice(["AND", "OR", "XOR"])
-            a = rng.randint(0, 1)
-            b = rng.randint(0, 1)
-            prompt = f"Evaluate {op}({a},{b}). Answer with 0 or 1."
-            answer = str(_boolean_gate(op, a, b))
-        elif mode == "parity":
-            bits = "".join(rng.choice("01") for _ in range(rng.randint(4, 10)))
-            prompt = f"Parity for {bits}. Answer 0 for even ones and 1 for odd ones."
-            answer = str(sum(bit == "1" for bit in bits) % 2)
-        else:
-            x = rng.randint(1, 5)
-            y = rng.randint(1, 5)
-            prompt = (
-                "What does this Python snippet print? Answer with one integer.\n"
-                f"v = {x}\n"
-                f"v = v + {y}\n"
-                "print(v)"
-            )
-            answer = str(x + y)
-
-        rows.append(_make_record("phase5_verifier", mode, prompt, answer, f"{split}_synthetic"))
-    return rows
-
-    for _ in range(count):
-        mode = rng.choice(["math", "boolean_formula", "code_output"])
-        if mode == "math":
-            a = rng.randint(10, 99)
-            b = rng.randint(10, 99)
-            op = rng.choice(["+", "-", "*"])
-            prompt = f"Compute exactly: {a} {op} {b}"
-            answer = str(eval(f"{a}{op}{b}"))
-        elif mode == "boolean_formula":
-            a = rng.randint(0, 1)
-            b = rng.randint(0, 1)
-            c = rng.randint(0, 1)
-            prompt = f"Evaluate (({a} XOR {b}) AND {c}). Answer with 0 or 1."
-            answer = str((a ^ b) & c)
-        else:
-            x = rng.randint(1, 9)
-            y = rng.randint(1, 9)
-            z = rng.randint(1, 9)
-            prompt = (
-                "What is the output of this Python snippet?\n"
-                f"print(({x} + {y}) * {z})"
-            )
-            answer = str((x + y) * z)
-
-        rows.append(_make_record("phase5_verifier", mode, prompt, answer, f"{split}_synthetic"))
-    return rows
-
 
 def build_phase6_memory(count: int, seed: int, split: str) -> List[Dict]:
     return build_phase6_memory_v2(count, seed, split)
-
-    rng = random.Random(seed)
-    rows: List[Dict] = []
-    owners = ["selene", "orion", "maia", "nolan", "iris", "vega", "lucan", "sora", "talin", "mira"]
-    badges = ["amber", "cobalt", "fennel", "ivory", "juniper", "mosaic", "onyx", "saffron", "topaz", "violet"]
-    routes = ["atlas", "beacon", "cedar", "delta", "ember", "glacier", "harbor", "iona", "mistral", "solstice"]
-    modules = ["lumen", "quill", "rivet", "solace", "tundra", "vortex", "willow", "zephyr", "cinder", "petal"]
-    styles = ["nimble", "steady", "lucid", "quiet", "precise", "vivid", "measured", "brisk", "gentle", "stark"]
-
-    for _ in range(count):
-        facts = {
-            "owner": rng.choice(owners),
-            "badge": rng.choice(badges),
-            "route": rng.choice(routes),
-            "module": rng.choice(modules),
-            "style": rng.choice(styles),
-        }
-        mode = rng.choice(["direct_recall", "overwrite_recall", "pair_recall", "fact_table"])
-
-        if mode == "direct_recall":
-            ask_key = rng.choice(["badge", "route", "module", "style"])
-            prompt = textwrap.dedent(
-                f"""
-                System: remember the following session profile.
-                User: owner={facts['owner']}
-                Assistant: stored.
-                User: badge={facts['badge']}
-                Assistant: stored.
-                User: route={facts['route']}
-                Assistant: stored.
-                User: module={facts['module']}
-                Assistant: stored.
-                User: style={facts['style']}
-                Assistant: stored.
-                User: what is the {ask_key}? Reply with the stored value only.
-                Assistant:
-                """
-            ).strip()
-            answer = facts[ask_key]
-        elif mode == "overwrite_recall":
-            key = rng.choice(["badge", "route", "module", "style"])
-            pools = {
-                "badge": badges,
-                "route": routes,
-                "module": modules,
-                "style": styles,
-            }
-            replacement_pool = [value for value in pools[key] if value != facts[key]]
-            updated = rng.choice(replacement_pool)
-            prompt = textwrap.dedent(
-                f"""
-                System: keep session memory updated.
-                User: {key}={facts[key]}
-                Assistant: stored.
-                User: update {key}={updated}
-                Assistant: updated.
-                User: what is the {key} now? Reply with the new value only.
-                Assistant:
-                """
-            ).strip()
-            answer = updated
-        elif mode == "pair_recall":
-            prompt = textwrap.dedent(
-                f"""
-                System: remember the owner profile.
-                User: owner={facts['owner']}
-                Assistant: stored.
-                User: module={facts['module']}
-                Assistant: stored.
-                User: route={facts['route']}
-                Assistant: stored.
-                User: which module belongs to {facts['owner']}? Reply with one word only.
-                Assistant:
-                """
-            ).strip()
-            answer = facts["module"]
-        else:
-            prompt = textwrap.dedent(
-                f"""
-                System: remember this compact session card.
-                User:
-                owner:{facts['owner']}
-                badge:{facts['badge']}
-                route:{facts['route']}
-                module:{facts['module']}
-                style:{facts['style']}
-                Assistant: stored.
-                User: return the badge for this card. Answer with one word only.
-                Assistant:
-                """
-            ).strip()
-            answer = facts["badge"]
-
-        rows.append(_make_record("phase6_memory", mode, prompt, answer, f"{split}_synthetic"))
-    return rows
-
-    names = ["ana", "bruno", "caio", "dora"]
-    cities = ["oslo", "lima", "kyoto", "recife"]
-    tools = ["edge", "train", "cache", "agent"]
-    langs = ["pt", "en", "es", "de"]
-    tones = ["calm", "bold", "clean", "exact"]
-
-    for _ in range(count):
-        mode = rng.choice(["direct_recall", "overwrite_recall", "pair_recall", "fact_table"])
-        facts = {
-            "name": rng.choice(names),
-            "city": rng.choice(cities),
-            "tool": rng.choice(tools),
-            "lang": rng.choice(langs),
-            "tone": rng.choice(tones),
-        }
-
-        if mode == "direct_recall":
-            ask_key = rng.choice(["city", "tool", "lang", "tone"])
-            transcript = textwrap.dedent(
-                f"""
-                System: remember the following facts for this session.
-                User: name={facts['name']}
-                Assistant: stored.
-                User: city={facts['city']}
-                Assistant: stored.
-                User: tool={facts['tool']}
-                Assistant: stored.
-                User: lang={facts['lang']}
-                Assistant: stored.
-                User: tone={facts['tone']}
-                Assistant: stored.
-                User: what is the {ask_key}? Reply with the stored value only.
-                Assistant:
-                """
-            ).strip()
-            answer = facts[ask_key]
-        elif mode == "overwrite_recall":
-            key = rng.choice(["city", "tool", "lang", "tone"])
-            original = facts[key]
-            replacement_pool = [
-                value
-                for value in {"city": cities, "tool": tools, "lang": langs, "tone": tones}[key]
-                if value != original
-            ]
-            updated = rng.choice(replacement_pool)
-            transcript = textwrap.dedent(
-                f"""
-                System: keep session memory updated.
-                User: {key}={original}
-                Assistant: stored.
-                User: update {key}={updated}
-                Assistant: updated.
-                User: what is the {key} now? Reply with the new value only.
-                Assistant:
-                """
-            ).strip()
-            answer = updated
-        elif mode == "fact_table":
-            transcript = textwrap.dedent(
-                f"""
-                System: remember this compact profile table.
-                User:
-                name:{facts['name']}
-                city:{facts['city']}
-                tool:{facts['tool']}
-                lang:{facts['lang']}
-                tone:{facts['tone']}
-                Assistant: stored.
-                User: return the tool for this profile. Answer with one word only.
-                Assistant:
-                """
-            ).strip()
-            answer = facts["tool"]
-        else:
-            transcript = textwrap.dedent(
-                f"""
-                System: remember the user profile.
-                User: name={facts['name']}
-                Assistant: stored.
-                User: tool={facts['tool']}
-                Assistant: stored.
-                User: Which tool belongs to {facts['name']}? Answer with one word only.
-                Assistant:
-                """
-            ).strip()
-            answer = facts["tool"]
-
-        rows.append(_make_record("phase6_memory", mode, transcript, answer, f"{split}_synthetic"))
-    return rows
-
-    for _ in range(count):
-        facts = {
-            "name": rng.choice(names),
-            "city": rng.choice(cities),
-            "tool": rng.choice(tools),
-            "lang": rng.choice(langs),
-        }
-        ask_key = rng.choice(list(facts.keys()))
-        transcript = textwrap.dedent(
-            f"""
-            System: store the following session facts.
-            User: name={facts['name']}
-            Assistant: memorized.
-            User: city={facts['city']}
-            Assistant: memorized.
-            User: tool={facts['tool']}
-            Assistant: memorized.
-            User: lang={facts['lang']}
-            Assistant: memorized.
-            User: What is the {ask_key}?
-            Assistant:
-            """
-        ).strip()
-        rows.append(_make_record("phase6_memory", "memory_recall", transcript, facts[ask_key], f"{split}_synthetic"))
-    return rows
 
 
 def build_phase3_curated_text_v2(repo_root: Path, count: int, seed: int, split: str) -> List[Dict]:
@@ -1800,23 +1329,36 @@ def build_phase3_curated_text_v2(repo_root: Path, count: int, seed: int, split: 
     real_docs = _phase3_real_documents(repo_root, split, seed)
     random.Random(seed + 13).shuffle(real_docs)
 
+    if os.environ.get("NSOS_CURRICULUM_LANG", "").lower() == "pt":
+        # PT-first: so corpus real PT (sem handwritten EN, sem repo, sem codigo);
+        # limite = count (era 560 — o gargalo que fazia o codigo dominar o pool).
+        for title, chunk, source in real_docs[:count]:
+            docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
+        return _expand_records(docs, count, rng)
+
     for title, body, source in _phase3_reference_documents(split):
         for index, chunk in enumerate(chunk_text(body, chunk_chars=360, overlap_chars=48)):
             docs.append(_make_doc_record("phase3_curated_text", f"{title} #{index + 1}", chunk, source))
 
-    real_limit = 560 if split == "train" else 112
+    # Cap real docs by the requested phase budget, not a fixed 560.  The
+    # G6 radiography traced the v10 "code mode" (~6:1 code:text in the
+    # unique pool) to this cap: with the v11 30,000-row budget only 560
+    # real chunks entered and _expand_records duplicated them while
+    # code_chunks (count//8) flooded the mix.  The PT branch above was
+    # already fixed the same way.
+    real_limit = count
     for title, chunk, source in real_docs[:real_limit]:
         docs.append(_make_doc_record("phase3_curated_text", title, chunk, source))
 
     prose_chunks: List[Tuple[str, str, str]] = []
     for title, path in _repo_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
+        raw = read_text_strict(path)
         for index, chunk in enumerate(chunk_text(raw, chunk_chars=560, overlap_chars=64)):
             prose_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
 
     code_chunks: List[Tuple[str, str, str]] = []
     for title, path in _repo_code_documents(repo_root):
-        raw = path.read_text(encoding="utf-8", errors="ignore")
+        raw = read_text_strict(path)
         tagged = f"File: {path.name}\n\n{raw}"
         for index, chunk in enumerate(chunk_text(tagged, chunk_chars=420, overlap_chars=56)):
             code_chunks.append((f"{title} #{index + 1}", chunk, str(path.relative_to(repo_root))))
@@ -2147,11 +1689,8 @@ def build_tokenizer_bundle(curriculum_root: Path, target_vocab: int) -> Path:
     for phase in manifest["phases"]:
         phase_name = phase["name"]
         train_rows = read_jsonl(curriculum_root / phase["train_file"])
-        eval_rows = read_jsonl(curriculum_root / phase["eval_file"])
         phase_texts: List[str] = []
         for row in train_rows:
-            phase_texts.extend(_tokenizer_training_texts_for_row(phase_name, row))
-        for row in eval_rows[: max(1, len(eval_rows) // 2)]:
             phase_texts.extend(_tokenizer_training_texts_for_row(phase_name, row))
         phase_texts = _downsample_texts(
             phase_texts,
@@ -2179,6 +1718,19 @@ def build_tokenizer_bundle(curriculum_root: Path, target_vocab: int) -> Path:
         encoding="utf-8",
     )
     return tokenizer_path
+
+
+
+def read_text_strict(path) -> str:
+    """(auditoria #15) Leitura com contabilidade de perda: errors="ignore"
+    descartava bytes em silencio.  Decodifica com errors="replace", conta os
+    U+FFFD e ABORTA acima de 0.1% (corpus corrompido nao entra calado)."""
+    raw = Path(path).read_bytes()
+    text = raw.decode("utf-8", errors="replace")
+    bad = text.count(chr(0xFFFD))
+    if bad and bad > max(1, len(text) // 1000):
+        raise ValueError(f"{path}: {bad} bytes invalidos (> 0.1%) — corpus corrompido")
+    return text
 
 
 def curriculum_texts_for_phase(curriculum_root: Path, phase_name: str, split: str) -> List[Dict]:

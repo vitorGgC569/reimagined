@@ -7,7 +7,7 @@
 #include <random>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "../include/gpu_backend.h"
 #endif
 
 namespace nsos {
@@ -42,33 +42,21 @@ void HolographicMemory::add_concept(std::string name, const Tensor &vec) {
     int new_capacity = capacity * 2;
     Tensor new_matrix({new_capacity, dim}, item_memory_matrix.get_device());
 
-    // Copy existing data
-    if (item_memory_matrix.get_device() == Device::CPU) {
-      std::memcpy(new_matrix.data(), item_memory_matrix.data(),
-                  (size_t)current_size * dim * sizeof(float));
-    } else {
-#ifdef USE_CUDA
-      cudaMemcpy(new_matrix.raw_data(), item_memory_matrix.raw_data(),
-                 (size_t)current_size * dim * sizeof(float),
-                 cudaMemcpyDeviceToDevice);
-#endif
-    }
+    copy_tensor_bytes(
+        new_matrix.raw_data(), new_matrix.get_device(),
+        item_memory_matrix.raw_data(), item_memory_matrix.get_device(),
+        static_cast<size_t>(current_size) * dim * sizeof(float));
 
     item_memory_matrix = new_matrix;
     capacity = new_capacity;
   }
 
   // Insert at current_size offset
-  if (stored_vec.get_device() == Device::CPU) {
-    std::memcpy(item_memory_matrix.data() + (size_t)current_size * dim,
-                stored_vec.data(), dim * sizeof(float));
-  } else {
-#ifdef USE_CUDA
-    cudaMemcpy(item_memory_matrix.raw_data() + (size_t)current_size * dim,
-               stored_vec.raw_data(), dim * sizeof(float),
-               cudaMemcpyDeviceToDevice);
-#endif
-  }
+  copy_tensor_bytes(
+      item_memory_matrix.raw_data() +
+          static_cast<size_t>(current_size) * dim,
+      item_memory_matrix.get_device(), stored_vec.raw_data(),
+      stored_vec.get_device(), static_cast<size_t>(dim) * sizeof(float));
 
   current_size++;
 }
@@ -167,10 +155,14 @@ std::string HolographicMemory::query(const Tensor &query_vec) {
   float max_score = -std::numeric_limits<float>::infinity();
   int best_idx = -1;
 
+  // A caller may pass a query shorter than the stored hypervector
+  // dimensionality; only the overlapping prefix may be dotted to avoid
+  // reading past the query buffer.  For a full-length query this is a no-op.
+  const int score_extent = std::min(dim, static_cast<int>(query_cpu.size));
   for (int i = 0; i < current_size; ++i) {
     float score = 0.0f;
     const float *concept_ptr = memory_ptr + static_cast<size_t>(i) * dim;
-    for (int j = 0; j < dim; ++j) {
+    for (int j = 0; j < score_extent; ++j) {
       score += concept_ptr[j] * query_ptr[j];
     }
 
@@ -195,10 +187,14 @@ Tensor HolographicMemory::retrieve_vector(const Tensor &query_vec, int top_k,
   const float *query_ptr = query_cpu.data();
   const float *memory_ptr = memory_cpu.data();
   std::vector<std::pair<float, int>> ranked;
+  // Clamp the dot-product to the overlap between the query and the stored
+  // hypervector dimensionality (see query()); avoids reading past a short
+  // query buffer while leaving full-length queries unaffected.
+  const int score_extent = std::min(dim, static_cast<int>(query_cpu.size));
   for (int i = 0; i < current_size; ++i) {
     float score = 0.0f;
     const float *concept_ptr = memory_ptr + static_cast<size_t>(i) * dim;
-    for (int j = 0; j < dim; ++j) {
+    for (int j = 0; j < score_extent; ++j) {
       score += concept_ptr[j] * query_ptr[j];
     }
     ranked.push_back({score, i});
@@ -209,18 +205,23 @@ Tensor HolographicMemory::retrieve_vector(const Tensor &query_vec, int top_k,
   std::partial_sort(ranked.begin(), ranked.begin() + k, ranked.end(),
                     std::greater<std::pair<float, int>>());
 
-  // 4. Softmax Weights on CPU
+  // 4. Softmax Weights on CPU.  Floor the temperature so a caller passing
+  // temperature == 0 (or a tiny/negative value) cannot divide by zero and
+  // inject NaN/Inf into the softmax.  The default temperature (1.0) and any
+  // sane positive value are unchanged.
+  const float safe_temperature = std::max(temperature, 1e-6f);
   std::vector<float> weights(k);
   float sum_exp = 0;
-  float max_score = ranked[0].first / temperature;
+  float max_score = ranked[0].first / safe_temperature;
 
   for (int i = 0; i < k; ++i) {
-    weights[i] = std::exp((ranked[i].first / temperature) - max_score);
+    weights[i] = std::exp((ranked[i].first / safe_temperature) - max_score);
     sum_exp += weights[i];
   }
 
+  const float inv_sum_exp = 1.0f / std::max(sum_exp, 1e-9f);
   for (int i = 0; i < k; ++i) {
-    weights[i] /= sum_exp;
+    weights[i] *= inv_sum_exp;
   }
 
   Tensor result = Tensor::zeros({dim}, Device::CPU);

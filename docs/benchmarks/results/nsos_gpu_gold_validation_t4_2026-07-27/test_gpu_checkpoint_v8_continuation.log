@@ -1,0 +1,5 @@
+$ /content/nsos-build-gpu-gold-sm75/test_gpu_checkpoint_v8_continuation
+[GPUParity:checkpoint_v8_continuation] device=Tesla T4 cc=7.5 runtime=12080
+[GPUParity:checkpoint_v8_continuation] begin
+[GPUParity:checkpoint_v8_continuation] version=8 round_trip_param_diff=0 continuation_loss_diff=0 continuation_param_diff=0
+[GPUParity:checkpoint_v8_continuation] PASS

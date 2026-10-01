@@ -4,11 +4,11 @@
 #include "tensor.h"
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
-#include <vector>
 
 
 class DataLoader {
@@ -17,7 +17,8 @@ public:
              int max_queue = 5);
   ~DataLoader();
 
-  // Returns true if a batch was loaded, false if EOF
+  // Returns true if a complete batch was loaded and false at clean EOF.
+  // Missing, truncated and failed reads throw instead of synthesizing data.
   bool next(nsos::Tensor &batch);
 
 private:
@@ -26,6 +27,7 @@ private:
   std::string path;
   int batch_size;
   int d_model;
+  size_t max_queue;
 
   std::thread worker;
   std::atomic<bool> stop_flag;
@@ -35,9 +37,7 @@ private:
   std::condition_variable not_empty;
   std::condition_variable not_full;
 
-  // Mock file pointer
-  size_t current_idx;
-  size_t total_samples;
+  std::exception_ptr worker_error;
 };
 
 #endif

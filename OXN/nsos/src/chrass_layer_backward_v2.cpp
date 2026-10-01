@@ -22,16 +22,48 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
   const float *gy_ptr = grad_output.data();
   const float *x_ptr = input.data();
   float *gx_ptr = grad_input.data();
+  const float *w_ptr = values_param.data.data();
+  const int nnz_count = values_param.data.size;
 
   // Prepare Bias Gradients (Accumulate over batch)
   Tensor d_bias = Tensor::zeros({dim}, bias.data.get_device());
   float *db_ptr = d_bias.data();
 
-  // Reset Sparse Weight Gradients
-  // grad_values is aligned with 'values'
-  if (grad_values.size() != values.size())
-    grad_values.resize(values.size());
-  std::fill(grad_values.begin(), grad_values.end(), 0.0f);
+  // Sparse weight gradients ACCUMULATE into values_param.grad — the codebase-wide
+  // autograd contract.  The Trainer zeroes every parameter grad once per optimizer
+  // step and then runs the micro-batch backwards; the standalone step() clears the
+  // grad after applying its update.  Never reset here: doing so would drop all but
+  // the last micro-batch's gradient in a multi-bucket step (the bias path already
+  // accumulates via add_grad — the weight must match).  Lazy-allocate on the first
+  // call / shape change.
+  if (values_param.grad.size != nnz_count) {
+    values_param.grad = Tensor::zeros({nnz_count}, bias.data.get_device());
+  }
+  float *gw_ptr = values_param.grad.data();
+
+  // Saturation mask: the forward clamps |out| > 100 and zeroes NaN/Inf, both of
+  // which have zero local derivative.  Recompute the pre-clamp pre-activation so
+  // the backward routes NO gradient through saturated/sanitized outputs (else
+  // dL/dx, dL/dW and dL/db are wrong at clamped elements).
+  const float *bias_ptr = bias.data.data();
+  std::vector<float> active(static_cast<size_t>(batch) * static_cast<size_t>(dim),
+                            1.0f);
+#pragma omp parallel for
+  for (int b = 0; b < batch; ++b) {
+    const float *in_row = x_ptr + b * dim;
+    for (int r = 0; r < dim; ++r) {
+      float sum = 0.0f;
+      const int start = row_ptr[r];
+      const int end = row_ptr[r + 1];
+      for (int i = start; i < end; ++i) {
+        sum += w_ptr[i] * in_row[col_indices[i]];
+      }
+      sum += bias_ptr[r];
+      const bool saturated = std::isnan(sum) || std::isinf(sum) ||
+                             sum > 100.0f || sum < -100.0f;
+      active[static_cast<size_t>(b) * dim + r] = saturated ? 0.0f : 1.0f;
+    }
+  }
 
 // Backward Pass:
 // y = Wx + b
@@ -71,7 +103,7 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
     // gx[c] += value * gy[r]
 
     for (int r = 0; r < dim; ++r) {
-      float g_val = gy_row[r];
+      float g_val = gy_row[r] * active[static_cast<size_t>(b) * dim + r];
       // Skip if gradient is effectively zero (Sparse Backprop)
       if (std::abs(g_val) < 1e-9)
         continue;
@@ -81,7 +113,7 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
 
       for (int i = start; i < end; ++i) {
         int c = col_indices[i];
-        float w = values[i];
+        float w = w_ptr[i];
         gx_row[c] += w * g_val;
       }
     }
@@ -94,29 +126,27 @@ Tensor ChrassLayer::backward(const Tensor &grad_output, const Tensor &input) {
     const float *x_row = x_ptr + b * dim;
 
     for (int r = 0; r < dim; ++r) {
-      float grad = gy_row[r];
+      float grad = gy_row[r] * active[static_cast<size_t>(b) * dim + r];
 
       // Bias Grad
       db_ptr[r] += grad;
 
-      // Weight Grad
+      // Weight Grad -> values_param.grad
       int start = row_ptr[r];
       int end = row_ptr[r + 1];
       for (int i = start; i < end; ++i) {
         int c = col_indices[i];
         // dL/dW_{rc} = gy[r] * x[c]
-        grad_values[i] += grad * x_row[c];
+        gw_ptr[i] += grad * x_row[c];
       }
     }
   }
 
   // Gradient Clipping for Weights (Stability)
-  // Norm-based or Value-based? Value based per Chrass spec.
-  for (auto &g : grad_values) {
-    if (g > 1.0f)
-      g = 1.0f;
-    if (g < -1.0f)
-      g = -1.0f;
+  // Value-clip in-place on values_param.grad
+  for (int i = 0; i < nnz_count; ++i) {
+    if (gw_ptr[i] > 1.0f) gw_ptr[i] = 1.0f;
+    if (gw_ptr[i] < -1.0f) gw_ptr[i] = -1.0f;
   }
 
   // Update Bias Grad

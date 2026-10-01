@@ -1,0 +1,56 @@
+name: OContabil CI
+
+# CI do produto OContabil (WPF + WebView2). Separado do industrial-ci do NSOS.
+on:
+  push:
+    branches: [ main, 'feature/**' ]
+    paths:
+      - 'OContabil/**'
+      - '.github/workflows/ocontabil-ci.yml'
+  pull_request:
+    paths:
+      - 'OContabil/**'
+  workflow_dispatch:
+
+jobs:
+  build-and-security:
+    name: Build + suíte de segurança (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: |
+          dotnet restore OContabil/OContabil/OContabil.csproj
+          dotnet restore OContabil/OContabil.SecurityTests/OContabil.SecurityTests.csproj
+          dotnet restore OContabil/OContabil.UISmoke/OContabil.UISmoke.csproj
+
+      - name: Build OContabil (Release)
+        run: dotnet build OContabil/OContabil/OContabil.csproj -c Release --no-restore
+
+      - name: Build harness (compile-check)
+        run: dotnet build OContabil/OContabil.UISmoke/OContabil.UISmoke.csproj -c Release --no-restore
+
+      # Gate de segurança: o programa sai com código = nº de alertas Médio/Alto/Crítico.
+      # Exit 0 (zero alertas) => passa; qualquer alerta não mitigado => falha o job.
+      - name: Suíte de segurança (0 Médio/Alto/Crítico)
+        run: dotnet run --project OContabil/OContabil.SecurityTests/OContabil.SecurityTests.csproj -c Release
+
+      # Smoke do publish self-contained — garante que o distribuível (com DLLs nativas)
+      # realmente gera. Não roda a UI (FlaUI/WebView2 exigem sessão interativa).
+      - name: Smoke do publish self-contained
+        run: dotnet publish OContabil/OContabil/OContabil.csproj -c Release -r win-x64 --self-contained true -o ${{ runner.temp }}/pub --nologo
+
+      - name: Verifica DLLs nativas no publish
+        shell: pwsh
+        run: |
+          $pub = "${{ runner.temp }}/pub"
+          $req = @('OContabil.exe','e_sqlcipher.dll','pdfium.dll','libSkiaSharp.dll','x64/tesseract50.dll')
+          $missing = $req | Where-Object { -not (Test-Path (Join-Path $pub $_)) }
+          if ($missing) { Write-Error "Faltando no publish: $($missing -join ', ')"; exit 1 }
+          Write-Host "OK: todas as DLLs nativas presentes no publish."

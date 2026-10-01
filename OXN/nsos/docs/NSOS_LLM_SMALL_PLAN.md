@@ -39,6 +39,19 @@ Goal:
 
 - move from smoke success to held-out generalization
 
+**Status (2026-07): held-out generalization DEMONSTRATED at smoke scale.**
+Char-level LM on WikiText-2 (922k chars, vocab 90), local NSOS-only run on a
+GTX 1050: **VAL perplexity on held-out text (unseen 10%) = 4.46 (pure Mamba 5L)
+/ 4.86 (Mamba+attention hybrid 4L)** vs uniform baseline 90, with train≈val
+(train ppl ~4.2-4.6) — i.e. the model predicts unseen text nearly as well as
+training text, so it learned transferable structure, NOT memorization.  This
+plus synthetic length-extrapolation (MQAR trained n_kv=8 → tested n_kv=16;
+selective-copy field-length extrapolation) is genuine generalization
+**in-distribution + length, at small scale**.  Still OPEN (do not overclaim):
+cross-domain / other-language, large-scale, and reasoning generalization — those
+are the remaining work below.  (Earlier notes that framed generalization as
+unproven / "only memorizes" are superseded by this result.)
+
 Implementation order:
 
 1. lock a staged curriculum
@@ -50,8 +63,11 @@ Implementation order:
 Acceptance criteria:
 
 - exact-match accuracy improves across algorithms / circuits / memory
+  (✅ met at smoke scale: MQAR n_kv=8 recall 0.86-0.97; selective-copy 0.82-0.995)
 - held-out text loss decreases
+  (✅ met: WikiText val ppl 4.46-4.86 vs baseline 90, train≈val)
 - the model can answer unseen prompts, not only memorized sequence continuations
+  (✅ met at smoke scale: held-out val ppl ≈ train ppl = generalizes, not memorizes)
 
 ### 2. Final Edge Inference Speed
 

@@ -1,19 +1,16 @@
 #ifndef NSOS_MPI_H
 #define NSOS_MPI_H
 
-#include "tensor.h"
-#include <vector>
+#include "fabric.h"
 
 namespace nsos {
 
 class MultiNodeOrchestrator {
-  int rank = 0;
-  int world_size = 1;
-  std::vector<float> buffer; // Persistent buffer for sync
+  Fabric fabric_;
 
 public:
   MultiNodeOrchestrator();
-  ~MultiNodeOrchestrator();
+  ~MultiNodeOrchestrator() noexcept;
 
   // Distributed Training Interface
   // Synchronize Gradients (AllReduce + Average)

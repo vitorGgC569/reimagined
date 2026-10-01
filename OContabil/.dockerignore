@@ -1,0 +1,16 @@
+**/.git
+**/.vs
+**/.vscode
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/out
+**/.DS_Store
+**/*.user
+**/*.suo
+**/*.db
+**/*.db-journal
+**/CRASH_OCONTABIL.txt
+OContabil.Tests/
+installer/

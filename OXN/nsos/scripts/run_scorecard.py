@@ -17,14 +17,18 @@ python OXN/nsos/scripts/run_scorecard.py \\
     --pack ... --seeds 1 2 3
 
 The output lands in `<out>/scorecard/<timestamp>/{scorecard.json,scorecard.md,per_benchmark/}`.
-A copy of the latest markdown is symlinked/copied to `OXN/nsos/docs/SCORECARD.md`.
+Use --copy-to-docs to explicitly publish a complete scorecard to docs/SCORECARD.md.
 """
 from __future__ import annotations
 
 # Eager datasets import before torch — Windows segfault workaround.
-import datasets  # noqa: F401
+try:
+    import datasets  # noqa: F401
+except ImportError:
+    pass  # Each benchmark reports its missing dataset dependency explicitly.
 
 import argparse
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -36,6 +40,7 @@ sys.path.insert(0, str(HERE.parent))
 
 from eval.orchestrator import run_scorecard  # noqa: E402
 from eval.adapters.dummy_adapter import DummyAdapter  # noqa: E402
+from eval.benchmarks.base import measurement_errors  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -43,7 +48,7 @@ def main(argv=None) -> int:
     p.add_argument("--adapter", choices=["nsos", "dummy"], default="nsos",
                    help="Which model to score.  'dummy' for framework smoke test.")
     p.add_argument("--pack", type=str, default=None,
-                   help="Path to NSOS .bin pack (required when --adapter nsos).")
+                   help="Model-pack directory or raw .bin checkpoint (required for nsos).")
     p.add_argument("--build-dir", type=str, default=None,
                    help="NSOS build directory containing nsos_ext.")
     p.add_argument("--tokenizer", type=str, default=None,
@@ -56,15 +61,23 @@ def main(argv=None) -> int:
                    help="Quick caps (default).  --full overrides.")
     p.add_argument("--full", action="store_true",
                    help="Full benchmark sizes (much slower).")
-    p.add_argument("--only", nargs="*", default=None,
+    p.add_argument("--suite", choices=["default", "english", "ptbr", "all"],
+                   default="default",
+                   help="Which benchmark suite to run. 'default'/'english' = "
+                        "the canonical 5; 'ptbr' = Portuguese only; 'all' = "
+                        "both. The English suite says nothing about a PT-BR "
+                        "model, so use 'ptbr' or 'all' for this product.")
+    p.add_argument("--only", nargs="+", default=None,
                    help="Run only these benchmark ids.  e.g. --only hellaswag arc_easy")
-    p.add_argument("--seeds", nargs="*", type=int, default=[42],
+    p.add_argument("--seeds", nargs="+", type=int, default=[42],
                    help="Seeds for seed-sensitive benchmarks (MMLU subset).")
     p.add_argument("--verbose", action="store_true")
-    p.add_argument("--copy-to-docs", action="store_true", default=True,
-                   help="Copy the markdown to OXN/nsos/docs/SCORECARD.md (default).")
+    p.add_argument("--copy-to-docs", action="store_true", default=False,
+                   help="Explicitly publish a complete scorecard to docs/SCORECARD.md.")
     p.add_argument("--no-copy-to-docs", dest="copy_to_docs", action="store_false")
     args = p.parse_args(argv)
+    if args.copy_to_docs and (args.adapter == "dummy" or not args.full):
+        p.error("Publishing requires a full model evaluation; smoke/quick runs remain artifacts")
 
     # Build adapter
     if args.adapter == "dummy":
@@ -85,14 +98,19 @@ def main(argv=None) -> int:
         print(f"[scorecard] loaded NSOS pack: {adapter.capability.notes}", flush=True)
 
     # Filter benchmarks
-    from eval.orchestrator import DEFAULT_BENCHMARKS
+    from eval.orchestrator import resolve_suite
+    suite = resolve_suite(args.suite)
     if args.only:
-        benchmarks = [b for b in DEFAULT_BENCHMARKS if b[0] in args.only]
+        benchmarks = [b for b in suite if b[0] in args.only]
         missing = set(args.only) - {b[0] for b in benchmarks}
         if missing:
-            print(f"WARN: unknown benchmark ids: {missing}", file=sys.stderr)
+            print(f"ERROR: unknown benchmark ids for suite "
+                  f"{args.suite!r}: {missing}", file=sys.stderr)
+            return 2
     else:
-        benchmarks = DEFAULT_BENCHMARKS
+        benchmarks = suite
+    print(f"[scorecard] suite={args.suite} "
+          f"benchmarks={[b[0] for b in benchmarks]}", flush=True)
 
     quick = not args.full
 
@@ -105,8 +123,9 @@ def main(argv=None) -> int:
         verbose=args.verbose,
     )
 
-    # Copy latest markdown into docs/ so the canonical location is fresh.
-    if args.copy_to_docs:
+    failures = scorecard_failures(result)
+    # Never replace the authored scorecard with a failed or incomplete run.
+    if args.copy_to_docs and not failures:
         src = Path(args.out) / result.timestamp / "scorecard.md"
         dst = HERE.parent / "docs" / "SCORECARD.md"
         try:
@@ -124,7 +143,24 @@ def main(argv=None) -> int:
         print(f"  {b.name:<22} {b.primary_metric:<10} = {v:.4f}  "
               f"[{b.status}, n={b.n_examples}, {b.wall_time_s:.1f}s]")
     print(f"  total wall: {result.wall_time_s:.1f}s")
-    return 0
+    failures = scorecard_failures(result)
+    for failure in failures:
+        print(f"[scorecard:error] {failure}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+def scorecard_failures(result) -> list[str]:
+    """An incomplete or non-finite scorecard must not look green to CI."""
+    failures = []
+    if not result.benchmarks:
+        failures.append("no benchmarks were evaluated")
+    for benchmark in result.benchmarks:
+        errors = measurement_errors(benchmark)
+        if errors:
+            failures.append(
+                f"{benchmark.name}: " + "; ".join(errors)
+            )
+    return failures
 
 
 if __name__ == "__main__":

@@ -1,0 +1,38 @@
+{
+  "_comment": "Config 6GB-safe (RTX 2060 6GB). Treino BitNet-QAT custa ~16 bytes/param (mestre FP32 + grad + Adam m + v). Aqui: dense (sem MoE), d_model 768, 16 layers, batch 4 -> ~150-180M params totais -> ~2.5-3GB pesos+otimizador + ativacao + contexto CUDA. Cabe em 6GB com folga. Para voltar a 11GB+ use o runtime.json original.",
+  "version": "1.0",
+  "model": {
+    "num_layers": 16,
+    "d_model": 768,
+    "vocab_size": 8192,
+    "max_context_tokens": 1024,
+    "n_heads": 12,
+    "n_kv_heads": 4,
+    "sliding_window": 4096,
+    "attention_period": 2,
+    "attention_slot": 2,
+    "use_moe": false,
+    "num_experts": 2,
+    "num_experts_per_token": 2,
+    "moe_period": 3,
+    "moe_slot": 3,
+    "moe_expert_hidden_dim": 0,
+    "use_gradient_checkpointing": true,
+    "use_exact_attention_training": true,
+    "use_flash_attn": false,
+    "dropout": 0.0,
+    "batch_size": 4
+  },
+  "training": {
+    "seed": 1337,
+    "target_steps": 50000,
+    "warmup_steps": 700,
+    "learning_rate": 0.00055,
+    "weight_decay": 0.003,
+    "max_grad_norm": 0.9,
+    "checkpoint_every_steps": 100,
+    "log_every_steps": 25,
+    "max_doc_chars": 4096,
+    "shuffle_buffer_docs": 8192
+  }
+}

@@ -14,9 +14,13 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #else
 using SOCKET = int;
@@ -37,7 +41,16 @@ struct HttpApiServerConfig {
     bool enable_admin_endpoints = false;
     int inference_replicas = 0;
     size_t rate_limit_requests_per_minute = 240;
+    // Hard bounds for attacker-controlled cardinality and streaming output.
+    // Both are independently configurable because request rate and memory
+    // pressure are different operational concerns.
+    size_t max_rate_limit_clients = 10000;
+    size_t max_stream_pending_bytes = 1024 * 1024;
     bool trust_proxy_headers = false;
+    // Exact peer IPs allowed to supply X-Forwarded-* headers. Empty is invalid
+    // when proxy trust is enabled, preventing direct clients from spoofing TLS
+    // or rate-limit identities.
+    std::vector<std::string> trusted_proxy_ips;
     bool require_tls_proxy_header = false;
     int socket_timeout_ms = 10000;
     int max_json_depth = 32;
@@ -52,6 +65,10 @@ struct HttpApiServerConfig {
     size_t max_train_text_bytes = 64 * 1024;
     std::string pack_output_root = "artifacts/model_packs";
     bool allow_pack_absolute_paths = false;
+    // When true, inject CORS headers that allow any origin (Access-Control-Allow-Origin: *).
+    // Enable with --allow-cors when the UI is served from a different origin (file://, dev server, etc.).
+    // Never enable on a public-facing server without understanding the implications.
+    bool allow_cors = false;
 };
 
 class HttpApiServer {
@@ -89,6 +106,9 @@ private:
     std::vector<std::thread> workers_;
     std::chrono::steady_clock::time_point started_at_{};
     mutable std::shared_mutex model_state_mutex_;
+    std::mutex active_training_mutex_;
+    std::unordered_set<InferenceEngine*>
+        active_training_engines_;
     std::mutex replica_mutex_;
     std::condition_variable replica_cv_;
     std::vector<std::unique_ptr<InferenceEngine>> inference_replicas_;
@@ -98,6 +118,10 @@ private:
     std::mutex rate_limit_mutex_;
     std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point>>
         recent_requests_by_client_;
+    // Cadence counter for the idle-client sweep that bounds the rate-limit map
+    // (an idle/transient/spoofed client identity would otherwise leak a map
+    // entry forever — a memory-exhaustion DoS).  Guarded by rate_limit_mutex_.
+    uint64_t rate_limit_sweep_counter_ = 0;
 
     bool initialize_sockets();
     void cleanup_sockets();

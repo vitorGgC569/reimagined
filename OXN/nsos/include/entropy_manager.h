@@ -1,6 +1,21 @@
 #ifndef ENTROPY_MANAGER_H
 #define ENTROPY_MANAGER_H
 
+// ===========================================================================
+// DEMONSTRATION HEADER — NOT PRODUCTION CODE.
+//
+// ReversibleCPU and SelfHostingCompiler implement no reversible computing, no
+// Landauer-limit accounting and no compilation. Every method body is console
+// narration. Despite the name, this file has no connection to the BitNet
+// quantization stack.
+//
+// Reachable only from tests/verify_sre_engineering.cpp, a standalone
+// diagnostic that is not a CMake target.
+// ===========================================================================
+#if !defined(NSOS_ALLOW_DEMONSTRATION_HEADERS)
+#error "entropy_manager.h is demonstration-only scaffolding. Define NSOS_ALLOW_DEMONSTRATION_HEADERS to include it from a diagnostic target."
+#endif
+
 #include <iostream>
 #include <vector>
 #include <string>

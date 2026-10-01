@@ -1,58 +1,56 @@
+"""Fail-closed Python GPU memory-contract smoke test."""
+
+from __future__ import annotations
+
 import os
+import pathlib
 import sys
+
+import numpy as np
 import torch
 
-# Add build to path
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
-sys.path.append(os.path.join(ROOT_DIR, "build"))
+
+ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
+BUILD_DIR = pathlib.Path(
+    os.environ.get("NSOS_BUILD_DIR", ROOT_DIR / "OXN" / "nsos" / "build")
+).resolve()
+sys.path.insert(0, str(BUILD_DIR))
 
 try:
     import nsos_ext
-except ImportError:
-    print("❌ nsos_ext not found.")
-    sys.exit(1)
+except ImportError as error:
+    raise RuntimeError(
+        f"GPU memory test requires nsos_ext in NSOS_BUILD_DIR={BUILD_DIR}"
+    ) from error
 
-def test_cpu_safety():
-    print("🔬 Testing CPU Safety...")
-    t = nsos_ext.Tensor([2, 2], nsos_ext.Device.CPU)
 
-    # Should work
-    try:
-        arr = t.numpy()
-        print("✅ CPU .numpy() works.")
-    except Exception as e:
-        print(f"❌ CPU .numpy() failed: {e}")
-        sys.exit(1)
+def require_cuda() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for test_gpu_safe")
+    if not hasattr(nsos_ext, "Device") or not hasattr(nsos_ext.Device, "GPU"):
+        raise RuntimeError("nsos_ext was built without the GPU Device binding")
 
-    # Should work
-    try:
-        t_cpu = t.cpu()
-        print("✅ CPU .cpu() works.")
-    except Exception as e:
-        print(f"❌ CPU .cpu() failed: {e}")
-        sys.exit(1)
 
-    # Should FAIL (Not GPU)
-    try:
-        iface = t.__cuda_array_interface__
-        print("❌ CPU __cuda_array_interface__ should have failed but didn't.")
-        sys.exit(1)
-    except RuntimeError as e:
-        print(f"✅ CPU __cuda_array_interface__ correctly failed: {e}")
-    except AttributeError:
-        print("❌ Property not found?")
+def test_cpu_copy_contract() -> None:
+    tensor = nsos_ext.Tensor([2, 2], nsos_ext.Device.CPU, 3.0)
+    np.testing.assert_array_equal(tensor.numpy(), np.full((2, 2), 3.0))
+    assert tensor.cpu().device == nsos_ext.Device.CPU
 
-def test_gpu_mock():
-    # We can't actually allocate GPU memory without a GPU.
-    # But we can verify the binding exists.
-    print("🔬 Testing GPU Binding Existence...")
 
-    if not hasattr(nsos_ext.Tensor, "cpu"):
-        print("❌ .cpu() method missing.")
-        sys.exit(1)
+def test_gpu_device_memory_contract() -> None:
+    require_cuda()
+    nsos_ext.set_strict_gpu_execution(True)
 
-    print("✅ Bindings present.")
+    gpu_tensor = nsos_ext.Tensor([2, 2], nsos_ext.Device.GPU, 3.0)
+    assert gpu_tensor.device == nsos_ext.Device.GPU
+
+    gpu_result = gpu_tensor.add(gpu_tensor)
+    assert gpu_result.device == nsos_ext.Device.GPU
+    host_result = np.asarray(gpu_result.cpu().numpy()).copy()
+    np.testing.assert_array_equal(host_result, np.full((2, 2), 6.0))
+
 
 if __name__ == "__main__":
-    test_cpu_safety()
-    test_gpu_mock()
+    test_cpu_copy_contract()
+    test_gpu_device_memory_contract()
+    print("GPU memory contract PASS")

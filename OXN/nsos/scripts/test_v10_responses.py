@@ -37,8 +37,11 @@ if os.name == "nt":
         try:
             if p.exists():
                 os.add_dll_directory(str(p))
-        except (AttributeError, OSError):
-            pass
+        except (AttributeError, OSError) as exc:
+            print(
+                f"[runtime] DLL directory registration failed for {p}: {exc}",
+                file=sys.stderr,
+            )
 
 import nsos_ext as nsos  # type: ignore  # noqa: E402
 

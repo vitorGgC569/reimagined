@@ -1,54 +1,84 @@
-import os
-import sys
-import torch
-import numpy as np
+"""Fail-closed Python CPU/GPU model parity.
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
-sys.path.append(os.path.join(ROOT_DIR, "build"))
+This incubation test is not a supported-product release gate, but it must never
+report success without executing CUDA. Set NSOS_BUILD_DIR to the directory that
+contains the CUDA-enabled ``nsos_ext`` module.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import sys
+import tempfile
+
+import numpy as np
+import torch
+
+
+ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
+BUILD_DIR = pathlib.Path(
+    os.environ.get("NSOS_BUILD_DIR", ROOT_DIR / "OXN" / "nsos" / "build")
+).resolve()
+sys.path.insert(0, str(BUILD_DIR))
 
 try:
     import nsos_ext
-except ImportError:
-    print("❌ nsos_ext not found.")
-    sys.exit(1)
+except ImportError as error:
+    raise RuntimeError(
+        f"CUDA parity requires nsos_ext in NSOS_BUILD_DIR={BUILD_DIR}"
+    ) from error
 
-def test_cpu_gpu_parity():
-    print("🔬 Running CPU/GPU Parity Check...")
 
+def require_cuda() -> None:
     if not torch.cuda.is_available():
-        print("⚠️  No GPU detected. Skipping test.")
-        sys.exit(0)
+        raise RuntimeError("CUDA is required for test_cpu_gpu_parity")
+    if not hasattr(nsos_ext, "Device") or not hasattr(nsos_ext.Device, "GPU"):
+        raise RuntimeError("nsos_ext was built without the GPU Device binding")
 
-    # 1. CPU Run
+
+def test_cpu_gpu_parity() -> None:
+    require_cuda()
+    nsos_ext.set_strict_gpu_execution(True)
     nsos_ext.set_seed(42)
-    model_cpu = nsos_ext.JambaModel(1, 64, 100)
-    # Ensure CPU device (default)
 
-    ctx_cpu = nsos_ext.Context()
+    model_cpu = nsos_ext.JambaModel(1, 64, 100, nsos_ext.Device.CPU)
+    model_cpu.set_training_mode(False)
     input_ids = [1, 2, 3, 4]
 
-    out_cpu = np.array(model_cpu.forward_ids(input_ids, ctx_cpu), copy=True)
+    checkpoint_path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="nsos_python_gpu_parity_",
+            suffix=".bin",
+            delete=False,
+        ) as checkpoint:
+            checkpoint_path = pathlib.Path(checkpoint.name)
+        model_cpu.save(str(checkpoint_path))
 
-    # 2. GPU Run
-    # How to set device in C++ model?
-    # JambaModel constructor doesn't take device.
-    # It initializes weights on CPU by default.
-    # We need to move it? 'to(Device::GPU)'?
-    # Python bindings don't expose 'model.to()'.
-    # But weights are Tensors.
-    # We can iterate parameters and move them.
+        model_gpu = nsos_ext.JambaModel(1, 64, 100, nsos_ext.Device.GPU)
+        model_gpu.load(str(checkpoint_path), True)
+        model_gpu.to(nsos_ext.Device.GPU)
+        model_gpu.set_training_mode(False)
 
-    print("   Moving model to GPU...")
-    # This logic assumes we exposed .to() or can write to .data
-    # For V1, JambaModel manages its own memory.
-    # If the SDK config has 'use_cuda=true', maybe it allocates on GPU?
-    # Let's check nsos_sdk logic or if we need to implement migration.
+        output_cpu = np.asarray(model_cpu.forward_ids(input_ids).numpy()).copy()
+        output_gpu_tensor = model_gpu.forward_ids(input_ids)
+        if output_gpu_tensor.device != nsos_ext.Device.GPU:
+            raise AssertionError("GPU model returned a non-GPU Tensor")
+        output_gpu = np.asarray(output_gpu_tensor.cpu().numpy()).copy()
 
-    # Limitation: Current binding doesn't easily support moving full model.
-    # We mark this as "TODO: Implement Model::to(Device)"
-    print("⚠️  Model migration to GPU not fully exposed in bindings yet.")
-    print("   Skipping actual comparison.")
-    sys.exit(0)
+        np.testing.assert_allclose(
+            output_cpu,
+            output_gpu,
+            rtol=5e-3,
+            atol=5e-3,
+            err_msg="CPU/GPU Jamba logits diverged",
+        )
+    finally:
+        if checkpoint_path is not None:
+            checkpoint_path.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     test_cpu_gpu_parity()
+    print("CPU/GPU parity PASS")

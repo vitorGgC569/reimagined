@@ -53,6 +53,30 @@ std::string write_temp_floats(const std::string& tag, std::size_t count) {
   return path.string();
 }
 
+void test_binary_mode_preserves_control_bytes() {
+  const std::vector<unsigned char> expected{0x0d, 0x0a, 0x1a, 0x00};
+  const auto path = std::filesystem::temp_directory_path() /
+                    "nsos_smart_loader_binary_mode.bin";
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(expected.data()),
+                 static_cast<std::streamsize>(expected.size()));
+  }
+
+  nsos::SmartLoader loader;
+  nsos::Tensor destination({1}, nsos::Device::CPU);
+  const nsos::LoadResult result =
+      loader.submit_request(path.string(), 0, expected.size(), &destination)
+          .get();
+  check(result.success(), "binary control-byte read must succeed");
+  check(std::memcmp(destination.raw_data(), expected.data(), expected.size()) ==
+            0,
+        "SmartLoader must not apply text-mode byte translation");
+  std::error_code error;
+  std::filesystem::remove(path, error);
+  std::cout << "[smart_loader] binary_mode PASS" << std::endl;
+}
+
 void test_single_read() {
   constexpr std::size_t N = 256;
   const std::string path = write_temp_floats("single", N);
@@ -130,6 +154,43 @@ void test_missing_file_yields_error() {
   check(!result.error_msg.empty(), "error_msg must be populated on failure");
   std::cout << "[smart_loader] missing_file PASS (error="
             << result.error_msg << ")" << std::endl;
+}
+
+void test_short_read_yields_error() {
+  constexpr std::size_t N = 8;
+  const std::string path = write_temp_floats("short", N);
+  nsos::SmartLoader loader;
+  nsos::Tensor dest({static_cast<int>(N + 1)}, nsos::Device::CPU);
+  auto fut = loader.submit_request(
+      path, 0, (N + 1) * sizeof(float), &dest);
+  const nsos::LoadResult result = fut.get();
+  check(!result.success(), "short read must fail closed");
+  check(result.bytes_read < 0,
+        "short read must not publish a successful byte count");
+  check(result.error_msg.find("short read") != std::string::npos,
+        "short read must publish an actionable diagnostic");
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  std::cout << "[smart_loader] short_read PASS" << std::endl;
+}
+
+void test_destructor_drains_owned_request() {
+  constexpr std::size_t N = 128;
+  const std::string path = write_temp_floats("destructor", N);
+  nsos::Tensor dest({static_cast<int>(N)}, nsos::Device::CPU);
+  std::future<nsos::LoadResult> future;
+  {
+    nsos::SmartLoader loader;
+    future = loader.submit_request(path, 0, N * sizeof(float), &dest);
+  }
+  check(future.wait_for(std::chrono::milliseconds(0)) ==
+            std::future_status::ready,
+        "SmartLoader destructor must fulfill every owned request");
+  check(future.get().success(),
+        "request drained by SmartLoader destructor must succeed");
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  std::cout << "[smart_loader] destructor_drain PASS" << std::endl;
 }
 
 void test_drain_with_many_requests() {
@@ -231,8 +292,11 @@ void test_concurrent_producers() {
 int main() {
   try {
     test_single_read();
+    test_binary_mode_preserves_control_bytes();
     test_offset_read();
     test_missing_file_yields_error();
+    test_short_read_yields_error();
+    test_destructor_drains_owned_request();
     test_drain_with_many_requests();
     test_concurrent_producers();
     std::cout << "[smart_loader] ALL PASS" << std::endl;

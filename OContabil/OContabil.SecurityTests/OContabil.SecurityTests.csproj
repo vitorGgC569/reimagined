@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Suite de testes de seguranca (pentest deterministico) do OContabil.
+       Linka os helpers de defesa por arquivo (sem puxar WPF/EF) e valida cada
+       vetor. Exit code = numero de vetores NAO mitigados (0 = suite limpa). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\OContabil\Services\SecurePath.cs" Link="Linked\SecurePath.cs" />
+    <Compile Include="..\OContabil\Services\SecureCsv.cs" Link="Linked\SecureCsv.cs" />
+    <Compile Include="..\OContabil\Services\SafeLog.cs" Link="Linked\SafeLog.cs" />
+    <Compile Include="..\OContabil\Services\Crypto.cs" Link="Linked\Crypto.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+</Project>

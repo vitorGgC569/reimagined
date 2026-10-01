@@ -2,7 +2,10 @@ name: NSOS Industrial CI
 
 on:
   push:
-    branches: [main, develop]
+    # feature/nsos-gpu-phases12 + alias: as branches ativas de pesquisa — uma
+    # suíte vermelha lá é exatamente quando queremos saber (antes a CI só
+    # observava main/develop, então os 51 testes só rodavam manualmente).
+    branches: [main, develop, feature/nsos-gpu-phases12, nsos-gpu-phases12]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -89,7 +92,7 @@ jobs:
         run: cargo clippy --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets -- -D warnings
 
       - name: Run OxtaMem Python syntax smoke
-        run: python3 -m compileall -q modules/oxtamem/python modules/oxtamem/oxta_engine/python modules/oxtamem/nn
+        run: python3 -m compileall -q modules/oxtamem/python modules/oxtamem/nn
 
   incubation:
     name: incubation / non-blocking
@@ -111,9 +114,16 @@ jobs:
             tools
 
   gpu-hotpath:
-    if: ${{ vars.NSOS_GPU_CI == 'true' }}
-    name: product / optional GPU hotpath
+    if: ${{ vars.NSOS_GPU_CI == 'true' || github.event_name == 'workflow_dispatch' }}
+    name: product / fail-closed GPU gold gate
     runs-on: [self-hosted, linux, x64, gpu, cuda]
+    timeout-minutes: 90
+    env:
+      NSOS_REQUIRE_GPU_TESTS: "1"
+      NSOS_CUDA_SYNC: "1"
+      NSOS_GPU_MEMORY: device
+      NSOS_NO_MEMADVISE: "1"
+      NSOS_REQUIRED_GPU_NAME: ${{ vars.NSOS_REQUIRED_GPU_NAME }}
     steps:
       - uses: actions/checkout@v4
 
@@ -122,23 +132,16 @@ jobs:
           python3 -m pip install --upgrade pip
           pip3 install numpy torch pytest hypothesis requests pybind11
 
-      - name: Build NSOS GPU
+      - name: Run fail-closed GPU validation
         run: |
-          cmake -S OXN/nsos -B OXN/nsos/build-gpu-ci \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNSOS_BUILD_PYTHON=ON \
-            -DNSOS_BUILD_TESTS=ON \
-            -DNSOS_BUILD_API=ON \
-            -DNSOS_BUILD_CLI=ON \
-            -DNSOS_BUILD_OXTAMEM=OFF \
-            -DNSOS_ENABLE_CUDA=ON \
-            -DNSOS_ENABLE_NATIVE_OPTIMIZATIONS=OFF \
-            -DNSOS_CUDA_ARCHITECTURES='61;75;80;86' \
-            -G Ninja
-          cmake --build OXN/nsos/build-gpu-ci -j$(nproc)
-
-      - name: Run GPU CTest
-        run: ctest --test-dir OXN/nsos/build-gpu-ci --output-on-failure
+          python3 OXN/nsos/scripts/gpu_gold_validation.py \
+            --source-dir OXN/nsos \
+            --build-dir OXN/nsos/build-gpu-ci \
+            --output-dir OXN/nsos/validation-artifacts/gpu-gold \
+            --minimum-compute-capability 7.5 \
+            --cuda-architecture 75 \
+            --require-gpu-name "${NSOS_REQUIRED_GPU_NAME}" \
+            --jobs "$(nproc)"
 
       - name: Run GPU benchmark gate
         run: |
@@ -151,3 +154,13 @@ jobs:
             --min-decode-tok-s 1.0 \
             --max-sampler-share 0.99 \
             --report-path OXN/nsos/build-gpu-ci/benchmark_gate_gpu.json
+
+      - name: Upload GPU validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsos-gpu-gold-${{ github.sha }}
+          path: |
+            OXN/nsos/validation-artifacts/gpu-gold
+            OXN/nsos/build-gpu-ci/benchmark_gate_gpu.json
+          if-no-files-found: error

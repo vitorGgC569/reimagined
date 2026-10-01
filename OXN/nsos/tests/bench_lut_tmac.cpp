@@ -8,7 +8,9 @@
 // tells us if the LUT + heat-map trick actually helps over a naive
 // impl.  It does NOT tell us if LUT-TMAC beats the existing SIMD
 // production path `gemm_158bit_ultra` — that comparison requires
-// linking BitNetAdapter and is a separate bench (TODO).
+// linking BitNetAdapter. That is intentionally outside this scalar
+// microbenchmark; production promotion relies on the end-to-end model gate,
+// where dispatch, packing and the complete runtime are measured together.
 //
 // Build via tests CMake target `bench_lut_tmac`.  Run with no args.
 

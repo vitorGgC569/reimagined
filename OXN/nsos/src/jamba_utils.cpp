@@ -1,6 +1,7 @@
 #include "../include/jamba_utils.h"
 
 #include <algorithm>
+#include <atomic>
 
 namespace nsos {
 
@@ -37,16 +38,45 @@ bool layer_matches_schedule(int layer_one_based, int period, int slot) {
     return ((layer_one_based - 1) % period) == normalized_slot;
 }
 
+namespace {
+// Época compartilhada com a cópia local de mamba2.cpp via
+// current_parameter_name_epoch().  Atômico por higiene; o treino é
+// single-thread no caminho de parameters().
+std::atomic<long long> g_param_name_epoch{0};
+}  // namespace
+
+void bump_parameter_name_epoch() {
+    g_param_name_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+long long current_parameter_name_epoch() {
+    return g_param_name_epoch.load(std::memory_order_relaxed);
+}
+
 void prefix_parameter_names(std::vector<Parameter*>& params, const std::string& prefix) {
+    const long long epoch = current_parameter_name_epoch();
     for (auto* param : params) {
         if (!param) {
             continue;
         }
-        const std::string current = param->name.empty() ? param->base_name : param->name;
-        const std::string leaf = param->base_name.empty() ? current : param->base_name;
+        if (param->name_frozen()) {
+            continue;
+        }
+        // Primeira visita nesta época: descarta o absoluto da passada anterior
+        // e reconstrói do base_name (folha).  Visitas seguintes (níveis acima
+        // na MESMA época) compõem o relativo já construído.  (Chamadas
+        // standalone repetidas de um submódulo sem bump continuam compondo —
+        // comportamento antigo, fora do caminho do modelo; uma heurística de
+        // starts-with cobriria isso mas poderia dropar níveis legítimos.)
+        const bool fresh = param->name_epoch != epoch;
+        param->name_epoch = epoch;
+        const std::string current =
+            fresh ? std::string() : (param->name.empty() ? param->base_name : param->name);
+        const std::string leaf = param->base_name.empty()
+                                     ? (param->name.empty() ? current : param->name)
+                                     : param->base_name;
         param->base_name = leaf;
-        param->name =
-            (current.find('.') == std::string::npos) ? (prefix + leaf) : (prefix + current);
+        param->name = (fresh || current.empty()) ? (prefix + leaf) : (prefix + current);
     }
 }
 

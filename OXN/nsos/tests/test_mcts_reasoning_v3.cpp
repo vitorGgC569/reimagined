@@ -4,6 +4,9 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
 
 
 using namespace nsos;
@@ -105,6 +108,65 @@ void test_mcts_batch_evaluator() {
   assert(batch_calls.load(std::memory_order_relaxed) > 0);
 }
 
+void test_mcts_evaluator_contract_is_fail_closed() {
+  Tensor root_state = Tensor::zeros({4}, Device::CPU);
+  MCTSConfig config;
+  config.num_simulations = 2;
+  config.max_depth = 2;
+  config.num_children_per_expansion = 2;
+
+  MCTSReasoning wrong_cardinality(root_state, simple_evaluator, config);
+  wrong_cardinality.set_batch_evaluator(
+      [](const std::vector<Tensor>&) { return std::vector<float>{}; });
+  bool cardinality_rejected = false;
+  try {
+    wrong_cardinality.search();
+  } catch (const std::runtime_error& error) {
+    cardinality_rejected =
+        std::string(error.what()).find("contract violation") !=
+        std::string::npos;
+  }
+  if (!cardinality_rejected) {
+    throw std::runtime_error(
+        "MCTS silently replaced an invalid batch result");
+  }
+
+  MCTSReasoning non_finite(root_state, simple_evaluator, config);
+  non_finite.set_batch_evaluator([](const std::vector<Tensor>& states) {
+    return std::vector<float>(
+        states.size(), std::numeric_limits<float>::quiet_NaN());
+  });
+  bool non_finite_rejected = false;
+  try {
+    non_finite.search();
+  } catch (const std::runtime_error& error) {
+    non_finite_rejected =
+        std::string(error.what()).find("non-finite") != std::string::npos;
+  }
+  if (!non_finite_rejected) {
+    throw std::runtime_error(
+        "MCTS accepted a non-finite evaluator output");
+  }
+
+  MCTSReasoning scalar_non_finite(
+      root_state,
+      [](const Tensor&) {
+        return std::numeric_limits<float>::infinity();
+      },
+      config);
+  bool scalar_non_finite_rejected = false;
+  try {
+    scalar_non_finite.search();
+  } catch (const std::runtime_error& error) {
+    scalar_non_finite_rejected =
+        std::string(error.what()).find("non-finite") != std::string::npos;
+  }
+  if (!scalar_non_finite_rejected) {
+    throw std::runtime_error(
+        "MCTS accepted a non-finite scalar evaluator output");
+  }
+}
+
 void test_mcts_ultraplan_batch_swarm() {
   Tensor root_state = Tensor::zeros({4}, Device::CPU);
   MCTSConfig config;
@@ -142,6 +204,7 @@ int main() {
   try {
     test_mcts_reasoning_industrial();
     test_mcts_batch_evaluator();
+    test_mcts_evaluator_contract_is_fail_closed();
     test_mcts_ultraplan_batch_swarm();
     std::cout << "\nMCTS V3 KERNEL TEST PASSED." << std::endl;
     return 0;

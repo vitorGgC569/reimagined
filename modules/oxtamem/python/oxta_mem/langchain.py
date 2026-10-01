@@ -24,6 +24,8 @@ class GeodesicCausalRetriever(BaseRetriever):
     depth: int = 10
 
     def __init__(self, client: GeodesicClient, depth: int = 10):
+        if not isinstance(depth, int) or isinstance(depth, bool) or not 0 <= depth <= 1024:
+            raise ValueError("depth must be an integer in 0..1024")
         super().__init__()
         self.client = client
         self.depth = depth
@@ -38,6 +40,8 @@ class GeodesicCausalRetriever(BaseRetriever):
         Returns the history of that key as a sequence of documents.
         """
         key = query.strip()
+        if not key:
+            raise ValueError("retrieval key must not be empty")
 
         # Use the native driver or redis to fetch history
         # Note: If using Redis driver, ensure the server supports RECALL or fetch manually iteratively
@@ -48,7 +52,7 @@ class GeodesicCausalRetriever(BaseRetriever):
         except NotImplementedError:
             # Fallback for Redis: just get latest
             latest = self.client.load_latest(key)
-            history = [latest] if latest else []
+            history = [latest] if latest is not None else []
 
         docs = []
         for i, state in enumerate(history):

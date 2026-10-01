@@ -1,0 +1,12 @@
+'vswhere.exe' n∆o Ç reconhecido como um comando interno
+ou externo, um programa oper†vel ou um arquivo em lotes.
+[B width 8 done]
+[B width 16 done]
+[B width 24 done]
+[B width 32 done]
+[B width 48 done]
+[B width 64 done]
+[A width 16 done]
+[A width 32 done]
+[A width 64 done]
+[A width 128 done]

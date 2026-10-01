@@ -43,7 +43,15 @@ DATASET_CACHE = DRIVE_ROOT / "_datasets_processed"
 RAW_DATASET_CACHE = DRIVE_ROOT / "_datasets_raw"
 RUNS_ROOT = DRIVE_ROOT / "runs"
 NSOS_BUILD_DIR = REPO_ROOT / "OXN/nsos/build-colab"
-NSOS_EXT_SO_NAME = "nsos_ext.cpython-311-x86_64-linux-gnu.so"
+# pybind11 builds the .so with a Python-ABI suffix that includes the runtime
+# minor version (e.g. cpython-311 in May 2025, cpython-312 in May 2026 after
+# Colab bumped Python).  Hardcoding the suffix breaks the Drive cache lookup
+# every time Colab upgrades — derive from sys.version_info instead so the
+# cache key tracks the actual ABI we're caching.
+NSOS_EXT_SO_NAME = (
+    f"nsos_ext.cpython-{sys.version_info.major}{sys.version_info.minor}"
+    f"-x86_64-linux-gnu.so"
+)
 
 # Map: GPU name keyword → (profile_40m, profile_80m)
 # Default for v11 is the 80M variant — user opted for "Option 2" sweet

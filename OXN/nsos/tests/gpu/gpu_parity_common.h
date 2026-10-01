@@ -27,35 +27,44 @@
 #include <string>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "gpu_backend.h"
 #endif
 
 namespace nsos {
 namespace gpu_parity_test {
 
-// Returns true when a CUDA-capable device is present and selectable.
-// When CUDA was not compiled in, prints a skip notice and returns false.
-inline bool cuda_available_or_skip(const char* test_name) {
+// GPU binaries are fail-closed by design: invoking one without a GPU build
+// and a selectable device is a test failure, never a successful "skip".
+inline void require_cuda_device(const char* test_name) {
 #ifndef USE_CUDA
-  std::cout << "[GPUParity:" << test_name
-            << "] skipped: CUDA not enabled at build time." << std::endl;
-  return false;
+  throw std::runtime_error(
+      std::string("[GPUParity:") + test_name +
+      "] a GPU backend is required but was not enabled at build time");
 #else
-  int device_count = 0;
-  const cudaError_t status = cudaGetDeviceCount(&device_count);
-  if (status != cudaSuccess || device_count <= 0) {
-    std::cout << "[GPUParity:" << test_name
-              << "] skipped: no CUDA device available "
-              << "(cudaGetDeviceCount=" << static_cast<int>(status) << ")."
-              << std::endl;
-    return false;
+  int selected_device = -1;
+  std::string selection_error;
+  if (!gpu::select_preferred_device(&selected_device, &selection_error)) {
+    throw std::runtime_error(
+        std::string("[GPUParity:") + test_name +
+        "] GPU device is required but unavailable: " + selection_error);
   }
   cudaDeviceProp props{};
-  cudaGetDeviceProperties(&props, 0);
+  const cudaError_t props_status =
+      cudaGetDeviceProperties(&props, selected_device);
+  if (props_status != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("[GPUParity:") + test_name +
+        "] GPU device property query failed: " +
+        cudaGetErrorString(props_status));
+  }
   std::cout << "[GPUParity:" << test_name << "] device=" << props.name
-            << " cc=" << props.major << "." << props.minor
-            << " runtime=" << CUDART_VERSION << std::endl;
-  return true;
+            << " backend=" << gpu::backend_name();
+#if defined(NSOS_GPU_BACKEND_HIP)
+  std::cout << " arch=" << props.gcnArchName;
+#else
+  std::cout << " arch=sm_" << props.major << props.minor;
+#endif
+  std::cout << " runtime=" << CUDART_VERSION << std::endl;
 #endif
 }
 
@@ -67,7 +76,7 @@ inline void cuda_sync_or_throw(const char* phase) {
 #ifdef USE_CUDA
   const cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("CUDA sync failed at ") + phase +
+    throw std::runtime_error(std::string("GPU sync failed at ") + phase +
                              ": " + cudaGetErrorString(err));
   }
 #else
@@ -80,8 +89,8 @@ inline void cuda_sync_or_throw(const char* phase) {
 // the offending index, the two values and the absolute delta — those
 // are the data points debugging requires; throwing a bare assertion
 // silently strips them.
-inline void assert_close(const Tensor& lhs, const Tensor& rhs, float tol,
-                         const char* label) {
+inline void assert_close(const Tensor& lhs, const Tensor& rhs, float atol,
+                         const char* label, float rtol = 0.0f) {
   Tensor lhs_cpu = lhs.cpu();
   Tensor rhs_cpu = rhs.cpu();
   if (lhs_cpu.size != rhs_cpu.size) {
@@ -94,12 +103,16 @@ inline void assert_close(const Tensor& lhs, const Tensor& rhs, float tol,
     const float a = lhs_cpu.data()[i];
     const float b = rhs_cpu.data()[i];
     const float diff = std::abs(a - b);
-    if (!(diff <= tol)) {
-      char buf[256];
+    const float threshold =
+        atol + rtol * std::max(std::abs(a), std::abs(b));
+    if (!(diff <= threshold)) {
+      char buf[320];
       std::snprintf(
           buf, sizeof(buf),
-          "%s: mismatch at index %d (lhs=%.6f rhs=%.6f |delta|=%.6f tol=%.6f)",
-          label, i, a, b, diff, tol);
+          "%s: mismatch at index %d "
+          "(lhs=%.6f rhs=%.6f |delta|=%.6f atol=%.6f rtol=%.8f "
+          "threshold=%.6f)",
+          label, i, a, b, diff, atol, rtol, threshold);
       throw std::runtime_error(buf);
     }
   }
@@ -110,10 +123,8 @@ inline void assert_close(const Tensor& lhs, const Tensor& rhs, float tol,
 // this exactly once.
 template <typename Fn>
 int run_parity(const char* test_name, Fn&& body) {
-  if (!cuda_available_or_skip(test_name)) {
-    return 0;
-  }
   try {
+    require_cuda_device(test_name);
     std::cout << "[GPUParity:" << test_name << "] begin" << std::endl;
     body();
     cuda_sync_or_throw(test_name);

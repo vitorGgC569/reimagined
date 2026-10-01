@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -22,9 +23,8 @@ namespace nsos {
 using io_ssize_t = std::int64_t;
 
 // Result of a single async load.  `bytes_read >= 0` indicates a real read;
-// negative values plus a non-empty `error_msg` indicate failure.  Callers
-// that care about partial reads should also compare `bytes_read` to the
-// requested size.
+// negative values plus a non-empty `error_msg` indicate failure. A successful
+// result always represents the complete byte range requested.
 struct LoadResult {
   io_ssize_t bytes_read = -1;
   std::string error_msg;
@@ -36,7 +36,7 @@ struct LoadResult {
 
 // Internal request node — owned by the worker thread until the promise
 // is fulfilled.  Not part of the public API; exposed in the header only
-// so std::queue<IORequest*> compiles in the class body.
+// so the queue's unique_ptr value type is complete in the class body.
 struct IORequest {
   std::string filepath;
   size_t offset = 0;
@@ -55,9 +55,8 @@ struct IORequest {
 //   * `drain()` blocks until every in-flight request has completed.
 //     Safe to call concurrently with submit_request; useful in
 //     checkpoint barriers and the destructor's pre-stop drain.
-//   * The destructor stops the worker AFTER draining, so promises
-//     left in-flight are fulfilled rather than abandoned (which would
-//     cause future::get() to throw broken_promise).
+//   * The destructor rejects new work, lets the worker drain every request it
+//     already owns, and only then joins it; no owned promise is abandoned.
 //
 // Threading:
 //   * One internal worker thread services the FIFO request queue.
@@ -70,9 +69,8 @@ class SmartLoader {
  public:
   // `buffer_size` is retained for source-compatibility with the previous
   // signature.  It is not used by the current implementation: the worker
-  // reads directly into the caller-supplied Tensor and does not maintain
-  // an internal pool.  Will be removed in a future cleanup PR once any
-  // residual call sites have migrated.
+  // reads directly into the caller-supplied Tensor and does not maintain an
+  // internal pool. Passing any value therefore has identical semantics.
   explicit SmartLoader(size_t buffer_size = 1024 * 1024 * 128);
   ~SmartLoader();
 
@@ -100,7 +98,7 @@ class SmartLoader {
   std::thread worker_thread_;
   std::atomic<bool> running_{true};
 
-  std::queue<IORequest*> request_queue_;
+  std::queue<std::unique_ptr<IORequest>> request_queue_;
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
 

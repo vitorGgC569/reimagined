@@ -79,7 +79,7 @@ void Worker::execute_reasoning(const TaskNotification& task) {
             float norm_sq = 0.0f;
             const float* d = s.data();
             for (int i = 0; i < s.size; ++i) norm_sq += d[i] * d[i];
-            return -std::sqrt(norm_sq / std::max(s.size, 1));
+            return -std::sqrt(norm_sq / std::max<int64_t>(s.size, 1));
         };
 
         MCTSConfig cfg;

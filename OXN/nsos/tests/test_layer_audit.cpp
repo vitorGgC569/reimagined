@@ -104,7 +104,43 @@ int main() {
                 "missing training backward layer records");
         require(train_summary.router_records > 0, "missing MoE router audit records");
         require(train_summary.training_steps == 1, "missing training step audit record");
+        require(train_summary.parameter_records > 0,
+                "missing per-parameter optimizer audit records");
+        require(train_summary.changed_parameter_records > 0,
+                "audited optimizer step changed no parameters");
+        require(train_summary.hybrid_interaction_records >= 2,
+                "missing forward/backward Mamba-Attention interaction records");
         require(train_summary.healthy(), "training audit contains NaN/Inf");
+        const auto parameter_records = audit.parameter_records();
+        require(!parameter_records.empty(),
+                "parameter audit record collection is empty");
+        for (const auto& record : parameter_records) {
+            require(!record.name.empty(), "parameter audit name is empty");
+            require(record.weight_sha256_before.size() == 64,
+                    "invalid pre-update SHA-256");
+            require(record.gradient_sha256.size() == 64,
+                    "invalid gradient SHA-256");
+            require(record.update_sha256.size() == 64,
+                    "invalid update SHA-256");
+            require(record.weight_sha256_after.size() == 64,
+                    "invalid post-update SHA-256");
+        }
+        const auto hybrid_records =
+            audit.hybrid_interaction_records();
+        require(hybrid_records.size() >= 2,
+                 "hybrid interaction collection is incomplete");
+        for (const auto& record : hybrid_records) {
+            require(record.ffn_signal.elements > 0,
+                    "hybrid audit omitted FFN signal");
+            require(record.ffn_contribution.elements > 0,
+                    "hybrid audit omitted FFN contribution");
+            require(std::isfinite(
+                        record.mamba_ffn_contribution_cosine),
+                    "hybrid Mamba/FFN cosine is non-finite");
+            require(std::isfinite(
+                        record.attention_ffn_contribution_cosine),
+                    "hybrid Attention/FFN cosine is non-finite");
+        }
 
         const std::vector<int> probe = {1, 2, 3, 4, 5};
         audit.set_phase("pre_reload_probe");
@@ -122,6 +158,16 @@ int main() {
         const std::filesystem::path audit_json = audit_report_path(preserve_audit_report);
         require(engine.save_model_pack(pack_dir.string()), "save_model_pack failed");
 
+        // The model pack bundles an edge (1.58-bit) linear pack, so load_model
+        // releases the FP32 weights and serves ternary by default.  This is a
+        // pack ROUND-TRIP PARITY test (before vs after within 1e-5), which only
+        // makes sense on the FP32 reference path -- opt into it via the
+        // documented escape hatch so we compare like-for-like.
+#if defined(_WIN32)
+        _putenv_s("NSOS_KEEP_FP32_WEIGHTS", "1");
+#else
+        setenv("NSOS_KEEP_FP32_WEIGHTS", "1", 1);
+#endif
         InferenceEngine reloaded;
         require(reloaded.load_model(pack_dir.string(), ModelConfig{}),
                 "reload model pack failed");
@@ -147,6 +193,14 @@ int main() {
                 "audit JSON missing token contexts");
         require(json.find("\"training_steps\"") != std::string::npos,
                 "audit JSON missing training steps");
+        require(json.find("\"parameter_records\"") != std::string::npos,
+                "audit JSON missing parameter records");
+        require(json.find("\"hybrid_interactions\"") != std::string::npos,
+                "audit JSON missing hybrid interaction records");
+        require(json.find("\"ffn_contribution\"") != std::string::npos,
+                "audit JSON missing FFN branch contribution");
+        require(json.find("\"weight_sha256_before\"") != std::string::npos,
+                "audit JSON missing parameter hashes");
         require(json.find("\"router\"") != std::string::npos,
                 "audit JSON missing router details");
 

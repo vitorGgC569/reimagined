@@ -20,8 +20,22 @@ struct TensorIterator {
     int rank;
     
     TensorIterator(Tensor& out, const Tensor& in1, const Tensor& in2) {
-        if (!compute_broadcast_shape(in1.shape, in2.shape, out.shape))
-            throw std::runtime_error("Broadcasting Error");
+        if (out.get_device() != in1.get_device() ||
+            out.get_device() != in2.get_device()) {
+            throw std::invalid_argument(
+                "TensorIterator requires all tensors on the same device");
+        }
+        TensorShape expected_shape;
+        if (!compute_broadcast_shape(
+                in1.shape, in2.shape, expected_shape)) {
+            throw std::invalid_argument(
+                "TensorIterator received non-broadcastable shapes");
+        }
+        if (out.shape != expected_shape ||
+            out.size != static_cast<int>(expected_shape.numel())) {
+            throw std::invalid_argument(
+                "TensorIterator output shape does not match broadcast result");
+        }
             
         shape = out.shape.dims;
         numel = out.size;

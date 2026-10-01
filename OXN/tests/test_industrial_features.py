@@ -1,11 +1,7 @@
 import os
 import sys
 import unittest
-import importlib.util
 from pathlib import Path
-
-_DLL_HANDLES = []
-
 
 def _candidate_build_paths():
     root = Path(__file__).resolve().parents[1]
@@ -24,37 +20,14 @@ def _candidate_build_paths():
     return candidates
 
 
-def _bootstrap_paths():
-    for candidate in _candidate_build_paths():
-        candidate = candidate.resolve()
-        for path in (candidate, candidate / "Release"):
-            if path.exists():
-                if hasattr(os, "add_dll_directory"):
-                    _DLL_HANDLES.append(os.add_dll_directory(str(path)))
-                sys.path.insert(0, str(path))
-
-
 def _import_nsos_ext():
-    _bootstrap_paths()
-    try:
-        import nsos_ext  # type: ignore
-        return nsos_ext
-    except ImportError:
-        for candidate in _candidate_build_paths():
-            candidate = candidate.resolve()
-            for root in (candidate, candidate / "Release"):
-                if not root.exists():
-                    continue
-                matches = sorted(root.glob("nsos_ext*.pyd"))
-                if not matches:
-                    continue
-                spec = importlib.util.spec_from_file_location("nsos_ext", matches[0])
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules["nsos_ext"] = module
-                    spec.loader.exec_module(module)
-                    return module
-        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "nsos" / "scripts"))
+    from native_module import load_native_module, resolve_native_build_dir
+    explicit = os.environ.get("NSOS_BUILD_DIR")
+    directory = resolve_native_build_dir(Path(explicit) if explicit else None, _candidate_build_paths())
+    module = load_native_module(directory)
+    print(f"Native artifact: {module.__file__}")
+    return module
 
 
 nsos_ext = _import_nsos_ext()

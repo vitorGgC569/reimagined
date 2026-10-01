@@ -1,0 +1,173 @@
+﻿<Window x:Class="ContaDocAI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:views="clr-namespace:ContaDocAI.Views"
+        xmlns:vm="clr-namespace:ContaDocAI.ViewModels"
+        Title="ContaDoc AI — Processamento Inteligente de Documentos"
+        Height="800" Width="1400" MinHeight="600" MinWidth="1000"
+        Background="{StaticResource BgBrush}"
+        WindowStartupLocation="CenterScreen"
+        WindowState="Maximized">
+
+    <Window.DataContext>
+        <vm:MainViewModel/>
+    </Window.DataContext>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="260"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- ═══ Sidebar ═══ -->
+        <Border Grid.Column="0" Background="{StaticResource CardBrush}"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
+            <DockPanel>
+                <!-- Brand -->
+                <Border DockPanel.Dock="Top" Height="64"
+                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+                    <StackPanel Orientation="Horizontal" Margin="20,0" VerticalAlignment="Center">
+                        <Border Width="36" Height="36" CornerRadius="6" Background="{StaticResource AccentGradient}">
+                            <TextBlock Text="📄" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+                            <TextBlock Text="ContaDoc AI" FontSize="15" FontWeight="Bold"
+                                       Foreground="{StaticResource TextPrimaryBrush}" FontFamily="Segoe UI"/>
+                            <TextBlock Text="GLINER 2 ENGINE" FontSize="9" FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextTertiaryBrush}"
+                                       FontFamily="Segoe UI"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- User Footer -->
+                <Border DockPanel.Dock="Bottom" Height="64"
+                        BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+                    <StackPanel Orientation="Horizontal" Margin="16,0" VerticalAlignment="Center">
+                        <Border Width="34" Height="34" CornerRadius="17">
+                            <Border.Background>
+                                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                    <GradientStop Color="#FF6366f1" Offset="0"/>
+                                    <GradientStop Color="#FF8b5cf6" Offset="1"/>
+                                </LinearGradientBrush>
+                            </Border.Background>
+                            <TextBlock Text="RS" FontSize="12" FontWeight="Bold" Foreground="White"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <StackPanel Margin="10,0,0,0" VerticalAlignment="Center">
+                            <TextBlock Text="Ricardo Silva" FontSize="13" FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextPrimaryBrush}"/>
+                            <TextBlock Text="Administrador" FontSize="10"
+                                       Foreground="{StaticResource TextTertiaryBrush}"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- Navigation -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="10,16">
+                    <StackPanel>
+                        <!-- Principal -->
+                        <TextBlock Text="PRINCIPAL" FontSize="10" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextTertiaryBrush}" Margin="12,0,0,8"
+                                   FontFamily="Segoe UI"/>
+
+                        <RadioButton Style="{StaticResource NavButton}" IsChecked="True"
+                                     Command="{Binding NavigateCommand}" CommandParameter="Dashboard">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="📊" FontSize="16" Width="24"/>
+                                <TextBlock Text="Dashboard" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </StackPanel>
+                        </RadioButton>
+
+                        <RadioButton Style="{StaticResource NavButton}"
+                                     Command="{Binding NavigateCommand}" CommandParameter="Upload">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="📤" FontSize="16" Width="24"/>
+                                <TextBlock Text="Upload" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </StackPanel>
+                        </RadioButton>
+
+                        <RadioButton Style="{StaticResource NavButton}"
+                                     Command="{Binding NavigateCommand}" CommandParameter="Validation">
+                            <Grid>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="✅" FontSize="16" Width="24"/>
+                                    <TextBlock Text="Validacao" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </StackPanel>
+                                <Border HorizontalAlignment="Right" Background="{StaticResource AccentBrush}"
+                                        CornerRadius="10" Padding="7,1" Margin="0,0,4,0"
+                                        Visibility="{Binding ValidationBadge, Converter={x:Static views:Converters.VisibleIfPositive}}">
+                                    <TextBlock Text="{Binding ValidationBadge}" FontSize="10" FontWeight="Bold"
+                                               Foreground="White"/>
+                                </Border>
+                            </Grid>
+                        </RadioButton>
+
+                        <!-- Gestao -->
+                        <TextBlock Text="GESTAO" FontSize="10" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextTertiaryBrush}" Margin="12,20,0,8"
+                                   FontFamily="Segoe UI"/>
+
+                        <RadioButton Style="{StaticResource NavButton}"
+                                     Command="{Binding NavigateCommand}" CommandParameter="Clients">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="🏢" FontSize="16" Width="24"/>
+                                <TextBlock Text="Clientes" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </StackPanel>
+                        </RadioButton>
+
+                        <!-- Sistema -->
+                        <TextBlock Text="SISTEMA" FontSize="10" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextTertiaryBrush}" Margin="12,20,0,8"
+                                   FontFamily="Segoe UI"/>
+
+                        <RadioButton Style="{StaticResource NavButton}"
+                                     Command="{Binding NavigateCommand}" CommandParameter="Settings">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="⚙️" FontSize="16" Width="24"/>
+                                <TextBlock Text="Configuracoes" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            </StackPanel>
+                        </RadioButton>
+                    </StackPanel>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
+
+        <!-- ═══ Main Area ═══ -->
+        <DockPanel Grid.Column="1">
+            <!-- Header -->
+            <Border DockPanel.Dock="Top" Height="64" Background="{StaticResource CardBrush}"
+                    BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+                <DockPanel Margin="32,0">
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="{Binding PageTitle}" FontSize="18" FontWeight="Bold"
+                                   Foreground="{StaticResource TextPrimaryBrush}" FontFamily="Segoe UI"/>
+                        <TextBlock Text="{Binding PageSubtitle}" FontSize="12"
+                                   Foreground="{StaticResource TextTertiaryBrush}" Margin="0,1,0,0"/>
+                    </StackPanel>
+
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Border Background="{StaticResource InputBrush}" CornerRadius="6"
+                                BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                                Padding="4,0" Height="36" Width="240">
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="🔍" FontSize="12" Margin="6,0,8,0" VerticalAlignment="Center"
+                                           Foreground="{StaticResource TextTertiaryBrush}"/>
+                                <TextBox Text="" Background="Transparent" BorderThickness="0"
+                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                         FontSize="12" VerticalAlignment="Center" Width="180"
+                                         CaretBrush="{StaticResource TextPrimaryBrush}"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <!-- Content Area -->
+            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                          Padding="32,24">
+                <ContentControl x:Name="pageHost"/>
+            </ScrollViewer>
+        </DockPanel>
+    </Grid>
+</Window>

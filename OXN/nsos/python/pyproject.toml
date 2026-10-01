@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsos-mamba"
+version = "0.1.1"
+description = "Wrapper Python isolado para Mamba/Attention do NSOS com streaming incremental padrao."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Oxta" }
+]
+keywords = ["mamba", "attention", "ssm", "nsos", "edge-ai", "streaming"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+  "numpy>=1.23",
+]
+
+[project.urls]
+Homepage = "https://github.com/vitorGgC569/reimagined"
+Documentation = "https://github.com/vitorGgC569/reimagined/tree/nsos-gpu-phases12/OXN/nsos/docs"
+Source = "https://github.com/vitorGgC569/reimagined"
+
+[tool.setuptools]
+packages = ["nsos_mamba"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+nsos_mamba = ["*.pyd"]

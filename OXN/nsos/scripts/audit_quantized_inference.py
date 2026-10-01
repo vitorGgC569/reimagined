@@ -64,7 +64,8 @@ def _process_rss_mb() -> float:
         import psutil
         return psutil.Process().memory_info().rss / (1024 * 1024)
     except ImportError:
-        pass
+        if os.name == "nt":
+            return float("nan")
     try:
         with open("/proc/self/status", "r") as f:
             for line in f:
@@ -72,7 +73,7 @@ def _process_rss_mb() -> float:
                     kb = int(line.split()[1])
                     return kb / 1024
     except OSError:
-        pass
+        return float("nan")
     return float("nan")
 
 

@@ -1,6 +1,8 @@
 #include "../include/tensor.h"
 #include <cassert>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -35,6 +37,11 @@ void test_stress_model() {
   Tensor x = Tensor::random({1, 10, 16});
 
   for (int i = 0; i < 100; ++i) {
+    for (Parameter* parameter : model.parameters()) {
+      if (parameter) {
+        parameter->zero_grad();
+      }
+    }
     Context ctx;
     Tensor out = model.forward(x, &ctx);
     ASSERT_TRUE(out.shape[2] == 32); // Expect vocab_size (32)
@@ -65,15 +72,9 @@ void test_slice_torture() {
     ASSERT_TRUE(s2.shape[0] == 10);
     ASSERT_TRUE(s2.shape[1] == 10);
 
-    // Write to slice (deep copy check: shouldn't affect t? user wanted deep
-    // copy) With deep copy slice, s is independent.
+    const float original = t.get({start, 0});
     s.data()[0] = 999.0f;
-    // Verify t is unchanged at that pos?
-    // t[start * 100] should not be 999
-    float t_val = t.get({start, 0});
-    // Wait, earlier the user asked "Slice deep copy".
-    // If s is deep copy, s.data()[0] modification does NOT affect t.
-    ASSERT_TRUE(t_val != 999.0f || t.get({start, 0}) != 999.0f); // Logic check
+    ASSERT_TRUE(t.get({start, 0}) == original);
   }
   std::cout << "[Stability] Slice Torture Passed." << std::endl;
 }

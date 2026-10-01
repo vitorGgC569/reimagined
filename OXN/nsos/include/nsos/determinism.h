@@ -55,6 +55,18 @@ private:
   mutable std::mutex mutex_;
 };
 
+// Opt-in bit-reproducible training (NSOS_DETERMINISTIC=1).  Several GPU
+// fast-paths accumulate via order-nondeterministic atomicAdd — the embedding
+// gradient scatter, the Mamba grad_A reduction, and the MoE scatter — and the
+// loss reduction order can vary on device.  When this returns true, those ops
+// are routed to their deterministic host/ordered implementations so two runs
+// with the same seed produce byte-identical gradients (trading GPU throughput
+// for reproducibility, which checkpoint replay / continual learning require).
+// Read once from the env on first call; override at runtime with the setter.
+// Default false -> existing (fast, non-deterministic) behavior is unchanged.
+bool deterministic_reductions_enabled();
+void set_deterministic_reductions(bool enabled);
+
 // Macro para contexto determinístico
 #define NSOS_DETERMINISTIC_SCOPE(component, op, seq)                           \
   auto _rng =                                                                  \

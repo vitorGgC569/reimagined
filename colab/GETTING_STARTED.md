@@ -1,10 +1,18 @@
-# NSOS v11 — Getting Started (Colab)
+# NSOS v11 â€” Getting Started (legacy federated workflow)
 
 Step-by-step checklist to start training v11 (80M params, ~1.6B tokens) on Google Colab.
 
+> **Current benchmark:** this guide predates the July 2026 validation campaign
+> and is retained only for the older federated v11 training workflow. To
+> reproduce the validated NSOS/Jamba/OxtaMem benchmark, clone branch
+> `nsos-gpu-phases12` and use
+> [`bench_expanded_validation_t4_2026-07-22.ipynb`](bench_expanded_validation_t4_2026-07-22.ipynb).
+> The authoritative artifact index is
+> [`../docs/benchmarks/README.md`](../docs/benchmarks/README.md).
+
 ## Pre-flight (one-time, ~30 min)
 
-### ✅ Step 1 — Push the repo to GitHub
+### âœ… Step 1 â€” Push the repo to GitHub
 
 The notebook clones from GitHub, so the repo needs to be there.
 
@@ -20,23 +28,23 @@ git branch -M main
 git push -u origin main
 ```
 
-If `git remote add` errors with "remote origin already exists", that's fine — just `git push -u origin main`.
+If `git remote add` errors with "remote origin already exists", that's fine â€” just `git push -u origin main`.
 
-### ✅ Step 2 — (Optional) Set up GitHub token for private repos
+### âœ… Step 2 â€” (Optional) Set up GitHub token for private repos
 
 If your repo is **private**:
 
 1. Go to https://github.com/settings/tokens?type=beta
-2. Click "Generate new token" → "Fine-grained personal access token"
+2. Click "Generate new token" â†’ "Fine-grained personal access token"
 3. Repository access: select your `reimagined-main` repo
 4. Permissions: Contents = Read-only
 5. Generate and copy the token (starts with `github_pat_...`)
-6. In Colab: click the key icon in the left sidebar → "Add new secret"
+6. In Colab: click the key icon in the left sidebar â†’ "Add new secret"
 7. Name: `GH_TOKEN`, Value: paste your token. Toggle "Notebook access" ON.
 
 If your repo is **public**, skip this step.
 
-### ✅ Step 3 — Install Google Drive Desktop (for local sync later)
+### âœ… Step 3 â€” Install Google Drive Desktop (for local sync later)
 
 Download from https://www.google.com/drive/download/. Install with default settings. After install, your Drive will be at `G:\My Drive\` (or `H:\` if G is taken).
 
@@ -44,19 +52,19 @@ This isn't needed for the Colab side, but you'll want it for the local-sync daem
 
 ## Training session (~24 hours total, 2-3 Colab sessions)
 
-### ✅ Step 4 — Open the notebook in Colab
+### âœ… Step 4 â€” Open the notebook in Colab
 
 1. Go to https://colab.research.google.com/
-2. **File → Open notebook → GitHub tab**
+2. **File â†’ Open notebook â†’ GitHub tab**
 3. URL: `https://github.com/<YOUR_USERNAME>/reimagined-main`
 4. Branch: `main`
 5. Select `colab/train_v11.ipynb`
-6. **Runtime → Change runtime type:**
+6. **Runtime â†’ Change runtime type:**
    - Hardware accelerator: **T4 GPU** (default, free)
    - Version: Latest
    - Click Save
 
-### ✅ Step 5 — Edit cell 2 (GitHub URL)
+### âœ… Step 5 â€” Edit cell 2 (GitHub URL)
 
 In the notebook, find the cell that starts with `REPO_URL = ...` and replace `<YOUR_GIT_REMOTE>` with your GitHub username:
 
@@ -65,12 +73,12 @@ REPO_URL = 'https://github.com/<YOUR_USERNAME>/reimagined-main.git'
 #                                 ^^^^^^^^^^^^^^^^^ edit this
 ```
 
-### ✅ Step 6 — Run all cells
+### âœ… Step 6 â€” Run all cells
 
-**Runtime → Run all** (or Ctrl+F9).
+**Runtime â†’ Run all** (or Ctrl+F9).
 
 What you'll see, in order:
-1. **Cell 2 (mount Drive)**: Asks permission to access Drive — click "Connect to Google Drive" and grant.
+1. **Cell 2 (mount Drive)**: Asks permission to access Drive â€” click "Connect to Google Drive" and grant.
 2. **Cell 4 (clone repo)**: Should take <30s.
 3. **Cell 6 (bootstrap)**: First run takes ~15-20 min (builds nsos_ext.so for T4). Subsequent runs <30s (cache hit).
 4. **Cell 8 (fetch datasets)**: First run takes ~1-3h (downloads ~30-50GB to Drive). Subsequent runs <10s.
@@ -78,14 +86,14 @@ What you'll see, in order:
 
 **Total first session: ~14-15h** (15-20 min setup + ~14h training of partial curriculum).
 
-### ✅ Step 7 — On session timeout, just re-open the notebook
+### âœ… Step 7 â€” On session timeout, just re-open the notebook
 
 When Colab disconnects (after 12h on free tier):
 
 1. Reopen `https://colab.research.google.com/`
 2. Open the same `train_v11.ipynb` (Colab remembers it under "Recent")
-3. Runtime → Reconnect
-4. Runtime → Run all
+3. Runtime â†’ Reconnect
+4. Runtime â†’ Run all
 5. The bootstrap will detect that the .so is cached in Drive (skip build)
 6. The trainer will detect the latest checkpoint in Drive and resume from there
 
@@ -93,7 +101,7 @@ Expect 2-3 sessions to complete the full curriculum.
 
 ## Monitoring (optional, in parallel)
 
-### Local sync daemon (mirrors Drive → local)
+### Local sync daemon (mirrors Drive â†’ local)
 
 In a separate Windows PowerShell window, leave this running:
 
@@ -131,7 +139,7 @@ Your repo is private and you didn't set up `GH_TOKEN`. Go back to Pre-flight Ste
 The 80M profile assumes T4 (16GB). If your session got a V100 (16GB, also fine) or worse, K80 (deprecated), it may OOM. Edit the profile or rerun until you get T4.
 
 ### "Checkpoint download is slow on local"
-Drive Desktop syncs cloud → local on its own schedule. Check the Drive Desktop tray icon for sync status. Forcing: right-click on the file in Drive Desktop → "Available offline".
+Drive Desktop syncs cloud â†’ local on its own schedule. Check the Drive Desktop tray icon for sync status. Forcing: right-click on the file in Drive Desktop â†’ "Available offline".
 
 ### "Bootstrap fails on 'pybind11 not found'"
 Bootstrap runs `pip install pybind11>=2.10`. If it fails, in a Colab cell run:
@@ -147,8 +155,8 @@ After full curriculum (2-3 sessions):
 |---|---|
 | Held-out loss (phase 4) | ~3.5-4.5 (vs v10's 7.3) |
 | Teacher token accuracy | 55-70% (vs v10's 39%) |
-| Coherence of generated text | "Inglês fluente com algum raciocínio" (vs v10's "duo Sub aid 79") |
-| Local inference speed | 0.05 tok/s CPU, ~3 tok/s GPU (slightly slower than 40M due to 2× param count) |
+| Coherence of generated text | "InglÃªs fluente com algum raciocÃ­nio" (vs v10's "duo Sub aid 79") |
+| Local inference speed | 0.05 tok/s CPU, ~3 tok/s GPU (slightly slower than 40M due to 2Ã— param count) |
 
 ## When done
 
@@ -161,3 +169,4 @@ Next steps (post-training):
 1. **Test inference quality locally** with the chat UI
 2. **(Optional) Pacote A.3 + GPU repack** to get faster local inference
 3. **(Optional) Distill to 20M** for snappier local chat
+

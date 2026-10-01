@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -114,6 +115,56 @@ struct MCTSConfig {
   float dirichlet_alpha = 0.3f;
 };
 
+// Production reasoning has no implicit LM-confidence reward or random latent
+// expansion. Callers supply task-specific, versioned proposals and verification.
+// Callbacks must not mutate their inputs or model/session state. A verifier can
+// be executable or learned/calibrated; its evidence is not a proof by itself.
+struct ReasoningProposal {
+  Tensor state;
+  float prior = 1.0f;
+};
+
+struct ReasoningVerification {
+  float score = 0.0f; // task correctness/utility in [0,1], NOT logit confidence
+  std::string evidence;
+};
+
+struct ReasoningPolicy {
+  std::string policy_id;
+  std::string verifier_id;
+  using Proposer = std::function<std::vector<ReasoningProposal>(const Tensor&, int, int)>;
+  using Verifier = std::function<std::vector<ReasoningVerification>(const std::vector<Tensor>&)>;
+  Proposer propose;
+  Verifier verify;
+  void validate() const;
+};
+
+struct VerifiedReasoningReport {
+  std::string policy_id;
+  std::string verifier_id;
+  std::string evidence;
+  int evaluated_states = 0; // includes root; bounded by num_simulations
+  int proposal_calls = 0;
+  float baseline_score = 0.0f;
+  float best_score = 0.0f;
+  double elapsed_ms = 0.0;
+};
+
+struct VerifiedReasoningResult {
+  Tensor state;
+  VerifiedReasoningReport report;
+};
+
+VerifiedReasoningResult run_verified_reasoning(
+    const Tensor& root, const ReasoningPolicy& policy, const MCTSConfig& config);
+
+// A small executable verifier for structured tasks/tests. It checks the actual
+// decoded answer, never entropy. General-language correctness needs another
+// explicitly supplied verifier; this is not an automatic trained critic.
+ReasoningPolicy::Verifier exact_token_verifier(
+    std::vector<int> expected,
+    std::function<std::vector<int>(const Tensor&)> decode);
+
 class MCTSReasoning {
 public:
   using Evaluator = std::function<float(const Tensor &)>;
@@ -147,12 +198,12 @@ private:
   std::vector<ReasoningNode *> expand_children(ReasoningNode *node);
   float expand_and_evaluate(ReasoningNode *node);
   void backpropagate(ReasoningNode *node, float value);
+  float evaluate_state(const Tensor& state) const;
   std::vector<float> evaluate_states(const std::vector<Tensor>& states) const;
 
   float uct_score(const ReasoningNode *child,
                   const ReasoningNode *parent) const;
   ReasoningNode *select_child(ReasoningNode *parent);
-  float rollout(ReasoningNode *node, int depth);
   bool is_cycle(const ReasoningNode *node, uint64_t state_hash) const;
 
   MCTSConfig config_;

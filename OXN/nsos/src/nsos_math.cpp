@@ -101,40 +101,53 @@ void MathOps::pack_B_matrix(int N, int K, const float* B, int ldb, float* buffer
 }
 
 void MathOps::gemm_prepacked(int M, int N, int K, float alpha, const float* A, int lda, const float* B_packed, float beta, float* C, int ldc) {
-    const int MC = 256; 
-    
-    // Scale C
-    #pragma omp parallel for
-    for(int i=0; i<M; ++i) { for(int j=0; j<N; ++j) C[i*ldc + j] *= beta; }
-    
+    // MC aligned to MR so every m-block tiles cleanly into MR micro-rows and a
+    // single GLOBAL pack of A is addressable by row (packA + (i+ir)*K).
+    const int MC = (256 / MR) * MR;
+
+    // Scale C.  BLAS contract: when beta == 0, C is NOT read (it may hold
+    // uninitialized garbage / NaN that 0*x would propagate) -- SET it to 0
+    // instead of multiplying.  beta == 1 leaves C untouched (pure accumulate).
+    if (beta == 0.0f) {
+        #pragma omp parallel for
+        for(int i=0; i<M; ++i) { for(int j=0; j<N; ++j) C[(size_t)i*ldc + j] = 0.0f; }
+    } else if (beta != 1.0f) {
+        #pragma omp parallel for
+        for(int i=0; i<M; ++i) { for(int j=0; j<N; ++j) C[(size_t)i*ldc + j] *= beta; }
+    }
+
+    // Pack ALL of A ONCE.  The previous loop re-packed each m-block once PER
+    // n-panel (n_panels times redundant) -- on a 1024^3 gemm that is ~60x more
+    // packing traffic than needed.  pack_A zero-pads each MR-strip, so the
+    // buffer is roundup(M,MR)*K and the MR over-read of the final strip lands in
+    // that padding (in-bounds).  thread_local STORAGE is reused across calls and
+    // owned by the calling thread; the worker threads read it via the shared raw
+    // pointer `packA` (a plain local, NOT the thread_local variable -- accessing
+    // the thread_local symbol inside the parallel region would resolve to each
+    // worker's own empty copy).
+    thread_local std::vector<float> packA_storage;
+    const int M_padded = ((M + MR - 1) / MR) * MR;
+    packA_storage.resize(static_cast<size_t>(M_padded) * K);
+    float* packA = packA_storage.data();
+    pack_A(M, K, A, lda, packA);
+
     const int n_panels = (N + NR - 1) / NR;
     const int m_blocks = (M + MC - 1) / MC;
     #pragma omp parallel for
     for(int tile=0; tile<n_panels*m_blocks; ++tile) {
-        int panel = tile / m_blocks;
-        int block = tile - panel * m_blocks;
-        int j = panel * NR; // Iterate Panels of B (NR columns)
-        int i = block * MC;
-        int mc_eff = std::min(MC, M-i);
-        int n_eff = std::min(NR, N-j);
-
-        float* packA = (float*)ArenaAllocator::instance().alloc(mc_eff * K * sizeof(float), Device::CPU);
-
-        // Pack A
-        pack_A(mc_eff, K, A + i*lda, lda, packA);
-
-        // Pointer to B panel
+        const int panel = tile / m_blocks;
+        const int block = tile - panel * m_blocks;
+        const int j = panel * NR; // Panel of B (NR columns)
+        const int i = block * MC;
+        const int mc_eff = std::min(MC, M-i);
+        const int n_eff = std::min(NR, N-j);
         const float* b_panel = B_packed + (size_t)j * K;
 
-        // Macro Kernel
         for(int ir=0; ir<mc_eff; ir+=MR) {
-            int mr_eff = std::min(MR, mc_eff-ir);
-            const float* a_micro = packA + ir * K; // A packed is [MC][K] -> actually packed in small strips?
-            // Wait, original pack_A packs K dim contiguous for MR rows.
-            // Yes, K loop inner.
-            
-            float* c_ptr = C + (i+ir)*ldc + j;
-            
+            const int mr_eff = std::min(MR, mc_eff-ir);
+            const float* a_micro = packA + (size_t)(i+ir) * K;  // global MR-strip
+            float* c_ptr = C + (size_t)(i+ir)*ldc + j;
+
             if (mr_eff == MR && n_eff == NR) {
                 micro_kernel(K, a_micro, b_panel, c_ptr, ldc, alpha);
             } else {
@@ -143,7 +156,7 @@ void MathOps::gemm_prepacked(int M, int N, int K, float alpha, const float* A, i
                 micro_kernel(K, a_micro, b_panel, tile_values, NR, alpha);
                 for(int r=0; r<mr_eff; ++r)
                     for(int c=0; c<n_eff; ++c)
-                        c_ptr[r*ldc+c] += tile_values[r*NR+c];
+                        c_ptr[(size_t)r*ldc+c] += tile_values[r*NR+c];
             }
         }
     }
@@ -151,20 +164,38 @@ void MathOps::gemm_prepacked(int M, int N, int K, float alpha, const float* A, i
 
 // Fallback GEMM calls prepacked logic internally if not packed
 void MathOps::gemm(int M, int N, int K, float alpha, const float* A, int lda, const float* B, int ldb, float beta, float* C, int ldc) {
-    // On-the-fly pack B
-    // Optimization: If B is small, pack on stack. If large, use Arena.
-    size_t b_sz = get_packed_B_size(N, K);
-    float* b_buf = (float*)ArenaAllocator::instance().alloc(b_sz, Device::CPU);
-    pack_B_matrix(N, K, B, ldb, b_buf);
-    gemm_prepacked(M, N, K, alpha, A, lda, b_buf, beta, C, ldc);
+    // Pack B once into a thread_local buffer, reused across calls and owned by
+    // the calling thread (pack_B_matrix's omp workers and gemm_prepacked read it
+    // via the shared raw pointer).  Replaces the never-rewound arena alloc, which
+    // grew unboundedly across gemm calls.
+    thread_local std::vector<float> b_buf;
+    b_buf.resize(get_packed_B_size(N, K) / sizeof(float));
+    pack_B_matrix(N, K, B, ldb, b_buf.data());
+    gemm_prepacked(M, N, K, alpha, A, lda, b_buf.data(), beta, C, ldc);
 }
 
 // Vector Ops remain same
 void MathOps::vec_add(int n, const float* a, const float* b, float* y) {
-    int i=0; for (; i <= n - 8; i += 8) { SimdPacket<float> va = SimdPacket<float>::load(a + i); SimdPacket<float> vb = SimdPacket<float>::load(b + i); (va + vb).store(y + i); } for (; i < n; ++i) y[i] = a[i] + b[i];
+    // Step by the actual packet width (8 AVX / 4 NEON / 1 generic); the fixed
+    // i+=8 left elements uncomputed on non-AVX builds (garbage in the output).
+    constexpr int W = SimdPacket<float>::width;
+    int i = 0;
+    for (; i <= n - W; i += W) {
+        SimdPacket<float> va = SimdPacket<float>::load(a + i);
+        SimdPacket<float> vb = SimdPacket<float>::load(b + i);
+        (va + vb).store(y + i);
+    }
+    for (; i < n; ++i) y[i] = a[i] + b[i];
 }
 void MathOps::vec_mul(int n, const float* a, const float* b, float* y) {
-    int i=0; for (; i <= n - 8; i += 8) { SimdPacket<float> va = SimdPacket<float>::load(a + i); SimdPacket<float> vb = SimdPacket<float>::load(b + i); (va * vb).store(y + i); } for (; i < n; ++i) y[i] = a[i] * b[i];
+    constexpr int W = SimdPacket<float>::width;
+    int i = 0;
+    for (; i <= n - W; i += W) {
+        SimdPacket<float> va = SimdPacket<float>::load(a + i);
+        SimdPacket<float> vb = SimdPacket<float>::load(b + i);
+        (va * vb).store(y + i);
+    }
+    for (; i < n; ++i) y[i] = a[i] * b[i];
 }
 
 } // namespace nsos

@@ -1,6 +1,7 @@
 #pragma once
 #include "autograd.h"
 #include "bitlinear.h"
+#include "ttt_recurrence.h"
 #include <vector>
 #include <memory>
 
@@ -28,7 +29,7 @@ public:
     uint64_t state_;
     float cached_gaussian_;
 
-    TTTLayer(int dim, int hidden, float lr = 0.001f);
+    TTTLayer(int dim, int hidden, float lr = 0.001f, uint64_t seed = 0);
     
     Tensor forward(const Tensor &x);
     Tensor backward(const Tensor &g);
@@ -45,6 +46,8 @@ public:
     void set_friction(float f);
     void set_max_grad_norm(float m);
     void set_checkpoint_interval(int i);
+    void set_batch_valid_lengths(const std::vector<int>& lengths);
+    size_t saved_state_history_bytes() const noexcept;
     
     Tensor get_current_adaptation();
     TTTSessionSnapshot snapshot_state() const;
@@ -63,8 +66,18 @@ private:
     Tensor saved_values_;
     Tensor saved_pre_adaptation_;
     Tensor saved_errors_;
+    bool saved_device_recurrence_ = false;
+    bool saved_full_bptt_ = false;
+    int saved_full_batch_ = 0;
+    int saved_full_seq_ = 0;
+    std::vector<int> batch_valid_lengths_, saved_full_lengths_;
+    Tensor saved_momentum_boundaries_;
+    ttt::RecurrenceConfig saved_full_config_{0, 0, 32, 0, 0, 0, false};
 
     Tensor compute_force(const Tensor& x, const Tensor& target);
+    Tensor forward_full(const Tensor& x, const Tensor& flat);
+    Tensor backward_full(const Tensor& g);
+    void clear_backward_state();
 };
 
 } // namespace nsos

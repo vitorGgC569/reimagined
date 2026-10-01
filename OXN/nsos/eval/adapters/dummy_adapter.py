@@ -47,6 +47,11 @@ class DummyAdapter(ModelAdapter):
                    "framework before any real model exists."),
         )
 
+    def evaluation_identity(self) -> dict:
+        return {"kind": "synthetic", "model_name": "dummy/uniform-random",
+                "vocab_size": self._vocab_size,
+                "max_seq_len": self._max_seq_len}
+
     def tokenize(self, text: str) -> List[int]:
         # Char-level toy tokenizer modulo vocab.  Deterministic.
         return [ord(c) % self._vocab_size for c in text]

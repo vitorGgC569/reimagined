@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "execution_date": "2026-07-22",
+  "hardware": "NVIDIA Tesla T4",
+  "artifact_set_commit": "6a34eee0643dd48b718b4d616468ccfadec76a81",
+  "artifact_set_commit_subject": "Mark legacy Colab guide and link current benchmark",
+  "runtime_commits": {
+    "expanded_notebook_and_raw_json": "4462b62",
+    "historical_report_base_run": "ec97b3e",
+    "moe_arm_registration": "8eda86f730e68c956b62097a3f93cbe2d235b6ff"
+  },
+  "artifacts": {
+    "report": {
+      "path": "docs/benchmarks/jamba_vs_nsos_oxtamem_t4_2026-07-22.md",
+      "git_blob_sha1": "c4358f63352f8a1e97018d7e4fb5d185c9857b0d",
+      "sha256": "0f166080f8ca89751e89a5728432d811aaacfa2d893817ea7d155013a45aa1d3",
+      "byte_exact_to_artifact_set_commit": true
+    },
+    "raw_results": {
+      "path": "docs/benchmarks/results/expanded_validation_t4_2026-07-22.json",
+      "git_blob_sha1": "4ea076be27f20ef92cc24346e5045a7dc8222f97",
+      "sha256": "3da5264b60198e8f2548b92f7125e7dc93d639886ab34409bec7d196ef618428",
+      "byte_exact_to_artifact_set_commit": true
+    },
+    "executed_notebook_current": {
+      "path": "colab/bench_expanded_validation_t4_2026-07-22.ipynb",
+      "git_blob_sha1": "c0a734ef6cfd3c9168a044c98190fe6dbc5bdf49",
+      "sha256": "8bc22920287de733aa365ae1b1c4a654f2780a4b25795be973ee9641c1c05f0c",
+      "code_cells": 18,
+      "executed_code_cells": 17,
+      "output_cells": 17,
+      "note": "UTF-8-normalized notebook with an added fail-closed CUDA backend assertion; saved T4 outputs are retained."
+    },
+    "executed_notebook_at_artifact_set_commit": {
+      "git_blob_sha1": "d0a8bee2eb259e8a02570de5dc33125a3dd17bb3",
+      "sha256": "cbb00ce45d6acc240aa4371e075363feb57dd825bf7b91c1d9874ecca49c0c17"
+    }
+  },
+  "datasets": {
+    "facebook_babi_qa_en_10k_qa1_revision": "1d86ad39d1c3ea2ff4b77eeb85f7c6ebd622a95f",
+    "train_sha256": "f1d67aa230d7aba0ed310df0d696a3ba9a07270e1670fe64c6901c24e5016f3f",
+    "test_sha256": "9875dfad271cbfa5c49adb5809dd67be3826394a5d4d66dc74cab0c81483e2f8"
+  }
+}

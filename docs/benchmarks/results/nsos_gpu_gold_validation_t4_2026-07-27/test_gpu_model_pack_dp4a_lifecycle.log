@@ -1,0 +1,8 @@
+$ /content/nsos-build-gpu-gold-sm75/test_gpu_model_pack_dp4a_lifecycle
+[GPUParity:model_pack_dp4a_lifecycle] device=Tesla T4 cc=7.5 runtime=12080
+[GPUParity:model_pack_dp4a_lifecycle] begin
+[Tokenizer] Loading BPE model from /tmp/nsos_gpu_dp4a_lifecycle_pack/tokenizer.nsos...
+[Tokenizer] Loaded vocab size: 256
+[InferenceEngine] edge pack loaded; FP32 linear weights released (1.58-bit inference mode).
+[GPUParity:model_pack_dp4a_lifecycle] layer=0 load_dispatches=1 clone_dispatches=1
+[GPUParity:model_pack_dp4a_lifecycle] PASS

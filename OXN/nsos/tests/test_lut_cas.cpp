@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -130,7 +132,10 @@ int main() {
 
     std::printf("=== lut_cas file I/O round-trip ===\n");
     const std::string tmp_path = "test_lut_cas_tmp.cas";
-    bool wrote = nsos::lut_cas::write_to_file(multi.matrices[0], tmp_path);
+    const auto first_single = nsos::lut_cas::encode(
+        matrices[0], rows_cols[0].first, rows_cols[0].second,
+        nsos::lut_cas::TileK::K8);
+    bool wrote = nsos::lut_cas::write_to_file(first_single, tmp_path);
     nsos::lut_cas::CasPack reloaded;
     bool read_ok = nsos::lut_cas::read_from_file(tmp_path, reloaded);
     bool roundtrip = (reloaded.total_tiles == multi.matrices[0].total_tiles)
@@ -154,7 +159,51 @@ int main() {
                 reloaded_multi.matrices.size(),
                 reloaded_multi.shared_dictionary.size());
 
-    const bool all_ok = (ok == total) && multi_ok && roundtrip && multi_io_ok;
+    std::printf("=== lut_cas malformed-input rejection ===\n");
+    bool malformed_ok = true;
+    try {
+        (void)nsos::lut_cas::encode({0u}, 1, 8,
+                                    nsos::lut_cas::TileK::K8);
+        malformed_ok = false;
+    } catch (const std::runtime_error&) {
+    }
+    auto bad_pack = first_single;
+    bad_pack.tile_indices[0] =
+        static_cast<uint16_t>(bad_pack.dictionary.size());
+    try {
+        (void)nsos::lut_cas::decode(bad_pack);
+        malformed_ok = false;
+    } catch (const std::runtime_error&) {
+    }
+
+    const std::string hostile_path = "test_lut_cas_hostile.cas";
+    {
+        std::ofstream f(hostile_path, std::ios::binary);
+        const char magic[4] = {'C', 'A', 'S', '1'};
+        const uint32_t version = 1;
+        const uint8_t tile_k = 8;
+        const uint32_t one = 1;
+        const uint32_t cols8 = 8;
+        const uint32_t huge = (std::numeric_limits<uint32_t>::max)();
+        const uint32_t uniq = 1;
+        f.write(magic, sizeof(magic));
+        f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        f.write(reinterpret_cast<const char*>(&tile_k), sizeof(tile_k));
+        f.write(reinterpret_cast<const char*>(&one), sizeof(one));
+        f.write(reinterpret_cast<const char*>(&cols8), sizeof(cols8));
+        f.write(reinterpret_cast<const char*>(&huge), sizeof(huge));
+        f.write(reinterpret_cast<const char*>(&uniq), sizeof(uniq));
+    }
+    nsos::lut_cas::CasPack hostile;
+    malformed_ok =
+        malformed_ok &&
+        !nsos::lut_cas::read_from_file(hostile_path, hostile);
+    std::remove(hostile_path.c_str());
+    std::printf("  malformed inputs: %s\n\n",
+                malformed_ok ? "PASS" : "FAIL");
+
+    const bool all_ok =
+        (ok == total) && multi_ok && roundtrip && multi_io_ok && malformed_ok;
     std::printf("\n=== overall: %s ===\n", all_ok ? "PASS" : "FAIL");
     return all_ok ? 0 : 1;
 }

@@ -17,8 +17,24 @@ NeuralSelfHealer::NeuralSelfHealer(const HealingConfig &cfg) : cfg_(cfg) {}
 // ============================================================================
 std::pair<float, float>
 NeuralSelfHealer::measure_confidence(const Tensor &logits) const {
-  const int vocab = logits.shape.back();
-  const float *raw = logits.data() + (logits.size - vocab);
+  // The extractor returns a caller-controlled tensor that may live on the
+  // GPU; materialize on the host before any pointer arithmetic so we never
+  // dereference a device pointer on the CPU.
+  const Tensor host_logits =
+      logits.get_device() == Device::GPU ? logits.cpu() : logits;
+
+  // Guard against an empty or malformed logits tensor.  vocab is the size of
+  // the last dimension; if it is non-positive or larger than the buffer, the
+  // offset (size - vocab) would underflow and read out of bounds.  Treat such
+  // input as maximally uncertain (zero confidence, zero entropy).
+  if (host_logits.size <= 0 || host_logits.shape.size() == 0) {
+    return {0.0f, 0.0f};
+  }
+  int vocab = host_logits.shape.back();
+  if (vocab <= 0 || vocab > host_logits.size) {
+    vocab = host_logits.size;
+  }
+  const float *raw = host_logits.data() + (host_logits.size - vocab);
 
   float max_val = *std::max_element(raw, raw + vocab);
   float sum_exp = 0.0f;
@@ -258,6 +274,24 @@ bool NeuralSelfHealer::verify(const std::vector<int> &tokens,
     report.failure_reason = oss.str();
   }
   return report.success;
+}
+
+std::vector<int> generate_with_self_healing(JambaModel& model,
+                                            const std::vector<int>& prompt,
+                                            int max_tokens,
+                                            HealingReport& report,
+                                            const HealingConfig& cfg) {
+  NeuralSelfHealer healer(cfg);
+  D2FDecoder decoder(&model);
+  healer.set_logits_extractor([&model](const std::vector<int>& ids) -> Tensor {
+    Context c;
+    return model.forward_ids(ids, &c);
+  });
+  healer.set_token_decoder([&decoder](const std::vector<int>& p, int max_len, float temp,
+                                      float top_p, int top_k, int eos, Context* ctx) {
+    return decoder.generate(p, max_len, ctx, temp, top_p, top_k, eos);
+  });
+  return healer.generate_healed(prompt, max_tokens, report);
 }
 
 } // namespace nsos

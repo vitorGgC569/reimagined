@@ -1,0 +1,60 @@
+=====================================================================
+ 25-LAYER FORWARD-ONLY COMPETITIVE STACK — hierarchical composition?
+=====================================================================
+ task: super-class = (bG0 XOR bG1, bG2 XOR bG3)  [non-linear of parts]
+ data: 12000 train / 3000 test, dim=64, 16 parts/4 groups, 4 classes, chance=0.250
+ stack: 25 layers x 64 neurons, k-taper 4/3/2, graded sparse codes
+ homeostasis: conscience + dead-unit reinit + winner decorrelation
+
+PER-DEPTH (core stack)  [readout = measurement only, no backprop]
+ depth  ncc    lin    L1xfer  dead   entropy sparse protoC  quant  null
+   0*  0.307  0.355  0.244    -      -      0.000    -      -      -
+   1   0.387  0.478  0.387  0.094  0.965  0.938  0.167  0.293  0
+   2   0.343  0.368  0.250  0.062  0.913  0.938  0.084  0.171  0
+   3   0.331  0.350  0.234  0.406  0.803  0.938  0.048  0.009  0
+   4   0.329  0.349  0.219  0.688  0.690  0.938  0.046  0.000  0
+   5   0.297  0.317  0.232  0.766  0.644  0.938  0.041  0.050  0
+   6   0.297  0.317  0.249  0.781  0.628  0.938  0.043  -0.000  0
+   7   0.297  0.317  0.302  0.781  0.628  0.938  0.044  0.000  0
+   8   0.297  0.318  0.254  0.797  0.605  0.938  0.037  0.026  0
+   9   0.297  0.318  0.283  0.797  0.605  0.938  0.046  -0.000  0
+  10   0.297  0.318  0.232  0.797  0.605  0.953  0.019  -0.000  0
+  11   0.297  0.318  0.233  0.797  0.605  0.953  0.017  0.000  0
+  12   0.297  0.318  0.244  0.797  0.605  0.953  0.015  0.000  0
+  13   0.297  0.318  0.209  0.797  0.605  0.953  0.016  -0.000  0
+  14   0.297  0.318  0.239  0.797  0.605  0.953  0.023  0.000  0
+  15   0.297  0.318  0.264  0.797  0.605  0.953  0.018  0.000  0
+  16   0.297  0.318  0.252  0.797  0.605  0.953  0.022  0.000  0
+  17   0.297  0.318  0.255  0.797  0.605  0.953  0.021  0.000  0
+  18   0.297  0.318  0.262  0.797  0.605  0.953  0.020  0.000  0
+  19   0.297  0.318  0.272  0.797  0.605  0.969  0.008  0.000  0
+  20   0.297  0.318  0.241  0.797  0.605  0.969  0.006  -0.000  0
+  21   0.297  0.318  0.304  0.797  0.605  0.969  0.012  0.000  0
+  22   0.297  0.318  0.241  0.797  0.605  0.969  0.007  0.000  0
+  23   0.297  0.318  0.267  0.797  0.605  0.969  0.009  0.000  0
+  24   0.297  0.318  0.255  0.797  0.605  0.969  0.002  0.000  0
+  25   0.297  0.318  0.220  0.797  0.605  0.969  0.009  0.000  0
+ (* depth 0 = raw input)
+
+CONTROLS (NCC unless noted):
+  raw-input floor (depth 0) .............. 0.307  (chance 0.250)
+  single-layer (depth 1) ................. 0.387
+  CORE best  (depth  1) .................. 0.387
+  CORE final (depth 25) ................. 0.297
+  inhibition-OFF stack (best/final) ..... 0.199 / 0.191  [expect collapse]
+  anti-collapse-OFF (best/final/dead@25). 0.329 / 0.315 / dead=0.86
+  const-k=3 stack (best) ................ 0.374
+  random-frozen stack (best) ........... 0.304
+  shuffled-depth (final) ............... 0.278  (in-order final 0.297)
+  width-scaled 1-layer m=1600 (ncc/lin). 0.467 / 0.632
+
+HONESTY CHECKS:
+  [1] best beats single-layer by >=0.10 ... NO  (0.387 -> 0.387, +0.000)
+  [2] best beats raw floor by >=0.20 ...... NO  (+0.080)
+  [3] depth beats equal-capacity width .... NO  (deep 0.387 vs wide 0.632)
+  [4] order matters (shuffle drops >=0.05). NO  (0.019 drop)
+  [5] learning is real (rnd < 0.35) ....... YES (0.304)
+  [6] representation stays healthy @peak .. YES (dead 0.09, entropy 0.97)
+
+VERDICT: PLATEAU — no depth beats single-layer by >=0.10 (best 0.387 vs single 0.387). Layer 1 already captures it.
+=====================================================================

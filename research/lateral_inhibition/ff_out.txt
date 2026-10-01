@@ -1,0 +1,19 @@
+=====================================================================
+ FORWARD-FORWARD — local signal: does depth compose? (no backprop)
+=====================================================================
+ XOR-of-groups, 4 classes, chance 0.250 | unsupervised ref: single-layer 0.387
+ classify = argmax_label accumulated goodness; no-leak curve excludes layer 0
+
+PLAIN-FF (k=64, alpha=0.70, lr=0.030, 15 epochs)
+  acc (layers 0..d):    d1  0.907  d2  0.963  d3  0.959  d5  0.932  d8  0.924  d12 0.903  d18 0.894  d25 0.894  
+  acc (layers 1..d, no-leak): d1  0.191  d2  0.939  d3  0.925  d5  0.873  d8  0.859  d12 0.825  d18 0.809  d25 0.809  
+  layer-0-ONLY (leak check) = 0.907   |   best no-leak = 0.939 @ depth 2
+  => depth helps (no-leak best - depth2): +0.000  [little depth gain]
+
+FF + LATERAL INHIBITION (k=16, alpha=0.70, lr=0.030, 15 epochs)
+  acc (layers 0..d):    d1  0.896  d2  0.948  d3  0.933  d5  0.902  d8  0.884  d12 0.882  d18 0.880  d25 0.880  
+  acc (layers 1..d, no-leak): d1  0.191  d2  0.924  d3  0.892  d5  0.839  d8  0.804  d12 0.801  d18 0.801  d25 0.801  
+  layer-0-ONLY (leak check) = 0.896   |   best no-leak = 0.924 @ depth 2
+  => depth helps (no-leak best - depth2): +0.000  [little depth gain]
+
+=====================================================================

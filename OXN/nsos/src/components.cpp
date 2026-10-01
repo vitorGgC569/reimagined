@@ -97,8 +97,7 @@ Tensor MuonOptimizer::newton_schulz(const Tensor &G) {
 
   for (int k = 0; k < steps; ++k) {
     // A = X^T * X
-    Tensor XT = X.transpose();
-    Tensor A = XT.matmul(X); // [C, R] @ [R, C] -> [C, C]
+    Tensor A = matmul_tn(X, X); // [C, R] @ [R, C] -> [C, C]
 
     // B = 3I - A
     // A and I are C x C

@@ -6,6 +6,9 @@ NSOS. For the NSOS MVP it is **not** a public network service.
 ## MVP Status
 
 - Native Rust engine: beta.
+- Durable writes use a checksummed append-only metadata journal with torn-tail
+  recovery and amortized snapshot compaction; full metadata is not rewritten
+  for every record.
 - Python SDK: beta, safe serializer only.
 - RESP server: experimental, loopback-first, bounded, and authenticated when
   bound outside loopback.

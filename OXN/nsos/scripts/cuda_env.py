@@ -8,6 +8,11 @@ from typing import Iterable, List, Optional, Tuple
 
 
 WINDOWS_CUDA_ROOT = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+WINDOWS_HIP_ROOTS = (
+    Path(r"C:\TheRock\build"),
+    Path(r"C:\Program Files\AMD\ROCm"),
+)
+_DLL_DIRECTORY_HANDLES: list[object] = []
 
 
 def _version_key(path: Path) -> Tuple[int, ...]:
@@ -73,12 +78,52 @@ def find_cuda_bin_dirs(preferred_root: Optional[Path] = None) -> List[Path]:
     return _dedupe_keep_order(bins)
 
 
-def add_windows_runtime_dirs(build_dir: Path, preferred_cuda_root: Optional[Path] = None) -> None:
+def find_hip_roots(preferred_root: Optional[Path] = None) -> List[Path]:
+    roots: List[Path] = []
+    if preferred_root is not None:
+        roots.append(Path(preferred_root))
+    for env_name in ("NSOS_HIP_ROOT", "ROCM_PATH", "HIP_PATH"):
+        value = os.environ.get(env_name)
+        if value:
+            roots.append(Path(value))
+    for installed_root in WINDOWS_HIP_ROOTS:
+        if not installed_root.exists():
+            continue
+        if (installed_root / "bin").is_dir():
+            roots.append(installed_root)
+        roots.extend(
+            child
+            for child in installed_root.iterdir()
+            if child.is_dir() and (child / "bin").is_dir()
+        )
+    return [path for path in _dedupe_keep_order(roots) if path.exists()]
+
+
+def find_hip_bin_dirs(preferred_root: Optional[Path] = None) -> List[Path]:
+    bins: List[Path] = []
+    for root in find_hip_roots(preferred_root):
+        for suffix in ("bin", "lib\\llvm\\bin"):
+            candidate = root / suffix
+            if candidate.is_dir():
+                bins.append(candidate)
+    return _dedupe_keep_order(bins)
+
+
+def add_windows_runtime_dirs(
+    build_dir: Path,
+    preferred_cuda_root: Optional[Path] = None,
+    preferred_hip_root: Optional[Path] = None,
+) -> None:
     if os.name != "nt":
         return
-    os.add_dll_directory(str(build_dir))
-    for cuda_bin in find_cuda_bin_dirs(preferred_cuda_root):
-        os.add_dll_directory(str(cuda_bin))
+    runtime_dirs = [Path(build_dir)]
+    runtime_dirs.extend(find_cuda_bin_dirs(preferred_cuda_root))
+    runtime_dirs.extend(find_hip_bin_dirs(preferred_hip_root))
+    for runtime_dir in _dedupe_keep_order(runtime_dirs):
+        if not runtime_dir.is_dir():
+            continue
+        handle = os.add_dll_directory(str(runtime_dir))
+        _DLL_DIRECTORY_HANDLES.append(handle)
 
 
 def detect_preferred_cuda_root() -> Optional[Path]:
@@ -87,6 +132,13 @@ def detect_preferred_cuda_root() -> Optional[Path]:
 
 
 def parse_preferred_cuda_root(text: str | None) -> Optional[Path]:
+    if not text:
+        return None
+    path = Path(text)
+    return path if path.exists() else None
+
+
+def parse_preferred_hip_root(text: str | None) -> Optional[Path]:
     if not text:
         return None
     path = Path(text)
@@ -106,6 +158,10 @@ def prepend_cuda_bin_to_path(preferred_root: Optional[Path] = None) -> None:
 
 def describe_cuda_roots() -> List[str]:
     return [str(path) for path in find_cuda_roots()]
+
+
+def describe_hip_roots() -> List[str]:
+    return [str(path) for path in find_hip_roots()]
 
 
 if __name__ == "__main__":

@@ -11,13 +11,12 @@ optimization plan touches:
   * MoERouter forward (Phase 4 fast path)
 
 Outputs a JSON report with per-op CPU/GPU mean latencies + speedup.
-Honest: no warmup is hidden, no fake numbers; if GPU is slower than
-CPU on this hardware (small batches on GTX 1050 Ti is plausible due
-to launch overhead), the report will say so.
+Honest: warmup and measured samples are reported separately; if GPU is slower
+than CPU for a small shape, the report says so.
 
 Run:
   $env:PYTHONIOENCODING = "utf-8"
-  python bench_gpu_vs_cpu.py --build-dir <path-to-build-cuda-validation>
+  python bench_gpu_vs_cpu.py --build-dir <path-to-configured-gpu-build>
 """
 from __future__ import annotations
 
@@ -26,28 +25,55 @@ import json
 import os
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from oxta_contabil.benchmark_policy import configured_test_inventory
+
+import numpy as np
+
+
+_dll_handles: list[Any] = []
 
 
 def _load_nsos(build_dir: Path):
     if str(build_dir) not in sys.path:
         sys.path.insert(0, str(build_dir))
     if os.name == "nt":
-        # Add the build dir AND the CUDA toolkit bin dirs to the DLL
-        # search list so cudart64_*.dll resolves at module-load time.
+        # Keep handles alive for the lifetime of the extension.
         candidates = [
             build_dir,
             Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"),
             Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin"),
         ]
+        for key in ("NSOS_HIP_ROOT", "ROCM_PATH", "HIP_PATH"):
+            if os.environ.get(key):
+                root = Path(os.environ[key])
+                candidates.extend(
+                    (root / "bin", root / "lib" / "llvm" / "bin")
+                )
         for path in candidates:
             try:
                 if path.exists():
-                    os.add_dll_directory(str(path))
-            except (AttributeError, OSError):
-                pass
+                    _dll_handles.append(
+                        os.add_dll_directory(str(path))
+                    )
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "Python on Windows does not expose os.add_dll_directory"
+                ) from exc
+            except OSError as exc:
+                print(
+                    f"[runtime] DLL directory rejected: {path}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     import nsos_ext  # type: ignore
     return nsos_ext
 
@@ -74,8 +100,64 @@ def time_call(label: str, fn: Callable[[], Any], *, repeat: int = 20,
 
 def speedup(cpu_mean: float, gpu_mean: float) -> float:
     if gpu_mean <= 0:
-        return float("nan")
+        raise RuntimeError("measured GPU latency must be positive")
     return cpu_mean / gpu_mean
+
+
+def parity_metrics(
+    cpu_tensor,
+    gpu_tensor,
+    *,
+    atol: float,
+    rtol: float,
+) -> Dict[str, Any]:
+    cpu = np.asarray(cpu_tensor.numpy(), dtype=np.float32)
+    gpu = np.asarray(gpu_tensor.numpy(), dtype=np.float32)
+    if cpu.shape != gpu.shape:
+        raise RuntimeError(
+            f"CPU/GPU parity shape mismatch: {cpu.shape} != {gpu.shape}"
+        )
+    if not np.isfinite(cpu).all() or not np.isfinite(gpu).all():
+        raise RuntimeError("CPU/GPU parity produced a non-finite value")
+    absolute = np.abs(cpu - gpu)
+    maximum = float(absolute.max(initial=0.0))
+    mean = float(absolute.mean()) if absolute.size else 0.0
+    if not np.allclose(cpu, gpu, atol=atol, rtol=rtol):
+        flat_index = int(np.argmax(absolute))
+        index = np.unravel_index(flat_index, absolute.shape)
+        raise RuntimeError(
+            "CPU/GPU parity failed at "
+            f"{index}: cpu={float(cpu[index])} gpu={float(gpu[index])} "
+            f"abs={float(absolute[index])} atol={atol} rtol={rtol}"
+        )
+    return {
+        "passed": True,
+        "atol": atol,
+        "rtol": rtol,
+        "max_abs_error": maximum,
+        "mean_abs_error": mean,
+        "elements": int(absolute.size),
+    }
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    serialized = json.dumps(
+        value, indent=2, ensure_ascii=False, allow_nan=False
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".tmp."
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -87,6 +169,12 @@ def bench_matmul(nsos, M: int, K: int, N: int, *, repeat: int) -> Dict[str, Any]
     b_cpu = nsos.Tensor.random([K, N], nsos.Device.CPU)
     a_gpu = a_cpu.to(nsos.Device.GPU)
     b_gpu = b_cpu.to(nsos.Device.GPU)
+    parity = parity_metrics(
+        a_cpu.matmul(b_cpu),
+        a_gpu.matmul(b_gpu).cpu(),
+        atol=1e-3,
+        rtol=2e-4,
+    )
 
     cpu = time_call(
         f"matmul[{M}x{K}x{N}] cpu",
@@ -105,6 +193,7 @@ def bench_matmul(nsos, M: int, K: int, N: int, *, repeat: int) -> Dict[str, Any]
         "shape": {"M": M, "K": K, "N": N},
         "cpu": cpu,
         "gpu": gpu,
+        "parity": parity,
         "speedup_cpu_div_gpu": speedup(cpu["mean_s"], gpu["mean_s"]),
     }
 
@@ -119,7 +208,7 @@ def bench_bitlinear(nsos, in_features: int, out_features: int, batch: int, *,
     cpu_params = cpu_layer.parameters()
     gpu_params = gpu_layer.parameters()
     for cp, gp in zip(cpu_params, gpu_params):
-        gp.data.copy_from(cp.data)
+        gp.copy_data_from(cp.data)
 
     gpu_layer.to(nsos.Device.GPU)
     cpu_layer.set_precision_mode(2)
@@ -133,6 +222,12 @@ def bench_bitlinear(nsos, in_features: int, out_features: int, batch: int, *,
 
     x_cpu = nsos.Tensor.random([batch, in_features], nsos.Device.CPU)
     x_gpu = x_cpu.to(nsos.Device.GPU)
+    parity = parity_metrics(
+        cpu_layer.forward(x_cpu),
+        gpu_layer.forward(x_gpu).cpu(),
+        atol=3e-3,
+        rtol=5e-4,
+    )
 
     cpu = time_call(
         f"bitlinear[{batch}x{in_features}->{out_features}] cpu_packed",
@@ -154,6 +249,7 @@ def bench_bitlinear(nsos, in_features: int, out_features: int, batch: int, *,
                    "out_features": out_features},
         "cpu": cpu,
         "gpu": gpu,
+        "parity": parity,
         "speedup_cpu_div_gpu": speedup(cpu["mean_s"], gpu["mean_s"]),
     }
 
@@ -167,12 +263,18 @@ def bench_mamba(nsos, d_model: int, d_state: int, n_heads: int, batch: int,
     cpu_params = cpu_layer.parameters()
     gpu_params = gpu_layer.parameters()
     for cp, gp in zip(cpu_params, gpu_params):
-        gp.data.copy_from(cp.data)
+        gp.copy_data_from(cp.data)
 
     gpu_layer.to(nsos.Device.GPU)
 
     x_cpu = nsos.Tensor.random([batch, seq, d_model], nsos.Device.CPU)
     x_gpu = x_cpu.to(nsos.Device.GPU)
+    parity = parity_metrics(
+        cpu_layer.forward(x_cpu, None),
+        gpu_layer.forward(x_gpu, None).cpu(),
+        atol=3e-3,
+        rtol=5e-4,
+    )
 
     cpu = time_call(
         f"mamba[{batch}x{seq}x{d_model}] cpu",
@@ -190,6 +292,7 @@ def bench_mamba(nsos, d_model: int, d_state: int, n_heads: int, batch: int,
                    "d_state": d_state, "n_heads": n_heads},
         "cpu": cpu,
         "gpu": gpu,
+        "parity": parity,
         "speedup_cpu_div_gpu": speedup(cpu["mean_s"], gpu["mean_s"]),
     }
 
@@ -203,12 +306,28 @@ def bench_moe_router(nsos, d_model: int, num_experts: int, top_k: int,
     cpu_params = cpu_router.parameters()
     gpu_params = gpu_router.parameters()
     for cp, gp in zip(cpu_params, gpu_params):
-        gp.data.copy_from(cp.data)
+        gp.copy_data_from(cp.data)
 
     gpu_router.to(nsos.Device.GPU)
 
     x_cpu = nsos.Tensor.random([rows, d_model], nsos.Device.CPU)
     x_gpu = x_cpu.to(nsos.Device.GPU)
+    cpu_logits, cpu_weights = cpu_router.forward(x_cpu)
+    gpu_logits, gpu_weights = gpu_router.forward(x_gpu)
+    parity = {
+        "logits": parity_metrics(
+            cpu_logits,
+            gpu_logits.cpu(),
+            atol=2e-3,
+            rtol=5e-4,
+        ),
+        "weights": parity_metrics(
+            cpu_weights,
+            gpu_weights.cpu(),
+            atol=2e-3,
+            rtol=5e-4,
+        ),
+    }
 
     cpu = time_call(
         f"moe_router[{rows}x{d_model}->{num_experts}@{top_k}] cpu",
@@ -231,6 +350,7 @@ def bench_moe_router(nsos, d_model: int, num_experts: int, top_k: int,
                    "num_experts": num_experts, "top_k": top_k},
         "cpu": cpu,
         "gpu": gpu,
+        "parity": parity,
         "speedup_cpu_div_gpu": speedup(cpu["mean_s"], gpu["mean_s"]),
     }
 
@@ -242,25 +362,52 @@ def bench_moe_router(nsos, d_model: int, num_experts: int, top_k: int,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", required=True, type=Path,
-                        help="Directory containing nsos_ext.pyd (CUDA build)")
+                        help="Configured directory containing nsos_ext")
     parser.add_argument("--repeat", type=int, default=20,
                         help="Per-op timed iterations (after warmup)")
     parser.add_argument("--report", type=Path, default=None,
                         help="Optional path to write JSON report")
     args = parser.parse_args()
+    if args.repeat <= 0:
+        raise ValueError("--repeat must be positive")
 
     nsos = _load_nsos(args.build_dir)
+    test_inventory = configured_test_inventory(args.build_dir)
 
-    # Quick CUDA sanity check; bail out cleanly if no device visible.
-    cuda_present = False
+    backend = nsos.gpu_backend_name()
+    if backend not in {"cuda", "hip"}:
+        raise RuntimeError(
+            f"benchmark requires a CUDA or HIP build, got {backend!r}"
+        )
+    devices = list(nsos.gpu_devices())
+    selected_device = int(nsos.selected_gpu_device())
+    selected = next(
+        (
+            device
+            for device in devices
+            if int(device["index"]) == selected_device
+        ),
+        None,
+    )
+    if selected is None or not bool(selected.get("compiled", False)):
+        raise RuntimeError(
+            "selected GPU is absent or not compiled into this binary"
+        )
+    if test_inventory["gpu_backend"].lower() != backend:
+        raise RuntimeError(
+            "configured CTest inventory backend does not match the loaded "
+            "NSOS extension"
+        )
+    nsos.set_strict_gpu_execution(True)
     try:
-        # Allocating a 1-element GPU tensor will throw if CUDA missing.
         nsos.Tensor.zeros([1], nsos.Device.GPU)
-        cuda_present = True
     except Exception as ex:
-        print(f"[bench] CUDA not available: {ex}", file=sys.stderr)
+        print(f"[bench] GPU not available: {ex}", file=sys.stderr)
         sys.exit(2)
-    print(f"[bench] CUDA available: {cuda_present}")
+    print(
+        f"[bench] backend={backend} selected_device={selected}",
+        flush=True,
+    )
 
     results: List[Dict[str, Any]] = []
     print("\n=== matmul ===")
@@ -303,12 +450,19 @@ def main() -> None:
               f"speedup={r['speedup_cpu_div_gpu']:.2f}x")
 
     summary = {
-        "device": "GTX 1050 Ti (sm_61, GTX 1050 Ti reference)",
+        "schema_version": 2,
+        "backend": backend,
+        "selected_device": selected,
+        "visible_devices": devices,
+        "configured_test_inventory": test_inventory,
+        "strict_gpu_execution": bool(nsos.strict_gpu_execution()),
+        "repeat": args.repeat,
+        "warmup": 5,
+        "timing_scope": "operation plus synchronized output transfer to CPU",
         "results": results,
     }
     if args.report:
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        atomic_write_json(args.report, summary)
         print(f"\n[bench] wrote report → {args.report}")
 
 
