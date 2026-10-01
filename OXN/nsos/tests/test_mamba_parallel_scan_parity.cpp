@@ -11,6 +11,7 @@
 // CPU-only CTest lanes must not register it as a GPU validation gate.
 #include "tensor.h"
 #include "cuda/mamba_kernels.cuh"
+#include "gpu_backend.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -28,14 +29,15 @@ int main() {
       "[mamba_parallel_scan_parity] CUDA required but disabled\n");
   return 1;
 #else
-  int dev_count = 0;
-  const cudaError_t device_status = cudaGetDeviceCount(&dev_count);
-  if (device_status != cudaSuccess || dev_count == 0) {
+  int selected_device = -1;
+  std::string selection_error;
+  if (!gpu::select_preferred_device(
+          &selected_device, &selection_error)) {
     std::fprintf(
         stderr,
-        "[mamba_parallel_scan_parity] CUDA device required but unavailable "
-        "(cudaGetDeviceCount=%d)\n",
-        static_cast<int>(device_status));
+        "[mamba_parallel_scan_parity] GPU device required but unavailable: "
+        "%s\n",
+        selection_error.c_str());
     return 1;
   }
 

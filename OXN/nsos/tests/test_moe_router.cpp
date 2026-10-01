@@ -45,43 +45,49 @@ void test_moe_router_output() {
     // Input tensor: [batch=4, d_model=64]
     Tensor input = Tensor::random({4, 64}, Device::CPU);
 
-    auto [indices, weights] = router.forward(input);
+    auto [logits, weights] = router.forward(input);
 
-    // Check shapes
-    bool shape_ok = (indices.shape.size() == 2 && indices.shape[0] == 4 &&
-                     indices.shape[1] == 2 && weights.shape.size() == 2 &&
-                     weights.shape[0] == 4 && weights.shape[1] == 2);
+    // The public router contract returns dense logits plus a dense expert
+    // weight matrix whose non-selected entries are zeroed by top-k.
+    bool shape_ok = (logits.shape.size() == 2 && logits.shape[0] == 4 &&
+                     logits.shape[1] == 16 && weights.shape.size() == 2 &&
+                     weights.shape[0] == 4 && weights.shape[1] == 16);
 
     if (!shape_ok) {
       msg = "Wrong output shapes";
     } else {
-      // Check indices are valid (0-15 for 16 experts)
-      bool indices_valid = true;
+      bool logits_valid = true;
+      bool sparsity_valid = true;
       for (int b = 0; b < 4; ++b) {
-        for (int k = 0; k < 2; ++k) {
-          int idx = (int)indices.get({b, k});
-          if (idx < 0 || idx >= 16) {
-            indices_valid = false;
-            break;
+        int non_zero = 0;
+        for (int expert = 0; expert < 16; ++expert) {
+          logits_valid =
+              logits_valid && std::isfinite(logits.get({b, expert}));
+          const float weight = weights.get({b, expert});
+          if (weight > 0.0f) {
+            ++non_zero;
           }
         }
+        sparsity_valid = sparsity_valid && non_zero == 2;
       }
 
       // Check weights sum to ~1.0 per sample
       bool weights_valid = true;
       for (int b = 0; b < 4; ++b) {
         float sum = 0;
-        for (int k = 0; k < 2; ++k) {
-          sum += weights.get({b, k});
+        for (int expert = 0; expert < 16; ++expert) {
+          sum += weights.get({b, expert});
         }
         if (std::abs(sum - 1.0f) > 0.01f) {
           weights_valid = false;
         }
       }
 
-      ok = indices_valid && weights_valid;
-      if (!indices_valid)
-        msg = "Invalid expert indices";
+      ok = logits_valid && sparsity_valid && weights_valid;
+      if (!logits_valid)
+        msg = "Router logits contain NaN/Inf";
+      else if (!sparsity_valid)
+        msg = "Top-k mask did not retain exactly two experts";
       else if (!weights_valid)
         msg = "Weights don't sum to 1.0";
     }
@@ -106,7 +112,9 @@ void test_moe_block_integration() {
 
   try {
     // Create JambaBlock with MoE enabled (is_moe=true)
-    JambaBlock block(64, false, true, false, 0, 4);
+    JambaBlock block(
+        64, false, true, false, 0, 4,
+        4, 2, 4, 2, false);
 
     // Input tensor: [batch=2, seq=8, d_model=64]
     Tensor input = Tensor::random({2, 8, 64}, Device::CPU);
@@ -153,34 +161,46 @@ void test_moe_load_balancing() {
 
   try {
     MoERouter router(64, 8, 2);
+    router.gate->set_exact_linear_mode(true);
+    router.gate->set_training_mode(false);
+    Tensor gate_weight = Tensor::zeros({8, 64}, Device::CPU);
+    for (int expert = 0; expert < 8; ++expert) {
+      gate_weight.data()[expert * 64 + expert] = 5.0f;
+    }
+    router.gate->weight.copy_data_from(gate_weight);
     std::vector<int> expert_counts(8, 0);
 
-    // Run multiple batches and count expert usage
-    for (int iter = 0; iter < 10; ++iter) {
-      Tensor input = Tensor::random({8, 64}, Device::CPU);
-      auto [indices, weights] = router.forward(input);
-
-      for (int b = 0; b < 8; ++b) {
-        for (int k = 0; k < 2; ++k) {
-          int idx = (int)indices.get({b, k});
-          if (idx >= 0 && idx < 8) {
-            expert_counts[idx]++;
-          }
+    // Every row has a unique, deliberately dominant expert. This proves
+    // diversity without a probabilistic assertion over random initialization.
+    Tensor input = Tensor::zeros({8, 64}, Device::CPU);
+    for (int row = 0; row < 8; ++row) {
+      input.data()[row * 64 + row] = 1.0f;
+    }
+    auto [logits, weights] = router.forward(input);
+    (void)logits;
+    bool dominant_experts_selected = true;
+    for (int row = 0; row < 8; ++row) {
+      for (int expert = 0; expert < 8; ++expert) {
+        if (weights.get({row, expert}) > 0.0f) {
+          expert_counts[static_cast<size_t>(expert)]++;
         }
       }
+      dominant_experts_selected =
+          dominant_experts_selected &&
+          weights.get({row, row}) > 0.0f;
     }
 
-    // Check that at least 4 different experts were used
     int used_experts = 0;
     for (int i = 0; i < 8; ++i) {
       if (expert_counts[i] > 0)
         used_experts++;
     }
 
-    ok = (used_experts >= 2); // At least 2 experts should be used
+    ok = dominant_experts_selected && used_experts == 8;
     if (!ok) {
-      msg = "Only " + std::to_string(used_experts) +
-            " experts used (expected >= 2)";
+      msg = "Deterministic routing selected " +
+            std::to_string(used_experts) +
+            " experts; expected every dominant expert";
     }
   } catch (const std::exception &e) {
     msg = e.what();

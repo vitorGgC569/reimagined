@@ -300,13 +300,16 @@ def _split_is_train(key: str, train_fraction: float) -> bool:
 def _row_split_key(row: Dict) -> str:
     """Stable, content-addressed identity for a dataset row.
 
-    Prefers an explicit id; otherwise a canonical serialization so the
-    train/eval assignment is reproducible and independent of dict ordering.
+    IDs and source labels are metadata, not semantic identity: two rows with
+    different IDs but identical content must never land on opposite sides of
+    the train/eval boundary.
     """
-    rid = row.get("id")
-    if rid not in (None, ""):
-        return str(rid)
-    return json.dumps(row, sort_keys=True, ensure_ascii=False)
+    content = {
+        key: value
+        for key, value in row.items()
+        if key not in {"id", "source", "split"}
+    }
+    return json.dumps(content, sort_keys=True, ensure_ascii=False)
 
 
 def _pick_split_subset(
@@ -383,17 +386,14 @@ def _normalize_inline_text(text: str) -> str:
 
 
 def _expand_records(records: List[Dict], count: int, rng: random.Random) -> List[Dict]:
-    if len(records) >= count:
-        rng.shuffle(records)
-        return records[:count]
-    expanded = list(records)
-    cursor = 0
-    while records and len(expanded) < count:
-        template = records[cursor % len(records)]
-        duplicate = dict(template)
-        duplicate["id"] = stable_hash(f"{template['id']}:{len(expanded)}")
-        expanded.append(duplicate)
-        cursor += 1
+    # Never manufacture sample count by copying content under a new ID. That
+    # inflated dataset-size telemetry and could put semantically identical
+    # rows into evaluation after later repartitioning. A smaller honest corpus
+    # is preferable to duplicated supervision.
+    unique: Dict[str, Dict] = {}
+    for record in records:
+        unique.setdefault(_row_split_key(record), record)
+    expanded = list(unique.values())
     rng.shuffle(expanded)
     return expanded[:count]
 
@@ -1689,11 +1689,8 @@ def build_tokenizer_bundle(curriculum_root: Path, target_vocab: int) -> Path:
     for phase in manifest["phases"]:
         phase_name = phase["name"]
         train_rows = read_jsonl(curriculum_root / phase["train_file"])
-        eval_rows = read_jsonl(curriculum_root / phase["eval_file"])
         phase_texts: List[str] = []
         for row in train_rows:
-            phase_texts.extend(_tokenizer_training_texts_for_row(phase_name, row))
-        for row in eval_rows[: max(1, len(eval_rows) // 2)]:
             phase_texts.extend(_tokenizer_training_texts_for_row(phase_name, row))
         phase_texts = _downsample_texts(
             phase_texts,

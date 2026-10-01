@@ -1,19 +1,22 @@
-// CUDA mixed-precision capability and execution contract.
+// CUDA/HIP mixed-precision capability and execution contract.
 //
-// FP16 is executed on sm_70+, BF16 on sm_80+.  Unsupported requests must throw
-// instead of silently falling back to FP32.  On capable GPUs the test also runs
-// a real FP16 training step and validates dynamic loss-scaler advancement.
+// Capability is taken from the backend abstraction, not CUDA's major/minor
+// fields (HIP uses those fields for gfx generations). Unsupported requests
+// must throw instead of silently falling back to FP32. On capable GPUs the
+// test also runs a real FP16 training step and validates loss scaling.
 
 #include "gpu_parity_common.h"
+#include "gpu_backend.h"
 #include "jamba.h"
 #include "trainer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "gpu_backend.h"
 #endif
 
 using nsos::Device;
@@ -22,6 +25,7 @@ using nsos::ModelConfig;
 using nsos::Tensor;
 using nsos::Trainer;
 using nsos::TrainPhaseScheduler;
+using nsos::matmul_tn;
 using nsos::set_matmul_precision_mode;
 using nsos::gpu_parity_test::assert_close;
 using nsos::gpu_parity_test::cuda_sync_or_throw;
@@ -44,8 +48,14 @@ bool low_precision_matmul_is_rejected(const Tensor& a, const Tensor& b,
   } catch (const std::runtime_error& error) {
     set_matmul_precision_mode(0);
     const std::string message(error.what());
+#if defined(NSOS_GPU_BACKEND_HIP)
+    const std::string expected = mode == 1
+                                     ? "BF16 GEMM is not validated"
+                                     : "FP16 GEMM is not validated";
+#else
     const std::string expected =
         mode == 1 ? "requires sm_80" : "requires sm_70";
+#endif
     if (message.find(expected) == std::string::npos) {
       throw std::runtime_error(
           "mixed-precision request failed for the wrong reason: " + message);
@@ -62,13 +72,19 @@ int main() {
   return run_parity("mixed_precision_contract", [] {
 #ifdef USE_CUDA
     int device = 0;
-    cudaDeviceProp properties{};
     require(cudaGetDevice(&device) == cudaSuccess,
-            "cannot query active CUDA device");
-    require(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
-            "cannot query CUDA compute capability");
-    std::cout << "[GPUParity:mixed_precision_contract] active_sm="
-              << properties.major << properties.minor << std::endl;
+            "cannot query active GPU device");
+    const std::vector<nsos::gpu::DeviceInfo> devices =
+        nsos::gpu::enumerate_devices();
+    const auto active = std::find_if(
+        devices.begin(), devices.end(), [device](const auto& info) {
+          return info.index == device;
+        });
+    require(active != devices.end(),
+            "cannot query active backend mixed-precision capabilities");
+    std::cout << "[GPUParity:mixed_precision_contract] active_arch="
+              << active->architecture << " fp16=" << active->fp16
+              << " bf16=" << active->bf16 << std::endl;
 
     Tensor a_cpu({16, 16}, Device::CPU);
     Tensor b_cpu({16, 16}, Device::CPU);
@@ -81,14 +97,33 @@ int main() {
     Tensor a_gpu = a_cpu.to(Device::GPU);
     Tensor b_gpu = b_cpu.to(Device::GPU);
     Tensor fp32_reference = a_cpu.matmul(b_cpu);
+    Tensor tn_a_cpu({7, 5}, Device::CPU);
+    Tensor tn_b_cpu({7, 9}, Device::CPU);
+    for (int index = 0; index < tn_a_cpu.size; ++index) {
+      tn_a_cpu.data()[index] =
+          static_cast<float>((index % 17) - 8) / 13.0f;
+    }
+    for (int index = 0; index < tn_b_cpu.size; ++index) {
+      tn_b_cpu.data()[index] =
+          static_cast<float>((index % 23) - 11) / 19.0f;
+    }
+    Tensor tn_a_gpu = tn_a_cpu.to(Device::GPU);
+    Tensor tn_b_gpu = tn_b_cpu.to(Device::GPU);
+    Tensor tn_reference = tn_a_cpu.transpose().matmul(tn_b_cpu);
 
-    if (properties.major >= 7) {
+    if (active->fp16) {
       set_matmul_precision_mode(2);
       Tensor fp16_output = a_gpu.matmul(b_gpu);
       cuda_sync_or_throw("mixed_precision/fp16_matmul");
       set_matmul_precision_mode(0);
       assert_close(fp16_output.cpu(), fp32_reference, 3e-2f,
                    "mixed_precision_fp16_matmul");
+      set_matmul_precision_mode(2);
+      Tensor fp16_tn_output = matmul_tn(tn_a_gpu, tn_b_gpu);
+      cuda_sync_or_throw("mixed_precision/fp16_matmul_tn");
+      set_matmul_precision_mode(0);
+      assert_close(fp16_tn_output.cpu(), tn_reference, 3e-2f,
+                   "mixed_precision_fp16_matmul_tn");
 
       ModelConfig config;
       config.num_layers = 1;
@@ -134,13 +169,19 @@ int main() {
                 << std::endl;
     }
 
-    if (properties.major >= 8) {
+    if (active->bf16) {
       set_matmul_precision_mode(1);
       Tensor bf16_output = a_gpu.matmul(b_gpu);
       cuda_sync_or_throw("mixed_precision/bf16_matmul");
       set_matmul_precision_mode(0);
       assert_close(bf16_output.cpu(), fp32_reference, 6e-2f,
                    "mixed_precision_bf16_matmul");
+      set_matmul_precision_mode(1);
+      Tensor bf16_tn_output = matmul_tn(tn_a_gpu, tn_b_gpu);
+      cuda_sync_or_throw("mixed_precision/bf16_matmul_tn");
+      set_matmul_precision_mode(0);
+      assert_close(bf16_tn_output.cpu(), tn_reference, 6e-2f,
+                   "mixed_precision_bf16_matmul_tn");
       std::cout << "[GPUParity:mixed_precision_contract] bf16=executed"
                 << std::endl;
     } else {

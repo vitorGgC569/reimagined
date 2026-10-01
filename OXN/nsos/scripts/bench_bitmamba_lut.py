@@ -47,8 +47,8 @@ def setup_nsos(build_dir: Path):
                 build_dir,
                 parse_preferred_cuda_root(os.environ.get("NSOS_CUDA_ROOT")),
             )
-        except ImportError:
-            pass  # cuda_env optional on non-CUDA builds
+        except ImportError as exc:
+            print(f"[runtime] cuda_env unavailable: {exc}", file=sys.stderr)
     if str(build_dir) not in sys.path:
         sys.path.insert(0, str(build_dir))
     import nsos_ext  # type: ignore  # noqa: F401
@@ -82,8 +82,8 @@ if os.name == 'nt':
         from cuda_env import add_windows_runtime_dirs, parse_preferred_cuda_root
         add_windows_runtime_dirs({str(build_dir)!r},
             parse_preferred_cuda_root(os.environ.get('NSOS_CUDA_ROOT')))
-    except ImportError:
-        pass
+    except ImportError as exc:
+        print(f'[runtime] cuda_env unavailable: {{exc}}', file=sys.stderr)
 import nsos_ext
 
 # This script intentionally minimal — relies on whatever testbed function

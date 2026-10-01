@@ -1,6 +1,6 @@
 use memmap2::MmapMut;
-use rkyv::{Archive, Deserialize, Serialize};
 use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -131,15 +131,10 @@ fn ensure_index_capacity(idx: &Index, wanted: usize) -> Result<(), String> {
 }
 
 fn valid_search_vector(vector: &[f32]) -> bool {
-    if vector.len() != DEFAULT_VECTOR_DIMENSIONS
-        || vector.iter().any(|value| !value.is_finite())
-    {
+    if vector.len() != DEFAULT_VECTOR_DIMENSIONS || vector.iter().any(|value| !value.is_finite()) {
         return false;
     }
-    let norm_squared = vector
-        .iter()
-        .map(|value| value * value)
-        .sum::<f32>();
+    let norm_squared = vector.iter().map(|value| value * value).sum::<f32>();
     norm_squared.is_finite() && norm_squared > 1e-12
 }
 
@@ -299,45 +294,43 @@ impl GeodesicEngine {
         if bytes.is_empty() {
             return Ok(());
         }
-        let payload: &[u8] = if bytes.starts_with(METADATA_MAGIC) {
-            if bytes.len() < METADATA_ENVELOPE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "metadata envelope is truncated",
-                ));
-            }
-            let version = u32::from_le_bytes(
-                bytes[8..12]
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad metadata version"))?,
-            );
-            let payload_len = u64::from_le_bytes(
-                bytes[12..20]
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad metadata length"))?,
-            );
-            let checksum = u64::from_le_bytes(
-                bytes[20..28]
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad metadata checksum"))?,
-            );
-            let payload_len = usize::try_from(payload_len).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "metadata length overflows usize")
-            })?;
-            if version != METADATA_VERSION
-                || payload_len != bytes.len() - METADATA_ENVELOPE_BYTES
-                || fnv1a64(&bytes[METADATA_ENVELOPE_BYTES..]) != checksum
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "metadata envelope validation failed",
-                ));
-            }
-            &bytes[METADATA_ENVELOPE_BYTES..]
-        } else {
-            // Version-1 compatibility: legacy files were raw rkyv payloads.
-            &bytes
-        };
+        let payload: &[u8] =
+            if bytes.starts_with(METADATA_MAGIC) {
+                if bytes.len() < METADATA_ENVELOPE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metadata envelope is truncated",
+                    ));
+                }
+                let version = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad metadata version")
+                })?);
+                let payload_len = u64::from_le_bytes(bytes[12..20].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad metadata length")
+                })?);
+                let checksum = u64::from_le_bytes(bytes[20..28].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad metadata checksum")
+                })?);
+                let payload_len = usize::try_from(payload_len).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metadata length overflows usize",
+                    )
+                })?;
+                if version != METADATA_VERSION
+                    || payload_len != bytes.len() - METADATA_ENVELOPE_BYTES
+                    || fnv1a64(&bytes[METADATA_ENVELOPE_BYTES..]) != checksum
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "metadata envelope validation failed",
+                    ));
+                }
+                &bytes[METADATA_ENVELOPE_BYTES..]
+            } else {
+                // Version-1 compatibility: legacy files were raw rkyv payloads.
+                &bytes
+            };
         // rkyv validates the alignment of archived roots. Envelope payloads
         // start 28 bytes into their backing allocation, so a plain subslice is
         // not guaranteed to satisfy that contract on every allocator/platform.
@@ -345,10 +338,9 @@ impl GeodesicEngine {
         // keeps already-written stores readable without changing the file format.
         let mut aligned_payload = AlignedVec::<16>::with_capacity(payload.len());
         aligned_payload.extend_from_slice(payload);
-        let metadata = rkyv::from_bytes::<EngineMetadata, rkyv::rancor::Error>(
-            aligned_payload.as_slice(),
-        )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let metadata =
+            rkyv::from_bytes::<EngineMetadata, rkyv::rancor::Error>(aligned_payload.as_slice())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         if metadata.current_offset > self.mmap.len() as u64 {
             return Err(io::Error::new(
@@ -376,9 +368,7 @@ impl GeodesicEngine {
             }
         }
         for (address, vector) in &metadata.vector_records {
-            if *address >= metadata.current_offset
-                || !valid_search_vector(vector)
-            {
+            if *address >= metadata.current_offset || !valid_search_vector(vector) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "metadata contains an invalid vector record",
@@ -439,21 +429,18 @@ impl GeodesicEngine {
                     "metadata journal magic is invalid",
                 ));
             }
-            let version = u32::from_le_bytes(
-                bytes[cursor + 8..cursor + 12]
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad journal version"))?,
-            );
-            let payload_len = u64::from_le_bytes(
-                bytes[cursor + 12..cursor + 20]
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad journal length"))?,
-            );
-            let checksum = u64::from_le_bytes(
-                bytes[cursor + 20..cursor + 28]
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad journal checksum"))?,
-            );
+            let version =
+                u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad journal version")
+                })?);
+            let payload_len =
+                u64::from_le_bytes(bytes[cursor + 12..cursor + 20].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad journal length")
+                })?);
+            let checksum =
+                u64::from_le_bytes(bytes[cursor + 20..cursor + 28].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad journal checksum")
+                })?);
             if version != JOURNAL_VERSION || payload_len > MAX_JOURNAL_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -487,7 +474,7 @@ impl GeodesicEngine {
             let entry = rkyv::from_bytes::<JournalEntry, rkyv::rancor::Error>(
                 aligned_payload.as_slice(),
             )
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
             cursor = record_end;
             records = records.saturating_add(1);
 
@@ -524,8 +511,7 @@ impl GeodesicEngine {
                 ));
             }
             if let Some(vector) = entry.vector {
-                if !valid_search_vector(&vector)
-                    || self.vector_records.len() >= MAX_VECTOR_RECORDS
+                if !valid_search_vector(&vector) || self.vector_records.len() >= MAX_VECTOR_RECORDS
                 {
                     self.current_offset = previous_offset;
                     return Err(io::Error::new(
@@ -544,7 +530,13 @@ impl GeodesicEngine {
     fn rebuild_vector_index(&mut self) -> io::Result<()> {
         if let Some(index) = &mut self.vector_index {
             ensure_index_capacity(index, self.vector_records.len()).map_err(io::Error::other)?;
-            for (address, vector) in &self.vector_records {
+            // HashMap deliberately randomizes iteration order. Feeding that
+            // order into HNSW changes graph construction after every reopen,
+            // even when the durable records are byte-identical. Rebuild in
+            // monotonically increasing arena-address order instead.
+            let mut records = self.vector_records.iter().collect::<Vec<_>>();
+            records.sort_unstable_by_key(|(address, _)| **address);
+            for (address, vector) in records {
                 index.add(*address, vector).map_err(|error| {
                     io::Error::other(format!("Vector index restore error: {error}"))
                 })?;
@@ -610,18 +602,18 @@ impl GeodesicEngine {
 
         let mut journal = OpenOptions::new()
             .read(true)
-            .write(true)
             .create(true)
             .append(true)
             .open(&self.journal_path)?;
         use std::io::Write;
         if let Err(error) = journal.write_all(&bytes).and_then(|_| journal.sync_all()) {
-            let _ = journal.set_len(existing_len).and_then(|_| journal.sync_all());
+            let _ = journal
+                .set_len(existing_len)
+                .and_then(|_| journal.sync_all());
             return Err(error);
         }
         drop(journal);
-        self.journal_records_since_snapshot =
-            self.journal_records_since_snapshot.saturating_add(1);
+        self.journal_records_since_snapshot = self.journal_records_since_snapshot.saturating_add(1);
 
         // Snapshot after O(N) new records for O(1) amortized persistence. A
         // failed compaction is harmless: the journal is already durable.
@@ -735,16 +727,16 @@ impl GeodesicEngine {
         let previous_offset = self.current_offset;
         let previous_dirty = self.dirty;
         let addr = self.write_internal(token_id, value)?;
-        if self.sync_on_write {
-            if let Err(error) = self.persist_incremental(token_id, addr, None) {
-                self.rollback_logical_write(
-                    token_id,
-                    previous_head,
-                    previous_offset,
-                    previous_dirty,
-                );
-                return Err(error.to_string());
-            }
+        if self.sync_on_write
+            && let Err(error) = self.persist_incremental(token_id, addr, None)
+        {
+            self.rollback_logical_write(
+                token_id,
+                previous_head,
+                previous_offset,
+                previous_dirty,
+            );
+            return Err(error.to_string());
         }
         Ok(addr)
     }
@@ -787,30 +779,25 @@ impl GeodesicEngine {
             && let Err(error) = idx.add(addr, &vector)
         {
             let _ = idx.remove(addr);
+            self.rollback_logical_write(token_id, previous_head, previous_offset, previous_dirty);
+            return Err(format!("Vector index error: {error}"));
+        }
+
+        self.vector_records.insert(addr, vector.clone());
+        if self.sync_on_write
+            && let Err(error) = self.persist_incremental(token_id, addr, Some(&vector))
+        {
+            self.vector_records.remove(&addr);
+            if let Some(idx) = &mut self.vector_index {
+                let _ = idx.remove(addr);
+            }
             self.rollback_logical_write(
                 token_id,
                 previous_head,
                 previous_offset,
                 previous_dirty,
             );
-            return Err(format!("Vector index error: {error}"));
-        }
-
-        self.vector_records.insert(addr, vector.clone());
-        if self.sync_on_write {
-            if let Err(error) = self.persist_incremental(token_id, addr, Some(&vector)) {
-                self.vector_records.remove(&addr);
-                if let Some(idx) = &mut self.vector_index {
-                    let _ = idx.remove(addr);
-                }
-                self.rollback_logical_write(
-                    token_id,
-                    previous_head,
-                    previous_offset,
-                    previous_dirty,
-                );
-                return Err(error.to_string());
-            }
+            return Err(error.to_string());
         }
 
         Ok(addr)
@@ -955,10 +942,8 @@ impl GeodesicEngine {
 
         let mut aligned_payload = AlignedVec::<16>::with_capacity(payload.len());
         aligned_payload.extend_from_slice(payload);
-        let node = rkyv::from_bytes::<Node, rkyv::rancor::Error>(
-            aligned_payload.as_slice(),
-        )
-        .ok()?;
+        let node =
+            rkyv::from_bytes::<Node, rkyv::rancor::Error>(aligned_payload.as_slice()).ok()?;
         if node.value.len() > MAX_VALUE_BYTES || node.prev.is_some_and(|previous| previous >= addr)
         {
             return None;
@@ -1017,27 +1002,33 @@ impl GeodesicEngine {
     /// (smaller = closer; ~0 means near-identical direction).  Lets callers
     /// threshold on relevance instead of blindly trusting the top-k ordering.
     pub fn search_similar_scored(&self, vector: Vec<f32>, k: usize) -> Vec<(f32, Node)> {
-        let mut results = Vec::new();
-        if !valid_search_vector(&vector)
-            || k == 0
-            || k > MAX_SEARCH_RESULTS
-        {
-            return results;
+        if !valid_search_vector(&vector) || k == 0 || k > MAX_SEARCH_RESULTS {
+            return Vec::new();
         }
+        let mut candidates: Vec<(f32, u64, Node)> = Vec::new();
 
         if let Some(idx) = &self.vector_index {
-            // usearch returns keys (our store addresses) and distances, ordered
-            // closest-first; pair them so callers get a relevance score.
+            // Do not expose the index's incidental tie order through the ABI.
+            // Distance uses IEEE total ordering and the durable arena address
+            // is the stable secondary key.
             if let Ok(matches) = idx.search(&vector, k) {
                 for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
                     if let Some(node) = self.read_node_at(*key) {
-                        results.push((*distance, node));
+                        candidates.push((*distance, *key, node));
                     }
                 }
             }
         }
 
-        results
+        candidates.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        candidates
+            .into_iter()
+            .map(|(distance, _, node)| (distance, node))
+            .collect()
     }
 }
 
@@ -1705,4 +1696,3 @@ mod tests {
         println!("=====================================================================\n");
     }
 }
-

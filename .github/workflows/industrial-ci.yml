@@ -92,7 +92,7 @@ jobs:
         run: cargo clippy --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets -- -D warnings
 
       - name: Run OxtaMem Python syntax smoke
-        run: python3 -m compileall -q modules/oxtamem/python modules/oxtamem/oxta_engine/python modules/oxtamem/nn
+        run: python3 -m compileall -q modules/oxtamem/python modules/oxtamem/nn
 
   incubation:
     name: incubation / non-blocking

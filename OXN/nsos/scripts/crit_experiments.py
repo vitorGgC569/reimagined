@@ -80,10 +80,7 @@ def exp_kesten(args) -> int:
 # ─────────────────────────── helpers de modelo ────────────────────────────────
 def make_model(nsos, profile, vocab, dev, batch):
     cfg = build_model_config(nsos, profile, vocab, dev)
-    try:
-        cfg.default_batch_size = batch
-    except Exception:
-        pass
+    cfg.default_batch_size = batch
     m = nsos.JambaModel(cfg, dev)
     m.to(dev)
     set_model_training_mode(m, True)

@@ -174,9 +174,12 @@ def compute_sequence_logprob(engine, tokenizer, prompt: str, response: str,
         nll = engine.evaluate_supervised_loss(prompt_tokens, response_tokens)
         return -float(nll) * len(response_tokens)
     except AttributeError:
-        pass
-    # Fallback: per-token greedy compare against logits.  Less
-    # efficient but works with any binding that exposes logits.
+        if not hasattr(engine, "next_token_logits"):
+            raise RuntimeError(
+                "DPO requires evaluate_supervised_loss or next_token_logits"
+            )
+    # Explicit compatibility path: per-token logits when the fused helper is
+    # absent. It remains exact, only less efficient.
     log_p = 0.0
     context = list(prompt_tokens)
     for tok in response_tokens:
@@ -187,8 +190,10 @@ def compute_sequence_logprob(engine, tokenizer, prompt: str, response: str,
             denom = math.log(sum(math.exp(l - m) for l in logits)) + m
             log_p += float(logits[tok]) - denom
             context.append(tok)
-        except AttributeError:
-            return 0.0
+        except AttributeError as exc:
+            raise RuntimeError(
+                "DPO next_token_logits disappeared during evaluation"
+            ) from exc
     return log_p
 
 

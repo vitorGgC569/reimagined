@@ -92,6 +92,6 @@ private:
 
 // Global signal handler declarations
 void signal_handler(int signum);
-inline void install_crash_handler() {
-  // Already handled in globals.cpp but kept for compatibility
-}
+// Explicit opt-in. NSOS never takes ownership of process-wide fatal signals
+// merely because the library was loaded.
+void install_crash_handler();

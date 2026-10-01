@@ -52,6 +52,49 @@ int main() {
     require(history[1].content == "hello\nworld", "oldest message mismatch");
     require(std::filesystem::exists(store_path), "causal store file was not created");
 
+    const auto retrieval_path = std::filesystem::temp_directory_path() /
+                                "nsos_memory_retrieval_regression.bin";
+    std::filesystem::remove(retrieval_path);
+    Tensor old_state = Tensor::zeros({4}, Device::CPU);
+    old_state.data()[0] = 1.0f;
+    {
+      MemorySystem durable(4);
+      durable.enable_causal_store(retrieval_path.string());
+      durable.store_episodic(old_state);
+      require(durable.retrieve(old_state, 4).size() == 1,
+              "RAM and durable copies must be deduplicated");
+    }
+    {
+      MemorySystem reopened(4);
+      reopened.enable_causal_store(retrieval_path.string());
+      Tensor newer = Tensor::zeros({4}, Device::CPU);
+      newer.data()[1] = 1.0f;
+      reopened.store_episodic(newer);
+      const auto recalled = reopened.retrieve(old_state, 1);
+      require(recalled.size() == 1 && recalled[0].data()[0] == 1.0f &&
+                  recalled[0].data()[1] == 0.0f,
+              "a new RAM write must not mask durable history after restart");
+      require(reopened.retrieve(old_state, 4).size() == 2,
+              "retrieval must merge RAM and durable items without duplicates");
+      require(reopened.retrieve(old_state, 0).empty(), "top_k=0 must be empty");
+    }
+    std::filesystem::remove(retrieval_path);
+
+    MemorySystem item_memory(4);
+    item_memory.store_episodic(old_state);
+    Tensor near_state = old_state.clone();
+    near_state.data()[1] = 0.1f;
+    item_memory.store_episodic(near_state);
+    const auto exact_item = item_memory.retrieve(near_state, 1);
+    require(exact_item.size() == 1 && exact_item[0].data()[1] == 0.1f,
+            "top-k must return stored items, not moving-average centroids");
+    auto stale_clusters = item_memory.snapshot_runtime_clusters();
+    for (auto& cluster : stale_clusters) cluster.last_access = {};
+    item_memory.restore_runtime_clusters(stale_clusters);
+    (void)item_memory.retrieve(near_state, 1);
+    require(item_memory.snapshot_runtime_clusters()[0].last_access >
+                std::chrono::system_clock::time_point{}, "retrieval must refresh LRU");
+
     const auto corrupt_path =
         std::filesystem::temp_directory_path() / "nsos_memory_causal_corrupt.bin";
     std::filesystem::remove(corrupt_path);

@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -105,6 +106,9 @@ private:
     std::vector<std::thread> workers_;
     std::chrono::steady_clock::time_point started_at_{};
     mutable std::shared_mutex model_state_mutex_;
+    std::mutex active_training_mutex_;
+    std::unordered_set<InferenceEngine*>
+        active_training_engines_;
     std::mutex replica_mutex_;
     std::condition_variable replica_cv_;
     std::vector<std::unique_ptr<InferenceEngine>> inference_replicas_;

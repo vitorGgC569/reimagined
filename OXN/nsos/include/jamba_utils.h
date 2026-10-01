@@ -13,11 +13,8 @@ int select_kv_heads(int n_heads, int requested);
 bool layer_matches_schedule(int layer_one_based, int period, int slot);
 void prefix_parameter_names(std::vector<Parameter*>& params, const std::string& prefix);
 
-// Época global de nomeação de parâmetros.  JambaModel::parameters() chama
-// bump_parameter_name_epoch() no início de cada passada; o primeiro
-// prefix_parameter_names que toca um Parameter na época nova reconstrói o
-// nome a partir do base_name (folha), tornando a nomeação idempotente entre
-// passadas (antes, cada passada re-prefixava o absoluto da anterior).
+// A naming epoch is used only while constructing a model's one-time canonical
+// parameter registry.  Once a name is frozen, prefixing is a no-op.
 void bump_parameter_name_epoch();
 long long current_parameter_name_epoch();
 Tensor make_zero_like(const Tensor& x);

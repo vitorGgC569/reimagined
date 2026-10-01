@@ -75,8 +75,11 @@ def setup_nsos_env() -> None:
             try:
                 if p.exists():
                     os.add_dll_directory(str(p))
-            except (AttributeError, OSError):
-                pass
+            except (AttributeError, OSError) as exc:
+                print(
+                    f"[runtime] DLL directory registration failed for {p}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 def build_prompt(kind: str, user_text: str) -> str:

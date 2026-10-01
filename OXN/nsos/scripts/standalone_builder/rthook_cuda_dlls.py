@@ -15,5 +15,8 @@ if hasattr(os, "add_dll_directory") and getattr(sys, "frozen", False):
         if _candidate.is_dir():
             try:
                 os.add_dll_directory(str(_candidate))
-            except (OSError, FileNotFoundError):
-                pass
+            except (OSError, FileNotFoundError) as exc:
+                print(
+                    f"[runtime] DLL directory registration failed for {_candidate}: {exc}",
+                    file=sys.stderr,
+                )

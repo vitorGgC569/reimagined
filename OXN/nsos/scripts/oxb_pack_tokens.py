@@ -33,11 +33,12 @@ from typing import Any, Iterator, List, Optional, Tuple
 
 # ── Resolve aion_core and nsos_ext modules ───────────────────────────────────
 def _import_aion_core():
+    initial_error = None
     try:
         import aion_core  # noqa
         return aion_core
-    except ImportError:
-        pass
+    except ImportError as exc:
+        initial_error = exc
     here = Path(__file__).resolve().parent
     repo_root = here.parent.parent.parent
     candidates = [
@@ -55,15 +56,16 @@ def _import_aion_core():
         "aion_core not found. Build OXB first:\n"
         "  cmake -S OXB/aion_core_cpp -B OXB/aion_core_cpp/build-validation\n"
         "  cmake --build OXB/aion_core_cpp/build-validation --config Release --target aion_core"
-    )
+    ) from initial_error
 
 
 def _import_nsos_ext():
+    initial_error = None
     try:
         import nsos_ext  # noqa
         return nsos_ext
-    except ImportError:
-        pass
+    except ImportError as exc:
+        initial_error = exc
     here = Path(__file__).resolve().parent
     candidates = [
         here.parent / "build-chrass-validation" / "Release",
@@ -79,7 +81,9 @@ def _import_nsos_ext():
                 return nsos_ext
             except ImportError:
                 continue
-    raise ImportError("nsos_ext not built. Build with NSOS_BUILD_PYTHON=ON.")
+    raise ImportError(
+        "nsos_ext not built. Build with NSOS_BUILD_PYTHON=ON."
+    ) from initial_error
 
 
 # ── .ox3p file format ───────────────────────────────────────────────────────

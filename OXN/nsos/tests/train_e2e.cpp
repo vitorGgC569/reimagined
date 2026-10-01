@@ -20,6 +20,10 @@ static std::vector<int> make_cyclic_dataset(int length, int vocab) {
 }
 
 int main() {
+    try {
+    // Keep progress visible when CTest captures stdout so a native fast-fail
+    // still identifies the last completed E2E stage.
+    std::cout << std::unitbuf;
     std::cout << "========================================\n";
     std::cout << "   NSOS - End-to-End Training Smoke     \n";
     std::cout << "========================================\n\n";
@@ -29,7 +33,8 @@ int main() {
     const int N_LAYERS = 1;
 #ifdef USE_CUDA
     const Device RUNTIME_DEVICE = Device::GPU;
-    std::cout << "[Backend] CUDA build detected. This E2E now attempts the GPU path.\n\n";
+    std::cout << "[Backend] " << nsos::gpu::backend_name()
+              << " GPU build detected. This E2E now attempts the GPU path.\n\n";
 #else
     const Device RUNTIME_DEVICE = Device::CPU;
     std::cout << "[Backend] CPU-only build.\n\n";
@@ -133,11 +138,15 @@ int main() {
 
     Context ctx;
     Tensor latent = model.forward_ids(prompt, &ctx);
-    Tensor refined = model.reason(latent, 50);
-    Tensor final_state = model.run_reasoning_loop(latent, 2);
-    std::cout << "[Reasoning] latent_norm=" << latent.norm()
-              << " refined_norm=" << refined.norm()
-              << " final_norm=" << final_state.norm() << "\n\n";
+    // This language-training smoke has no task correctness verifier. Do not
+    // label entropy reduction as reasoning; require explicit registration.
+    bool missing_verifier_rejected = false;
+    try { model.reason(latent, 50); }
+    catch (const std::logic_error&) { missing_verifier_rejected = true; }
+    if (!missing_verifier_rejected) {
+        throw std::runtime_error("Reasoning accepted an absent correctness verifier");
+    }
+    std::cout << "[Reasoning] no verifier registered; correctly rejected\n\n";
 
     HealingConfig heal_cfg;
     heal_cfg.confidence_threshold = 0.01f;
@@ -165,5 +174,9 @@ int main() {
     std::cout << "\n========================================\n";
     std::cout << "  NSOS E2E PIPELINE COMPLETE\n";
     std::cout << "========================================\n";
-    return 0;
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "[E2E] fatal stage failure: " << error.what() << std::endl;
+        return 1;
+    }
 }

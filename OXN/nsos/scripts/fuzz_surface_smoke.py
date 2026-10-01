@@ -4,16 +4,12 @@ import argparse
 import json
 import os
 import random
-import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
-
-from cuda_env import add_windows_runtime_dirs, parse_preferred_cuda_root
-
+from native_module import load_native_module, native_artifact_identity, resolve_native_build_dir
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run lightweight fuzz smoke tests for NSOS runtime surfaces.")
@@ -24,30 +20,15 @@ def parse_args() -> argparse.Namespace:
 
 def detect_build_dir(explicit: Path | None) -> Path:
     candidates: list[Path] = []
-    if explicit is not None:
-        explicit = explicit.expanduser().resolve()
-        candidates.extend([explicit, explicit / "Release"])
     repo_root = Path(__file__).resolve().parents[3]
     nsos_root = repo_root / "OXN" / "nsos"
     for name in ["build-mvp", "build_cuda129", "build_v1", "build_full", "build_codex", "build-ci-local", "build"]:
         candidates.extend([nsos_root / name / "Release", nsos_root / name])
-    for candidate in candidates:
-        if candidate.is_dir() and any(candidate.glob("nsos_ext*.pyd")):
-            return candidate.resolve()
-    raise RuntimeError("Could not find a build directory with nsos_ext.")
+    return resolve_native_build_dir(explicit, candidates)
 
 
 def load_nsos(build_dir: Path):
-    if str(build_dir) not in sys.path:
-        sys.path.insert(0, str(build_dir))
-    if os.name == "nt":
-        add_windows_runtime_dirs(
-            build_dir,
-            parse_preferred_cuda_root(os.environ.get("NSOS_CUDA_ROOT")),
-        )
-    import nsos_ext as nsos  # type: ignore
-
-    return nsos
+    return load_native_module(build_dir)
 
 
 def build_config(nsos):
@@ -100,6 +81,7 @@ def main() -> int:
 
     report = {
         "build_dir": str(build_dir),
+        "native_artifact": native_artifact_identity(nsos),
         "tokenizer_corruption": {"ok": False},
         "checkpoint_corruption": {"ok": False},
         "http_malformed_requests": {"ok": False, "skipped": False},
@@ -141,8 +123,16 @@ def main() -> int:
 
         api_binary = find_api_binary(build_dir)
         if api_binary is None:
-            report["http_malformed_requests"] = {"ok": True, "skipped": True, "reason": "api binary missing"}
+            raise RuntimeError("Required HTTP fuzz target nsos_api_server is missing")
         else:
+            # The server loads a self-describing pack, not an implicit random
+            # model with incompatible CLI/default head geometry.
+            fixture_engine = nsos.InferenceEngine()
+            if not fixture_engine.load_model(str(model_path), config):
+                raise RuntimeError("Failed to load the HTTP fuzz fixture")
+            pack_dir = tmpdir / "http_pack"
+            if not fixture_engine.save_model_pack(str(pack_dir)):
+                raise RuntimeError("Failed to save the HTTP fuzz fixture pack")
             port = random.randint(18080, 18999)
             env = os.environ.copy()
             env["NSOS_API_TOKEN"] = auth_token
@@ -153,14 +143,8 @@ def main() -> int:
                     "127.0.0.1",
                     "--port",
                     str(port),
-                    "--layers",
-                    "2",
-                    "--d-model",
-                    "64",
-                    "--vocab",
-                    "320",
-                    "--auth-token",
-                    auth_token,
+                    "--model",
+                    str(pack_dir),
                 ],
                 cwd=str(build_dir),
                 stdout=subprocess.PIPE,
@@ -213,10 +197,19 @@ def main() -> int:
                 )
                 if proc.poll() is not None:
                     raise RuntimeError("HTTP server crashed after malformed requests")
+                if not responses[0].startswith((b"HTTP/1.1 400", b"HTTP/1.1 405")):
+                    raise RuntimeError("Invalid HTTP method was not explicitly rejected")
+                if not responses[1].startswith(b"HTTP/1.1 400"):
+                    raise RuntimeError("Invalid JSON was not explicitly rejected")
+                recovery = send_raw_http(
+                    port, b"GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\n" + auth_header + b"\r\n")
+                if not recovery.startswith(b"HTTP/1.1 200"):
+                    raise RuntimeError("HTTP server did not recover to ready after malformed requests")
                 report["http_malformed_requests"] = {
                     "ok": True,
                     "skipped": False,
                     "response_sizes": [len(chunk) for chunk in responses],
+                    "recovery_ready": True,
                 }
             finally:
                 if proc.poll() is None:

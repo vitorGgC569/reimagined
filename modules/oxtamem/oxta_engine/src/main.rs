@@ -50,7 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if !is_loopback_host(&args.host)
         && (!args.allow_insecure_remote
-            || args.auth_token.as_ref().map_or(true, |token| token.len() < 16))
+            || args
+                .auth_token
+                .as_ref()
+                .is_none_or(|token| token.len() < 16))
     {
         return Err(
             "refusing remote clear-text RESP without --allow-insecure-remote and a >=16-byte auth token"

@@ -44,6 +44,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -68,6 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--instruction-bundle", type=Path, required=True,
                         help="JSONL of {prompt, answer, kind} rows.  Can "
                              "be the output of generate_synthetic_instructions.py.")
+    parser.add_argument("--eval-bundle", type=Path, default=None,
+                        help="Optional independent held-out JSONL.  When set, "
+                             "the instruction bundle is used entirely for training "
+                             "and this file is never mixed into it.")
     parser.add_argument("--model-config", type=Path, required=True,
                         help="effective_model_config.json from the pretrain run.")
     parser.add_argument("--tokenizer", type=Path, required=True,
@@ -106,6 +111,9 @@ def parse_args() -> argparse.Namespace:
                         help="In-phase eval cadence.  At 0 disables.")
     parser.add_argument("--eval-samples", type=int, default=32,
                         help="Held-out samples per in-phase eval pass.")
+    parser.add_argument("--eval-generation-samples", type=int, default=0,
+                        help="Optional number of held-out rows for greedy generation. "
+                             "Zero keeps eval teacher-forced only (recommended while training).")
     parser.add_argument("--eval-fraction", type=float, default=0.05,
                         help="Fraction of the bundle held out for eval. "
                              "Drawn deterministically with --seed.")
@@ -113,6 +121,10 @@ def parse_args() -> argparse.Namespace:
                         help="Execution device.")
     parser.add_argument("--seed", type=int, default=20260516,
                         help="Seed for shuffling + held-out split.")
+    parser.add_argument("--allow-config-digest-mismatch", action="store_true",
+                        help="Load a fingerprint/shape-compatible legacy checkpoint with "
+                             "strict=False when only the complete ModelConfig digest differs. "
+                             "The load is fail-closed on bad integrity, flags, names, or shapes.")
     return parser.parse_args()
 
 
@@ -181,8 +193,9 @@ def build_supervised_tokens(tokenizer, row: Dict, eos_token_id: int) -> Tuple[Li
     return prompt_tokens, answer_tokens
 
 
-def compute_eval_metrics(engine, tokenizer, rows: List[Dict],
-                         eos_token_id: int, max_samples: int) -> Dict[str, float]:
+def compute_eval_metrics(model, tokenizer, rows: List[Dict],
+                         eos_token_id: int, max_samples: int,
+                         generation_samples: int = 0) -> Dict[str, float]:
     """Run held-out eval: teacher token accuracy (predicting each
     answer token given the gold prefix) + exact greedy generation
     match (full-answer generation matches gold)."""
@@ -190,48 +203,83 @@ def compute_eval_metrics(engine, tokenizer, rows: List[Dict],
     if n == 0:
         return {"answer_loss": 0.0, "teacher_token_accuracy": 0.0,
                  "exact_total": 0, "exact_correct": 0, "exact_accuracy": 0.0}
+    # Evaluation is deliberately implemented against JambaModel rather than
+    # InferenceEngine so a legacy checkpoint can be loaded with strict=False
+    # without weakening the training path.  A single full-prefix forward per
+    # row gives both teacher-forced loss and accuracy without Python-side
+    # token-by-token GPU synchronizations.
+    import numpy as np
+
     teacher_correct = 0
     teacher_total = 0
     losses: List[float] = []
     exact_correct = 0
+    exact_total = 0
     for row in rows[:n]:
         prompt_tokens, answer_tokens = build_supervised_tokens(tokenizer, row, eos_token_id)
         if not prompt_tokens or not answer_tokens:
             continue
-        # Teacher-forced loss on the answer span
+        # Teacher-forced loss on the answer span.  Row j predicts token j+1,
+        # therefore the first answer token is scored at prompt_len-1.
         full = list(prompt_tokens) + list(answer_tokens)
-        try:
-            loss = engine.evaluate_supervised_loss(prompt_tokens, answer_tokens)
-            losses.append(float(loss))
-        except AttributeError:
-            # Fallback: skip loss if engine doesn't expose this helper.
-            pass
-        # Teacher token accuracy: argmax at each answer position
-        for i, gold_tok in enumerate(answer_tokens):
-            try:
-                pred = engine.next_token_greedy(prompt_tokens + answer_tokens[:i])
-                teacher_total += 1
-                if pred == gold_tok:
-                    teacher_correct += 1
-            except AttributeError:
-                break
-        # Exact generation match
-        try:
-            full_prompt = (f"<|task:{row.get('kind', 'instruction')}|>\n"
-                           f"Prompt:\n{row.get('prompt', '')}\nAnswer:\n")
-            gen = engine.generate(full_prompt, max_tokens=64, temperature=0.0)
-            gold = row.get("answer", "").strip()
-            if gen.strip().startswith(gold):
+        logits = np.asarray(model.forward_ids(full).numpy(), dtype=np.float32)
+        if logits.ndim != 2 or logits.shape[0] != len(full):
+            raise RuntimeError(f"unexpected eval logits shape: {logits.shape}")
+        answer_logits = logits[len(prompt_tokens) - 1:len(full) - 1]
+        gold = np.asarray(answer_tokens, dtype=np.int64)
+        if answer_logits.shape[0] != gold.shape[0]:
+            raise RuntimeError("eval answer/logit alignment mismatch")
+        shifted = answer_logits - answer_logits.max(axis=1, keepdims=True)
+        log_norm = np.log(np.exp(shifted).sum(axis=1))
+        losses.append(float(np.mean(log_norm - shifted[np.arange(gold.size), gold])))
+        preds = np.argmax(answer_logits, axis=1)
+        teacher_correct += int(np.sum(preds == gold))
+        teacher_total += int(gold.size)
+
+        # Greedy generation is opt-in because it performs one full-prefix
+        # forward per generated token and must never contend with training by
+        # default.  It is useful for a small end-of-phase quality probe.
+        if generation_samples > 0 and exact_total < generation_samples:
+            generated = list(prompt_tokens)
+            for _ in range(64):
+                next_logits = np.asarray(model.forward_ids(generated).numpy(), dtype=np.float32)[-1]
+                next_tok = int(np.argmax(next_logits))
+                generated.append(next_tok)
+                if next_tok == eos_token_id:
+                    break
+            generated_answer = tokenizer.decode(generated[len(prompt_tokens):]).strip()
+            target_answer = row.get("answer", "").strip()
+            if generated_answer.startswith(target_answer):
                 exact_correct += 1
-        except AttributeError:
-            pass
+            exact_total += 1
     return {
         "answer_loss": sum(losses) / max(len(losses), 1) if losses else 0.0,
         "teacher_token_accuracy": teacher_correct / max(teacher_total, 1),
-        "exact_total": n,
+        "exact_total": exact_total,
         "exact_correct": exact_correct,
-        "exact_accuracy": exact_correct / max(n, 1),
+        "exact_accuracy": exact_correct / max(exact_total, 1),
     }
+
+
+def save_training_checkpoint(model, trainer, path: Path) -> None:
+    """Persist model plus the matching optimizer/runtime sidecar.
+
+    InferenceEngine.save_checkpoint intentionally serializes only model bytes.
+    SFT recovery also needs Adam/scheduler/RNG state, so direct JambaModel
+    loading uses the Trainer's transactional sidecar API whenever available.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(path))
+    state_path = path.with_suffix(path.suffix + ".trainer.state")
+    trainer.save_training_state(str(state_path), str(path))
+
+
+def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main() -> int:
@@ -247,6 +295,9 @@ def main() -> int:
     # ── Load tokenizer ──────────────────────────────────────────────────
     tokenizer = nsos.Tokenizer()
     tokenizer.load(str(args.tokenizer))
+    # Keep every produced checkpoint self-describing and directly loadable by
+    # the SDK/terminal sampler (the engine searches beside model.bin).
+    shutil.copy2(args.tokenizer, args.out_dir / "tokenizer.nsos")
     # Register ChatML markers idempotently — SFT bundles built by
     # build_sft_bundle.py format prompts with <|im_start|>/<|im_end|>;
     # without registration BPE would split each marker into many
@@ -254,8 +305,10 @@ def main() -> int:
     try:
         from chatml import register_special_tokens
         register_special_tokens(tokenizer)
-    except ImportError:
-        pass  # chatml module added in VISION Phase 2; legacy runs without it still work
+    except ImportError as exc:
+        raise RuntimeError(
+            "SFT requires chatml special-token registration"
+        ) from exc
     eos_token_id = tokenizer.encode("<|endoftext|>")[0]
     print(f"[sft] tokenizer vocab_size={tokenizer.vocab_size} eos={eos_token_id}")
 
@@ -265,14 +318,61 @@ def main() -> int:
     for k, v in config_dict.items():
         if hasattr(config, k):
             setattr(config, k, v)
+    # The conversational pilot was materialized with exact attention
+    # training disabled; keep the serialized architecture digest identical
+    # when loading its checkpoint for this SFT phase.
+    config.use_exact_attention_training = False
     config.use_cuda = (args.device == "gpu") if args.device != "auto" else True
 
     print(f"[sft] loading pretrain checkpoint: {args.pretrain_checkpoint}")
-    engine = nsos.InferenceEngine()
-    if not engine.load_model(str(args.pretrain_checkpoint), config):
-        sys.stderr.write("[fatal] failed to load pretrain checkpoint\n")
-        return 1
-    model = engine.model
+    engine = None
+    if args.allow_config_digest_mismatch:
+        # The v4 checkpoint has a matching integrity trailer, architecture
+        # fingerprint, parameter names and shapes; only its complete config
+        # digest predates the current serialized operational defaults.  The
+        # native strict=False loader still rejects bad integrity, flag
+        # mismatches, unknown/shape-mismatched tensors, and zero matches.
+        device = nsos.Device.GPU if config.use_cuda else nsos.Device.CPU
+        model = nsos.JambaModel(config, device)
+        try:
+            model.load(str(args.pretrain_checkpoint), False)
+        except Exception as exc:
+            sys.stderr.write(f"[fatal] legacy-compatible checkpoint load failed: {exc}\n")
+            return 1
+        print("[sft] checkpoint load mode=legacy-compatible strict=False "
+              "(integrity/fingerprint/shape checks remain enforced)")
+    else:
+        engine = nsos.InferenceEngine()
+        if not engine.load_model(str(args.pretrain_checkpoint), config):
+            sys.stderr.write("[fatal] failed to load pretrain checkpoint\n")
+            return 1
+        model = engine.model
+
+    build_binary = next(iter(sorted(build_dir.glob("nsos_ext*.pyd"),
+                                    key=lambda p: p.name)), None)
+    run_manifest = {
+        "schema": "nsos-sft-run-v1",
+        "filter_version": "canarim-sft-gold-filter-v15",
+        "instruction_bundle": str(args.instruction_bundle.resolve()),
+        "eval_bundle": str(args.eval_bundle.resolve()) if args.eval_bundle else None,
+        "pretrain_checkpoint": str(args.pretrain_checkpoint.resolve()),
+        "pretrain_checkpoint_sha256": sha256_file(args.pretrain_checkpoint),
+        "tokenizer": str((args.out_dir / "tokenizer.nsos").resolve()),
+        "tokenizer_sha256": sha256_file(args.out_dir / "tokenizer.nsos"),
+        "build_dir": str(build_dir.resolve()),
+        "build_binary": str(build_binary.resolve()) if build_binary else None,
+        "build_binary_sha256": sha256_file(build_binary) if build_binary else None,
+        "checkpoint_load_mode": "legacy-compatible-strict-false" if args.allow_config_digest_mismatch else "strict",
+        "integrity_policy": "checkpoint SHA-256 trailer + architecture fingerprint + parameter names/shapes",
+        "device": "gpu" if config.use_cuda else "cpu",
+        "seed": args.seed,
+        "max_steps": args.max_steps,
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "eval_generation_samples": args.eval_generation_samples,
+    }
+    (args.out_dir / "run_manifest.json").write_text(
+        json.dumps(run_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     # ── Trainer with SFT-tuned hyperparameters ──────────────────────────
     trainer = nsos.Trainer(model, args.lr)
@@ -293,8 +393,16 @@ def main() -> int:
     if not rows:
         sys.stderr.write("[fatal] instruction bundle is empty\n")
         return 1
-    train_rows, eval_rows = deterministic_split(rows, args.eval_fraction, args.seed)
-    print(f"[sft] split: train={len(train_rows)} eval={len(eval_rows)}")
+    if args.eval_bundle is not None:
+        train_rows = rows
+        eval_rows = load_jsonl(args.eval_bundle)
+        if not eval_rows:
+            sys.stderr.write("[fatal] independent eval bundle is empty\n")
+            return 1
+        print(f"[sft] independent eval: train={len(train_rows)} eval={len(eval_rows)}")
+    else:
+        train_rows, eval_rows = deterministic_split(rows, args.eval_fraction, args.seed)
+        print(f"[sft] split: train={len(train_rows)} eval={len(eval_rows)}")
 
     # ── Training loop ───────────────────────────────────────────────────
     metrics_path = args.out_dir / "sft_metrics.jsonl"
@@ -338,8 +446,9 @@ def main() -> int:
 
             # Eval + champion selection
             if args.eval_every_steps > 0 and step % args.eval_every_steps == 0:
-                metrics = compute_eval_metrics(engine, tokenizer, eval_rows,
-                                                eos_token_id, args.eval_samples)
+                metrics = compute_eval_metrics(model, tokenizer, eval_rows,
+                                                eos_token_id, args.eval_samples,
+                                                args.eval_generation_samples)
                 metrics["step"] = step
                 metrics["train_loss"] = float(loss)
                 metrics["lr"] = float(trainer.learning_rate)
@@ -352,21 +461,25 @@ def main() -> int:
                 if score > best_eval_score:
                     best_eval_score = score
                     champion = args.out_dir / "sft_champion.bin"
-                    engine.save_checkpoint(str(champion))
+                    trainer.global_step_count = step
+                    save_training_checkpoint(model, trainer, champion)
                     print(f"[sft] new champion checkpoint saved -> {champion}")
 
             # Rolling checkpoint
             if args.checkpoint_every_steps > 0 and step % args.checkpoint_every_steps == 0:
                 rolling = args.out_dir / f"sft_step_{step:06d}.bin"
-                engine.save_checkpoint(str(rolling))
+                trainer.global_step_count = step
+                save_training_checkpoint(model, trainer, rolling)
                 # Keep only the last 3 rolling checkpoints to bound disk usage.
                 rolling_all = sorted(args.out_dir.glob("sft_step_*.bin"))
                 for old in rolling_all[:-3]:
                     old.unlink(missing_ok=True)
+                    old.with_suffix(old.suffix + ".trainer.state").unlink(missing_ok=True)
 
     # Final checkpoint
     final = args.out_dir / "sft_final.bin"
-    engine.save_checkpoint(str(final))
+    trainer.global_step_count = step
+    save_training_checkpoint(model, trainer, final)
     print(f"[sft] final checkpoint -> {final}")
     print(f"[sft] best eval score: {best_eval_score:.4f}")
     return 0

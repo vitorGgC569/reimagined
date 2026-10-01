@@ -83,9 +83,11 @@ void quant4_store_m(const float* m, int n, Quant4OptState& st) {
         return;
     }
     st.quantized = true;
-    const int num_blocks = (n + kQuant4BlockSize - 1) / kQuant4BlockSize;
+    const int num_blocks =
+        n / kQuant4BlockSize + static_cast<int>(n % kQuant4BlockSize != 0);
     st.m_absmax.assign(static_cast<size_t>(num_blocks), 0.0f);
-    st.m_codes.assign(static_cast<size_t>((n + 1) / 2), 0);
+    st.m_codes.assign(
+        static_cast<size_t>(n / 2 + static_cast<int>(n % 2 != 0)), 0);
 
     for (int blk = 0; blk < num_blocks; ++blk) {
         const int start = blk * kQuant4BlockSize;
@@ -109,7 +111,8 @@ void quant4_load_m(const Quant4OptState& st, float* m_out, int n) {
         std::copy(st.m_fp32.begin(), st.m_fp32.begin() + n, m_out);
         return;
     }
-    const int num_blocks = (n + kQuant4BlockSize - 1) / kQuant4BlockSize;
+    const int num_blocks =
+        n / kQuant4BlockSize + static_cast<int>(n % kQuant4BlockSize != 0);
     for (int blk = 0; blk < num_blocks; ++blk) {
         const int start = blk * kQuant4BlockSize;
         const int end = std::min(start + kQuant4BlockSize, n);
@@ -128,7 +131,8 @@ void quant4_store_v(const float* v, int n, int rows, int cols, Quant4OptState& s
         return;
     }
     st.quantized = true;
-    st.v_codes.assign(static_cast<size_t>((n + 1) / 2), 0);
+    st.v_codes.assign(
+        static_cast<size_t>(n / 2 + static_cast<int>(n % 2 != 0)), 0);
 
     const bool use_rank1 = rows > 0 && cols > 0 &&
                            static_cast<long long>(rows) * cols == n;
@@ -165,7 +169,8 @@ void quant4_store_v(const float* v, int n, int rows, int cols, Quant4OptState& s
     }
 
     // Block-wise abs-max fallback (still zero-safe via the linear no-zero map).
-    const int num_blocks = (n + kQuant4BlockSize - 1) / kQuant4BlockSize;
+    const int num_blocks =
+        n / kQuant4BlockSize + static_cast<int>(n % kQuant4BlockSize != 0);
     st.v_absmax.assign(static_cast<size_t>(num_blocks), 0.0f);
     for (int blk = 0; blk < num_blocks; ++blk) {
         const int start = blk * kQuant4BlockSize;
@@ -201,7 +206,8 @@ void quant4_load_v(const Quant4OptState& st, float* v_out, int n) {
         }
         return;
     }
-    const int num_blocks = (n + kQuant4BlockSize - 1) / kQuant4BlockSize;
+    const int num_blocks =
+        n / kQuant4BlockSize + static_cast<int>(n % kQuant4BlockSize != 0);
     for (int blk = 0; blk < num_blocks; ++blk) {
         const int start = blk * kQuant4BlockSize;
         const int end = std::min(start + kQuant4BlockSize, n);

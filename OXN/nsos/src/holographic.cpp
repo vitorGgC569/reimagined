@@ -7,7 +7,7 @@
 #include <random>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "../include/gpu_backend.h"
 #endif
 
 namespace nsos {
@@ -42,33 +42,21 @@ void HolographicMemory::add_concept(std::string name, const Tensor &vec) {
     int new_capacity = capacity * 2;
     Tensor new_matrix({new_capacity, dim}, item_memory_matrix.get_device());
 
-    // Copy existing data
-    if (item_memory_matrix.get_device() == Device::CPU) {
-      std::memcpy(new_matrix.data(), item_memory_matrix.data(),
-                  (size_t)current_size * dim * sizeof(float));
-    } else {
-#ifdef USE_CUDA
-      cudaMemcpy(new_matrix.raw_data(), item_memory_matrix.raw_data(),
-                 (size_t)current_size * dim * sizeof(float),
-                 cudaMemcpyDeviceToDevice);
-#endif
-    }
+    copy_tensor_bytes(
+        new_matrix.raw_data(), new_matrix.get_device(),
+        item_memory_matrix.raw_data(), item_memory_matrix.get_device(),
+        static_cast<size_t>(current_size) * dim * sizeof(float));
 
     item_memory_matrix = new_matrix;
     capacity = new_capacity;
   }
 
   // Insert at current_size offset
-  if (stored_vec.get_device() == Device::CPU) {
-    std::memcpy(item_memory_matrix.data() + (size_t)current_size * dim,
-                stored_vec.data(), dim * sizeof(float));
-  } else {
-#ifdef USE_CUDA
-    cudaMemcpy(item_memory_matrix.raw_data() + (size_t)current_size * dim,
-               stored_vec.raw_data(), dim * sizeof(float),
-               cudaMemcpyDeviceToDevice);
-#endif
-  }
+  copy_tensor_bytes(
+      item_memory_matrix.raw_data() +
+          static_cast<size_t>(current_size) * dim,
+      item_memory_matrix.get_device(), stored_vec.raw_data(),
+      stored_vec.get_device(), static_cast<size_t>(dim) * sizeof(float));
 
   current_size++;
 }

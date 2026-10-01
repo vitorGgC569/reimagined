@@ -1,4 +1,5 @@
 #include "../include/mamba2.h"
+#include "../include/gpu_execution.h"
 #include "../include/cuda/mamba_kernels.cuh"
 #include "../include/jamba_utils.h"
 #include "../include/nsos/determinism.h"
@@ -6,13 +7,220 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace nsos {
 
 namespace {
+
+#ifdef USE_CUDA
+// Event-based, opt-in stage timer for faithful-Mamba diagnosis.  It adds no
+// events, fences or output unless NSOS_MAMBA_STAGE_TIMING=1.  A single pair is
+// reused between marks so diagnostic VRAM/resource use stays bounded.
+class MambaStageTimer {
+public:
+    explicit MambaStageTimer(Device device)
+        : enabled_(device == Device::GPU && [] {
+              const char* value =
+                  std::getenv("NSOS_MAMBA_STAGE_TIMING");
+              return value != nullptr && value[0] == '1';
+          }()) {
+        if (!enabled_) return;
+        const cudaError_t start_status = cudaEventCreate(&start_);
+        const cudaError_t stop_status = cudaEventCreate(&stop_);
+        if (start_status != cudaSuccess || stop_status != cudaSuccess) {
+            if (start_ != nullptr) {
+                gpu::report_cleanup_status(
+                    cudaEventDestroy(start_),
+                    "Mamba timer start-event rollback");
+            }
+            if (stop_ != nullptr) {
+                gpu::report_cleanup_status(
+                    cudaEventDestroy(stop_),
+                    "Mamba timer stop-event rollback");
+            }
+            start_ = nullptr;
+            stop_ = nullptr;
+            throw std::runtime_error(
+                "Mamba stage timing event creation failed");
+        }
+        if (cudaEventRecord(start_, nsos::gpu::current_stream()) != cudaSuccess) {
+            gpu::report_cleanup_status(
+                cudaEventDestroy(start_),
+                "Mamba timer start-event rollback");
+            gpu::report_cleanup_status(
+                cudaEventDestroy(stop_),
+                "Mamba timer stop-event rollback");
+            start_ = nullptr;
+            stop_ = nullptr;
+            throw std::runtime_error(
+                "Mamba stage timing start record failed");
+        }
+    }
+
+    MambaStageTimer(const MambaStageTimer&) = delete;
+    MambaStageTimer& operator=(const MambaStageTimer&) = delete;
+
+    ~MambaStageTimer() noexcept {
+        if (start_ != nullptr) {
+            gpu::report_cleanup_status(
+                cudaEventDestroy(start_), "Mamba timer start-event release");
+        }
+        if (stop_ != nullptr) {
+            gpu::report_cleanup_status(
+                cudaEventDestroy(stop_), "Mamba timer stop-event release");
+        }
+    }
+
+    void mark(std::string_view label) {
+        if (!enabled_) return;
+        if (cudaEventRecord(stop_, nsos::gpu::current_stream()) != cudaSuccess ||
+            cudaEventSynchronize(stop_) != cudaSuccess) {
+            throw std::runtime_error(
+                "Mamba stage timing fence failed");
+        }
+        float milliseconds = 0.0f;
+        if (cudaEventElapsedTime(&milliseconds, start_, stop_) !=
+            cudaSuccess) {
+            throw std::runtime_error(
+                "Mamba stage timing elapsed query failed");
+        }
+        milliseconds = std::max(milliseconds, 0.0f);
+        std::fprintf(stderr, "[mtime] %.*s=%.3fms\n",
+                     static_cast<int>(label.size()), label.data(),
+                     static_cast<double>(milliseconds));
+        if (cudaEventRecord(start_, nsos::gpu::current_stream()) != cudaSuccess) {
+            throw std::runtime_error(
+                "Mamba stage timing restart failed");
+        }
+    }
+
+private:
+    bool enabled_ = false;
+    cudaEvent_t start_ = nullptr;
+    cudaEvent_t stop_ = nullptr;
+};
+#else
+class MambaStageTimer {
+public:
+    explicit MambaStageTimer(Device) {}
+    void mark(std::string_view) {}
+};
+#endif
+
+// The chunked scan uses the same workspace sizes in every Mamba layer. Keeping
+// one owner per host thread avoids sixteen deferred pool allocations before
+// the default stream's release events become reusable. Thread-local ownership
+// also prevents concurrent inference/training replicas from aliasing scratch.
+struct FaithfulChunkWorkspace {
+    Tensor carry;
+    Tensor scale;
+    Tensor lane_a;
+    Tensor lane_d;
+
+    void ensure(int carry_values, int scale_values,
+                int lane_partial_values) {
+        const auto ensure_tensor = [](Tensor& tensor, int values) {
+            if (values <= 0) {
+                throw std::invalid_argument(
+                    "faithful chunk workspace requires positive size");
+            }
+            if (tensor.get_device() != Device::GPU ||
+                tensor.size < values) {
+                tensor = Tensor::uninitialized({values}, Device::GPU);
+            }
+        };
+        ensure_tensor(carry, carry_values);
+        ensure_tensor(scale, scale_values);
+        ensure_tensor(lane_a, lane_partial_values);
+        ensure_tensor(lane_d, lane_partial_values);
+    }
+};
+
+FaithfulChunkWorkspace& faithful_chunk_workspace() {
+    thread_local FaithfulChunkWorkspace workspace;
+    return workspace;
+}
+
+// Scratch for the time-parallel forward scan: per-chunk end states, the
+// per-chunk decay products and the carry entering each chunk.
+struct FaithfulForwardChunkWorkspace {
+    Tensor end_local;
+    Tensor total_decay;
+    Tensor carry;
+
+    void ensure(int state_values, int decay_values) {
+        const auto ensure_tensor = [](Tensor& tensor, int values) {
+            if (values <= 0) {
+                throw std::invalid_argument(
+                    "faithful forward chunk workspace requires positive "
+                    "size");
+            }
+            if (tensor.get_device() != Device::GPU ||
+                tensor.size < values) {
+                tensor = Tensor::uninitialized({values}, Device::GPU);
+            }
+        };
+        ensure_tensor(end_local, state_values);
+        ensure_tensor(total_decay, decay_values);
+        ensure_tensor(carry, state_values);
+    }
+};
+
+FaithfulForwardChunkWorkspace& faithful_forward_chunk_workspace() {
+    thread_local FaithfulForwardChunkWorkspace workspace;
+    return workspace;
+}
+
+// State-parallel backward needs one gh value for every row/channel/state.
+// A transient Tensor per layer cannot be recycled until the asynchronous
+// default-stream consumers finish, so a 16-layer backward can retain sixteen
+// copies in the allocator.  One thread-local owner is safe because every
+// producer/finalizer and the next layer are enqueued on the same ordered
+// default stream; separate host threads never alias this storage.
+struct FaithfulStateParallelWorkspace {
+    Tensor gh_history;
+
+    void ensure(int values) {
+        if (values <= 0) {
+            throw std::invalid_argument(
+                "faithful state-parallel workspace requires positive size");
+        }
+        if (gh_history.get_device() != Device::GPU ||
+            gh_history.size < values) {
+            gh_history = Tensor::uninitialized({values}, Device::GPU);
+        }
+    }
+};
+
+FaithfulStateParallelWorkspace& faithful_state_parallel_workspace() {
+    thread_local FaithfulStateParallelWorkspace workspace;
+    return workspace;
+}
+
+#ifdef USE_CUDA
+int ensure_faithful_runtime_warp_size(int& cached_warp_size) {
+    if (cached_warp_size > 0) return cached_warp_size;
+    int device_id = 0;
+    cudaDeviceProp properties{};
+    const cudaError_t device_status = cudaGetDevice(&device_id);
+    const cudaError_t properties_status =
+        device_status == cudaSuccess
+            ? cudaGetDeviceProperties(&properties, device_id)
+            : device_status;
+    if (properties_status != cudaSuccess || properties.warpSize <= 0) {
+        throw std::runtime_error(
+            std::string("Mamba2 could not audit the active GPU warp size: ") +
+            cudaGetErrorString(properties_status));
+    }
+    cached_warp_size = properties.warpSize;
+    return cached_warp_size;
+}
+#endif
 
 // GPU-first DEFAULT ON (NSOS_MAMBA_GPU_STEP=0 opts out): route the proper
 // single-token decode (diagonal AND N-state) through the fused on-device step
@@ -71,6 +279,114 @@ bool can_use_gpu_mamba_single_token(const Tensor& x,
 #endif
 }
 
+int checked_int_product(int lhs, int rhs, const char* label) {
+    if (lhs < 0 || rhs < 0) {
+        throw std::invalid_argument(std::string(label) +
+                                    " received a negative dimension");
+    }
+    const int64_t value =
+        static_cast<int64_t>(lhs) * static_cast<int64_t>(rhs);
+    if (value > std::numeric_limits<int>::max()) {
+        throw std::overflow_error(std::string(label) +
+                                  " exceeds the supported int index range");
+    }
+    return static_cast<int>(value);
+}
+
+int require_positive_mamba_dimension(int value, const char* label) {
+    if (value <= 0) {
+        throw std::invalid_argument(
+            std::string("Mamba2SSD ") + label + " must be positive");
+    }
+    return value;
+}
+
+int checked_mamba_inner_width(
+    int model_width, const MambaConfig& config) {
+    if (!config.faithful_mamba2) {
+        return model_width;
+    }
+    if (config.expand <= 0 || config.head_dim <= 0 ||
+        config.n_groups <= 0 || config.conv_kernel <= 0) {
+        throw std::invalid_argument(
+            "Mamba2SSD faithful dimensions must be positive");
+    }
+    const int inner = checked_int_product(
+        model_width, config.expand, "Mamba2 faithful inner width");
+    if (inner % config.head_dim != 0) {
+        throw std::invalid_argument(
+            "Mamba2 faithful inner width must be divisible by head_dim");
+    }
+    return inner;
+}
+
+int checked_mamba_head_count(
+    int model_width, int inner_width, int requested_heads,
+    const MambaConfig& config) {
+    if (!config.faithful_mamba2) {
+        return require_positive_mamba_dimension(
+            requested_heads, "head count");
+    }
+    const int heads = inner_width / config.head_dim;
+    if (heads <= 0 || heads % config.n_groups != 0) {
+        throw std::invalid_argument(
+            "Mamba2 faithful head count must be positive and divisible by "
+            "n_groups");
+    }
+    (void)model_width;
+    return heads;
+}
+
+int checked_mamba_head_width(
+    int model_width, int head_count, const MambaConfig& config) {
+    if (config.faithful_mamba2) {
+        return config.head_dim;
+    }
+    return std::max(model_width / head_count, 1);
+}
+
+int checked_mamba_group_count(const MambaConfig& config) {
+    return config.faithful_mamba2
+               ? require_positive_mamba_dimension(
+                     config.n_groups, "group count")
+               : 1;
+}
+
+int checked_mamba_conv_width(int inner_width, int group_count,
+                             int state_width,
+                             const MambaConfig& config) {
+    if (!config.faithful_mamba2) {
+        return inner_width;
+    }
+    const int group_state = checked_int_product(
+        group_count, state_width, "Mamba2 faithful group-state width");
+    const int64_t value =
+        static_cast<int64_t>(inner_width) + 2LL * group_state;
+    if (value > std::numeric_limits<int>::max()) {
+        throw std::overflow_error(
+            "Mamba2 faithful convolution width exceeds int range");
+    }
+    return static_cast<int>(value);
+}
+
+void validate_faithful_conv_launch(int rows, int inner, int group_state,
+                                   int kernel_width) {
+    if (rows <= 0 || inner <= 0 || group_state <= 0 ||
+        kernel_width <= 0) {
+        throw std::invalid_argument(
+            "Mamba2 faithful convolution dimensions must be positive");
+    }
+    const int64_t convdim =
+        static_cast<int64_t>(inner) + 2LL * group_state;
+    const int64_t elements = static_cast<int64_t>(rows) * convdim;
+    if (convdim > std::numeric_limits<int>::max() ||
+        elements > std::numeric_limits<int>::max()) {
+        throw std::overflow_error(
+            "Mamba2 faithful convolution launch exceeds the supported "
+            "32-bit kernel index range");
+    }
+}
+
 void copy_float_bytes_device_safe(float* dst,
                                   Device dst_device,
                                   const float* src,
@@ -95,10 +411,12 @@ void copy_float_bytes_device_safe(float* dst,
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string("cudaMemcpy failed: ") + cudaGetErrorString(err));
         }
+        record_gpu_transfer(dst_device, src_device, bytes);
         return;
     }
 #endif
     std::memcpy(dst, src, bytes);
+    record_gpu_transfer(dst_device, src_device, bytes);
 }
 
 // N1: A is stored in the LOG domain.  The effective decay rate is
@@ -160,47 +478,29 @@ thread_local Mamba2SSD::ThreadBuffers Mamba2SSD::buffers_{};
 
 Mamba2SSD::Mamba2SSD(int d_model_value, int d_state_value, int n_heads_value,
                      const MambaConfig& config)
-    : d_model(d_model_value),
-      d_state(d_state_value),
-      n_heads(config.faithful_mamba2
-                  ? (std::max(config.expand, 1) * d_model_value) /
-                        std::max(config.head_dim, 1)
-                  : std::max(n_heads_value, 1)),
-      d_head(config.faithful_mamba2
-                 ? std::max(config.head_dim, 1)
-                 : std::max(d_model_value / std::max(n_heads_value, 1), 1)),
-      d_inner(config.faithful_mamba2
-                  ? std::max(config.expand, 1) * d_model_value
-                  : d_model_value),
-      conv_dim(config.faithful_mamba2
-                   ? std::max(config.expand, 1) * d_model_value +
-                         2 * std::max(config.n_groups, 1) *
-                             std::max(d_state_value, 1)
-                   : d_model_value),
-      n_groups(config.faithful_mamba2 ? std::max(config.n_groups, 1) : 1),
+    : d_model(require_positive_mamba_dimension(
+          d_model_value, "model width")),
+      d_state(require_positive_mamba_dimension(
+          d_state_value, "state width")),
+      d_inner(checked_mamba_inner_width(d_model, config)),
+      n_heads(checked_mamba_head_count(
+          d_model, d_inner, n_heads_value, config)),
+      d_head(checked_mamba_head_width(
+          d_model, n_heads, config)),
+      n_groups(checked_mamba_group_count(config)),
+      conv_dim(checked_mamba_conv_width(
+          d_inner, n_groups, d_state, config)),
       config_(config),
-      out_proj(config.faithful_mamba2
-                   ? std::max(config.expand, 1) * d_model_value
-                   : d_model_value,
-               d_model_value, !config.faithful_mamba2),
+      out_proj(d_inner, d_model, !config.faithful_mamba2),
       // N1: A holds A_log; A_log = 0 ⇒ A_eff = exp(0) = 1, matching the old
       // A = ones / max(A,1e-3) default exactly while removing the dead-channel
       // gradient mask.  D (the skip scale) stays ones.
-      A(Tensor::zeros({config.faithful_mamba2
-                           ? (std::max(config.expand, 1) * d_model_value) /
-                                 std::max(config.head_dim, 1)
-                           : d_model_value},
+      A(Tensor::zeros({config.faithful_mamba2 ? n_heads : d_model},
                       Device::CPU),
         "mamba.A"),
-      D(Tensor::ones({config.faithful_mamba2
-                          ? (std::max(config.expand, 1) * d_model_value) /
-                                std::max(config.head_dim, 1)
-                          : d_model_value},
+      D(Tensor::ones({config.faithful_mamba2 ? n_heads : d_model},
                      Device::CPU),
         "mamba.D") {
-  if (d_model <= 0 || d_state <= 0) {
-    throw std::invalid_argument("Mamba2SSD dimensions must be positive");
-  }
   if (config_.faithful_mamba2) {
     if (config_.expand <= 0 || config_.head_dim <= 0 || config_.n_groups <= 0 ||
         d_inner % config_.head_dim != 0 || n_heads <= 0 ||
@@ -521,6 +821,10 @@ Tensor Mamba2SSD::ssd_forward(const Tensor& x, const Tensor& delta,
     if (x.get_device() == Device::GPU) {
         ++gpu_fast_path_fallbacks_;  // scan batched caiu no host com tensores GPU
         last_fallback_reason_ = "ssd_forward_host_fallback";
+        if (strict_gpu_execution()) {
+            throw std::runtime_error(
+                "Strict GPU selective scan forward has no eligible device path");
+        }
     }
     Tensor x_host = x.get_device() == Device::GPU ? x.cpu() : x;
     Tensor delta_host = delta.get_device() == Device::GPU ? delta.cpu() : delta;
@@ -803,7 +1107,8 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
     if (dim != d_model) {
         throw std::runtime_error("Mamba2SSD proper path: last dim != d_model");
     }
-    const int rows = batch * seq;
+    const int rows =
+        checked_int_product(batch, seq, "Mamba2 proper forward rows");
     const int K = conv_kernel_;
     const Device dev = u.get_device();  // GPU-first: stay on the input's device
 
@@ -830,8 +1135,8 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
                               conv_pre.data(), batch, seq, dim, K);
     }
 
-    // xc = silu(conv_pre) = conv_pre * sigmoid(conv_pre) — device-agnostic.
-    Tensor xc = conv_pre.mul(conv_pre.sigmoid());
+    // xc = SiLU(conv_pre), fused into one elementwise device pass.
+    Tensor xc = conv_pre.silu();
 
     // Diagonal selective recurrence:
     // h_t = decay_t*h_{t-1} + softplus(dt_t)*B_t*xc_t;
@@ -875,7 +1180,7 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
     }
 
     // Separate SiLU gate, out projection and D skip — all device-agnostic.
-    Tensor gated = y_ssd.mul(z.mul(z.sigmoid()));
+    Tensor gated = y_ssd.mul(z.silu());
     Tensor projected = out_proj.forward(gated).reshape({rows, dim});
     Tensor skip = u_flat.mul(D.data);  // D is [dim], broadcast over rows
     Tensor result = projected.add(skip);
@@ -897,27 +1202,85 @@ Tensor Mamba2SSD::forward_proper(const Tensor& u) {
     // Prime the incremental stream: carry the final SSD state + the last (K-1)
     // x_proj taps so subsequent single tokens decode in O(1) (forward_proper_step).
     if (streaming_inference_) {
-        Tensor h_h = dev == Device::GPU ? h_hist.cpu() : h_hist;
-        Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
-        pp_stream_state_.assign(static_cast<size_t>(dim), 0.0f);
-        const float* hp = h_h.data();
-        for (int c = 0; c < dim; ++c) {
-            pp_stream_state_[static_cast<size_t>(c)] =
-                hp[static_cast<size_t>(rows - 1) * dim + c];
-        }
         const int taps = std::max(K - 1, 0);
-        pp_stream_ring_.assign(static_cast<size_t>(taps) * dim, 0.0f);
-        const float* xvp = xv_h.data();
-        for (int s = 0; s < taps; ++s) {
-            const int src_row = rows - taps + s;
-            if (src_row < 0) continue;
-            for (int c = 0; c < dim; ++c) {
-                pp_stream_ring_[static_cast<size_t>(s) * dim + c] =
-                    xvp[static_cast<size_t>(src_row) * dim + c];
+        const int ring_elements = checked_int_product(
+            taps, dim, "Mamba proper streaming ring");
+#ifdef USE_CUDA
+        if (dev == Device::GPU && batch == 1 &&
+            mamba_gpu_step_enabled()) {
+            pp_stream_h_dev_ =
+                Tensor::uninitialized({dim}, Device::GPU);
+            pp_stream_ring_dev_ = Tensor::uninitialized(
+                {std::max(ring_elements, 1)}, Device::GPU);
+            const bool prime_enqueued =
+                cuda::launch_mamba_prime_stream_carry(
+                h_hist.raw_data(), dim,
+                xv.raw_data(), dim,
+                nullptr, 0, nullptr, 0,
+                pp_stream_h_dev_.raw_data(),
+                pp_stream_ring_dev_.raw_data(),
+                batch, seq, taps);
+            if (!prime_enqueued) {
+                throw std::runtime_error(
+                    "Mamba proper GPU stream priming rejected invalid "
+                    "arguments");
             }
+            const cudaError_t prime_status = cudaGetLastError();
+            if (prime_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string(
+                        "Mamba proper GPU stream priming failed: ") +
+                    cudaGetErrorString(prime_status));
+            }
+            pp_stream_state_.clear();
+            pp_stream_ring_.clear();
+            pp_stream_dev_live_ = true;
+            ++stream_priming_gpu_calls_;
+        } else
+#endif
+        {
+#ifdef USE_CUDA
+            if (dev == Device::GPU) {
+                ++stream_priming_host_fallbacks_;
+                ++gpu_fast_path_fallbacks_;
+                last_fallback_reason_ =
+                    "proper_stream_priming_host_fallback";
+                if (strict_gpu_execution()) {
+                    throw std::runtime_error(
+                        "Strict GPU Mamba proper prefill cannot prime "
+                        "incremental carry through host memory");
+                }
+            }
+#endif
+            Tensor h_h =
+                dev == Device::GPU ? h_hist.cpu() : h_hist;
+            Tensor xv_h =
+                dev == Device::GPU ? xv.cpu() : xv;
+            pp_stream_state_.assign(
+                static_cast<size_t>(dim), 0.0f);
+            const float* hp = h_h.data();
+            for (int c = 0; c < dim; ++c) {
+                pp_stream_state_[static_cast<size_t>(c)] =
+                    hp[static_cast<size_t>(rows - 1) * dim + c];
+            }
+            pp_stream_ring_.assign(
+                static_cast<size_t>(ring_elements), 0.0f);
+            const float* xvp = xv_h.data();
+            const int batch_base = (batch - 1) * seq;
+            for (int s = 0; s < taps; ++s) {
+                const int source_time = seq - taps + s;
+                if (source_time < 0) continue;
+                const int source_row = batch_base + source_time;
+                for (int c = 0; c < dim; ++c) {
+                    pp_stream_ring_[
+                        static_cast<size_t>(s) * dim + c] =
+                        xvp[
+                            static_cast<size_t>(source_row) * dim + c];
+                }
+            }
+            pp_stream_dev_live_ = false;
         }
         pp_stream_active_ = true;
-        pp_stream_dev_live_ = false;  // re-sync device carry on next GPU step
     }
 
     return rank_2 ? result : result.reshape({batch, seq, dim});
@@ -928,18 +1291,12 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
     const int seq = pp_seq_;
     const int dim = d_model;
     const int K = conv_kernel_;
-    const int rows = batch * seq;
+    const int rows =
+        checked_int_product(batch, seq, "Mamba2 proper backward rows");
     const Device dev = grad_output.get_device();  // GPU-first: stay on device
 
     Tensor g = grad_output.shape.size() == 2 ? grad_output
                                              : grad_output.reshape({rows, dim});
-
-    // SiLU derivative d/dx[x·σ(x)] = σ(x)·(1 + x·(1 - σ(x))) — device-agnostic.
-    auto dsilu = [&](const Tensor& pre) {
-        Tensor s = pre.sigmoid();
-        Tensor one = Tensor::ones(std::vector<int>{rows, dim}, dev);
-        return s.mul(one.add(pre.mul(one.sub(s))));
-    };
 
     // Skip path: result = out_proj(...) + u*D.  grad_D = Σ_rows(g·u); the input
     // gradient via the skip is g·D (broadcast).  Device-agnostic Tensor ops.
@@ -950,9 +1307,10 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
     Tensor g_gated = out_proj.backward(g).reshape({rows, dim});
 
     // Gate y = y_ssd · silu(z).
-    Tensor silu_z = pp_z_.mul(pp_z_.sigmoid());
+    Tensor silu_z = pp_z_.silu();
     Tensor g_yssd = g_gated.mul(silu_z);
-    Tensor g_z = g_gated.mul(pp_y_ssd_).mul(dsilu(pp_z_));
+    Tensor g_z = Tensor::silu_backward(
+        g_gated.mul(pp_y_ssd_), pp_z_);
 
     // Scan backward (linear readout): GPU kernel on device, ordered host loop on
     // CPU.  Produces grads wrt the scan input xc, dt, A, B and C.
@@ -1040,7 +1398,8 @@ Tensor Mamba2SSD::backward_proper(const Tensor& grad_output) {
     }
 
     // xc = silu(conv_pre) -> grad_conv_pre (device-agnostic).
-    Tensor grad_conv_pre = g_xc.mul(dsilu(pp_conv_pre_));
+    Tensor grad_conv_pre =
+        Tensor::silu_backward(g_xc, pp_conv_pre_);
 
     // conv1d backward: GPU kernel on device, ordered host loop on CPU.
     Tensor grad_xv = Tensor::zeros(std::vector<int>{rows, dim}, dev);
@@ -1107,7 +1466,8 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
     if (H * P != dim) {
         throw std::runtime_error("Mamba2SSD nstate: d_model must equal n_heads*d_head");
     }
-    const int rows = batch * seq;
+    const int rows =
+        checked_int_product(batch, seq, "Mamba2 nstate forward rows");
     const int K = conv_kernel_;
     const Device dev = u.get_device();
 
@@ -1133,7 +1493,7 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
         conv1d_causal_forward(xv.data(), conv_weight_.data.data(),
                               conv_pre.data(), batch, seq, dim, K);
     }
-    Tensor xc = conv_pre.mul(conv_pre.sigmoid());
+    Tensor xc = conv_pre.silu();
 
     // ── N-state SSD scan ── GPU-resident kernel (state in registers) on device;
     // ordered host loop on CPU or when N exceeds the kernel's MAX_N.  Full state
@@ -1199,7 +1559,7 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
     }
 
     // Gate + out_proj + skip (device-agnostic).
-    Tensor gated = y_ssd.mul(z.mul(z.sigmoid()));
+    Tensor gated = y_ssd.mul(z.silu());
     Tensor projected = out_proj.forward(gated).reshape({rows, dim});
     Tensor skip = u_flat.mul(D.data);
     Tensor result = projected.add(skip);
@@ -1221,27 +1581,90 @@ Tensor Mamba2SSD::forward_proper_nstate(const Tensor& u) {
     // Prime the incremental stream (nstate): carry the final H*P*N state + last
     // (K-1) x_proj taps for O(1) single-token decode (forward_proper_nstate_step).
     if (streaming_inference_) {
-        Tensor st_h = dev == Device::GPU ? hist.cpu() : hist;
-        Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
         const size_t HPN = static_cast<size_t>(H) * P * N;
-        pp_stream_state_.assign(HPN, 0.0f);
-        const float* hp = st_h.data();
-        for (size_t k = 0; k < HPN; ++k) {
-            pp_stream_state_[k] = hp[static_cast<size_t>(rows - 1) * HPN + k];
+        if (HPN >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error(
+                "Mamba nstate streaming state exceeds int range");
         }
         const int taps = std::max(K - 1, 0);
-        pp_stream_ring_.assign(static_cast<size_t>(taps) * dim, 0.0f);
-        const float* xvp = xv_h.data();
-        for (int s = 0; s < taps; ++s) {
-            const int src_row = rows - taps + s;
-            if (src_row < 0) continue;
-            for (int c = 0; c < dim; ++c) {
-                pp_stream_ring_[static_cast<size_t>(s) * dim + c] =
-                    xvp[static_cast<size_t>(src_row) * dim + c];
+        const int ring_elements = checked_int_product(
+            taps, dim, "Mamba nstate streaming ring");
+#ifdef USE_CUDA
+        if (dev == Device::GPU && batch == 1 &&
+            nstate_scan_done && mamba_gpu_step_enabled()) {
+            pp_stream_h_dev_ = Tensor::uninitialized(
+                {static_cast<int>(HPN)}, Device::GPU);
+            pp_stream_ring_dev_ = Tensor::uninitialized(
+                {std::max(ring_elements, 1)}, Device::GPU);
+            const bool prime_enqueued =
+                cuda::launch_mamba_prime_stream_carry(
+                hist.raw_data(), static_cast<int>(HPN),
+                xv.raw_data(), dim,
+                nullptr, 0, nullptr, 0,
+                pp_stream_h_dev_.raw_data(),
+                pp_stream_ring_dev_.raw_data(),
+                batch, seq, taps);
+            if (!prime_enqueued) {
+                throw std::runtime_error(
+                    "Mamba nstate GPU stream priming rejected invalid "
+                    "arguments");
             }
+            const cudaError_t prime_status = cudaGetLastError();
+            if (prime_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string(
+                        "Mamba nstate GPU stream priming failed: ") +
+                    cudaGetErrorString(prime_status));
+            }
+            pp_stream_state_.clear();
+            pp_stream_ring_.clear();
+            pp_stream_dev_live_ = true;
+            ++stream_priming_gpu_calls_;
+        } else
+#endif
+        {
+#ifdef USE_CUDA
+            if (dev == Device::GPU) {
+                ++stream_priming_host_fallbacks_;
+                ++gpu_fast_path_fallbacks_;
+                last_fallback_reason_ =
+                    "nstate_stream_priming_host_fallback";
+                if (strict_gpu_execution()) {
+                    throw std::runtime_error(
+                        "Strict GPU Mamba nstate prefill cannot prime "
+                        "incremental carry through host memory");
+                }
+            }
+#endif
+            Tensor st_h =
+                dev == Device::GPU ? hist.cpu() : hist;
+            Tensor xv_h =
+                dev == Device::GPU ? xv.cpu() : xv;
+            pp_stream_state_.assign(HPN, 0.0f);
+            const float* hp = st_h.data();
+            for (size_t k = 0; k < HPN; ++k) {
+                pp_stream_state_[k] =
+                    hp[static_cast<size_t>(rows - 1) * HPN + k];
+            }
+            pp_stream_ring_.assign(
+                static_cast<size_t>(ring_elements), 0.0f);
+            const float* xvp = xv_h.data();
+            const int batch_base = (batch - 1) * seq;
+            for (int s = 0; s < taps; ++s) {
+                const int source_time = seq - taps + s;
+                if (source_time < 0) continue;
+                const int source_row = batch_base + source_time;
+                for (int c = 0; c < dim; ++c) {
+                    pp_stream_ring_[
+                        static_cast<size_t>(s) * dim + c] =
+                        xvp[
+                            static_cast<size_t>(source_row) * dim + c];
+                }
+            }
+            pp_stream_dev_live_ = false;
         }
         pp_stream_active_ = true;
-        pp_stream_dev_live_ = false;  // re-sync device carry on next GPU step
     }
 
     return rank_2 ? result : result.reshape({batch, seq, dim});
@@ -1252,7 +1675,8 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
     const int seq = pp_seq_;
     const int dim = d_model;
     const int K = conv_kernel_;
-    const int rows = batch * seq;
+    const int rows =
+        checked_int_product(batch, seq, "Mamba2 nstate backward rows");
     const int H = std::max(n_heads, 1);
     const int P = d_head;
     const int N = std::max(d_state, 1);
@@ -1260,19 +1684,14 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
     Tensor g = grad_output.shape.size() == 2 ? grad_output
                                              : grad_output.reshape({rows, dim});
 
-    auto dsilu = [&](const Tensor& pre) {
-        Tensor s = pre.sigmoid();
-        Tensor one = Tensor::ones(std::vector<int>{rows, dim}, dev);
-        return s.mul(one.add(pre.mul(one.sub(s))));
-    };
-
     // Skip + out_proj + gate (device-agnostic).
     Tensor grad_D = g.mul(pp_u_).sum(0, false);
     Tensor g_u = g.mul(D.data);
     Tensor g_gated = out_proj.backward(g).reshape({rows, dim});
-    Tensor silu_z = pp_z_.mul(pp_z_.sigmoid());
+    Tensor silu_z = pp_z_.silu();
     Tensor g_yssd = g_gated.mul(silu_z);
-    Tensor g_z = g_gated.mul(pp_y_ssd_).mul(dsilu(pp_z_));
+    Tensor g_z = Tensor::silu_backward(
+        g_gated.mul(pp_y_ssd_), pp_z_);
 
     // ── N-state SSD scan backward ── GPU-resident kernel on device; ordered
     // host loop on CPU or when N exceeds the kernel's MAX_N.
@@ -1283,14 +1702,39 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
     Tensor gA(std::vector<int>{H}, dev);
     bool nstate_bwd_done = false;
 #ifdef USE_CUDA
-    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n() &&
-        !determinism::deterministic_reductions_enabled()) {
-        cuda::launch_mamba_nstate_backward(
-            g_yssd.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
-            A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
-            pp_state_hist_.raw_data(), gXc.raw_data(), gDt.raw_data(),
-            gA.raw_data(), gB.raw_data(), gC.raw_data(), batch, seq, H, P, N);
-        nstate_bwd_done = true;
+    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n()) {
+        if (determinism::deterministic_reductions_enabled() &&
+            cuda::mamba_nstate_deterministic_backward_supported(P, N)) {
+            const bool launch_enqueued =
+                cuda::launch_mamba_nstate_backward_deterministic(
+                g_yssd.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
+                A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
+                pp_state_hist_.raw_data(), gXc.raw_data(), gDt.raw_data(),
+                gA.raw_data(), gB.raw_data(), gC.raw_data(), batch, seq, H, P,
+                N);
+            if (!launch_enqueued) {
+                throw std::runtime_error(
+                    "Mamba nstate deterministic backward rejected invalid "
+                    "arguments");
+            }
+            nstate_bwd_done = true;
+        } else if (!determinism::deterministic_reductions_enabled()) {
+            cuda::launch_mamba_nstate_backward(
+                g_yssd.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
+                A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
+                pp_state_hist_.raw_data(), gXc.raw_data(), gDt.raw_data(),
+                gA.raw_data(), gB.raw_data(), gC.raw_data(), batch, seq, H, P,
+                N);
+            nstate_bwd_done = true;
+        }
+        if (nstate_bwd_done) {
+            const cudaError_t launch_status = cudaGetLastError();
+            if (launch_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("Mamba nstate backward kernel failed: ") +
+                    cudaGetErrorString(launch_status));
+            }
+        }
     }
 #endif
     if (!nstate_bwd_done) {
@@ -1375,17 +1819,34 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
     A.add_grad(gA);
 
     // conv SiLU backward + conv1d backward.
-    Tensor grad_conv_pre = gXc.mul(dsilu(pp_conv_pre_));
+    Tensor grad_conv_pre =
+        Tensor::silu_backward(gXc, pp_conv_pre_);
     Tensor grad_xv = Tensor::zeros(std::vector<int>{rows, dim}, dev);
     Tensor grad_conv_w = Tensor::zeros({dim, K}, dev);
     bool conv_backward_done = false;
 #ifdef USE_CUDA
-    if (dev == Device::GPU && !determinism::deterministic_reductions_enabled()) {
-        cuda::launch_conv1d_causal_backward(
-            grad_conv_pre.raw_data(), pp_xv_.raw_data(),
-            conv_weight_.data.raw_data(), grad_xv.raw_data(),
-            grad_conv_w.raw_data(), batch, seq, dim, K);
-        conv_backward_done = true;
+    if (dev == Device::GPU) {
+        if (determinism::deterministic_reductions_enabled()) {
+            conv_backward_done =
+                cuda::launch_conv1d_causal_backward_deterministic(
+                    grad_conv_pre.raw_data(), pp_xv_.raw_data(),
+                    conv_weight_.data.raw_data(), grad_xv.raw_data(),
+                    grad_conv_w.raw_data(), batch, seq, dim, K);
+        } else {
+            cuda::launch_conv1d_causal_backward(
+                grad_conv_pre.raw_data(), pp_xv_.raw_data(),
+                conv_weight_.data.raw_data(), grad_xv.raw_data(),
+                grad_conv_w.raw_data(), batch, seq, dim, K);
+            conv_backward_done = true;
+        }
+        if (conv_backward_done) {
+            const cudaError_t launch_status = cudaGetLastError();
+            if (launch_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("Mamba conv backward kernel failed: ") +
+                    cudaGetErrorString(launch_status));
+            }
+        }
     }
 #endif
     if (!conv_backward_done) {
@@ -1419,6 +1880,483 @@ Tensor Mamba2SSD::backward_proper_nstate(const Tensor& grad_output) {
 // ===========================================================================
 // Faithful Mamba-2 block (state-spaces/mamba Mamba2 defaults).
 // ===========================================================================
+bool Mamba2SSD::faithful_grouped_projection_eligible(
+    const Tensor& input) const {
+#ifdef USE_CUDA
+    if (!config_.faithful_mamba2 ||
+        input.get_device() != Device::GPU ||
+        input.shape.size() != 2 ||
+        input.shape[1] != d_model) {
+        return false;
+    }
+    const std::array<const BitLinear*, 5> projections = {
+        z_proj_.get(), x_proj_.get(), B_proj_.get(), C_proj_.get(),
+        dt_proj_.get()};
+    const int group_state = checked_int_product(
+        n_groups, d_state, "Mamba2 faithful grouped state width");
+    const std::array<int, 5> widths = {
+        d_inner, d_inner, group_state, group_state,
+        n_heads};
+    for (size_t index = 0; index < projections.size(); ++index) {
+        const BitLinear* projection = projections[index];
+        if (projection == nullptr ||
+            !projection->exact_linear_mode() ||
+            !projection->reference_path_enabled() ||
+            projection->loqa.active ||
+            projection->input_features() != d_model ||
+            projection->output_features() != widths[index] ||
+            (index < 4 && projection->uses_bias()) ||
+            projection->weight.data.shape !=
+                TensorShape({widths[index], d_model}) ||
+            projection->weight.data.get_device() != Device::GPU) {
+            return false;
+        }
+    }
+    return !dt_proj_->uses_bias() ||
+           (dt_proj_->bias.data.shape == TensorShape({n_heads}) &&
+            dt_proj_->bias.data.get_device() == Device::GPU);
+#else
+    (void)input;
+    return false;
+#endif
+}
+
+bool Mamba2SSD::faithful_sensitive_grouped_projection_eligible(
+    const Tensor& input) const {
+#ifdef USE_CUDA
+    if (!config_.faithful_mamba2 ||
+        input.get_device() != Device::GPU ||
+        input.shape.size() != 2 ||
+        input.shape[1] != d_model) {
+        return false;
+    }
+    const int group_state = checked_int_product(
+        n_groups, d_state, "Mamba2 faithful grouped state width");
+    const std::array<const BitLinear*, 5> projections = {
+        z_proj_.get(), x_proj_.get(), B_proj_.get(), C_proj_.get(),
+        dt_proj_.get()};
+    const std::array<int, 5> widths = {
+        d_inner, d_inner, group_state, group_state, n_heads};
+    for (size_t index = 0; index < projections.size(); ++index) {
+        const BitLinear* projection = projections[index];
+        if (projection == nullptr ||
+            projection->input_features() != d_model ||
+            projection->output_features() != widths[index] ||
+            (index < 4 && projection->uses_bias()) ||
+            projection->weight.data.shape !=
+                TensorShape({widths[index], d_model}) ||
+            projection->weight.data.get_device() != Device::GPU) {
+            return false;
+        }
+        // B, C and dt are the mixed-precision-sensitive projections. They
+        // must remain exact plain linears for the grouped QAT path; z/x keep
+        // their own BitLinear forward/backward and may therefore be ternary.
+        if (index >= 2 &&
+            (!projection->exact_linear_mode() ||
+             !projection->reference_path_enabled() ||
+             projection->loqa.active)) {
+            return false;
+        }
+    }
+    return !dt_proj_->uses_bias() ||
+           (dt_proj_->bias.data.shape == TensorShape({n_heads}) &&
+            dt_proj_->bias.data.get_device() == Device::GPU);
+#else
+    (void)input;
+    return false;
+#endif
+}
+
+void Mamba2SSD::refresh_faithful_grouped_projection_cache() {
+    const int GS = checked_int_product(
+        n_groups, d_state, "Mamba2 faithful grouped state width");
+    const int64_t width64 =
+        2LL * d_inner + 2LL * GS + n_heads;
+    if (width64 <= 0 ||
+        width64 > std::numeric_limits<int>::max()) {
+        throw std::overflow_error(
+            "Mamba2 faithful grouped projection width exceeds int range");
+    }
+    const int width = static_cast<int>(width64);
+    const std::array<BitLinear*, 5> projections = {
+        z_proj_.get(), x_proj_.get(), B_proj_.get(), C_proj_.get(),
+        dt_proj_.get()};
+    std::array<uint64_t, 5> versions{};
+    for (size_t index = 0; index < projections.size(); ++index) {
+        if (projections[index] == nullptr) {
+            throw std::logic_error(
+                "Mamba2 faithful grouped projection is missing");
+        }
+        versions[index] = projections[index]->weight.version;
+    }
+    if (versions != faithful_grouped_projection_versions_) {
+        if (faithful_grouped_projection_content_epoch_ ==
+            std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error(
+                "Mamba2 grouped projection content epoch is exhausted");
+        }
+        ++faithful_grouped_projection_content_epoch_;
+    }
+    const bool owner_valid =
+        faithful_grouped_projection_weight_.shape ==
+            TensorShape({width, d_model}) &&
+        faithful_grouped_projection_weight_.get_device() == Device::GPU;
+    size_t expected_offset = 0;
+    bool storage_bound = owner_valid;
+    for (BitLinear* projection : projections) {
+        storage_bound =
+            storage_bound &&
+            projection->weight.data.raw_data() ==
+                faithful_grouped_projection_weight_.raw_data() +
+                    expected_offset;
+        expected_offset +=
+            static_cast<size_t>(projection->output_features()) *
+            static_cast<size_t>(d_model);
+    }
+    if (storage_bound) {
+        // Optimizer updates changed versions but wrote directly into the
+        // canonical packed owner through these aliasing views. No repack/copy
+        // is necessary.
+        faithful_grouped_projection_versions_ = versions;
+        return;
+    }
+
+    {
+        Tensor next =
+            Tensor::uninitialized({width, d_model}, Device::GPU);
+        size_t offset = 0;
+        for (BitLinear* projection : projections) {
+            const size_t elements =
+                static_cast<size_t>(projection->output_features()) *
+                static_cast<size_t>(d_model);
+            copy_tensor_bytes(
+                next.raw_data() + offset, Device::GPU,
+                projection->weight.data.raw_data(), Device::GPU,
+                elements * sizeof(float), /*async_d2d=*/true);
+            offset += elements;
+        }
+        if (offset != static_cast<size_t>(next.size)) {
+            throw std::logic_error(
+                "Mamba2 faithful grouped projection cache size mismatch");
+        }
+        faithful_grouped_projection_weight_ = std::move(next);
+        faithful_grouped_projection_versions_ = versions;
+        ++faithful_grouped_projection_cache_rebuilds_;
+    }
+
+    // Turn the independently named Parameter tensors into safe aliasing views
+    // over the packed owner. Checkpoint names and optimizer states remain
+    // unchanged, while every subsequent training step has zero packing copies.
+    size_t offset = 0;
+    for (BitLinear* projection : projections) {
+        const int rows = projection->output_features();
+        projection->weight.data =
+            faithful_grouped_projection_weight_.storage_view(
+                offset, {rows, d_model});
+        offset +=
+            static_cast<size_t>(rows) * static_cast<size_t>(d_model);
+    }
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
+Mamba2SSD::forward_faithful_grouped_projections(
+    const Tensor& input) {
+#ifndef USE_CUDA
+    (void)input;
+    throw std::logic_error("Grouped GPU projections are unavailable in a CPU build");
+#else
+    if (!faithful_grouped_projection_eligible(input)) {
+        throw std::logic_error(
+            "Mamba2 faithful grouped projection path is ineligible");
+    }
+    refresh_faithful_grouped_projection_cache();
+    const int GS = checked_int_product(
+        n_groups, d_state, "Mamba2 faithful grouped state width");
+    const int z_begin = 0;
+    const int x_begin = z_begin + d_inner;
+    const int b_begin = x_begin + d_inner;
+    const int c_begin = b_begin + GS;
+    const int dt_begin = c_begin + GS;
+    const int width = dt_begin + n_heads;
+    Tensor projected = matmul_nt_cached_weight(
+        input, faithful_grouped_projection_weight_,
+        faithful_grouped_projection_content_epoch_);
+    if (projected.shape.size() != 2 ||
+        projected.shape[1] != width) {
+        throw std::logic_error(
+            "Mamba2 faithful grouped projection output shape mismatch");
+    }
+    const int rows = input.shape[0];
+    Tensor z = Tensor::uninitialized({rows, d_inner}, Device::GPU);
+    Tensor xv = Tensor::uninitialized({rows, d_inner}, Device::GPU);
+    Tensor Bv = Tensor::uninitialized({rows, GS}, Device::GPU);
+    Tensor Cv = Tensor::uninitialized({rows, GS}, Device::GPU);
+    Tensor dt = Tensor::uninitialized({rows, n_heads}, Device::GPU);
+    const bool unpack_enqueued =
+        cuda::launch_mamba2_unpack_projection(
+        projected.raw_data(), z.raw_data(), xv.raw_data(), Bv.raw_data(),
+        Cv.raw_data(), dt.raw_data(), rows, d_inner, GS, n_heads,
+        false);
+    if (!unpack_enqueued) {
+        throw std::runtime_error(
+            "Mamba2 grouped projection unpack rejected invalid arguments");
+    }
+    const cudaError_t unpack_status = cudaGetLastError();
+    if (unpack_status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("Mamba2 grouped projection unpack failed: ") +
+            cudaGetErrorString(unpack_status));
+    }
+    if (dt_proj_->uses_bias()) {
+        dt = dt.add(dt_proj_->bias.data);
+    }
+    faithful_grouped_projection_backward_mode_ =
+        FaithfulGroupedProjectionMode::Full;
+    ++faithful_grouped_projection_forward_calls_;
+    ++faithful_grouped_projection_full_forward_calls_;
+    return {std::move(xv), std::move(z), std::move(Bv), std::move(Cv),
+            std::move(dt)};
+#endif
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
+Mamba2SSD::forward_faithful_sensitive_grouped_projections(
+    const Tensor& input) {
+#ifndef USE_CUDA
+    (void)input;
+    throw std::logic_error("Grouped GPU projections are unavailable in a CPU build");
+#else
+    if (!faithful_sensitive_grouped_projection_eligible(input)) {
+        throw std::logic_error(
+            "Mamba2 faithful sensitive grouped projection path is "
+            "ineligible");
+    }
+    refresh_faithful_grouped_projection_cache();
+    const int GS = checked_int_product(
+        n_groups, d_state, "Mamba2 faithful grouped state width");
+    const int64_t sensitive_width64 = 2LL * GS + n_heads;
+    if (sensitive_width64 <= 0 ||
+        sensitive_width64 > std::numeric_limits<int>::max()) {
+        throw std::overflow_error(
+            "Mamba2 sensitive projection width exceeds int range");
+    }
+    const int sensitive_width = static_cast<int>(sensitive_width64);
+    const size_t sensitive_offset =
+        static_cast<size_t>(2) * static_cast<size_t>(d_inner) *
+        static_cast<size_t>(d_model);
+    Tensor sensitive_weight =
+        faithful_grouped_projection_weight_.storage_view(
+            sensitive_offset, {sensitive_width, d_model});
+
+    Tensor z = z_proj_->forward(input).reshape({input.shape[0], d_inner});
+    Tensor xv = x_proj_->forward(input).reshape({input.shape[0], d_inner});
+    Tensor projected = matmul_nt_cached_weight(
+        input, sensitive_weight,
+        faithful_grouped_projection_content_epoch_);
+    if (projected.shape !=
+        TensorShape({input.shape[0], sensitive_width})) {
+        throw std::logic_error(
+            "Mamba2 sensitive grouped projection output shape mismatch");
+    }
+    const int rows = input.shape[0];
+    Tensor Bv = Tensor::uninitialized({rows, GS}, Device::GPU);
+    Tensor Cv = Tensor::uninitialized({rows, GS}, Device::GPU);
+    Tensor dt = Tensor::uninitialized({rows, n_heads}, Device::GPU);
+    const bool unpack_enqueued =
+        cuda::launch_mamba2_unpack_projection(
+        projected.raw_data(), nullptr, nullptr, Bv.raw_data(),
+        Cv.raw_data(), dt.raw_data(), rows, d_inner, GS, n_heads,
+        true);
+    if (!unpack_enqueued) {
+        throw std::runtime_error(
+            "Mamba2 sensitive grouped projection unpack rejected invalid "
+            "arguments");
+    }
+    const cudaError_t unpack_status = cudaGetLastError();
+    if (unpack_status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(
+                "Mamba2 sensitive grouped projection unpack failed: ") +
+            cudaGetErrorString(unpack_status));
+    }
+    if (dt_proj_->uses_bias()) {
+        dt = dt.add(dt_proj_->bias.data);
+    }
+    faithful_grouped_projection_backward_mode_ =
+        FaithfulGroupedProjectionMode::Sensitive;
+    ++faithful_grouped_projection_forward_calls_;
+    ++faithful_grouped_projection_sensitive_forward_calls_;
+    return {std::move(xv), std::move(z), std::move(Bv), std::move(Cv),
+            std::move(dt)};
+#endif
+}
+
+Tensor Mamba2SSD::backward_faithful_grouped_projections(
+    const Tensor& gx, const Tensor& gz, const Tensor& gB,
+    const Tensor& gC, const Tensor& gdt) {
+#ifdef USE_CUDA
+    const FaithfulGroupedProjectionMode mode =
+        faithful_grouped_projection_backward_mode_;
+    if (mode == FaithfulGroupedProjectionMode::None ||
+        pp_u_.get_device() != Device::GPU) {
+        throw std::logic_error(
+            "Mamba2 faithful grouped projection backward is inactive");
+    }
+    const std::array<BitLinear*, 5> projections = {
+        z_proj_.get(), x_proj_.get(), B_proj_.get(), C_proj_.get(),
+        dt_proj_.get()};
+    for (size_t index = 0; index < projections.size(); ++index) {
+        if (projections[index] == nullptr ||
+            projections[index]->weight.version !=
+                faithful_grouped_projection_versions_[index]) {
+            throw std::logic_error(
+                "Mamba2 projection weight changed between forward and "
+                "backward");
+        }
+    }
+    const int rows = pp_u_.shape[0];
+    const int GS = checked_int_product(
+        n_groups, d_state, "Mamba2 faithful grouped state width");
+    const int64_t width64 =
+        2LL * d_inner + 2LL * GS + n_heads;
+    const int64_t sensitive_width64 = 2LL * GS + n_heads;
+    const int64_t active_width64 =
+        mode == FaithfulGroupedProjectionMode::Full
+            ? width64
+            : sensitive_width64;
+    if (active_width64 <= 0 ||
+        active_width64 > std::numeric_limits<int>::max() ||
+        static_cast<int64_t>(rows) * active_width64 >
+            std::numeric_limits<int>::max()) {
+        throw std::overflow_error(
+            "Mamba2 grouped projection backward exceeds kernel index range");
+    }
+    const auto require_shape =
+        [rows](const Tensor& value, int columns, const char* label) {
+            if (value.shape != TensorShape({rows, columns}) ||
+                value.get_device() != Device::GPU) {
+                throw std::invalid_argument(
+                    std::string("Mamba2 grouped projection ") + label +
+                    " gradient shape/device mismatch");
+            }
+        };
+    require_shape(gx, d_inner, "x");
+    require_shape(gz, d_inner, "z");
+    require_shape(gB, GS, "B");
+    require_shape(gC, GS, "C");
+    require_shape(gdt, n_heads, "dt");
+
+    const int active_width = static_cast<int>(active_width64);
+    Tensor packed_grad =
+        Tensor::uninitialized({rows, active_width}, Device::GPU);
+    bool pack_enqueued = false;
+    if (mode == FaithfulGroupedProjectionMode::Full) {
+        pack_enqueued = cuda::launch_mamba2_pack_projection_grads(
+            gx.raw_data(), gz.raw_data(), gB.raw_data(), gC.raw_data(),
+            gdt.raw_data(), packed_grad.raw_data(), rows, d_inner, GS,
+            n_heads);
+    } else {
+        pack_enqueued =
+            cuda::launch_mamba2_pack_sensitive_projection_grads(
+            gB.raw_data(), gC.raw_data(), gdt.raw_data(),
+            packed_grad.raw_data(), rows, GS, n_heads);
+    }
+    if (!pack_enqueued) {
+        throw std::runtime_error(
+            "Mamba2 grouped projection gradient pack rejected invalid "
+            "arguments");
+    }
+    const cudaError_t pack_status = cudaGetLastError();
+    if (pack_status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(
+                "Mamba2 grouped projection gradient pack failed: ") +
+            cudaGetErrorString(pack_status));
+    }
+
+    // Consume the grouped forward exactly once. Any later exception leaves the
+    // training step failed instead of allowing a duplicate partial backward.
+    faithful_grouped_projection_backward_mode_ =
+        FaithfulGroupedProjectionMode::None;
+    if (dt_proj_->uses_bias()) {
+        dt_proj_->bias.add_grad(gdt.sum(0));
+    }
+    Tensor all_weight_grad =
+        matmul_tn(packed_grad, pp_u_);
+
+    Tensor input_grad;
+    if (mode == FaithfulGroupedProjectionMode::Full) {
+        const int z_begin = 0;
+        const int x_begin = z_begin + d_inner;
+        const int b_begin = x_begin + d_inner;
+        const int c_begin = b_begin + GS;
+        const int dt_begin = c_begin + GS;
+        z_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                static_cast<size_t>(z_begin) * d_model,
+                {d_inner, d_model}));
+        x_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                static_cast<size_t>(x_begin) * d_model,
+                {d_inner, d_model}));
+        B_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                static_cast<size_t>(b_begin) * d_model,
+                {GS, d_model}));
+        C_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                static_cast<size_t>(c_begin) * d_model,
+                {GS, d_model}));
+        dt_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                static_cast<size_t>(dt_begin) * d_model,
+                {n_heads, d_model}));
+        input_grad =
+            packed_grad.matmul(faithful_grouped_projection_weight_);
+        ++faithful_grouped_projection_full_backward_calls_;
+    } else {
+        const int c_begin = GS;
+        const int dt_begin = 2 * GS;
+        B_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                0, {GS, d_model}));
+        C_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                static_cast<size_t>(c_begin) * d_model,
+                {GS, d_model}));
+        dt_proj_->weight.add_grad(
+            all_weight_grad.storage_view(
+                static_cast<size_t>(dt_begin) * d_model,
+                {n_heads, d_model}));
+
+        Tensor z_input_grad =
+            z_proj_->backward(gz).reshape({rows, d_model});
+        input_grad =
+            x_proj_->backward(gx).reshape({rows, d_model});
+        input_grad = input_grad.add(z_input_grad);
+        const size_t sensitive_offset =
+            static_cast<size_t>(2) * static_cast<size_t>(d_inner) *
+            static_cast<size_t>(d_model);
+        Tensor sensitive_weight =
+            faithful_grouped_projection_weight_.storage_view(
+                sensitive_offset, {active_width, d_model});
+        input_grad =
+            input_grad.add(packed_grad.matmul(sensitive_weight));
+        ++faithful_grouped_projection_sensitive_backward_calls_;
+    }
+    ++faithful_grouped_projection_backward_calls_;
+    return input_grad;
+#else
+    (void)gx;
+    (void)gz;
+    (void)gB;
+    (void)gC;
+    (void)gdt;
+    throw std::logic_error(
+        "Mamba2 grouped projection backward requires a GPU backend");
+#endif
+}
+
 Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
     const bool rank_2 = u.shape.size() == 2;
     if (!rank_2 && u.shape.size() != 3) {
@@ -1429,35 +2367,62 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
     if (u.shape.back() != d_model || d_inner != n_heads * d_head) {
         throw std::runtime_error("Mamba2 faithful path shape mismatch");
     }
-    const int rows = batch * seq;
+    const int rows =
+        checked_int_product(batch, seq, "Mamba2 faithful forward rows");
     const int N = d_state;
     const int GS = n_groups * N;
     const int K = conv_kernel_;
     const Device dev = u.get_device();
+    validate_faithful_conv_launch(rows, d_inner, GS, K);
     Tensor u_flat = rank_2 ? u : u.reshape({rows, d_model});
 
-    Tensor xv = x_proj_->forward(u_flat).reshape({rows, d_inner});
-    Tensor z = z_proj_->forward(u_flat).reshape({rows, d_inner});
-    Tensor Bv = B_proj_->forward(u_flat).reshape({rows, GS});
-    Tensor Cv = C_proj_->forward(u_flat).reshape({rows, GS});
-    Tensor dt = dt_proj_->forward(u_flat).reshape({rows, n_heads});
+    faithful_grouped_projection_backward_mode_ =
+        FaithfulGroupedProjectionMode::None;
+    Tensor xv;
+    Tensor z;
+    Tensor Bv;
+    Tensor Cv;
+    Tensor dt;
+    if (faithful_grouped_projection_eligible(u_flat)) {
+        std::tie(xv, z, Bv, Cv, dt) =
+            forward_faithful_grouped_projections(u_flat);
+    } else if (faithful_sensitive_grouped_projection_eligible(u_flat)) {
+        std::tie(xv, z, Bv, Cv, dt) =
+            forward_faithful_sensitive_grouped_projections(u_flat);
+    } else {
+        xv = x_proj_->forward(u_flat).reshape({rows, d_inner});
+        z = z_proj_->forward(u_flat).reshape({rows, d_inner});
+        Bv = B_proj_->forward(u_flat).reshape({rows, GS});
+        Cv = C_proj_->forward(u_flat).reshape({rows, GS});
+        dt = dt_proj_->forward(u_flat).reshape({rows, n_heads});
+    }
 
-    Tensor x_pre({rows, d_inner}, dev);
-    Tensor B_pre({rows, GS}, dev);
-    Tensor C_pre({rows, GS}, dev);
+    // The causal-convolution producers cover every output element.
+    Tensor x_pre = Tensor::uninitialized({rows, d_inner}, dev);
+    Tensor B_pre = Tensor::uninitialized({rows, GS}, dev);
+    Tensor C_pre = Tensor::uninitialized({rows, GS}, dev);
+    Tensor x = Tensor::uninitialized({rows, d_inner}, dev);
+    Tensor B = Tensor::uninitialized({rows, GS}, dev);
+    Tensor C = Tensor::uninitialized({rows, GS}, dev);
 #ifdef USE_CUDA
     if (dev == Device::GPU) {
-        cuda::launch_conv1d_causal_forward(
-            xv.raw_data(), conv_weight_.data.raw_data(), x_pre.raw_data(),
-            batch, seq, d_inner, K);
-        cuda::launch_conv1d_causal_forward(
-            Bv.raw_data(), conv_weight_.data.raw_data() +
-                               static_cast<size_t>(d_inner) * K,
-            B_pre.raw_data(), batch, seq, GS, K);
-        cuda::launch_conv1d_causal_forward(
-            Cv.raw_data(), conv_weight_.data.raw_data() +
-                               static_cast<size_t>(d_inner + GS) * K,
-            C_pre.raw_data(), batch, seq, GS, K);
+        const bool conv_enqueued =
+            cuda::launch_mamba2_faithful_conv_forward(
+            xv.raw_data(), Bv.raw_data(), Cv.raw_data(),
+            conv_weight_.data.raw_data(), conv_bias_.data.raw_data(),
+            x_pre.raw_data(), B_pre.raw_data(), C_pre.raw_data(),
+            x.raw_data(), B.raw_data(), C.raw_data(), batch, seq,
+            d_inner, GS, K);
+        if (!conv_enqueued) {
+            throw std::runtime_error(
+                "Mamba2 faithful convolution rejected invalid arguments");
+        }
+        const cudaError_t conv_status = cudaGetLastError();
+        if (conv_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Mamba2 faithful convolution kernel failed: ") +
+                cudaGetErrorString(conv_status));
+        }
     } else
 #endif
     {
@@ -1471,16 +2436,30 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
             Cv.data(), conv_weight_.data.data() +
                            static_cast<size_t>(d_inner + GS) * K,
             C_pre.data(), batch, seq, GS, K);
+        x_pre = x_pre.add(conv_bias_.data.slice(0, 0, d_inner));
+        B_pre = B_pre.add(
+            conv_bias_.data.slice(0, d_inner, d_inner + GS));
+        C_pre = C_pre.add(
+            conv_bias_.data.slice(0, d_inner + GS, d_inner + 2 * GS));
+        x = x_pre.silu();
+        B = B_pre.silu();
+        C = C_pre.silu();
     }
-    x_pre = x_pre.add(conv_bias_.data.slice(0, 0, d_inner));
-    B_pre = B_pre.add(conv_bias_.data.slice(0, d_inner, d_inner + GS));
-    C_pre = C_pre.add(
-        conv_bias_.data.slice(0, d_inner + GS, d_inner + 2 * GS));
-    Tensor x = x_pre.mul(x_pre.sigmoid());
-    Tensor B = B_pre.mul(B_pre.sigmoid());
-    Tensor C = C_pre.mul(C_pre.sigmoid());
 
-    const bool save_history =
+    int history_chunk_size = 0;
+#ifdef USE_CUDA
+    if (dev == Device::GPU && training_mode_ && !streaming_inference_ &&
+        cuda::faithful_boundary_history_enabled()) {
+        const int wave = ensure_faithful_runtime_warp_size(faithful_runtime_warp_size_);
+        if (!determinism::deterministic_reductions_enabled() ||
+            !cuda::faithful_chunked_backward_enabled() ||
+            cuda::faithful_backward_chunk_size() != 32 || N > cuda::mamba_nstate_max_n() ||
+            !cuda::faithful_deterministic_head_wave_geometry_enabled(d_head, wave))
+            throw std::invalid_argument("Boundary history requires deterministic head-wave backward with chunk size 32");
+        history_chunk_size = 32;
+    }
+#endif
+    const bool save_history = history_chunk_size > 0 ||
         streaming_inference_ ||
         (training_mode_ &&
          (!config_.recompute_ssd || faithful_recompute_active_));
@@ -1490,23 +2469,150 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
             "Mamba2 faithful history exceeds max_seq_for_storage; use "
             "sequence chunking or raise the explicit safety limit");
     }
-    Tensor y({rows, d_inner}, dev);
+    Tensor y = Tensor::uninitialized({rows, d_inner}, dev);
     Tensor hist;
+    bool state_major_history = false;
+#ifdef USE_CUDA
+    state_major_history =
+        save_history && dev == Device::GPU && training_mode_ &&
+        !streaming_inference_ &&
+        cuda::faithful_state_major_history_enabled();
+#endif
     if (save_history) {
-        hist = Tensor({rows, n_heads, d_head, N}, dev);
+        const int history_rows = history_chunk_size > 0
+            ? checked_int_product(batch, (seq + history_chunk_size - 1) / history_chunk_size,
+                                  "Mamba boundary rows") : rows;
+        hist = state_major_history
+                   ? Tensor::uninitialized(
+                         {history_rows, N, n_heads, d_head}, dev)
+                   : Tensor::uninitialized(
+                         {history_rows, n_heads, d_head, N}, dev);
+        faithful_peak_state_history_bytes_ =
+            std::max(
+                faithful_peak_state_history_bytes_,
+                static_cast<size_t>(hist.size) * sizeof(float));
     }
     bool scan_done = false;
+    Tensor forward_decay_terms;
 #ifdef USE_CUDA
     if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n()) {
-        cuda::launch_mamba2_faithful_forward(
-            x.raw_data(), dt.raw_data(), A.data.raw_data(), B.raw_data(),
-            C.raw_data(), D.data.raw_data(), y.raw_data(),
-            save_history ? hist.raw_data() : nullptr,
-            batch, seq, n_heads, d_head, N, n_groups);
+        if (cuda::faithful_precomputed_decay_enabled()) {
+            forward_decay_terms = Tensor::uninitialized(
+                {rows, n_heads, cuda::kFaithfulDecayTermsWidth},
+                Device::GPU);
+            const bool decay_enqueued =
+                cuda::launch_mamba2_faithful_precompute_decay(
+                    dt.raw_data(), A.data.raw_data(),
+                    forward_decay_terms.raw_data(), batch, seq,
+                    n_heads);
+            if (!decay_enqueued) {
+                throw std::runtime_error(
+                    "Mamba2 faithful decay precompute rejected invalid "
+                    "arguments");
+            }
+            const cudaError_t decay_status = cudaGetLastError();
+            if (decay_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string(
+                        "Mamba2 faithful decay precompute failed: ") +
+                    cudaGetErrorString(decay_status));
+            }
+        }
+        const int forward_warp_size =
+            ensure_faithful_runtime_warp_size(faithful_runtime_warp_size_);
+        const float* forward_decay_ptr =
+            forward_decay_terms.size > 0
+                ? forward_decay_terms.raw_data()
+                : nullptr;
+        bool launch_enqueued = false;
+        bool forward_used_chunked = false;
+
+        // Time-parallel scan: only attempted when explicitly enabled and the
+        // shape is eligible.  The launcher itself re-validates and returns
+        // false without touching any output, so the sequential path below
+        // stays the guaranteed fallback.
+        if (cuda::faithful_chunked_forward_enabled() &&
+            d_head % forward_warp_size == 0) {
+            const int forward_chunk_size =
+                cuda::faithful_forward_chunk_size();
+            const int forward_chunks =
+                (seq + forward_chunk_size - 1) / forward_chunk_size;
+            if (forward_chunks > 1) {
+                const int forward_batch_heads = checked_int_product(
+                    batch, n_heads, "Mamba2 forward chunk batch heads");
+                const int forward_channel_values = checked_int_product(
+                    forward_batch_heads, d_head,
+                    "Mamba2 forward chunk channel values");
+                const int forward_channel_states = checked_int_product(
+                    forward_channel_values, N,
+                    "Mamba2 forward chunk channel states");
+                const int forward_state_values = checked_int_product(
+                    forward_channel_states, forward_chunks,
+                    "Mamba2 forward chunk state values");
+                const int forward_decay_values = checked_int_product(
+                    forward_batch_heads, forward_chunks,
+                    "Mamba2 forward chunk decay values");
+                FaithfulForwardChunkWorkspace& forward_workspace =
+                    faithful_forward_chunk_workspace();
+                forward_workspace.ensure(forward_state_values,
+                                         forward_decay_values);
+                int produced_chunks = 0;
+                forward_used_chunked =
+                    cuda::launch_mamba2_faithful_forward_chunked(
+                        x.raw_data(), dt.raw_data(), A.data.raw_data(),
+                        forward_decay_ptr, B.raw_data(), C.raw_data(),
+                        D.data.raw_data(), y.raw_data(),
+                        save_history ? hist.raw_data() : nullptr,
+                        forward_workspace.end_local.raw_data(),
+                        forward_workspace.total_decay.raw_data(),
+                        forward_workspace.carry.raw_data(), batch, seq,
+                        n_heads, d_head, N, n_groups, forward_warp_size,
+                        state_major_history, &produced_chunks, history_chunk_size);
+                launch_enqueued = forward_used_chunked;
+            }
+        }
+
+        if (!forward_used_chunked) {
+            launch_enqueued = cuda::launch_mamba2_faithful_forward(
+                x.raw_data(), dt.raw_data(), A.data.raw_data(),
+                forward_decay_ptr,
+                B.raw_data(), C.raw_data(), D.data.raw_data(),
+                y.raw_data(),
+                save_history ? hist.raw_data() : nullptr,
+                batch, seq, n_heads, d_head, N, n_groups,
+                forward_warp_size,
+                state_major_history, history_chunk_size);
+        }
+        if (!launch_enqueued) {
+            throw std::runtime_error(
+                "Mamba2 faithful forward rejected invalid arguments or "
+                "failed to enqueue required device initialization");
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Mamba2 faithful forward kernel failed: ") +
+                cudaGetErrorString(launch_status));
+        }
         scan_done = true;
+        ++gpu_fast_path_hits_;
+        ++faithful_forward_gpu_calls_;
     }
 #endif
     if (!scan_done) {
+#ifdef USE_CUDA
+        if (dev == Device::GPU) {
+            ++gpu_fast_path_fallbacks_;
+            ++faithful_forward_host_fallbacks_;
+            last_fallback_reason_ =
+                "faithful_forward_host_fallback";
+        }
+        if (dev == Device::GPU && strict_gpu_execution()) {
+            throw std::runtime_error(
+                "Strict GPU Mamba2 faithful forward has no eligible "
+                "device scan");
+        }
+#endif
         Tensor xh = dev == Device::GPU ? x.cpu() : x;
         Tensor Bh = dev == Device::GPU ? B.cpu() : B;
         Tensor Ch = dev == Device::GPU ? C.cpu() : C;
@@ -1569,7 +2675,7 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
     }
 
     // norm_before_gate=false: RMSNorm(y * SiLU(z)), then learned gamma.
-    Tensor gated_input = y.mul(z.mul(z.sigmoid()));
+    Tensor gated_input = Tensor::silu_gate(y, z);
     Tensor gated_norm = gated_input.rmsnorm(config_.rms_norm_eps);
     Tensor normalized = gated_norm.mul(norm_weight_.data);
     Tensor result = out_proj.forward(normalized).reshape({rows, d_model});
@@ -1578,7 +2684,14 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
         training_mode_ && config_.recompute_ssd &&
         !faithful_recompute_active_ && !streaming_inference_;
     faithful_checkpoint_input_ = checkpoint_forward ? u : Tensor();
-    if (checkpoint_forward) {
+    // On a supported GPU, checkpoint only the O(B*S*d_inner*d_state) history.
+    // The projections/convolution/gating intermediates are comparatively
+    // small and are required by backward anyway. Retaining them avoids the
+    // historical full-block recompute (all GEMMs, convolution, norms and
+    // output projection) while preserving the dominant history saving.
+    const bool selective_history_checkpoint =
+        checkpoint_forward && dev == Device::GPU && scan_done && history_chunk_size == 0;
+    if (checkpoint_forward && !selective_history_checkpoint && history_chunk_size == 0) {
         pp_u_ = Tensor();
         pp_xv_ = Tensor();
         pp_Bv_ = Tensor();
@@ -1590,9 +2703,12 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
         pp_B_ = Tensor();
         pp_C_ = Tensor();
         pp_dt_ = Tensor();
+        pp_decay_terms_ = Tensor();
         pp_z_ = Tensor();
         pp_y_ssd_ = Tensor();
         pp_state_hist_ = Tensor();
+        pp_state_hist_chunk_size_ = 0;
+        pp_state_hist_state_major_ = false;
         pp_gated_input_ = Tensor();
         pp_gated_norm_ = Tensor();
         x_proj_->discard_backward_state();
@@ -1601,6 +2717,8 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
         C_proj_->discard_backward_state();
         dt_proj_->discard_backward_state();
         out_proj.discard_backward_state();
+        faithful_grouped_projection_backward_mode_ =
+            FaithfulGroupedProjectionMode::None;
     } else {
         pp_u_ = u_flat;
         pp_xv_ = xv;
@@ -1613,9 +2731,17 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
         pp_B_ = B;
         pp_C_ = C;
         pp_dt_ = dt;
+        pp_decay_terms_ =
+            training_mode_ && forward_decay_terms.size > 0
+                ? forward_decay_terms
+                : Tensor();
         pp_z_ = z;
         pp_y_ssd_ = y;
-        pp_state_hist_ = hist;
+        pp_state_hist_ =
+            selective_history_checkpoint ? Tensor() : hist;
+        pp_state_hist_state_major_ =
+            !selective_history_checkpoint && state_major_history;
+        pp_state_hist_chunk_size_ = history_chunk_size;
         pp_gated_input_ = gated_input;
         pp_gated_norm_ = gated_norm;
     }
@@ -1624,67 +2750,232 @@ Tensor Mamba2SSD::forward_faithful(const Tensor& u) {
     proper_active_ = true;
 
     if (streaming_inference_) {
-        Tensor hh = dev == Device::GPU ? hist.cpu() : hist;
-        Tensor xvh = dev == Device::GPU ? xv.cpu() : xv;
-        Tensor Bvh = dev == Device::GPU ? Bv.cpu() : Bv;
-        Tensor Cvh = dev == Device::GPU ? Cv.cpu() : Cv;
-        const size_t state_size = static_cast<size_t>(d_inner) * N;
-        pp_stream_state_.assign(
-            hh.data() + static_cast<size_t>(rows - 1) * state_size,
-            hh.data() + static_cast<size_t>(rows) * state_size);
         const int taps = std::max(K - 1, 0);
-        pp_stream_ring_.assign(static_cast<size_t>(taps) * conv_dim, 0.0f);
-        for (int s = 0; s < taps; ++s) {
-            const int source = rows - taps + s;
-            if (source < 0) continue;
-            float* dst = pp_stream_ring_.data() +
-                         static_cast<size_t>(s) * conv_dim;
-            std::copy_n(xvh.data() + static_cast<size_t>(source) * d_inner,
-                        d_inner, dst);
-            std::copy_n(Bvh.data() + static_cast<size_t>(source) * GS, GS,
-                        dst + d_inner);
-            std::copy_n(Cvh.data() + static_cast<size_t>(source) * GS, GS,
-                        dst + d_inner + GS);
+        const int state_elements = checked_int_product(
+            d_inner, N, "faithful Mamba streaming state");
+        const int ring_elements = checked_int_product(
+            taps, conv_dim, "faithful Mamba streaming ring");
+#ifdef USE_CUDA
+        if (dev == Device::GPU && batch == 1 && scan_done &&
+            mamba_gpu_step_enabled()) {
+            pp_stream_h_dev_ = Tensor::uninitialized(
+                {state_elements}, Device::GPU);
+            pp_stream_ring_dev_ = Tensor::uninitialized(
+                {std::max(ring_elements, 1)}, Device::GPU);
+            const bool prime_enqueued =
+                cuda::launch_mamba_prime_stream_carry(
+                hist.raw_data(), state_elements,
+                xv.raw_data(), d_inner,
+                Bv.raw_data(), GS,
+                Cv.raw_data(), GS,
+                pp_stream_h_dev_.raw_data(),
+                pp_stream_ring_dev_.raw_data(),
+                batch, seq, taps);
+            if (!prime_enqueued) {
+                throw std::runtime_error(
+                    "Faithful Mamba-2 GPU stream priming rejected invalid "
+                    "arguments");
+            }
+            const cudaError_t prime_status = cudaGetLastError();
+            if (prime_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string(
+                        "Faithful Mamba-2 GPU stream priming failed: ") +
+                    cudaGetErrorString(prime_status));
+            }
+            pp_stream_state_.clear();
+            pp_stream_ring_.clear();
+            pp_stream_dev_live_ = true;
+            ++stream_priming_gpu_calls_;
+        } else
+#endif
+        {
+#ifdef USE_CUDA
+            if (dev == Device::GPU) {
+                ++stream_priming_host_fallbacks_;
+                ++gpu_fast_path_fallbacks_;
+                last_fallback_reason_ =
+                    "faithful_stream_priming_host_fallback";
+                if (strict_gpu_execution()) {
+                    throw std::runtime_error(
+                        "Strict GPU faithful Mamba-2 prefill cannot prime "
+                        "incremental carry through host memory");
+                }
+            }
+#endif
+            Tensor hh =
+                dev == Device::GPU ? hist.cpu() : hist;
+            Tensor xvh =
+                dev == Device::GPU ? xv.cpu() : xv;
+            Tensor Bvh =
+                dev == Device::GPU ? Bv.cpu() : Bv;
+            Tensor Cvh =
+                dev == Device::GPU ? Cv.cpu() : Cv;
+            pp_stream_state_.assign(
+                hh.data() +
+                    static_cast<size_t>(rows - 1) * state_elements,
+                hh.data() +
+                    static_cast<size_t>(rows) * state_elements);
+            pp_stream_ring_.assign(
+                static_cast<size_t>(ring_elements), 0.0f);
+            const int batch_base = (batch - 1) * seq;
+            for (int s = 0; s < taps; ++s) {
+                const int source_time = seq - taps + s;
+                if (source_time < 0) continue;
+                const int source = batch_base + source_time;
+                float* dst = pp_stream_ring_.data() +
+                             static_cast<size_t>(s) * conv_dim;
+                std::copy_n(
+                    xvh.data() +
+                        static_cast<size_t>(source) * d_inner,
+                    d_inner, dst);
+                std::copy_n(
+                    Bvh.data() + static_cast<size_t>(source) * GS,
+                    GS, dst + d_inner);
+                std::copy_n(
+                    Cvh.data() + static_cast<size_t>(source) * GS,
+                    GS, dst + d_inner + GS);
+            }
+            pp_stream_dev_live_ = false;
         }
         pp_stream_active_ = true;
-        pp_stream_dev_live_ = false;
     }
 
     return rank_2 ? result : result.reshape({batch, seq, d_model});
 }
 
 Tensor Mamba2SSD::backward_faithful(const Tensor& grad_output) {
+    MambaStageTimer stage_timer(grad_output.get_device());
     if (config_.recompute_ssd && pp_state_hist_.size == 0) {
-        if (faithful_checkpoint_input_.size == 0) {
-            throw std::runtime_error(
-                "Mamba2 faithful checkpoint input is unavailable");
+        ++faithful_recompute_forwards_;
+        bool history_restored = false;
+#ifdef USE_CUDA
+        if (pp_xc_.get_device() == Device::GPU &&
+            pp_xc_.shape ==
+                TensorShape({checked_int_product(
+                                 pp_batch_, pp_seq_,
+                                 "Mamba2 checkpoint rows"),
+                             d_inner}) &&
+            pp_dt_.shape ==
+                TensorShape({checked_int_product(
+                                 pp_batch_, pp_seq_,
+                                 "Mamba2 checkpoint rows"),
+                             n_heads}) &&
+            pp_B_.shape ==
+                TensorShape({checked_int_product(
+                                 pp_batch_, pp_seq_,
+                                 "Mamba2 checkpoint rows"),
+                             n_groups * d_state}) &&
+            pp_C_.shape == pp_B_.shape &&
+            d_state <= cuda::mamba_nstate_max_n()) {
+            const int rows = checked_int_product(
+                pp_batch_, pp_seq_, "Mamba2 checkpoint rows");
+            const bool state_major_history =
+                cuda::faithful_state_major_history_enabled() &&
+                !streaming_inference_;
+            Tensor history =
+                state_major_history
+                    ? Tensor::uninitialized(
+                          {rows, d_state, n_heads, d_head}, Device::GPU)
+                    : Tensor::uninitialized(
+                          {rows, n_heads, d_head, d_state}, Device::GPU);
+            Tensor output_scratch =
+                Tensor::uninitialized({rows, d_inner}, Device::GPU);
+            Tensor decay_terms = pp_decay_terms_;
+            if (cuda::faithful_precomputed_decay_enabled()) {
+                const TensorShape expected_decay_shape(
+                    {rows, n_heads, cuda::kFaithfulDecayTermsWidth});
+                if (decay_terms.get_device() != Device::GPU ||
+                    decay_terms.shape != expected_decay_shape) {
+                    decay_terms = Tensor::uninitialized(
+                        expected_decay_shape.dims, Device::GPU);
+                    const bool decay_enqueued =
+                        cuda::launch_mamba2_faithful_precompute_decay(
+                            pp_dt_.raw_data(), A.data.raw_data(),
+                            decay_terms.raw_data(), pp_batch_, pp_seq_,
+                            n_heads);
+                    if (!decay_enqueued) {
+                        throw std::runtime_error(
+                            "Mamba2 checkpoint decay precompute rejected "
+                            "invalid arguments");
+                    }
+                    const cudaError_t decay_status = cudaGetLastError();
+                    if (decay_status != cudaSuccess) {
+                        throw std::runtime_error(
+                            std::string(
+                                "Mamba2 checkpoint decay precompute failed: ") +
+                            cudaGetErrorString(decay_status));
+                    }
+                    pp_decay_terms_ = decay_terms;
+                }
+            }
+            const bool launch_enqueued =
+                cuda::launch_mamba2_faithful_forward(
+                pp_xc_.raw_data(), pp_dt_.raw_data(),
+                A.data.raw_data(),
+                decay_terms.size > 0 ? decay_terms.raw_data() : nullptr,
+                pp_B_.raw_data(), pp_C_.raw_data(),
+                D.data.raw_data(), output_scratch.raw_data(),
+                history.raw_data(), pp_batch_, pp_seq_, n_heads, d_head,
+                d_state, n_groups,
+                ensure_faithful_runtime_warp_size(
+                    faithful_runtime_warp_size_),
+                state_major_history);
+            if (!launch_enqueued) {
+                throw std::runtime_error(
+                    "Mamba2 selective checkpoint history recompute rejected "
+                    "invalid arguments");
+            }
+            const cudaError_t launch_status = cudaGetLastError();
+            if (launch_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string(
+                        "Mamba2 selective checkpoint history recompute "
+                        "failed: ") +
+                    cudaGetErrorString(launch_status));
+            }
+            faithful_peak_state_history_bytes_ =
+                std::max(
+                    faithful_peak_state_history_bytes_,
+                    static_cast<size_t>(history.size) * sizeof(float));
+            pp_state_hist_ = std::move(history);
+            pp_state_hist_state_major_ = state_major_history;
+            ++gpu_fast_path_hits_;
+            ++faithful_forward_gpu_calls_;
+            ++faithful_selective_history_recomputes_;
+            history_restored = true;
         }
-        Tensor checkpoint_input = faithful_checkpoint_input_;
-        faithful_recompute_active_ = true;
-        try {
-            (void)forward_faithful(checkpoint_input);
-        } catch (...) {
+#endif
+        if (!history_restored) {
+            if (faithful_checkpoint_input_.size == 0) {
+                throw std::runtime_error(
+                    "Mamba2 faithful checkpoint input is unavailable");
+            }
+            Tensor checkpoint_input = faithful_checkpoint_input_;
+            faithful_recompute_active_ = true;
+            try {
+                (void)forward_faithful(checkpoint_input);
+            } catch (...) {
+                faithful_recompute_active_ = false;
+                throw;
+            }
             faithful_recompute_active_ = false;
-            throw;
+            ++faithful_full_block_recompute_forwards_;
         }
-        faithful_recompute_active_ = false;
     }
+    stage_timer.mark("history");
     const int batch = pp_batch_;
     const int seq = pp_seq_;
-    const int rows = batch * seq;
+    const int rows =
+        checked_int_product(batch, seq, "Mamba2 faithful backward rows");
     const int N = d_state;
     const int GS = n_groups * N;
     const int K = conv_kernel_;
     const Device dev = grad_output.get_device();
+    validate_faithful_conv_launch(rows, d_inner, GS, K);
     Tensor go = grad_output.shape.size() == 2
                     ? grad_output
                     : grad_output.reshape({rows, d_model});
-
-    auto dsilu = [&](const Tensor& pre, int width) {
-        Tensor sigmoid = pre.sigmoid();
-        Tensor one = Tensor::ones({rows, width}, dev);
-        return sigmoid.mul(one.add(pre.mul(one.sub(sigmoid))));
-    };
 
     Tensor gnormalized =
         out_proj.backward(go).reshape({rows, d_inner});
@@ -1692,30 +2983,268 @@ Tensor Mamba2SSD::backward_faithful(const Tensor& grad_output) {
     Tensor ggated_norm = gnormalized.mul(norm_weight_.data);
     Tensor ggated = pp_gated_input_.rmsnorm_backward(
         ggated_norm, pp_gated_norm_, config_.rms_norm_eps);
-    Tensor silu_z = pp_z_.mul(pp_z_.sigmoid());
-    Tensor gy = ggated.mul(silu_z);
-    Tensor gz = ggated.mul(pp_y_ssd_).mul(dsilu(pp_z_, d_inner));
+    auto [gy, gz] = Tensor::silu_gate_backward(
+        ggated, pp_y_ssd_, pp_z_);
+    stage_timer.mark("outnorm_gate");
 
-    Tensor gx({rows, d_inner}, dev);
-    Tensor gdt({rows, n_heads}, dev);
-    Tensor gA({n_heads}, dev);
-    Tensor gB({rows, GS}, dev);
-    Tensor gC({rows, GS}, dev);
-    Tensor gD({n_heads}, dev);
+    // The GPU launcher initializes every reduction destination itself and
+    // writes gX exhaustively. The CPU fallback replaces each tensor below.
+    Tensor gx = Tensor::uninitialized({rows, d_inner}, dev);
+    Tensor gdt = Tensor::uninitialized({rows, n_heads}, dev);
+    Tensor gA = Tensor::uninitialized({n_heads}, dev);
+    Tensor gB = Tensor::uninitialized({rows, GS}, dev);
+    Tensor gC = Tensor::uninitialized({rows, GS}, dev);
+    Tensor gD = Tensor::uninitialized({n_heads}, dev);
+    // Keep deterministic two-stage workspaces alive through the complete
+    // backward. The device allocator may recycle a destroyed Tensor before
+    // asynchronous reduction consumers on the default stream have finished.
+    Tensor deterministic_partial_B;
+    Tensor deterministic_partial_C;
+    Tensor deterministic_partial_dt;
+    Tensor deterministic_partial_A;
+    Tensor deterministic_partial_D;
+    Tensor deterministic_gh_history;
+    float* deterministic_chunk_carry = nullptr;
+    float* deterministic_chunk_scale = nullptr;
+    float* deterministic_chunk_lane_A = nullptr;
+    float* deterministic_chunk_lane_D = nullptr;
+    Tensor backward_decay_terms;
     bool scan_done = false;
 #ifdef USE_CUDA
-    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n() &&
-        !determinism::deterministic_reductions_enabled()) {
-        cuda::launch_mamba2_faithful_backward(
-            gy.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
-            A.data.raw_data(), pp_B_.raw_data(), pp_C_.raw_data(),
-            D.data.raw_data(), pp_state_hist_.raw_data(), gx.raw_data(),
-            gdt.raw_data(), gA.raw_data(), gB.raw_data(), gC.raw_data(),
-            gD.raw_data(), batch, seq, n_heads, d_head, N, n_groups);
-        scan_done = true;
+    if (dev == Device::GPU && N <= cuda::mamba_nstate_max_n()) {
+        const bool chunked_requested =
+            cuda::faithful_chunked_backward_enabled() &&
+            (seq > cuda::faithful_backward_chunk_size() || pp_state_hist_chunk_size_ > 0);
+        if (cuda::faithful_precomputed_decay_enabled() ||
+            chunked_requested) {
+            const TensorShape expected_decay_shape(
+                {rows, n_heads, cuda::kFaithfulDecayTermsWidth});
+            if (pp_decay_terms_.get_device() == Device::GPU &&
+                pp_decay_terms_.shape == expected_decay_shape) {
+                backward_decay_terms = pp_decay_terms_;
+            } else {
+                backward_decay_terms = Tensor::uninitialized(
+                    expected_decay_shape.dims, Device::GPU);
+                const bool decay_enqueued =
+                    cuda::launch_mamba2_faithful_precompute_decay(
+                        pp_dt_.raw_data(), A.data.raw_data(),
+                        backward_decay_terms.raw_data(), batch, seq,
+                        n_heads);
+                if (!decay_enqueued) {
+                    throw std::runtime_error(
+                        "Mamba2 backward decay precompute rejected invalid "
+                        "arguments");
+                }
+                const cudaError_t decay_status = cudaGetLastError();
+                if (decay_status != cudaSuccess) {
+                    throw std::runtime_error(
+                        std::string(
+                            "Mamba2 backward decay precompute failed: ") +
+                        cudaGetErrorString(decay_status));
+                }
+            }
+        }
+        ensure_faithful_runtime_warp_size(faithful_runtime_warp_size_);
+        const bool deterministic =
+            determinism::deterministic_reductions_enabled();
+        const bool deterministic_gpu_eligible =
+            deterministic &&
+            d_head % faithful_runtime_warp_size_ == 0;
+        if (deterministic_gpu_eligible) {
+            const int waves_per_head =
+                d_head / faithful_runtime_warp_size_;
+            const bool head_wave_geometry =
+                cuda::faithful_deterministic_head_wave_geometry_enabled(
+                    d_head, faithful_runtime_warp_size_);
+            const bool chunked =
+                chunked_requested && head_wave_geometry;
+            if (chunked &&
+                (cuda::faithful_state_parallel_backward_enabled() ||
+                 cuda::faithful_deterministic_shared_carry_enabled())) {
+                throw std::invalid_argument(
+                    "NSOS_MAMBA_CHUNKED_BACKWARD cannot be combined with "
+                    "state-parallel or shared-carry experimental paths");
+            }
+            const int partials_per_group = checked_int_product(
+                n_heads / n_groups, waves_per_head,
+                "Mamba2 deterministic partials per group");
+            const int bc_values = checked_int_product(
+                rows, GS, "Mamba2 deterministic B/C values");
+            const int bc_partials = checked_int_product(
+                bc_values, partials_per_group,
+                "Mamba2 deterministic B/C partials");
+            const int dt_values = checked_int_product(
+                rows, n_heads, "Mamba2 deterministic dt values");
+            const int dt_partials = checked_int_product(
+                dt_values, waves_per_head,
+                "Mamba2 deterministic dt partials");
+            const int ad_values = checked_int_product(
+                batch, n_heads, "Mamba2 deterministic A/D values");
+            const int ad_partials = checked_int_product(
+                ad_values, waves_per_head,
+                "Mamba2 deterministic A/D partials");
+            deterministic_partial_B =
+                Tensor::uninitialized({bc_partials}, Device::GPU);
+            deterministic_partial_C =
+                Tensor::uninitialized({bc_partials}, Device::GPU);
+            deterministic_partial_dt =
+                Tensor::uninitialized({dt_partials}, Device::GPU);
+            deterministic_partial_A =
+                Tensor::uninitialized({ad_partials}, Device::GPU);
+            deterministic_partial_D =
+                Tensor::uninitialized({ad_partials}, Device::GPU);
+            if (chunked) {
+                const int chunk_size =
+                    cuda::faithful_backward_chunk_size();
+                const int chunks =
+                    (seq + chunk_size - 1) / chunk_size;
+                const int batch_heads = checked_int_product(
+                    batch, n_heads,
+                    "Mamba2 chunked batch heads");
+                const int channel_values = checked_int_product(
+                    batch_heads, d_head,
+                    "Mamba2 chunked channel values");
+                const int channel_states = checked_int_product(
+                    channel_values, N,
+                    "Mamba2 chunked channel states");
+                const int carry_values = checked_int_product(
+                    channel_states, chunks,
+                    "Mamba2 chunked carry values");
+                const int scale_values = checked_int_product(
+                    ad_values, chunks,
+                    "Mamba2 chunked scale values");
+                const int lane_partial_chunks = checked_int_product(
+                    ad_partials, chunks,
+                    "Mamba2 chunked lane partial chunks");
+                const int lane_partial_values = checked_int_product(
+                    lane_partial_chunks, faithful_runtime_warp_size_,
+                    "Mamba2 chunked lane partial values");
+                FaithfulChunkWorkspace& workspace =
+                    faithful_chunk_workspace();
+                workspace.ensure(carry_values, scale_values,
+                                 lane_partial_values);
+                deterministic_chunk_carry = workspace.carry.raw_data();
+                deterministic_chunk_scale = workspace.scale.raw_data();
+                deterministic_chunk_lane_A = workspace.lane_a.raw_data();
+                deterministic_chunk_lane_D = workspace.lane_d.raw_data();
+            } else if (
+                cuda::faithful_state_parallel_backward_enabled() &&
+                head_wave_geometry) {
+                const int row_channels = checked_int_product(
+                    rows, d_inner,
+                    "Mamba2 state-parallel row channels");
+                const int state_values = checked_int_product(
+                    row_channels, N,
+                    "Mamba2 state-parallel history values");
+                FaithfulStateParallelWorkspace& workspace =
+                    faithful_state_parallel_workspace();
+                workspace.ensure(state_values);
+                deterministic_gh_history = workspace.gh_history;
+            }
+            const bool launch_enqueued =
+                chunked
+                    ? cuda::launch_mamba2_faithful_backward_deterministic_chunked(
+                          gy.raw_data(), pp_xc_.raw_data(),
+                          pp_dt_.raw_data(), A.data.raw_data(),
+                          backward_decay_terms.raw_data(),
+                          pp_B_.raw_data(), pp_C_.raw_data(),
+                          D.data.raw_data(), pp_state_hist_.raw_data(),
+                          gx.raw_data(), gdt.raw_data(), gA.raw_data(),
+                          gB.raw_data(), gC.raw_data(), gD.raw_data(),
+                          deterministic_partial_B.raw_data(),
+                          deterministic_partial_C.raw_data(),
+                          deterministic_partial_dt.raw_data(),
+                          deterministic_partial_A.raw_data(),
+                          deterministic_partial_D.raw_data(),
+                          deterministic_chunk_carry,
+                          deterministic_chunk_scale,
+                          deterministic_chunk_lane_A,
+                          deterministic_chunk_lane_D, batch,
+                          seq, n_heads, d_head, N, n_groups,
+                          faithful_runtime_warp_size_,
+                          pp_state_hist_state_major_, pp_state_hist_chunk_size_)
+                    : cuda::launch_mamba2_faithful_backward_deterministic(
+                gy.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
+                A.data.raw_data(),
+                backward_decay_terms.size > 0
+                    ? backward_decay_terms.raw_data()
+                    : nullptr,
+                pp_B_.raw_data(), pp_C_.raw_data(),
+                D.data.raw_data(), pp_state_hist_.raw_data(), gx.raw_data(),
+                gdt.raw_data(), gA.raw_data(), gB.raw_data(), gC.raw_data(),
+                gD.raw_data(), deterministic_partial_B.raw_data(),
+                deterministic_partial_C.raw_data(),
+                deterministic_partial_dt.raw_data(),
+                deterministic_partial_A.raw_data(),
+                deterministic_partial_D.raw_data(),
+                deterministic_gh_history.size > 0
+                    ? deterministic_gh_history.raw_data()
+                    : nullptr,
+                batch, seq, n_heads,
+                d_head, N, n_groups, faithful_runtime_warp_size_,
+                pp_state_hist_state_major_);
+            if (!launch_enqueued) {
+                throw std::runtime_error(
+                    "Mamba2 deterministic faithful backward rejected "
+                    "invalid arguments");
+            }
+            ++faithful_deterministic_backward_calls_;
+            scan_done = true;
+        } else if (!deterministic) {
+            const bool launch_enqueued =
+                cuda::launch_mamba2_faithful_backward(
+                gy.raw_data(), pp_xc_.raw_data(), pp_dt_.raw_data(),
+                A.data.raw_data(),
+                backward_decay_terms.size > 0
+                    ? backward_decay_terms.raw_data()
+                    : nullptr,
+                pp_B_.raw_data(), pp_C_.raw_data(),
+                D.data.raw_data(), pp_state_hist_.raw_data(), gx.raw_data(),
+                gdt.raw_data(), gA.raw_data(), gB.raw_data(), gC.raw_data(),
+                gD.raw_data(), batch, seq, n_heads, d_head, N, n_groups,
+                pp_state_hist_state_major_);
+
+            if (!launch_enqueued) {
+                throw std::runtime_error(
+                    "Mamba2 faithful backward rejected invalid arguments or "
+                    "failed to enqueue device initialization");
+            }
+            if (cuda::faithful_warp_aggregation_enabled() &&
+                d_head % faithful_runtime_warp_size_ == 0) {
+                ++faithful_warp_aggregated_backward_calls_;
+            } else {
+                ++faithful_scalar_atomic_backward_calls_;
+            }
+            scan_done = true;
+        }
+        if (scan_done) {
+            const cudaError_t launch_status = cudaGetLastError();
+            if (launch_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string(
+                        "Mamba2 faithful backward kernel failed: ") +
+                    cudaGetErrorString(launch_status));
+            }
+            ++gpu_fast_path_hits_;
+            ++faithful_backward_gpu_calls_;
+        }
     }
 #endif
     if (!scan_done) {
+#ifdef USE_CUDA
+        if (dev == Device::GPU) {
+            ++gpu_fast_path_fallbacks_;
+            ++faithful_backward_host_fallbacks_;
+            last_fallback_reason_ =
+                "faithful_backward_host_fallback";
+        }
+        if (dev == Device::GPU && strict_gpu_execution()) {
+            throw std::runtime_error(
+                "Strict GPU Mamba2 faithful backward requires the "
+                "device reduction path; deterministic mode requires a "
+                "warp-aligned head width");
+        }
+#endif
         auto host = [](const Tensor& value) {
             return value.get_device() == Device::GPU ? value.cpu() : value;
         };
@@ -1774,7 +3303,10 @@ Tensor Mamba2SSD::backward_faithful(const Tensor& grad_output) {
                             const size_t si =
                                 static_cast<size_t>(chan) * N + n;
                             const size_t hi =
-                                static_cast<size_t>(row) * state_size + si;
+                                static_cast<size_t>(row) * state_size +
+                                (pp_state_hist_state_major_
+                                     ? static_cast<size_t>(n) * d_inner + chan
+                                     : si);
                             const size_t bi =
                                 static_cast<size_t>(row) * GS + group * N + n;
                             const float hprev =
@@ -1782,7 +3314,11 @@ Tensor Mamba2SSD::backward_faithful(const Tensor& grad_output) {
                                     ? 0.0f
                                     : hp[static_cast<size_t>(row - 1) *
                                              state_size +
-                                         si];
+                                         (pp_state_hist_state_major_
+                                              ? static_cast<size_t>(n) *
+                                                        d_inner +
+                                                    chan
+                                              : si)];
                             gCp[bi] += go_local * hp[hi];
                             const float gh =
                                 go_local * cp[bi] + carry[si];
@@ -1809,52 +3345,84 @@ Tensor Mamba2SSD::backward_faithful(const Tensor& grad_output) {
     }
     A.add_grad(gA);
     D.add_grad(gD);
+    stage_timer.mark("scan");
 
-    Tensor gxpre = gx.mul(dsilu(pp_conv_pre_, d_inner));
-    Tensor gBpre = gB.mul(dsilu(pp_B_conv_pre_, GS));
-    Tensor gCpre = gC.mul(dsilu(pp_C_conv_pre_, GS));
-    // The three bias gradients have different widths; build the concatenated
-    // vector explicitly instead of relying on broadcasting.
-    Tensor gbias({conv_dim}, Device::CPU);
-    Tensor gxbh = gxpre.sum(0);
-    Tensor gBbh = gBpre.sum(0);
-    Tensor gCbh = gCpre.sum(0);
+    Tensor gxpre = Tensor::silu_backward(gx, pp_conv_pre_);
+    Tensor gBpre = Tensor::silu_backward(gB, pp_B_conv_pre_);
+    Tensor gCpre = Tensor::silu_backward(gC, pp_C_conv_pre_);
+    Tensor gbias = Tensor::uninitialized({conv_dim}, dev);
     if (dev == Device::GPU) {
-        gxbh = gxbh.cpu();
-        gBbh = gBbh.cpu();
-        gCbh = gCbh.cpu();
+#ifdef USE_CUDA
+        const bool bias_enqueued =
+            cuda::launch_mamba2_faithful_bias_backward(
+            gxpre.raw_data(), gBpre.raw_data(), gCpre.raw_data(),
+            gbias.raw_data(), rows, d_inner, GS);
+        if (!bias_enqueued) {
+            throw std::runtime_error(
+                "Mamba2 faithful bias backward rejected invalid arguments");
+        }
+        const cudaError_t bias_status = cudaGetLastError();
+        if (bias_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string(
+                    "Mamba2 faithful bias backward kernel failed: ") +
+                cudaGetErrorString(bias_status));
+        }
+#else
+        throw std::logic_error(
+            "GPU tensor reached a build without a GPU backend");
+#endif
+    } else {
+        Tensor gxbh = gxpre.sum(0);
+        Tensor gBbh = gBpre.sum(0);
+        Tensor gCbh = gCpre.sum(0);
+        std::copy_n(gxbh.data(), d_inner, gbias.data());
+        std::copy_n(gBbh.data(), GS, gbias.data() + d_inner);
+        std::copy_n(gCbh.data(), GS, gbias.data() + d_inner + GS);
     }
-    std::copy_n(gxbh.data(), d_inner, gbias.data());
-    std::copy_n(gBbh.data(), GS, gbias.data() + d_inner);
-    std::copy_n(gCbh.data(), GS, gbias.data() + d_inner + GS);
-    conv_bias_.add_grad(dev == Device::GPU ? gbias.to(Device::GPU) : gbias);
+    conv_bias_.add_grad(gbias);
+    stage_timer.mark("post_scan");
 
-    Tensor gxv = Tensor::zeros({rows, d_inner}, dev);
-    Tensor gBv = Tensor::zeros({rows, GS}, dev);
-    Tensor gCv = Tensor::zeros({rows, GS}, dev);
-    Tensor gcw = Tensor::zeros({conv_dim, K}, dev);
+    // Each launcher clears its complete grad-input/grad-weight slice before
+    // accumulating into it, so pre-zeroing these four device buffers would
+    // duplicate bandwidth on every faithful backward pass.
+    Tensor gxv = Tensor::uninitialized({rows, d_inner}, dev);
+    Tensor gBv = Tensor::uninitialized({rows, GS}, dev);
+    Tensor gCv = Tensor::uninitialized({rows, GS}, dev);
+    Tensor gcw = Tensor::uninitialized({conv_dim, K}, dev);
     bool conv_done = false;
 #ifdef USE_CUDA
+    const bool deterministic_conv_gpu_eligible =
+        determinism::deterministic_reductions_enabled() &&
+        K <= cuda::kFaithfulReducedConvMaxKernel &&
+        cuda::faithful_reduced_conv_enabled();
     if (dev == Device::GPU &&
-        !determinism::deterministic_reductions_enabled()) {
-        cuda::launch_conv1d_causal_backward(
-            gxpre.raw_data(), pp_xv_.raw_data(),
-            conv_weight_.data.raw_data(), gxv.raw_data(), gcw.raw_data(),
-            batch, seq, d_inner, K);
-        cuda::launch_conv1d_causal_backward(
-            gBpre.raw_data(), pp_Bv_.raw_data(),
-            conv_weight_.data.raw_data() +
-                static_cast<size_t>(d_inner) * K,
-            gBv.raw_data(),
-            gcw.raw_data() + static_cast<size_t>(d_inner) * K, batch, seq,
-            GS, K);
-        cuda::launch_conv1d_causal_backward(
-            gCpre.raw_data(), pp_Cv_.raw_data(),
-            conv_weight_.data.raw_data() +
-                static_cast<size_t>(d_inner + GS) * K,
-            gCv.raw_data(),
-            gcw.raw_data() + static_cast<size_t>(d_inner + GS) * K, batch,
-            seq, GS, K);
+        (!determinism::deterministic_reductions_enabled() ||
+         deterministic_conv_gpu_eligible)) {
+        const bool conv_enqueued =
+            cuda::launch_mamba2_faithful_conv_backward(
+            gxpre.raw_data(), gBpre.raw_data(), gCpre.raw_data(),
+            pp_xv_.raw_data(), pp_Bv_.raw_data(), pp_Cv_.raw_data(),
+            conv_weight_.data.raw_data(), gxv.raw_data(), gBv.raw_data(),
+            gCv.raw_data(), gcw.raw_data(), batch, seq, d_inner, GS, K);
+        if (!conv_enqueued) {
+            throw std::runtime_error(
+                "Mamba2 faithful conv backward rejected invalid arguments "
+                "or failed to enqueue device initialization");
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string(
+                    "Mamba2 faithful conv backward kernel failed: ") +
+                cudaGetErrorString(launch_status));
+        }
+        if (K <= cuda::kFaithfulReducedConvMaxKernel &&
+            cuda::faithful_reduced_conv_enabled()) {
+            ++faithful_reduced_conv_backward_calls_;
+        } else {
+            ++faithful_generic_atomic_conv_backward_calls_;
+        }
         conv_done = true;
     }
 #endif
@@ -1892,14 +3460,59 @@ Tensor Mamba2SSD::backward_faithful(const Tensor& grad_output) {
         gcw = dev == Device::GPU ? gcwh.to(Device::GPU) : gcwh;
     }
     conv_weight_.add_grad(gcw);
+    stage_timer.mark("conv");
 
-    Tensor gu = x_proj_->backward(gxv).reshape({rows, d_model});
-    gu = gu.add(B_proj_->backward(gBv).reshape({rows, d_model}));
-    gu = gu.add(C_proj_->backward(gCv).reshape({rows, d_model}));
-    gu = gu.add(dt_proj_->backward(gdt).reshape({rows, d_model}));
-    gu = gu.add(z_proj_->backward(gz).reshape({rows, d_model}));
+    Tensor gu;
+    if (faithful_grouped_projection_backward_mode_ !=
+        FaithfulGroupedProjectionMode::None) {
+        gu = backward_faithful_grouped_projections(
+            gxv, gz, gBv, gCv, gdt);
+    } else {
+        gu = x_proj_->backward(gxv).reshape({rows, d_model});
+        gu = gu.add(B_proj_->backward(gBv).reshape({rows, d_model}));
+        gu = gu.add(C_proj_->backward(gCv).reshape({rows, d_model}));
+        gu = gu.add(dt_proj_->backward(gdt).reshape({rows, d_model}));
+        gu = gu.add(z_proj_->backward(gz).reshape({rows, d_model}));
+    }
+    stage_timer.mark("projections");
     const bool rank_2 = grad_output.shape.size() == 2;
-    return rank_2 ? gu : gu.reshape({batch, seq, d_model});
+    Tensor input_gradient =
+        rank_2 ? gu : gu.reshape({batch, seq, d_model});
+
+    // A forward state is a one-shot backward ticket. Releasing it here keeps
+    // checkpointed history residency to one layer during reverse traversal
+    // instead of accumulating every recomputed history until the next step.
+    faithful_checkpoint_input_ = Tensor();
+    pp_u_ = Tensor();
+    pp_xv_ = Tensor();
+    pp_Bv_ = Tensor();
+    pp_Cv_ = Tensor();
+    pp_conv_pre_ = Tensor();
+    pp_B_conv_pre_ = Tensor();
+    pp_C_conv_pre_ = Tensor();
+    pp_xc_ = Tensor();
+    pp_B_ = Tensor();
+    pp_C_ = Tensor();
+    pp_dt_ = Tensor();
+    pp_decay_terms_ = Tensor();
+    pp_z_ = Tensor();
+    pp_y_ssd_ = Tensor();
+    pp_state_hist_ = Tensor();
+    pp_state_hist_chunk_size_ = 0;
+    pp_state_hist_state_major_ = false;
+    pp_gated_input_ = Tensor();
+    pp_gated_norm_ = Tensor();
+    x_proj_->discard_backward_state();
+    z_proj_->discard_backward_state();
+    B_proj_->discard_backward_state();
+    C_proj_->discard_backward_state();
+    dt_proj_->discard_backward_state();
+    out_proj.discard_backward_state();
+    faithful_grouped_projection_backward_mode_ =
+        FaithfulGroupedProjectionMode::None;
+    proper_active_ = false;
+    stage_timer.mark("release");
+    return input_gradient;
 }
 
 Tensor Mamba2SSD::apply_gating(const Tensor& y_ssd, const Tensor& x,
@@ -1975,7 +3588,7 @@ Tensor Mamba2SSD::proper_stream_conv_(const Tensor& xv_host) {
     std::memcpy(conv_pre.data(),
                 conv_full.data() + static_cast<size_t>(K - 1) * dim,
                 static_cast<size_t>(dim) * sizeof(float));
-    Tensor xc = conv_pre.mul(conv_pre.sigmoid());
+    Tensor xc = conv_pre.silu();
     // Advance the window: drop the oldest tap, append the current x.
     if (K - 1 > 0) {
         if (!have_ring) {
@@ -2014,42 +3627,64 @@ Tensor Mamba2SSD::forward_proper_step(const Tensor& u) {
     Tensor dt = dt_proj_->forward(u_flat).reshape({R, dim});
 
 #ifdef USE_CUDA
-    // Fully on-device step (opt-in) — single sequence only.  Keeps the SSD state
-    // h + conv ring resident on the GPU across tokens; one fused kernel does
-    // conv+recurrence+gate.  Batched (R>1) decode uses the host loop below.
-    if (R == 1 && dev == Device::GPU && mamba_gpu_step_enabled()) {
+    // Device-resident state for every batch row; dispatch the fused recurrence
+    // once per row without downloading or restoring state between tokens.
+    if (R > 0 && dev == Device::GPU && mamba_gpu_step_enabled()) {
+        if (pp_stream_dev_live_ &&
+            (pp_stream_h_dev_.size != checked_int_product(R, dim, "proper batch state") ||
+             pp_stream_ring_dev_.size != checked_int_product(R, std::max(taps * dim, 1), "proper batch ring"))) {
+            throw std::invalid_argument("Mamba proper device state does not match the decode batch");
+        }
         if (!pp_stream_dev_live_) {
-            Tensor h0(std::vector<int>{dim}, Device::CPU);
-            std::memset(h0.data(), 0, static_cast<size_t>(dim) * sizeof(float));
-            if (static_cast<int>(pp_stream_state_.size()) == dim) {
+            const int state_size = checked_int_product(R, dim, "proper batch state");
+            Tensor h0(std::vector<int>{state_size}, Device::CPU);
+            if (static_cast<int>(pp_stream_state_.size()) == state_size) {
                 std::memcpy(h0.data(), pp_stream_state_.data(),
-                            static_cast<size_t>(dim) * sizeof(float));
+                            static_cast<size_t>(state_size) * sizeof(float));
             }
             pp_stream_h_dev_ = h0.to(Device::GPU);
-            const int ringlen = std::max(taps * dim, 1);
+            const int ringlen = checked_int_product(R, std::max(taps * dim, 1), "proper batch ring");
             Tensor r0(std::vector<int>{ringlen}, Device::CPU);
             std::memset(r0.data(), 0,
                         static_cast<size_t>(ringlen) * sizeof(float));
             if (taps > 0 &&
-                static_cast<int>(pp_stream_ring_.size()) == taps * dim) {
+                static_cast<int>(pp_stream_ring_.size()) == R * taps * dim) {
                 std::memcpy(r0.data(), pp_stream_ring_.data(),
-                            static_cast<size_t>(taps) * dim * sizeof(float));
+                            static_cast<size_t>(R) * taps * dim * sizeof(float));
             }
             pp_stream_ring_dev_ = r0.to(Device::GPU);
             pp_stream_dev_live_ = true;
         }
-        Tensor gated(std::vector<int>{1, dim}, Device::GPU);
-        cuda::launch_mamba_proper_step(
-            xv.raw_data(), z.raw_data(), Bt.raw_data(), Ct.raw_data(),
-            dt.raw_data(), A.data.raw_data(), conv_weight_.data.raw_data(),
-            pp_stream_ring_dev_.raw_data(), pp_stream_h_dev_.raw_data(),
-            gated.raw_data(), dim, K);
-        Tensor projected = out_proj.forward(gated).reshape({1, dim});
+        Tensor gated =
+            Tensor::uninitialized(std::vector<int>{R, dim}, Device::GPU);
+        for (int row = 0; row < R; ++row) {
+            cuda::launch_mamba_proper_step(
+                xv.raw_data() + row * dim, z.raw_data() + row * dim,
+                Bt.raw_data() + row * dim, Ct.raw_data() + row * dim,
+                dt.raw_data() + row * dim, A.data.raw_data(), conv_weight_.data.raw_data(),
+                pp_stream_ring_dev_.raw_data() + row * std::max(taps * dim, 1),
+                pp_stream_h_dev_.raw_data() + row * dim,
+                gated.raw_data() + row * dim, dim, K);
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Mamba proper streaming kernel failed: ") +
+                cudaGetErrorString(launch_status));
+        }
+        Tensor projected = out_proj.forward(gated).reshape({R, dim});
         Tensor skip = u_flat.mul(D.data);
         Tensor result = projected.add(skip);
-        return u.shape.size() == 2 ? result : result.reshape({1, 1, dim});
+        return u.shape.size() == 2 ? result : result.reshape({R, 1, dim});
     }
 #endif
+
+    if (dev == Device::GPU && strict_gpu_execution()) {
+        throw std::runtime_error(
+            "Strict GPU Mamba proper streaming step has no eligible "
+            "device path; NSOS_MAMBA_GPU_STEP=0 cannot "
+            "fall back to host execution");
+    }
 
     // Host step (default): pull projections to host for the scalar recurrence.
     Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
@@ -2074,7 +3709,8 @@ Tensor Mamba2SSD::forward_proper_step(const Tensor& u) {
     const float* dtp = dt_h.data();
     const float* ap = A_h.data();
     const float* cwp = cw_h.data();
-    Tensor y_ssd(std::vector<int>{R, dim}, Device::CPU);
+    Tensor y_ssd =
+        Tensor::uninitialized(std::vector<int>{R, dim}, Device::CPU);
     float* yp = y_ssd.data();
     for (int r = 0; r < R; ++r) {
         const size_t base = static_cast<size_t>(r) * dim;
@@ -2122,7 +3758,7 @@ Tensor Mamba2SSD::forward_proper_step(const Tensor& u) {
 
     // Gate on host (parity), then project + skip on the input device.
     Tensor z_h = dev == Device::GPU ? z.cpu() : z;
-    Tensor gated_h = y_ssd.mul(z_h.mul(z_h.sigmoid()));
+    Tensor gated_h = y_ssd.mul(z_h.silu());
     Tensor gated = dev == Device::GPU ? gated_h.to(Device::GPU) : gated_h;
     Tensor projected = out_proj.forward(gated).reshape({R, dim});
     Tensor skip = u_flat.mul(D.data);
@@ -2153,48 +3789,71 @@ Tensor Mamba2SSD::forward_proper_nstate_step(const Tensor& u) {
 
 #ifdef USE_CUDA
     // Fully on-device N-state step (GPU-first default; NSOS_MAMBA_GPU_STEP=0
-    // opts out) — single sequence.  The H×P×N state + conv ring stay resident
+    // opts out) — all batch rows. The H×P×N state + conv ring stay resident
     // on the GPU across tokens; one fused kernel does conv+N-state
     // recurrence+readout+gate.  Mirrors the host loop below 1:1
     // (test_gpu_parity_mamba_nstate_stream) and is CUDA-graph capturable.
-    if (R == 1 && dev == Device::GPU && mamba_gpu_step_enabled()) {
+    if (R > 0 && dev == Device::GPU && mamba_gpu_step_enabled()) {
         const size_t HPN_sz = static_cast<size_t>(H) * P * N;  // == dim * N
-        const int HPN_i = static_cast<int>(HPN_sz);
+        const int HPN_i = checked_int_product(R, static_cast<int>(HPN_sz), "nstate batch state");
+        if (pp_stream_dev_live_ &&
+            (pp_stream_h_dev_.size != HPN_i ||
+             pp_stream_ring_dev_.size != checked_int_product(R, std::max(taps * dim, 1), "nstate batch ring"))) {
+            throw std::invalid_argument("Mamba N-state device state does not match the decode batch");
+        }
         if (!pp_stream_dev_live_) {
             Tensor h0(std::vector<int>{HPN_i}, Device::CPU);
             std::memset(h0.data(), 0,
                         static_cast<size_t>(HPN_i) * sizeof(float));
-            if (pp_stream_state_.size() == HPN_sz) {
+            if (pp_stream_state_.size() == static_cast<size_t>(HPN_i)) {
                 std::memcpy(h0.data(), pp_stream_state_.data(),
-                            HPN_sz * sizeof(float));
+                            static_cast<size_t>(HPN_i) * sizeof(float));
             }
             pp_stream_h_dev_ = h0.to(Device::GPU);
-            const int ringlen = std::max(taps * dim, 1);
+            const int ringlen = checked_int_product(R, std::max(taps * dim, 1), "nstate batch ring");
             Tensor r0(std::vector<int>{ringlen}, Device::CPU);
             std::memset(r0.data(), 0,
                         static_cast<size_t>(ringlen) * sizeof(float));
             if (taps > 0 &&
-                static_cast<int>(pp_stream_ring_.size()) == taps * dim) {
+                static_cast<int>(pp_stream_ring_.size()) == R * taps * dim) {
                 std::memcpy(r0.data(), pp_stream_ring_.data(),
-                            static_cast<size_t>(taps) * dim * sizeof(float));
+                            static_cast<size_t>(R) * taps * dim * sizeof(float));
             }
             pp_stream_ring_dev_ = r0.to(Device::GPU);
             pp_stream_dev_live_ = true;
         }
-        Tensor gated(std::vector<int>{1, dim}, Device::GPU);
-        cuda::launch_mamba_nstate_step(
-            xv.raw_data(), z.raw_data(), Bt.raw_data(), Ct.raw_data(),
-            dt.raw_data(), A.data.raw_data(), conv_weight_.data.raw_data(),
-            pp_stream_ring_dev_.raw_data(), pp_stream_h_dev_.raw_data(),
-            gated.raw_data(), dim, K, P, N);
-        Tensor projected = out_proj.forward(gated).reshape({1, dim});
+        Tensor gated =
+            Tensor::uninitialized(std::vector<int>{R, dim}, Device::GPU);
+        for (int row = 0; row < R; ++row) {
+            cuda::launch_mamba_nstate_step(
+                xv.raw_data() + row * dim, z.raw_data() + row * dim,
+                Bt.raw_data() + row * H * N, Ct.raw_data() + row * H * N,
+                dt.raw_data() + row * H, A.data.raw_data(), conv_weight_.data.raw_data(),
+                pp_stream_ring_dev_.raw_data() + row * std::max(taps * dim, 1),
+                pp_stream_h_dev_.raw_data() + row * HPN_sz,
+                gated.raw_data() + row * dim, dim, K, P, N);
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Mamba N-state streaming kernel failed: ") +
+                cudaGetErrorString(launch_status));
+        }
+        Tensor projected = out_proj.forward(gated).reshape({R, dim});
         Tensor skip = u_flat.mul(D.data);
         Tensor result = projected.add(skip);
-        return rank3 ? result.reshape({1, 1, dim})
+        return rank3 ? result.reshape({R, 1, dim})
                      : (u.shape.size() == 2 ? result
                                             : result.reshape({1, 1, dim}));
     }
 #endif
+
+    if (dev == Device::GPU && strict_gpu_execution()) {
+        throw std::runtime_error(
+            "Strict GPU Mamba N-state streaming step has no eligible "
+            "device path; NSOS_MAMBA_GPU_STEP=0 cannot "
+            "fall back to host execution");
+    }
 
     Tensor xv_h = dev == Device::GPU ? xv.cpu() : xv;
     Tensor Bt_h = dev == Device::GPU ? Bt.cpu() : Bt;
@@ -2219,7 +3878,8 @@ Tensor Mamba2SSD::forward_proper_nstate_step(const Tensor& u) {
     const float* dtp = dt_h.data();
     const float* ap = A_h.data();   // per-head A_log [H], shared across rows
     const float* cwp = cw_h.data(); // conv weight [dim,K], shared across rows
-    Tensor y_ssd(std::vector<int>{R, dim}, Device::CPU);
+    Tensor y_ssd =
+        Tensor::uninitialized(std::vector<int>{R, dim}, Device::CPU);
     float* yp = y_ssd.data();
     std::vector<float> xc(static_cast<size_t>(dim), 0.0f);
     for (int r = 0; r < R; ++r) {
@@ -2275,7 +3935,7 @@ Tensor Mamba2SSD::forward_proper_nstate_step(const Tensor& u) {
     }
 
     Tensor z_h = dev == Device::GPU ? z.cpu() : z;
-    Tensor gated_h = y_ssd.mul(z_h.mul(z_h.sigmoid()));
+    Tensor gated_h = y_ssd.mul(z_h.silu());
     Tensor gated = dev == Device::GPU ? gated_h.to(Device::GPU) : gated_h;
     Tensor projected = out_proj.forward(gated).reshape({R, dim});
     Tensor skip = u_flat.mul(D.data);
@@ -2293,17 +3953,22 @@ Tensor Mamba2SSD::forward_faithful_step(const Tensor& u) {
     const int taps = std::max(K - 1, 0);
     const Device dev = u.get_device();
     Tensor u_flat = u.reshape({R, d_model});
-    Tensor xv = x_proj_->forward(u_flat).reshape({R, d_inner});
-    Tensor z = z_proj_->forward(u_flat).reshape({R, d_inner});
-    Tensor Bv = B_proj_->forward(u_flat).reshape({R, GS});
-    Tensor Cv = C_proj_->forward(u_flat).reshape({R, GS});
-    Tensor dt = dt_proj_->forward(u_flat).reshape({R, n_heads});
+    auto grouped = !training_mode_ && R == 1
+        ? decode_projections_.forward(u_flat, {x_proj_.get(), z_proj_.get(), B_proj_.get(), C_proj_.get(), dt_proj_.get()})
+        : std::vector<Tensor>{};
+    Tensor xv = (grouped.empty() ? x_proj_->forward(u_flat) : grouped[0]).reshape({R, d_inner});
+    Tensor z = (grouped.empty() ? z_proj_->forward(u_flat) : grouped[1]).reshape({R, d_inner});
+    Tensor Bv = (grouped.empty() ? B_proj_->forward(u_flat) : grouped[2]).reshape({R, GS});
+    Tensor Cv = (grouped.empty() ? C_proj_->forward(u_flat) : grouped[3]).reshape({R, GS});
+    Tensor dt = (grouped.empty() ? dt_proj_->forward(u_flat) : grouped[4]).reshape({R, n_heads});
 
 #ifdef USE_CUDA
-    if (R == 1 && dev == Device::GPU && mamba_gpu_step_enabled() &&
+    if (R > 0 && dev == Device::GPU && mamba_gpu_step_enabled() &&
         N <= cuda::mamba_nstate_max_n()) {
-        const int state_size = d_inner * N;
-        const int ring_size = std::max(taps * conv_dim, 1);
+        const int row_state_size = checked_int_product(d_inner, N, "faithful decode row state");
+        const int row_ring_size = std::max(taps * conv_dim, 1);
+        const int state_size = checked_int_product(R, row_state_size, "faithful decode batch state");
+        const int ring_size = checked_int_product(R, row_ring_size, "faithful decode batch ring");
         if (!pp_stream_dev_live_ ||
             pp_stream_h_dev_.size != state_size ||
             pp_stream_ring_dev_.size != ring_size) {
@@ -2315,7 +3980,7 @@ Tensor Mamba2SSD::forward_faithful_step(const Tensor& u) {
             Tensor ring({ring_size}, Device::CPU);
             if (taps > 0 &&
                 static_cast<int>(pp_stream_ring_.size()) ==
-                    taps * conv_dim) {
+                    R * taps * conv_dim) {
                 std::copy(pp_stream_ring_.begin(), pp_stream_ring_.end(),
                           ring.data());
             }
@@ -2323,23 +3988,52 @@ Tensor Mamba2SSD::forward_faithful_step(const Tensor& u) {
             pp_stream_ring_dev_ = ring.to(Device::GPU);
             pp_stream_dev_live_ = true;
         }
-        Tensor xBC({conv_dim}, Device::GPU);
-        Tensor y({1, d_inner}, Device::GPU);
+        Tensor xBC =
+            Tensor::uninitialized({R, conv_dim}, Device::GPU);
+        Tensor y =
+            Tensor::uninitialized({R, d_inner}, Device::GPU);
         cuda::launch_mamba2_faithful_conv_step(
             xv.raw_data(), Bv.raw_data(), Cv.raw_data(),
             conv_weight_.data.raw_data(), conv_bias_.data.raw_data(),
-            pp_stream_ring_dev_.raw_data(), xBC.raw_data(), d_inner, GS, K);
+            pp_stream_ring_dev_.raw_data(), xBC.raw_data(), d_inner, GS, K, R);
         cuda::launch_mamba2_faithful_step(
-            xBC.raw_data(), dt.raw_data(), A.data.raw_data(),
-            D.data.raw_data(), pp_stream_h_dev_.raw_data(), y.raw_data(),
-            n_heads, d_head, N, n_groups);
-        Tensor gated = y.mul(z.mul(z.sigmoid()));
-        Tensor normalized =
-            gated.rmsnorm(config_.rms_norm_eps).mul(norm_weight_.data);
-        Tensor result = out_proj.forward(normalized).reshape({1, d_model});
-        return rank3 ? result.reshape({1, 1, d_model}) : result;
+            xBC.raw_data(), dt.raw_data(), A.data.raw_data(), D.data.raw_data(),
+            pp_stream_h_dev_.raw_data(), y.raw_data(), n_heads, d_head, N, n_groups, R);
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Faithful Mamba-2 streaming kernels failed: ") +
+                cudaGetErrorString(launch_status));
+        }
+        Tensor normalized;
+        const char* fused = std::getenv("NSOS_GPU_MAMBA_FUSED_EPILOGUE");
+        if (fused && fused[0] == '0') {
+            normalized = y.mul(z.silu()).rmsnorm(config_.rms_norm_eps).mul(norm_weight_.data);
+        } else {
+            normalized = Tensor::uninitialized({R, d_inner}, Device::GPU);
+            cuda::launch_mamba_gated_rmsnorm(y.raw_data(), z.raw_data(), norm_weight_.data.raw_data(),
+                normalized.raw_data(), R, d_inner, config_.rms_norm_eps);
+            gpu::record_dispatch(gpu::DispatchPath::MambaEpilogue);
+        }
+        Tensor result = out_proj.forward(normalized).reshape({R, d_model});
+        ++gpu_fast_path_hits_;
+        ++faithful_streaming_gpu_calls_;
+        return rank3 ? result.reshape({R, 1, d_model}) : result;
     }
 #endif
+
+    if (dev == Device::GPU) {
+        ++gpu_fast_path_fallbacks_;
+        ++faithful_streaming_host_fallbacks_;
+        last_fallback_reason_ =
+            "faithful_streaming_host_fallback";
+    }
+    if (dev == Device::GPU && strict_gpu_execution()) {
+        throw std::runtime_error(
+            "Strict GPU faithful Mamba-2 streaming step has no eligible "
+            "device path; unsupported state width and "
+            "NSOS_MAMBA_GPU_STEP=0 cannot fall back to host execution");
+    }
 
     auto host = [](const Tensor& value) {
         return value.get_device() == Device::GPU ? value.cpu() : value;
@@ -2362,7 +4056,8 @@ Tensor Mamba2SSD::forward_faithful_step(const Tensor& u) {
         pp_stream_ring_.assign(
             static_cast<size_t>(R) * taps * conv_dim, 0.0f);
     }
-    Tensor yh({R, d_inner}, Device::CPU);
+    Tensor yh =
+        Tensor::uninitialized({R, d_inner}, Device::CPU);
     std::vector<float> xBC(static_cast<size_t>(conv_dim), 0.0f);
     for (int r = 0; r < R; ++r) {
         float* state =
@@ -2423,7 +4118,7 @@ Tensor Mamba2SSD::forward_faithful_step(const Tensor& u) {
         }
     }
     Tensor y = dev == Device::GPU ? yh.to(Device::GPU) : yh;
-    Tensor gated = y.mul(z.mul(z.sigmoid()));
+    Tensor gated = y.mul(z.silu());
     Tensor normalized =
         gated.rmsnorm(config_.rms_norm_eps).mul(norm_weight_.data);
     Tensor result = out_proj.forward(normalized).reshape({R, d_model});
@@ -2497,7 +4192,8 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
         Tensor selective_b = x_proj.sigmoid();
         Tensor selective_c = gate.sigmoid();
         Tensor x_scaled = x_proj.mul(selective_b);
-        Tensor y_ssd(state_shape, input.get_device());
+        Tensor y_ssd =
+            Tensor::uninitialized(state_shape, input.get_device());
 
 #ifdef USE_CUDA
         if (can_use_gpu_mamba_single_token(x_scaled, delta, A.data, *streaming_state_, y_ssd)) {
@@ -2513,6 +4209,13 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
                 y_ssd.raw_data(),
                 batch,
                 d_model);
+            const cudaError_t launch_status = cudaGetLastError();
+            if (launch_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string(
+                        "Mamba single-token update kernel failed: ") +
+                    cudaGetErrorString(launch_status));
+            }
             y_ssd = y_ssd.mul(selective_c.reshape(state_shape));
         } else
 #endif
@@ -2520,6 +4223,12 @@ Tensor Mamba2SSD::forward(const Tensor& u, Context* ctx) {
             ++gpu_fast_path_fallbacks_;
 #ifdef USE_CUDA
             last_fallback_reason_ = "selective_bc_cpu_fallback";
+            if (input.get_device() == Device::GPU &&
+                strict_gpu_execution()) {
+                throw std::runtime_error(
+                    "Strict GPU Mamba single-token execution has no "
+                    "eligible device kernel");
+            }
 #else
             last_fallback_reason_ = "cuda_unavailable";
 #endif
@@ -2653,6 +4362,12 @@ void Mamba2SSD::reset() {
     saved_C_ = Tensor();
     saved_ssd_ = Tensor();
     saved_state_history_ = Tensor();
+    // A failed/cancelled faithful training attempt reaches reset() through the
+    // Trainer rollback guard before backward can consume this recompute input.
+    // Releasing it here prevents exception paths from retaining a full input
+    // activation until the next successful forward overwrites the handle.
+    faithful_checkpoint_input_ = Tensor();
+    faithful_recompute_active_ = false;
     streaming_state_.reset();
     // Proper-path forward caches.
     proper_active_ = false;
@@ -2668,11 +4383,16 @@ void Mamba2SSD::reset() {
     pp_B_ = Tensor();
     pp_C_ = Tensor();
     pp_dt_ = Tensor();
+    pp_decay_terms_ = Tensor();
     pp_h_hist_ = Tensor();
     pp_y_ssd_ = Tensor();
     pp_gated_input_ = Tensor();
     pp_gated_norm_ = Tensor();
     pp_state_hist_ = Tensor();
+    pp_state_hist_chunk_size_ = 0;
+    pp_state_hist_state_major_ = false;
+    faithful_grouped_projection_backward_mode_ =
+        FaithfulGroupedProjectionMode::None;
     // Proper-path incremental decode cache.
     pp_stream_state_.clear();
     pp_stream_ring_.clear();
@@ -2686,6 +4406,30 @@ void Mamba2SSD::reset_runtime_telemetry() {
     gpu_fast_path_hits_ = 0;
     gpu_fast_path_fallbacks_ = 0;
     last_fallback_reason_.clear();
+    faithful_forward_gpu_calls_ = 0;
+    faithful_forward_host_fallbacks_ = 0;
+    faithful_backward_gpu_calls_ = 0;
+    faithful_backward_host_fallbacks_ = 0;
+    faithful_streaming_gpu_calls_ = 0;
+    faithful_streaming_host_fallbacks_ = 0;
+    stream_priming_gpu_calls_ = 0;
+    stream_priming_host_fallbacks_ = 0;
+    faithful_recompute_forwards_ = 0;
+    faithful_selective_history_recomputes_ = 0;
+    faithful_full_block_recompute_forwards_ = 0;
+    faithful_warp_aggregated_backward_calls_ = 0;
+    faithful_deterministic_backward_calls_ = 0;
+    faithful_scalar_atomic_backward_calls_ = 0;
+    faithful_reduced_conv_backward_calls_ = 0;
+    faithful_generic_atomic_conv_backward_calls_ = 0;
+    faithful_peak_state_history_bytes_ = 0;
+    faithful_grouped_projection_forward_calls_ = 0;
+    faithful_grouped_projection_backward_calls_ = 0;
+    faithful_grouped_projection_cache_rebuilds_ = 0;
+    faithful_grouped_projection_full_forward_calls_ = 0;
+    faithful_grouped_projection_sensitive_forward_calls_ = 0;
+    faithful_grouped_projection_full_backward_calls_ = 0;
+    faithful_grouped_projection_sensitive_backward_calls_ = 0;
 }
 
 void Mamba2SSD::to(Device dev) {
@@ -2715,6 +4459,12 @@ void Mamba2SSD::to(Device dev) {
         move_parameter(norm_weight_);
         move_parameter(A);
         move_parameter(D);
+        faithful_grouped_projection_weight_ = Tensor();
+        faithful_grouped_projection_versions_.fill(0);
+        faithful_grouped_projection_backward_mode_ =
+            FaithfulGroupedProjectionMode::None;
+        faithful_runtime_warp_size_ = 0;
+        pp_decay_terms_ = Tensor();
         pp_stream_h_dev_ = Tensor();
         pp_stream_ring_dev_ = Tensor();
         pp_stream_dev_live_ = false;
@@ -2745,15 +4495,12 @@ std::vector<Parameter*> Mamba2SSD::parameters() {
         add_proj(*C_proj_, "C_proj.");
         add_proj(*dt_proj_, "dt_proj.");
         add_proj(out_proj, "out_proj.");
-        conv_weight_.base_name = "conv1d_weight";
-        conv_weight_.name = "conv1d_weight";
+        conv_weight_.assign_relative_name("conv1d_weight");
         params.push_back(&conv_weight_);
         if (config_.faithful_mamba2) {
-            conv_bias_.base_name = "conv1d_bias";
-            conv_bias_.name = "conv1d_bias";
+            conv_bias_.assign_relative_name("conv1d_bias");
             params.push_back(&conv_bias_);
-            norm_weight_.base_name = "norm.weight";
-            norm_weight_.name = "norm.weight";
+            norm_weight_.assign_relative_name("norm.weight");
             params.push_back(&norm_weight_);
         }
     } else {
@@ -2761,11 +4508,9 @@ std::vector<Parameter*> Mamba2SSD::parameters() {
         add_proj(*in_proj_sensitive, "in_proj_sensitive.");
         add_proj(out_proj, "out_proj.");
     }
-    A.base_name = "A";
-    A.name = "A";
+    A.assign_relative_name("A");
     params.push_back(&A);
-    D.base_name = "D";
-    D.name = "D";
+    D.assign_relative_name("D");
     params.push_back(&D);
     return params;
 }
@@ -2788,10 +4533,16 @@ void Mamba2SSD::set_streaming_mode(bool enabled) {
     }
 }
 
-MambaStreamSnapshot Mamba2SSD::snapshot_streaming_state() const {
+MambaStreamSnapshot Mamba2SSD::snapshot_streaming_state(bool device_resident) const {
     MambaStreamSnapshot snapshot;
     snapshot.enabled = streaming_inference_;
     snapshot.state = streaming_state_;
+    if (device_resident && pp_stream_dev_live_ && pp_stream_h_dev_.size > 0) {
+        snapshot.proper_state_device = pp_stream_h_dev_.clone();
+        snapshot.proper_ring_device = pp_stream_ring_dev_.clone();
+        snapshot.proper_active = pp_stream_active_;
+        return snapshot;
+    }
     // Proper-path incremental decode state: carry per-sequence so fork/restore
     // does not bleed the SSD state + conv window across sequences.
     // If the device buffers hold the live state (GPU step path after >=1 token),
@@ -2832,9 +4583,21 @@ void Mamba2SSD::restore_streaming_state(const MambaStreamSnapshot& snapshot) {
     // Force the device buffers to re-sync from the restored host vectors on the
     // next GPU step (the previous device state belonged to another sequence).
     pp_stream_dev_live_ = false;
+    if (snapshot.proper_state_device.size > 0) {
+        if (A.data.get_device() == Device::GPU) {
+            pp_stream_h_dev_ = snapshot.proper_state_device.to(Device::GPU).clone();
+            pp_stream_ring_dev_ = snapshot.proper_ring_device.to(Device::GPU).clone();
+            pp_stream_dev_live_ = true;
+        } else {
+            Tensor state = snapshot.proper_state_device.cpu();
+            Tensor ring = snapshot.proper_ring_device.cpu();
+            pp_stream_state_.assign(state.data(), state.data() + state.size);
+            pp_stream_ring_.assign(ring.data(), ring.data() + ring.size);
+        }
+    }
 }
 
-std::vector<MambaStreamSnapshot> Mamba2SSD::snapshot_streaming_state_batch() const {
+std::vector<MambaStreamSnapshot> Mamba2SSD::snapshot_streaming_state_batch(bool device_resident) const {
     std::vector<MambaStreamSnapshot> snapshots;
     // ── Proper path: split the per-row SSD state + conv ring back into one
     // snapshot per sequence (the batched decode keeps R sequences contiguous in
@@ -2851,6 +4614,21 @@ std::vector<MambaStreamSnapshot> Mamba2SSD::snapshot_streaming_state_batch() con
         const size_t ringlen =
             static_cast<size_t>(taps) *
             (config_.faithful_mamba2 ? conv_dim : d_model);
+        if (device_resident && pp_stream_dev_live_ && pp_stream_h_dev_.size > 0) {
+            const int rows = static_cast<int>(pp_stream_h_dev_.size / statelen);
+            snapshots.resize(static_cast<size_t>(rows));
+            for (int row = 0; row < rows; ++row) {
+                auto& s = snapshots[static_cast<size_t>(row)];
+                s.enabled = streaming_inference_;
+                s.proper_active = pp_stream_active_;
+                s.proper_state_device = pp_stream_h_dev_.reshape({rows, static_cast<int>(statelen)})
+                    .slice(0, row, row + 1).reshape({static_cast<int>(statelen)});
+                const int ring_stride = static_cast<int>(std::max<size_t>(ringlen, 1));
+                s.proper_ring_device = pp_stream_ring_dev_.reshape({rows, ring_stride})
+                    .slice(0, row, row + 1).reshape({ring_stride});
+            }
+            return snapshots;
+        }
         std::vector<float> st = pp_stream_state_;
         std::vector<float> rg = pp_stream_ring_;
 #ifdef USE_CUDA
@@ -2915,14 +4693,56 @@ void Mamba2SSD::restore_streaming_state_batch(const std::vector<MambaStreamSnaps
     // contiguous per-row buffers the batched decode step reads. ──
     if (config_.proper_selective_ssm || config_.faithful_mamba2) {
         streaming_inference_ = snapshots.front().enabled;
+        const bool device_snapshots = std::all_of(snapshots.begin(), snapshots.end(),
+            [](const auto& s) { return s.proper_state_device.size > 0; });
+        if (device_snapshots && A.data.get_device() == Device::GPU) {
+            if (snapshots.size() > size_t(std::numeric_limits<int>::max()) ||
+                snapshots.front().proper_state_device.size <= 0 ||
+                snapshots.front().proper_state_device.size > std::numeric_limits<int>::max() ||
+                snapshots.front().proper_ring_device.size <= 0 ||
+                snapshots.front().proper_ring_device.size > std::numeric_limits<int>::max())
+                throw std::overflow_error("Mamba device snapshot size exceeds supported range");
+            const int rows = static_cast<int>(snapshots.size());
+            const int state_width = static_cast<int>(snapshots.front().proper_state_device.size);
+            const int ring_width = static_cast<int>(snapshots.front().proper_ring_device.size);
+            const int state_elements = checked_int_product(rows, state_width, "Mamba restored batch state");
+            const int ring_elements = checked_int_product(rows, ring_width, "Mamba restored batch ring");
+            Tensor states = Tensor::uninitialized({rows, state_width}, Device::GPU);
+            Tensor rings = Tensor::uninitialized({rows, ring_width}, Device::GPU);
+            for (int row = 0; row < rows; ++row) {
+                const auto& s = snapshots[static_cast<size_t>(row)];
+                if (s.proper_state_device.size != state_width || s.proper_ring_device.size != ring_width) {
+                    throw std::invalid_argument("Mamba device snapshot geometry differs between rows");
+                }
+                copy_float_bytes_device_safe(states.raw_data() + row * state_width, Device::GPU,
+                    s.proper_state_device.raw_data(), s.proper_state_device.get_device(),
+                    static_cast<size_t>(state_width) * sizeof(float));
+                copy_float_bytes_device_safe(rings.raw_data() + row * ring_width, Device::GPU,
+                    s.proper_ring_device.raw_data(), s.proper_ring_device.get_device(),
+                    static_cast<size_t>(ring_width) * sizeof(float));
+            }
+            pp_stream_h_dev_ = states.reshape({state_elements});
+            pp_stream_ring_dev_ = rings.reshape({ring_elements});
+            pp_stream_dev_live_ = true;
+            pp_stream_active_ = std::any_of(snapshots.begin(), snapshots.end(),
+                [](const auto& s) { return s.proper_active; });
+            pp_stream_state_.clear();
+            pp_stream_ring_.clear();
+            return;
+        }
         pp_stream_state_.clear();
         pp_stream_ring_.clear();
         bool any_active = false;
         for (const auto& s : snapshots) {
-            pp_stream_state_.insert(pp_stream_state_.end(), s.proper_state.begin(),
-                                    s.proper_state.end());
-            pp_stream_ring_.insert(pp_stream_ring_.end(), s.proper_ring.begin(),
-                                   s.proper_ring.end());
+            if (s.proper_state_device.size > 0) {
+                Tensor state = s.proper_state_device.cpu();
+                Tensor ring = s.proper_ring_device.cpu();
+                pp_stream_state_.insert(pp_stream_state_.end(), state.data(), state.data() + state.size);
+                pp_stream_ring_.insert(pp_stream_ring_.end(), ring.data(), ring.data() + ring.size);
+            } else {
+                pp_stream_state_.insert(pp_stream_state_.end(), s.proper_state.begin(), s.proper_state.end());
+                pp_stream_ring_.insert(pp_stream_ring_.end(), s.proper_ring.begin(), s.proper_ring.end());
+            }
             any_active = any_active || s.proper_active;
         }
         pp_stream_active_ = any_active;

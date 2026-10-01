@@ -82,10 +82,13 @@ int main() {
     // Dense baseline (SSA off) on CPU.
     const Tensor cpu_dense = cpu_dense_model.forward_ids_batch(batch_ids, nullptr).cpu();
 
-    // SSA on (small blocks + top_k=1 so sparse differs from dense).
-    cpu_model.set_sparse_attention(true, /*block_size=*/4, /*top_k_blocks=*/1,
+    // SSA on. With block_size=2 the longer row has nine causal blocks and
+    // sink + local + top-1 retain at most three, making this a stable wiring
+    // discriminator instead of the near-dense 3-of-5 selection produced by
+    // block_size=4.
+    cpu_model.set_sparse_attention(true, /*block_size=*/2, /*top_k_blocks=*/1,
                                    /*local_blocks=*/1, /*sink_blocks=*/1);
-    gpu_model.set_sparse_attention(true, 4, 1, 1, 1);
+    gpu_model.set_sparse_attention(true, 2, 1, 1, 1);
 
     const Tensor cpu_sparse = cpu_model.forward_ids_batch(batch_ids, nullptr).cpu();
     const Tensor gpu_sparse = gpu_model.forward_ids_batch(batch_ids, nullptr).cpu();

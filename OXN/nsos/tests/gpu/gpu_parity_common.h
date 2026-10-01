@@ -27,39 +27,44 @@
 #include <string>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "gpu_backend.h"
 #endif
 
 namespace nsos {
 namespace gpu_parity_test {
 
-// GPU binaries are fail-closed by design: invoking one without a CUDA build
+// GPU binaries are fail-closed by design: invoking one without a GPU build
 // and a selectable device is a test failure, never a successful "skip".
 inline void require_cuda_device(const char* test_name) {
 #ifndef USE_CUDA
   throw std::runtime_error(
       std::string("[GPUParity:") + test_name +
-      "] CUDA is required but was not enabled at build time");
+      "] a GPU backend is required but was not enabled at build time");
 #else
-  int device_count = 0;
-  const cudaError_t status = cudaGetDeviceCount(&device_count);
-  if (status != cudaSuccess || device_count <= 0) {
+  int selected_device = -1;
+  std::string selection_error;
+  if (!gpu::select_preferred_device(&selected_device, &selection_error)) {
     throw std::runtime_error(
         std::string("[GPUParity:") + test_name +
-        "] CUDA device is required but unavailable (cudaGetDeviceCount=" +
-        std::to_string(static_cast<int>(status)) + ")");
+        "] GPU device is required but unavailable: " + selection_error);
   }
   cudaDeviceProp props{};
-  const cudaError_t props_status = cudaGetDeviceProperties(&props, 0);
+  const cudaError_t props_status =
+      cudaGetDeviceProperties(&props, selected_device);
   if (props_status != cudaSuccess) {
     throw std::runtime_error(
         std::string("[GPUParity:") + test_name +
-        "] cudaGetDeviceProperties failed: " +
+        "] GPU device property query failed: " +
         cudaGetErrorString(props_status));
   }
   std::cout << "[GPUParity:" << test_name << "] device=" << props.name
-            << " cc=" << props.major << "." << props.minor
-            << " runtime=" << CUDART_VERSION << std::endl;
+            << " backend=" << gpu::backend_name();
+#if defined(NSOS_GPU_BACKEND_HIP)
+  std::cout << " arch=" << props.gcnArchName;
+#else
+  std::cout << " arch=sm_" << props.major << props.minor;
+#endif
+  std::cout << " runtime=" << CUDART_VERSION << std::endl;
 #endif
 }
 
@@ -71,7 +76,7 @@ inline void cuda_sync_or_throw(const char* phase) {
 #ifdef USE_CUDA
   const cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("CUDA sync failed at ") + phase +
+    throw std::runtime_error(std::string("GPU sync failed at ") + phase +
                              ": " + cudaGetErrorString(err));
   }
 #else

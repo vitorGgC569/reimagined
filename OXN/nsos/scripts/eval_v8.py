@@ -31,8 +31,11 @@ if str(BUILD_DIR) not in sys.path:
 if os.name == "nt":
     try:
         os.add_dll_directory(str(BUILD_DIR))
-    except (AttributeError, OSError):
-        pass
+    except (AttributeError, OSError) as exc:
+        print(
+            f"[runtime] DLL directory registration failed for {BUILD_DIR}: {exc}",
+            file=sys.stderr,
+        )
 
 import nsos_ext as nsos  # type: ignore
 

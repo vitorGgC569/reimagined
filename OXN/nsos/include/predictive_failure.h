@@ -1,6 +1,24 @@
 #ifndef PREDICTIVE_FAILURE_H
 #define PREDICTIVE_FAILURE_H
 
+// ===========================================================================
+// DEMONSTRATION HEADER — NOT PRODUCTION CODE.
+//
+// FailureOracle performs no hardware telemetry, no migration and no ticketing.
+// Its "thresholds" are hardcoded placeholders and
+// initiate_emergency_migration() only prints narration, including a fabricated
+// RMA ticket number. Nothing here detects or mitigates a real failure.
+//
+// Reachable only from tests/verify_sre_engineering.cpp, which is a standalone
+// diagnostic and is not a CMake target. This guard exists so the file can
+// never be pulled into a product translation unit by accident: including it
+// without opting in is a hard build error rather than a silent link against
+// fake safety infrastructure.
+// ===========================================================================
+#if !defined(NSOS_ALLOW_DEMONSTRATION_HEADERS)
+#error "predictive_failure.h is demonstration-only scaffolding. Define NSOS_ALLOW_DEMONSTRATION_HEADERS to include it from a diagnostic target."
+#endif
+
 #include <vector>
 #include <string>
 #include <map>

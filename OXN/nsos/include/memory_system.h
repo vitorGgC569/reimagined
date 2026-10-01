@@ -59,6 +59,8 @@ public:
 private:
   void microcompact_messages_locked();
   void validate_state_shape(const Tensor& state, const char* operation) const;
+  std::vector<Tensor> retrieval_candidates_locked(const Tensor& query_cpu,
+                                                 size_t top_k);
 
   // Tiered index is private: every access must hold memory_mutex.
   std::vector<Cluster> clusters;

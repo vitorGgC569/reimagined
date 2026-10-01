@@ -1,7 +1,8 @@
 # NSOS MVP
 
-NSOS is the supported neural runtime in this repository. The MVP is a
-CPU-first, authenticated inference service with CLI and Python bindings.
+NSOS is the supported neural runtime in this repository. It provides an
+authenticated inference service, CLI and Python bindings, with CPU plus
+selectable AMD HIP and NVIDIA CUDA backends.
 
 ## Supported In MVP
 
@@ -12,11 +13,14 @@ CPU-first, authenticated inference service with CLI and Python bindings.
 - Model pack load/save with bounded parsing, manifest version and checksums.
 - Tokenizer pack load/save with bounded parsing.
 - Native CTest suite plus Python binding smoke test.
+- AMD HIP/ROCm GPU training validated on Radeon RX 7600 (`gfx1102`).
+- NVIDIA CUDA backend retained with the same shared `.cu` kernel sources.
 
 ## Experimental Or Out Of Scope
 
-- CUDA/GPU runtime is experimental until `test_gpu_parity` is stable on the
-  target hardware.
+- A GPU/driver combination is production-eligible only after its complete
+  parity and end-to-end training gate passes on the target hardware.
+- NVIDIA CUDA was not executed on the AMD validation workstation.
 - Distributed/MPI orchestration is not an MVP production feature.
 - TTT product flows are research-only unless a release profile explicitly tests
   them.
@@ -30,7 +34,7 @@ Windows CPU MVP:
 
 ```powershell
 cmake -S .\OXN\nsos -B .\OXN\nsos\build-mvp `
-  -DNSOS_ENABLE_CUDA=OFF `
+  -DNSOS_GPU_BACKEND=NONE `
   -DNSOS_BUILD_PYTHON=ON `
   -DNSOS_BUILD_TESTS=ON `
   -DNSOS_BUILD_CLI=ON `
@@ -47,7 +51,7 @@ Linux CPU MVP:
 ```bash
 cmake -S OXN/nsos -B OXN/nsos/build-mvp \
   -DCMAKE_BUILD_TYPE=Release \
-  -DNSOS_ENABLE_CUDA=OFF \
+  -DNSOS_GPU_BACKEND=NONE \
   -DNSOS_BUILD_PYTHON=ON \
   -DNSOS_BUILD_TESTS=ON \
   -DNSOS_BUILD_CLI=ON \
@@ -131,14 +135,16 @@ docker run --rm -p 8080:8080 -e NSOS_API_TOKEN=change-me nsos-mvp
 
 The container binds `0.0.0.0` and therefore requires `NSOS_API_TOKEN`.
 
-## GPU Diagnostics
+## GPU Builds and Diagnostics
 
-CUDA builds are still useful for investigation:
+`NSOS_GPU_BACKEND` accepts `AUTO`, `NONE`, `CUDA` or `HIP`. The complete AMD
+SDK setup, CUDA-preserving build commands, device selection, RX 7600 training
+profile and DLL troubleshooting are in
+[docs/AMD_GPU_BACKEND.md](docs/AMD_GPU_BACKEND.md).
 
 ```powershell
-$env:NSOS_GPU_PARITY_CASE = "matmul"
-.\OXN\nsos\build_cuda129\Release\test_gpu_parity.exe
+ctest --test-dir .\OXN\nsos\build-codex-hip -j 1 --output-on-failure
 ```
 
-Available cases: `tensor_add`, `matmul`, `rmsnorm`, `bitlinear`,
-`mamba_streaming`, `jamba_batch`.
+The runtime reports the compiled backend and visible devices through
+`nsos_ext.gpu_backend_name()` and `nsos_ext.gpu_devices()`.

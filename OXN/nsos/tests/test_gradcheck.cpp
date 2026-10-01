@@ -685,6 +685,84 @@ void check_attention() {
                    kTolScan);
 }
 
+// ── Product hybrid: independent Mamba / Attention / FFN gates ───────────────
+// These LayerScale-style vectors are the control surface that lets the hybrid
+// preserve Mamba while adding the other branches. A sign/chain-rule error here
+// can make a branch appear harmful even when its own backward is correct.
+void check_parallel_hybrid_gates() {
+  ModelConfig config;
+  config.num_layers = 1;
+  config.d_model = 8;
+  config.vocab_size = 11;
+  config.n_heads = 2;
+  config.n_kv_heads = 1;
+  config.attention_period = 1;
+  config.attention_slot = 0;
+  config.force_mamba_last_layer = false;
+  config.hybrid_composition =
+      HybridComposition::ParallelGated;
+  config.faithful_attention_linears = true;
+  config.use_moe = false;
+  config.use_ttt = false;
+  config.use_chrass = false;
+  config.use_kan = false;
+  config.dropout = 0.0f;
+  config.mamba2_faithful = true;
+  config.mamba_expand = 1;
+  config.mamba_head_dim = 4;
+  config.mamba_n_groups = 1;
+  config.mamba_d_state = 4;
+  config.mamba_conv_kernel = 3;
+  config.tie_word_embeddings = false;
+
+  JambaModel model(config, Device::CPU);
+  Tensor input({3, config.d_model}, Device::CPU);
+  fill_smooth(input, 0.35f, 0.23f);
+  Tensor readout({3, config.vocab_size}, Device::CPU);
+  fill_smooth(readout, 0.27f, 0.31f);
+
+  const auto objective = [&](Parameter* perturbed) {
+    if (perturbed != nullptr) {
+      // Faithful Mamba/BitLinear grouped caches are versioned. Every finite
+      // difference perturbation must invalidate them explicitly.
+      perturbed->mark_updated();
+    }
+    Context context;
+    const Tensor output = model.forward(input, &context);
+    double value = 0.0;
+    for (int index = 0; index < output.size; ++index) {
+      value += static_cast<double>(output.data()[index]) *
+               static_cast<double>(readout.data()[index]);
+    }
+    return value;
+  };
+
+  auto parameters = model.parameters();
+  zero_all_grads(parameters);
+  Context context;
+  (void)model.forward(input, &context);
+  model.backward(readout, context);
+
+  for (const char* name :
+       {"layers.0.mamba.gate",
+        "layers.0.attn.gate",
+        "layers.0.ffn.gate"}) {
+    Parameter* parameter = find_param(parameters, name);
+    assert(parameter != nullptr);
+    assert(parameter->grad.size == parameter->data.size);
+    std::vector<float> analytic(
+        parameter->grad.data(),
+        parameter->grad.data() + parameter->grad.size);
+    const std::string label =
+        std::string("hybrid ") + name;
+    gradcheck_buffer(
+        parameter->data.data(), parameter->data.size,
+        analytic.data(),
+        [&]() { return objective(parameter); },
+        label.c_str(), kTolScan);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -711,6 +789,7 @@ int main() {
   check_kan();
   check_chrass();
   check_attention();
+  check_parallel_hybrid_gates();
   if (g_failures != 0) {
     std::printf("\n[gradcheck] %d check(s) FAILED\n", g_failures);
     return 1;

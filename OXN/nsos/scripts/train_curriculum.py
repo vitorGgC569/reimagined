@@ -16,7 +16,11 @@ from typing import Any, Dict, List, TextIO
 
 import numpy as np
 
-from cuda_env import add_windows_runtime_dirs, parse_preferred_cuda_root
+from cuda_env import (
+    add_windows_runtime_dirs,
+    parse_preferred_cuda_root,
+    parse_preferred_hip_root,
+)
 from nsos_curriculum_lib import (
     PHASE_ORDER,
     PHASE_ORDER_V11,
@@ -252,7 +256,7 @@ PROFILES["hybrid_pilot"]["model_config"] = {
     "n_kv_heads": 2,
     "sliding_window": 2048,
     "attention_period": 2,
-    "attention_slot": 2,
+    "attention_slot": 1,
     "use_moe": False,
     "num_experts": 4,
     "num_experts_per_token": 2,
@@ -380,12 +384,12 @@ PROFILES["hybrid_small"]["model_config"] = {
     "n_kv_heads": 4,
     "sliding_window": 4096,
     "attention_period": 2,
-    "attention_slot": 2,
+    "attention_slot": 1,
     "use_moe": True,
     "num_experts": 6,
     "num_experts_per_token": 2,
     "moe_period": 3,
-    "moe_slot": 3,
+    "moe_slot": 2,
     "use_ttt": False,
     "ttt_period": 64,
     "ttt_slot": 63,
@@ -407,12 +411,12 @@ PROFILES["hybrid_medium"]["model_config"] = {
     "n_kv_heads": 4,
     "sliding_window": 4096,
     "attention_period": 2,
-    "attention_slot": 2,
+    "attention_slot": 1,
     "use_moe": True,
     "num_experts": 8,
     "num_experts_per_token": 2,
     "moe_period": 3,
-    "moe_slot": 3,
+    "moe_slot": 2,
     "use_ttt": False,
     "ttt_period": 64,
     "ttt_slot": 63,
@@ -702,12 +706,12 @@ _v11_80m_model_config = {
     "n_kv_heads": 5,         # halved for GQA
     "sliding_window": 4096,
     "attention_period": 2,
-    "attention_slot": 2,
+    "attention_slot": 1,
     "use_moe": True,
     "num_experts": 8,
     "num_experts_per_token": 2,
     "moe_period": 3,
-    "moe_slot": 3,
+    "moe_slot": 2,
     # Cherry-pick #4 (Nemotron K·m invariant): expert FFN intermediate dim.
     # 0 = use historical default of d_model * 4 = 640 * 4 = 2560.
     # Override in variants below (_km_A, _km_B, _km_C) to test the
@@ -842,21 +846,23 @@ PROFILES["hybrid_v11_colab_t4_80m_km_C"]["validation_scope"] = (
 #   phase5_verifier:     200 steps                       = ~3.8M tokens × loop factor
 #   phase6_memory:       320 steps                       = ~6.1M tokens × loop factor
 #
-# Use this profile when training on the friend's RTX 2080 Ti for the first
-# Oxta Contábil production model.  Pair with `--checkpoint-every-steps 100`
-# so a crash/power-outage loses at most ~25 min of progress.
+# The resident parameter budget must be close to 200M, not merely the active
+# top-k budget. Eight 4096-wide experts produced 562M resident parameters and
+# could not fit weights + gradients + Adam moments on either 8 or 11 GiB.
+# Four 1024-wide experts retain sparse top-2 routing while keeping the complete
+# trainable model near the advertised memory class.
 _v11_200m_model_config = {
     "n_heads": 16,                  # 1024 / 64 = head_dim 64
     "n_kv_heads": 4,                # GQA 4:1
     "sliding_window": 4096,
     "attention_period": 2,          # 1 attention layer for every 2 layers
-    "attention_slot": 2,
+    "attention_slot": 1,            # zero-based slot: second layer in each pair
     "use_moe": True,
-    "num_experts": 8,
+    "num_experts": 4,
     "num_experts_per_token": 2,
     "moe_period": 3,                # 1 MoE layer for every 3 layers
-    "moe_slot": 3,
-    "moe_expert_hidden_dim": 0,     # default dm * 4 = 4096
+    "moe_slot": 2,                  # zero-based slot: third layer in each trio
+    "moe_expert_hidden_dim": 1024,
     "use_ttt": False,
     "ttt_period": 64,
     "ttt_slot": 63,
@@ -885,12 +891,32 @@ PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["phase_steps"] = deepcopy(_v11_2
 # at batch=12 + d_model=1024 spills past 11GB on Turing sm_75.
 PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["use_gradient_checkpointing"] = True
 PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]["validation_scope"] = (
-    "hybrid_rtx2080ti_200m_chinchilla25b: 200M-param hybrid (20 layers, "
-    "d_model=1024, MoE-8 top-2) for NVIDIA RTX 2080 Ti 11GB.  batch=12 + "
+    "hybrid_rtx2080ti_200m_chinchilla25b: ~200M resident-param hybrid "
+    "(20 layers, d_model=1024, MoE-4 top-2, expert hidden=1024) for NVIDIA "
+    "RTX 2080 Ti 11GB. batch=12 + "
     "gradient_checkpointing=True.  lr=5.5e-4, warmup=700.  Targets ~2.5B "
     "tokens (62% of Chinchilla-optimal for 200M).  Wall time: ~140h "
     "(~6 days 24/7, ~9 days at 18h/day).  Auto-checkpoint every 100 steps "
     "to /content/drive/MyDrive/oxta_packs/ or local checkpoint dir."
+)
+
+# RX 7600 / RDNA3 (gfx1102), 8 GiB.  Keep the architecture identical to the
+# NVIDIA 200M profile so checkpoints remain portable across HIP and CUDA.
+# Only the memory-sensitive training controls differ.
+PROFILES["hybrid_rx7600_200m_chinchilla25b"] = deepcopy(
+    PROFILES["hybrid_rtx2080ti_200m_chinchilla25b"]
+)
+PROFILES["hybrid_rx7600_200m_chinchilla25b"]["batch_size"] = 1
+PROFILES["hybrid_rx7600_200m_chinchilla25b"]["lr"] = 1.6e-4
+PROFILES["hybrid_rx7600_200m_chinchilla25b"]["warmup_steps"] = 900
+PROFILES["hybrid_rx7600_200m_chinchilla25b"]["use_gradient_checkpointing"] = True
+PROFILES["hybrid_rx7600_200m_chinchilla25b"]["validation_scope"] = (
+    "hybrid_rx7600_200m_chinchilla25b: backend-portable ~200M "
+    "resident-param hybrid (20 layers, d_model=1024, MoE-4 top-2, expert "
+    "hidden=1024) tuned conservatively for an "
+    "AMD Radeon RX 7600 8 GiB (gfx1102). batch=1, gradient checkpointing, "
+    "lr=1.6e-4, warmup=900. Checkpoints remain loadable by the matching "
+    "CUDA/NVIDIA architecture."
 )
 
 # ── hybrid_v11_colab_a100_80m ─────────────────────────────────────────────
@@ -1470,7 +1496,21 @@ def evaluate_release_gate(metrics_by_phase: Dict[str, Dict[str, float]]) -> Dict
     for phase_name, thresholds in RELEASE_GATE_THRESHOLDS.items():
         metrics = metrics_by_phase.get(phase_name, {})
         for metric_name, threshold in thresholds.items():
-            value = float(metrics.get(metric_name.replace("_min", "").replace("_max", ""), metrics.get(metric_name, 0.0)))
+            key = metric_name[:-4]
+            raw = metrics.get(key, metrics.get(metric_name))
+            try:
+                value = float(raw) if not isinstance(raw, bool) else math.nan
+            except (TypeError, ValueError, OverflowError):
+                value = math.nan
+            if not math.isfinite(value):
+                failures.append({
+                    "phase": phase_name,
+                    "metric": key,
+                    "expected": "present, finite numeric measurement",
+                    "actual": None,
+                    "reason": "missing_or_nonfinite",
+                })
+                continue
             if metric_name.endswith("_min"):
                 if value < float(threshold):
                     failures.append(
@@ -1506,9 +1546,18 @@ def phase_repetition_scale(profile: Dict, phase_name: str) -> float:
     env = os.environ.get("NSOS_RUL_SCALE")
     if env is not None and env != "":
         try:
-            return float(env)
-        except ValueError:
-            pass
+            value = float(env)
+        except ValueError as exc:
+            raise RuntimeError(
+                "NSOS_RUL_SCALE must be a finite floating-point value; "
+                f"received {env!r}"
+            ) from exc
+        if not math.isfinite(value):
+            raise RuntimeError(
+                "NSOS_RUL_SCALE must be a finite floating-point value; "
+                f"received {env!r}"
+            )
+        return value
     phase_scales = profile.get("phase_repetition_unlikelihood_scale", {})
     return float(phase_scales.get(phase_name, profile.get("repetition_unlikelihood_scale", 0.0)))
 
@@ -1549,16 +1598,18 @@ def resolve_auxiliary_stack_config(profile: Dict, phase_name: str) -> Dict[str, 
         "session_adapt": bool(enabled and merged.get("session_adapt", False)),
         "reasoning": bool(enabled and merged.get("reasoning", False)),
         "memory": bool(enabled and merged.get("memory", False)),
-        "reasoning_iterations": int(merged.get("reasoning_iterations", 1)) if enabled else 0,
-        "reasoning_simulations": int(merged.get("reasoning_simulations", 24)) if enabled else 0,
+        "reasoning_iterations": int(merged.get("reasoning_iterations", 1)),
+        "reasoning_simulations": int(merged.get("reasoning_simulations", 24)),
         "memory_blend": float(merged.get("memory_blend", 0.35)) if enabled else 0.0,
         "every_steps": max(1, int(merged.get("every_steps", 1))),
-        "prompt_max_tokens": int(merged.get("prompt_max_tokens", 96)) if enabled else 0,
-        "answer_max_tokens": int(merged.get("answer_max_tokens", 24)) if enabled else 0,
+        "prompt_max_tokens": int(merged.get("prompt_max_tokens", 96)),
+        "answer_max_tokens": int(merged.get("answer_max_tokens", 24)),
     }
 
 
 def apply_auxiliary_stack_schedule(trainer, aux_cfg: Dict[str, object]) -> None:
+    if aux_cfg.get("enabled") and not aux_cfg.get("session_adapt"):
+        raise ValueError("Auxiliary stack requires a TTT session_adapt consumer")
     trainer.phase_scheduler.auxiliary_stack_enabled = bool(aux_cfg.get("enabled", False))
     trainer.phase_scheduler.auxiliary_session_adapt_enabled = bool(
         aux_cfg.get("session_adapt", False)
@@ -1566,18 +1617,18 @@ def apply_auxiliary_stack_schedule(trainer, aux_cfg: Dict[str, object]) -> None:
     trainer.phase_scheduler.auxiliary_reasoning_enabled = bool(aux_cfg.get("reasoning", False))
     trainer.phase_scheduler.auxiliary_memory_enabled = bool(aux_cfg.get("memory", False))
     trainer.phase_scheduler.auxiliary_reasoning_iterations = int(
-        aux_cfg.get("reasoning_iterations", 0)
+        aux_cfg.get("reasoning_iterations", 1)
     )
     trainer.phase_scheduler.auxiliary_reasoning_simulations = int(
-        aux_cfg.get("reasoning_simulations", 0)
+        aux_cfg.get("reasoning_simulations", 24)
     )
     trainer.phase_scheduler.auxiliary_memory_blend = float(aux_cfg.get("memory_blend", 0.0))
     trainer.phase_scheduler.auxiliary_every_steps = int(aux_cfg.get("every_steps", 1))
     trainer.phase_scheduler.auxiliary_prompt_max_tokens = int(
-        aux_cfg.get("prompt_max_tokens", 0)
+        aux_cfg.get("prompt_max_tokens", 96)
     )
     trainer.phase_scheduler.auxiliary_answer_max_tokens = int(
-        aux_cfg.get("answer_max_tokens", 0)
+        aux_cfg.get("answer_max_tokens", 24)
     )
 
 
@@ -1831,7 +1882,24 @@ def parse_args() -> argparse.Namespace:
         "--resume-model",
         type=Path,
         default=None,
-        help="Optional checkpoint/model to load before training continues.",
+        help="Checkpoint model to resume. Exact resume also requires its training-state and progress sidecars.",
+    )
+    parser.add_argument(
+        "--resume-training-state",
+        type=Path,
+        default=None,
+        help="Optional explicit Trainer state sidecar; defaults to <resume-model>.state.",
+    )
+    parser.add_argument(
+        "--resume-progress",
+        type=Path,
+        default=None,
+        help="Optional explicit phase cursor sidecar; defaults to <resume-model>.progress.json.",
+    )
+    parser.add_argument(
+        "--weights-only-resume",
+        action="store_true",
+        help="Explicitly allow strict model-weight loading without optimizer/RNG/phase cursor state.",
     )
     parser.add_argument(
         "--checkpoint-every-steps",
@@ -2007,13 +2075,18 @@ def load_nsos(build_dir: Path):
         add_windows_runtime_dirs(
             build_dir,
             parse_preferred_cuda_root(os.environ.get("NSOS_CUDA_ROOT")),
+            parse_preferred_hip_root(
+                os.environ.get("NSOS_HIP_ROOT")
+                or os.environ.get("ROCM_PATH")
+                or os.environ.get("HIP_PATH")
+            ),
         )
     import nsos_ext as nsos  # type: ignore
 
     return nsos
 
 
-def maybe_enable_hybrid_resume_cuda_safe_mode(args, profile: Dict, logger: RunLogger) -> None:
+def maybe_enable_hybrid_resume_gpu_safe_mode(args, profile: Dict, logger: RunLogger) -> None:
     if os.name != "nt":
         return
     if not args.resume_model:
@@ -2027,13 +2100,134 @@ def maybe_enable_hybrid_resume_cuda_safe_mode(args, profile: Dict, logger: RunLo
     if not os.environ.get("NSOS_CUDA_SYNC"):
         os.environ["NSOS_CUDA_SYNC"] = "1"
         enabled.append("NSOS_CUDA_SYNC=1")
-    if not os.environ.get("CUDA_LAUNCH_BLOCKING"):
+    if (
+        not any(os.environ.get(name) for name in ("NSOS_HIP_ROOT", "ROCM_PATH", "HIP_PATH"))
+        and not os.environ.get("CUDA_LAUNCH_BLOCKING")
+    ):
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
         enabled.append("CUDA_LAUNCH_BLOCKING=1")
     if enabled:
         logger.log(
             "[device] enabling hybrid GPU resume safe mode on Windows: "
             + ", ".join(enabled)
+        )
+
+
+def _resolve_manifest_file(bundle_dir: Path, relative_path: object) -> Path:
+    parts = [part for part in str(relative_path).replace("\\", "/").split("/") if part]
+    candidate = (bundle_dir / Path(*parts)).resolve()
+    try:
+        candidate.relative_to(bundle_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Curriculum manifest path escapes bundle directory: {relative_path!r}"
+        ) from exc
+    return candidate
+
+
+def _curriculum_content_fingerprint(row: Dict) -> str:
+    content = {
+        key: value
+        for key, value in row.items()
+        if key not in {"id", "source", "split"}
+    }
+    canonical = json.dumps(content, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def validate_curriculum_manifest(bundle_dir: Path, manifest_path: Path) -> Dict:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid curriculum manifest: {manifest_path}: {exc}") from exc
+
+    phases = manifest.get("phases")
+    if not isinstance(phases, list):
+        raise RuntimeError("Curriculum manifest must contain a 'phases' list")
+    phase_names = [str(phase.get("name", "")) for phase in phases if isinstance(phase, dict)]
+    missing = sorted(set(PHASE_ORDER) - set(phase_names))
+    if missing:
+        raise RuntimeError(f"Curriculum manifest is missing phases: {missing}")
+
+    all_train_fingerprints: set[str] = set()
+    all_eval_fingerprints: set[str] = set()
+    for phase in phases:
+        phase_name = str(phase.get("name", ""))
+        for split in ("train", "eval"):
+            path = _resolve_manifest_file(bundle_dir, phase.get(f"{split}_file", ""))
+            if not path.is_file():
+                raise RuntimeError(f"Missing {phase_name} {split} file: {path}")
+            expected_sha = str(phase.get(f"{split}_sha256", "")).lower()
+            actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            if not expected_sha or actual_sha != expected_sha:
+                raise RuntimeError(
+                    f"{phase_name} {split} SHA-256 mismatch: "
+                    f"expected={expected_sha or '<missing>'} actual={actual_sha}"
+                )
+
+            rows: List[Dict] = []
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            f"Invalid JSONL at {path}:{line_number}: {exc}"
+                        ) from exc
+                    if not isinstance(row, dict):
+                        raise RuntimeError(
+                            f"Expected JSON object at {path}:{line_number}"
+                        )
+                    rows.append(row)
+
+            expected_samples = int(phase.get(f"{split}_samples", -1))
+            if expected_samples != len(rows):
+                raise RuntimeError(
+                    f"{phase_name} {split} sample-count mismatch: "
+                    f"manifest={expected_samples} file={len(rows)}"
+                )
+            fingerprints = [_curriculum_content_fingerprint(row) for row in rows]
+            if len(fingerprints) != len(set(fingerprints)):
+                raise RuntimeError(
+                    f"{phase_name} {split} contains duplicated semantic records"
+                )
+            if split == "train":
+                all_train_fingerprints.update(fingerprints)
+            else:
+                all_eval_fingerprints.update(fingerprints)
+
+    overlap = all_train_fingerprints & all_eval_fingerprints
+    if overlap:
+        raise RuntimeError(
+            f"Curriculum train/eval leakage detected: {len(overlap)} "
+            "semantic records overlap"
+        )
+    return manifest
+
+
+def validate_tokenizer_artifact(tokenizer_path: Path, target_vocab: int) -> None:
+    metadata_path = tokenizer_path.with_suffix(".json")
+    if not tokenizer_path.is_file() or not metadata_path.is_file():
+        raise RuntimeError(
+            f"Tokenizer artifact or metadata missing: {tokenizer_path}, {metadata_path}"
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid tokenizer metadata: {metadata_path}: {exc}") from exc
+    if int(metadata.get("target_vocab", -1)) != int(target_vocab):
+        raise RuntimeError(
+            f"Tokenizer target-vocab mismatch: expected={target_vocab} "
+            f"metadata={metadata.get('target_vocab')}"
+        )
+    expected_sha = str(metadata.get("sha256", "")).lower()
+    actual_sha = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
+    if not expected_sha or expected_sha != actual_sha:
+        raise RuntimeError(
+            f"Tokenizer SHA-256 mismatch: expected={expected_sha or '<missing>'} "
+            f"actual={actual_sha}"
         )
 
 
@@ -2049,8 +2243,10 @@ def ensure_bundle(
     tokenizer_path = bundle_dir / f"tokenizer_{target_vocab}.ox3"
     if rebuild or not manifest_path.exists():
         build_curriculum(repo_root, bundle_dir, seed=seed, phase_sizes=phase_sizes)
+    validate_curriculum_manifest(bundle_dir, manifest_path)
     if rebuild or not tokenizer_path.exists():
         build_tokenizer_bundle(bundle_dir, target_vocab=target_vocab)
+    validate_tokenizer_artifact(tokenizer_path, target_vocab)
     return tokenizer_path
 
 
@@ -3156,9 +3352,12 @@ def run_reload_probe(nsos, model, model_config, device, tokenizer, probe_rows: L
 
 
 def train_rows_direct(trainer, tokenizer, rows: List[Dict], max_steps: int, callback,
-                      seed: int, eos_token_id: int, batch_size: int) -> Dict[str, float]:
+                      seed: int, eos_token_id: int, batch_size: int,
+                      start_step: int = 0) -> Dict[str, float]:
     if not rows or max_steps <= 0:
         return {}
+    if start_step < 0 or start_step > max_steps:
+        raise ValueError("start_step must be in [0, max_steps]")
 
     rng = random.Random(seed)
     order = list(range(len(rows)))
@@ -3201,6 +3400,11 @@ def train_rows_direct(trainer, tokenizer, rows: List[Dict], max_steps: int, call
             break
 
         step += 1
+        # Reconstruct the deterministic shuffle/cursor sequence without
+        # replaying optimizer updates already present in the exact-resume
+        # sidecar.
+        if step <= start_step:
+            continue
         loss = trainer.train_supervised_batch(prompt_batch, answer_batch)
         if hasattr(trainer, "last_auxiliary_stats"):
             merge_auxiliary_metrics(
@@ -3573,7 +3777,7 @@ def main() -> int:
     print(f"[boot] RunLogger ready; session.log -> {session_log_path}", flush=True)
 
     try:
-        maybe_enable_hybrid_resume_cuda_safe_mode(args, profile, logger)
+        maybe_enable_hybrid_resume_gpu_safe_mode(args, profile, logger)
         build_dir = detect_build_dir(args.build_dir)
         print(f"[boot] build_dir resolved -> {build_dir}", flush=True)
         print(f"[boot] importing nsos_ext (CUDA libs init can take 30-90 s on first import)...", flush=True)
@@ -3705,16 +3909,15 @@ def main() -> int:
             layer_audit.set_enabled(True)
             model.set_audit_collector(layer_audit)
             logger.log(f"[audit] enabled path={layer_audit_path}")
-        if args.resume_model is not None and args.resume_model.exists():
-            try:
-                model.load(str(args.resume_model), True)
-                logger.log(f"[resume] strict checkpoint load ok: {args.resume_model}")
-            except RuntimeError as strict_error:
-                logger.log(
-                    f"[resume] strict checkpoint load failed: {strict_error}; retrying partial load"
-                )
-                model.load(str(args.resume_model), False)
-                logger.log(f"[resume] partial checkpoint load ok: {args.resume_model}")
+        resume_training_state_path: Path | None = None
+        resume_progress_path: Path | None = None
+        resume_progress: Dict[str, object] = {}
+        exact_resume_enabled = False
+        if args.resume_model is not None:
+            if not args.resume_model.is_file():
+                raise FileNotFoundError(f"Resume model does not exist: {args.resume_model}")
+            model.load(str(args.resume_model), True)
+            logger.log(f"[resume] strict checkpoint load ok: {args.resume_model}")
         print(f"[boot] constructing Trainer (lr={profile['lr']}, warmup={profile['warmup_steps']})...", flush=True)
         trainer = nsos.Trainer(model, profile["lr"])
         trainer.weight_decay = profile["weight_decay"]
@@ -3745,6 +3948,57 @@ def main() -> int:
             scheduler.quantized_precision_bits = int(qat_cfg.get("quantized_precision_bits", 2))
             scheduler.ternary_regularization = float(qat_cfg.get("ternary_regularization", 0.0))
         trainer.configure_progressive_qat(scheduler)
+        if args.resume_model is not None:
+            resume_training_state_path = (
+                args.resume_training_state
+                if args.resume_training_state is not None
+                else args.resume_model.with_suffix(".state")
+            )
+            resume_progress_path = (
+                args.resume_progress
+                if args.resume_progress is not None
+                else args.resume_model.with_suffix(".progress.json")
+            )
+            if args.weights_only_resume:
+                logger.log(
+                    "[resume] weights-only resume explicitly enabled; "
+                    "optimizer/RNG/phase cursor restart from the configured profile"
+                )
+            else:
+                if not resume_training_state_path.is_file():
+                    raise FileNotFoundError(
+                        "Exact resume requires Trainer state sidecar: "
+                        f"{resume_training_state_path}. Use --weights-only-resume "
+                        "only when restarting optimizer/scheduler state is intentional."
+                    )
+                if not resume_progress_path.is_file():
+                    raise FileNotFoundError(
+                        "Exact resume requires phase progress sidecar: "
+                        f"{resume_progress_path}. Use --weights-only-resume "
+                        "only when restarting the curriculum cursor is intentional."
+                    )
+                trainer.load_training_state(
+                    str(resume_training_state_path),
+                    str(args.resume_model),
+                )
+                try:
+                    resume_progress = json.loads(
+                        resume_progress_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"Invalid resume progress sidecar {resume_progress_path}: {exc}"
+                    ) from exc
+                if resume_progress.get("profile") not in (None, canonical_profile):
+                    raise RuntimeError(
+                        "Resume profile mismatch: checkpoint="
+                        f"{resume_progress.get('profile')} requested={canonical_profile}"
+                    )
+                exact_resume_enabled = True
+                logger.log(
+                    f"[resume] exact Trainer state + phase cursor restored: "
+                    f"state={resume_training_state_path} progress={resume_progress_path}"
+                )
         print(
             f"[boot] Trainer configured (total_training_steps={trainer.total_training_steps}, "
             f"qat={'on' if qat_enabled else 'off'}); preparing summary + entering phase loop next.",
@@ -3807,6 +4061,15 @@ def main() -> int:
                 "auxiliary_stack_profile": deepcopy(profile.get("auxiliary_stack", {})),
             },
             "resume_model": str(args.resume_model) if args.resume_model else "",
+            "resume_training_state": (
+                str(resume_training_state_path) if resume_training_state_path else ""
+            ),
+            "resume_progress": str(resume_progress_path) if resume_progress_path else "",
+            "resume_mode": (
+                "exact"
+                if exact_resume_enabled
+                else ("weights_only" if args.resume_model is not None else "fresh")
+            ),
             "phase_eval_mode": args.phase_eval_mode,
             "phase_eval_samples": args.phase_eval_samples,
             "phase_exact_samples": args.phase_exact_samples,
@@ -3867,10 +4130,52 @@ def main() -> int:
             "phases": [],
         }
 
+        active_checkpoint_progress: Dict[str, object] = {
+            "stage": "boot",
+            "phase": "",
+            "phase_index": -1,
+            "phase_step": 0,
+        }
+
         def save_checkpoint_artifact(name: str) -> None:
-            model.save(str(run_dir / f"{name}.bin"))
+            model_path = run_dir / f"{name}.bin"
+            state_path = run_dir / f"{name}.state"
+            progress_path = run_dir / f"{name}.progress.json"
+            model.save(str(model_path))
+            trainer.save_training_state(str(state_path), str(model_path))
             model.save_edge_linear_pack(str(run_dir / f"{name}.edge.nsos"))
             shutil.copy2(run_dir / "tokenizer.nsos", run_dir / f"{name}.tokenizer.nsos")
+            progress_payload = {
+                "format_version": 1,
+                "checkpoint": name,
+                "profile": canonical_profile,
+                "model_path": str(model_path),
+                "training_state_path": str(state_path),
+                "global_step_count": int(trainer.global_step_count),
+                **active_checkpoint_progress,
+            }
+            progress_tmp = progress_path.with_name(progress_path.name + ".tmp")
+            progress_tmp.write_text(
+                json.dumps(progress_payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(progress_tmp, progress_path)
+
+        def load_checkpoint_artifact(name: str) -> None:
+            model_path = run_dir / f"{name}.bin"
+            state_path = run_dir / f"{name}.state"
+            progress_path = run_dir / f"{name}.progress.json"
+            if not model_path.is_file() or not state_path.is_file():
+                raise RuntimeError(
+                    f"Checkpoint pair is incomplete: model={model_path} state={state_path}"
+                )
+            model.load(str(model_path), True)
+            trainer.load_training_state(str(state_path), str(model_path))
+            if progress_path.is_file():
+                progress_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+                for key in ("stage", "phase", "phase_index", "phase_step"):
+                    if key in progress_payload:
+                        active_checkpoint_progress[key] = progress_payload[key]
 
         def consider_global_champion(source_name: str, source_phase: str) -> float:
             nonlocal best_global_score, best_release_score
@@ -4032,6 +4337,31 @@ def main() -> int:
         # curated_text→algorithms→structured→instructions→verifier→memory.
         execution_phase_order = resolve_phase_order(
             profile.get("curriculum_phase_order"))
+        resume_phase_index = -1
+        resume_phase_step = 0
+        if exact_resume_enabled:
+            resume_stage = str(resume_progress.get("stage", ""))
+            resume_phase_name = str(resume_progress.get("phase", ""))
+            if resume_stage != "phase" or resume_phase_name not in execution_phase_order:
+                raise RuntimeError(
+                    "Exact automatic resume currently requires a phase checkpoint; "
+                    f"got stage={resume_stage!r} phase={resume_phase_name!r}"
+                )
+            resume_phase_index = execution_phase_order.index(resume_phase_name)
+            recorded_phase_index = int(
+                resume_progress.get("phase_index", resume_phase_index)
+            )
+            if recorded_phase_index != resume_phase_index:
+                raise RuntimeError(
+                    "Resume progress phase index does not match the active profile order"
+                )
+            resume_phase_step = int(resume_progress.get("phase_step", 0))
+            if resume_phase_step < 0:
+                raise RuntimeError("Resume phase_step cannot be negative")
+            logger.log(
+                f"[resume] curriculum cursor phase={resume_phase_name} "
+                f"index={resume_phase_index} step={resume_phase_step}"
+            )
         # AUDIT #8: open the LOCAL metrics file for writing.  Periodic
         # _flush_metrics_to_run_dir() copies it to the (possibly slow)
         # run_dir at phase boundaries.
@@ -4088,6 +4418,36 @@ def main() -> int:
                         )
                     )
 
+                if exact_resume_enabled and phase_index < resume_phase_index:
+                    if phase_name != "phase3_curated_text":
+                        history_rows = list(train_rows) + list(weak_kind_minipack_rows)
+                        supervised_history.extend(history_rows)
+                        family = PHASE_FAMILIES.get(phase_name)
+                        if family:
+                            supervised_history_by_family.setdefault(family, []).extend(
+                                history_rows
+                            )
+                    logger.log(f"[resume] skipping completed phase {phase_name}")
+                    continue
+
+                phase_start_step = (
+                    resume_phase_step
+                    if exact_resume_enabled and phase_index == resume_phase_index
+                    else 0
+                )
+                if phase_start_step > max_steps:
+                    raise RuntimeError(
+                        f"Resume step {phase_start_step} exceeds configured "
+                        f"max_steps {max_steps} for {phase_name}"
+                    )
+                active_checkpoint_progress.update(
+                    {
+                        "stage": "phase",
+                        "phase": phase_name,
+                        "phase_index": phase_index,
+                        "phase_step": phase_start_step,
+                    }
+                )
                 logger.log(
                     f"[train] {phase_name}: samples={len(train_rows)} mixed={len(phase_rows)} "
                     f"weak_pack={len(weak_kind_minipack_rows)} "
@@ -4108,9 +4468,12 @@ def main() -> int:
                 best_phase_name = ""
                 best_phase_metrics: Dict[str, float] | None = None
                 progress = logger.make_progress(max_steps, phase_name)
+                if progress is not None and phase_start_step > 0:
+                    progress.update(phase_start_step)
 
                 def callback(step: int, loss: float) -> None:
                     nonlocal ema_loss, best_phase_score, best_phase_step, best_phase_name, best_phase_metrics
+                    active_checkpoint_progress["phase_step"] = int(step)
                     if ema_loss is None:
                         ema_loss = loss
                     else:
@@ -4183,6 +4546,7 @@ def main() -> int:
                             profile["seq_len"],
                             callback,
                             max_steps,
+                            phase_start_step,
                         )
                     else:
                         phase_aux_metrics = train_rows_direct(
@@ -4194,6 +4558,7 @@ def main() -> int:
                             seed=args.seed + sum(ord(ch) for ch in phase_name),
                             eos_token_id=eos_token_id,
                             batch_size=profile["batch_size"],
+                            start_step=phase_start_step,
                         )
                 finally:
                     if progress is not None:
@@ -4211,7 +4576,7 @@ def main() -> int:
                 selected_source = "final"
                 if best_phase_name:
                     debug_eval_log(logger, f"{phase_name}:loading_best:start {best_phase_name}")
-                    model.load(str(run_dir / f"{best_phase_name}.bin"))
+                    load_checkpoint_artifact(best_phase_name)
                     debug_eval_log(logger, f"{phase_name}:loading_best:done {best_phase_name}")
                     save_checkpoint_artifact(f"{phase_name}_best")
                     selected_source = "best_eval"
@@ -4347,6 +4712,14 @@ def main() -> int:
                     args.seed,
                 )
                 if rehearsal_rows:
+                    active_checkpoint_progress.update(
+                        {
+                            "stage": "weak_kind_rehearsal",
+                            "phase": rehearsal_phase_name,
+                            "phase_index": len(execution_phase_order),
+                            "phase_step": 0,
+                        }
+                    )
                     rehearsal_lr_scale = float(profile.get("weak_kind_rehearsal_lr_scale", 1.0))
                     trainer.learning_rate = base_learning_rate * rehearsal_lr_scale
                     trainer.repetition_unlikelihood_scale = 0.0
@@ -4373,6 +4746,7 @@ def main() -> int:
 
                     def rehearsal_callback(step: int, loss: float) -> None:
                         nonlocal rehearsal_ema
+                        active_checkpoint_progress["phase_step"] = int(step)
                         if rehearsal_ema is None:
                             rehearsal_ema = loss
                         else:
@@ -4493,6 +4867,14 @@ def main() -> int:
             instruction_polish_steps = int(profile.get("instruction_polish_steps", 0))
             if instruction_polish_steps > 0 and args.override_phase_steps <= 0:
                 polish_phase_name = "instruction_polish"
+                active_checkpoint_progress.update(
+                    {
+                        "stage": "instruction_polish",
+                        "phase": polish_phase_name,
+                        "phase_index": len(execution_phase_order) + 1,
+                        "phase_step": 0,
+                    }
+                )
                 polish_rows = (
                     curriculum_texts_for_phase(args.bundle_dir, "phase4_instructions", "train")
                     + curriculum_texts_for_phase(args.bundle_dir, "phase5_verifier", "train")
@@ -4537,6 +4919,7 @@ def main() -> int:
                 def polish_callback(step: int, loss: float) -> None:
                     nonlocal polish_ema, polish_best_score, polish_best_step, polish_best_name
                     nonlocal polish_best_metrics
+                    active_checkpoint_progress["phase_step"] = int(step)
                     if polish_ema is None:
                         polish_ema = loss
                     else:
@@ -4617,7 +5000,7 @@ def main() -> int:
                 selected_source = "final"
                 if polish_best_name:
                     debug_eval_log(logger, f"{polish_phase_name}:loading_best:start {polish_best_name}")
-                    model.load(str(run_dir / f"{polish_best_name}.bin"))
+                    load_checkpoint_artifact(polish_best_name)
                     debug_eval_log(logger, f"{polish_phase_name}:loading_best:done {polish_best_name}")
                     save_checkpoint_artifact(f"{polish_phase_name}_best")
                     selected_source = "best_eval"
@@ -4721,6 +5104,14 @@ def main() -> int:
                 trainer.learning_rate = base_learning_rate
 
             if args.final_consolidation_steps > 0 and supervised_history:
+                active_checkpoint_progress.update(
+                    {
+                        "stage": "final_consolidation",
+                        "phase": "final_consolidation",
+                        "phase_index": len(execution_phase_order) + 2,
+                        "phase_step": 0,
+                    }
+                )
                 logger.log(
                     f"[train] consolidation: rows={len(supervised_history)} "
                     f"steps={args.final_consolidation_steps} batch={profile['batch_size']}"
@@ -4736,6 +5127,7 @@ def main() -> int:
 
                 def final_callback(step: int, loss: float) -> None:
                     nonlocal consolidation_ema
+                    active_checkpoint_progress["phase_step"] = int(step)
                     if consolidation_ema is None:
                         consolidation_ema = loss
                     else:
@@ -4864,17 +5256,17 @@ def main() -> int:
         holdout_champion_path = run_dir / "champion_holdout.bin"
         champion_path = run_dir / "champion_global.bin"
         if summary.get("release_candidate", {}).get("source") and release_candidate_path.exists():
-            model.load(str(release_candidate_path))
+            load_checkpoint_artifact("release_candidate")
             final_model_source = "release_candidate"
         elif (
             args.select_final_by_holdout
             and summary.get("capacity_champion", {}).get("source")
             and holdout_champion_path.exists()
         ):
-            model.load(str(holdout_champion_path))
+            load_checkpoint_artifact("champion_holdout")
             final_model_source = "champion_holdout"
         elif summary.get("global_champion", {}).get("source") and champion_path.exists():
-            model.load(str(champion_path))
+            load_checkpoint_artifact("champion_global")
             final_model_source = "champion_global"
         summary["final_model_source"] = final_model_source
 
@@ -4960,16 +5352,35 @@ def main() -> int:
                 f"failures={len(audit_report.get('failures', []))} "
                 f"summary={layer_audit_summary_path}"
             )
-        model.save(str(run_dir / "final_model.bin"))
-        model.save_edge_linear_pack(str(run_dir / "final_edge_linear.nsos"))
+        release_gate_failed = not bool(
+            summary.get("release_candidate", {}).get("source")
+        )
+        summary["release_gate"]["artifact_eligible"] = not release_gate_failed
+        if release_gate_failed:
+            save_checkpoint_artifact("research_model")
+            summary["artifact_status"] = "research_only_release_gate_failed"
+            summary["model_artifact"] = str(run_dir / "research_model.bin")
+            logger.log(
+                "[release] gate failed: saved research_model.bin; "
+                "no final_model.bin was emitted"
+            )
+        else:
+            save_checkpoint_artifact("final_model")
+            shutil.copy2(
+                run_dir / "final_model.edge.nsos",
+                run_dir / "final_edge_linear.nsos",
+            )
+            summary["artifact_status"] = "release_candidate"
+            summary["model_artifact"] = str(run_dir / "final_model.bin")
         save_run_summary(run_dir / "run_summary.json", summary)
-        logger.log(f"[done] final checkpoint: {run_dir / 'final_model.bin'}")
-        logger.log(f"[done] final edge pack: {run_dir / 'final_edge_linear.nsos'}")
+        logger.log(f"[done] model artifact: {summary['model_artifact']}")
         logger.log(f"[done] summary: {run_dir / 'run_summary.json'}")
         if audit_gate_failed:
             return 2
         if capacity_gate_failed:
             return 3
+        if release_gate_failed:
+            return 4
         return 0
     finally:
         logger.close()

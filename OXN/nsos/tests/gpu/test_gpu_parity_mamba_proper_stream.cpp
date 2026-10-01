@@ -65,6 +65,11 @@ int main() {
         y_stream_h.data()[static_cast<size_t>(t) * D + c] = yt.data()[c];
       }
     }
+    if (layer.stream_priming_gpu_calls() != 1 ||
+        layer.stream_priming_host_fallbacks() != 0) {
+      throw std::runtime_error(
+          "proper Mamba prefill did not prime streaming carry on-device");
+    }
     layer.set_streaming_mode(false);
 
     // Both paths are GPU kernels (full-scan vs fused step); tolerance covers the

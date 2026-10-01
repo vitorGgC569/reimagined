@@ -1,31 +1,35 @@
 #ifndef LEAN_INTEGRATION_H
 #define LEAN_INTEGRATION_H
 
+#include <stdexcept>
 #include <string>
 
 namespace nsos {
 
 /**
- * LeanVerifier: Stub for System 2 formal verification logic.
- * In a production System, this would bridge to a Lean 4 solver.
+ * Fail-closed boundary for an optional Lean 4 verification provider.
+ *
+ * No solver is linked in this build. In particular, this class must never
+ * infer validity from syntax or return an optimistic result: callers can test
+ * availability and must treat an unavailable provider as unverified.
  */
 class LeanVerifier {
 public:
   LeanVerifier() = default;
 
+  [[nodiscard]] constexpr bool available() const noexcept { return false; }
+
   /**
    * verify: Deterministic verification of logical/mathematical statements.
    */
-  bool verify(const std::string &statement) {
-    // Mock Verification Logic
-    // If it's a simple equation, we can evaluate it.
-    if (statement == "1+1=2")
-      return true;
-    if (statement == "2+2=4")
-      return true;
-
-    // Return true if it looks valid or if we're in "Optimistic Prototype Mode"
-    return true;
+  [[nodiscard]] bool verify(const std::string &statement) const {
+    if (statement.empty()) {
+      throw std::invalid_argument(
+          "Lean verification requires a non-empty statement");
+    }
+    throw std::runtime_error(
+        "Lean verification is unavailable: this NSOS build has no "
+        "authenticated Lean 4 provider");
   }
 };
 

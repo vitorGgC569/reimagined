@@ -125,8 +125,8 @@ class GpuSampler:
         if self._nvml is not None:
             try:
                 self._nvml.nvmlShutdown()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[gpu-sampler] NVML shutdown failed: {exc}", file=sys.stderr)
 
     def stats(self) -> Dict[str, float]:
         if not self.utils:

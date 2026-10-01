@@ -1,4 +1,5 @@
 #include "nsos/determinism.h"
+#include "runtime_execution_identity.h"
 #include <atomic>
 #include <cstdlib>
 #include <iomanip>
@@ -50,6 +51,7 @@ bool deterministic_reductions_enabled() {
 }
 
 void set_deterministic_reductions(bool enabled) {
+  RuntimeExecutionPolicyMutationGuard mutation;
   g_deterministic_reductions.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 

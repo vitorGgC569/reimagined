@@ -52,10 +52,7 @@ def run_arm(nsos, profile, vocab, host_arm: bool):
     nsos.set_seed(1234)
     dev = nsos.Device.GPU
     cfg = build_model_config(nsos, profile, vocab, dev)
-    try:
-        cfg.default_batch_size = 2
-    except Exception:
-        pass
+    cfg.default_batch_size = 2
     model = nsos.JambaModel(cfg, dev)
     model.to(dev)
     set_model_training_mode(model, True)
@@ -115,7 +112,7 @@ def main() -> int:
 
     import re as _re
 
-    # Classificador v5: exige ".attn." — na v4, mamba.out_proj (todo layer tem
+    # Classificador v5: exige ".attn." — na v4, mamba.out_proj (cada layer tem
     # um!) poluiu o grupo "controle", e o backward do mamba-11 roda DEPOIS do
     # backward da atencao-11, vendo a divergencia legitimamente => controle
     # inflado por max() com um tensor que NAO e controle.

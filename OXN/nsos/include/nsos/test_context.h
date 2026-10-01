@@ -2,6 +2,8 @@
 #include "determinism.h"
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
+#include <stdexcept>
 #include <string>
 
 namespace nsos {
@@ -23,9 +25,14 @@ public:
     std::filesystem::create_directories(temp_dir_);
   }
 
-  ~IsolatedTestContext() {
+  ~IsolatedTestContext() noexcept {
     // Limpar diretório temporário
-    std::filesystem::remove_all(temp_dir_);
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(temp_dir_, cleanup_error);
+    if (cleanup_error) {
+      std::cerr << "IsolatedTestContext cleanup failed for " << temp_dir_
+                << ": " << cleanup_error.message() << '\n';
+    }
     // Resetar determinismo
     determinism::DeterminismManager::instance().reset();
   }
@@ -37,10 +44,10 @@ public:
     determinism::DeterminismManager::instance().set_global_seed(seed_);
   }
 
-  // Placeholder para isolamento de hardware específico (CUDA, MPI)
   void isolate_cuda() {
-    // Em uma implementação real, poderíamos selecionar um dispositivo
-    // específico ou resetar o estado da GPU aqui.
+    throw std::logic_error(
+        "IsolatedTestContext::isolate_cuda is unsupported; select and "
+        "isolate the GPU explicitly in the GPU test harness");
   }
 
 private:

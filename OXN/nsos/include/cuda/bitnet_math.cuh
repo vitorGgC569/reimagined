@@ -5,7 +5,7 @@
 #include <vector>
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
-#include <cuda_runtime.h>
+#include "../gpu_backend.h"
 #endif
 
 namespace uhk {
@@ -55,86 +55,22 @@ inline std::vector<uint8_t> pack_ternary_weights(const std::vector<int8_t>& weig
 
 // Método 1: DP4A com expansão on-the-fly (Melhor para INT8 Activations)
 // Expande 4 pesos de 2 bits para 4 bytes INT8 em 1 registrador.
-__device__ __forceinline__ int dot_product_ternary_int8(uint32_t packed_weights_32, uint32_t packed_activations_32) {
-    // packed_weights_32 contém 16 pesos (4 bytes, 4 pesos por byte)
-    // packed_activations_32 contém 4 ativações (4 bytes)
-    // Isso não bate. Precisamos processar 4 pesos x 4 ativacoes.
-    // Entrada:
-    //   packed_weights_8: 1 byte contendo 4 pesos (2-bit cada)
-    //   packed_activations_32: 4 bytes contendo 4 ativações (int8)
-
-    // Expandir 4 pesos de 2 bits para 4 ints de 8 bits
-    // Pesos: 00=0, 01=1, 10=-1 (raw bits) -> mapear para int8 0, 1, -1
-    // Mapeamento mágico:
-    // 00 -> 0x00
-    // 01 -> 0x01
-    // 10 -> 0xFF (-1 em complemento de dois)
-    // 11 -> N/A
-
-    // Algoritmo de Expansão Bitwise (SWAR):
-    // w = byte
-    // vals = (w & 0x55) - ((w >> 1) & 0x55) ? Não, codificação não é padrão.
-    // Nossa codificação: 00=0, 01=1, 10=-1
-
-    // Expansão via LUT ou Bithacks. Vamos usar PRMT (Permute) ou lógica simples
-    // Vamos processar byte a byte do input de pesos.
-    // Assumindo input 'packed_weights_byte' (8 bits, 4 pesos) e 'activations' (32 bits, 4 int8)
-
-    // Implementação "Metal" precisa ser correta e rápida.
-    // Vamos usar __dp4a. Precisamos construir o registrador "weights_expanded".
-
-    // Extração:
-    // p0 = (w >> 0) & 3
-    // p1 = (w >> 2) & 3
-    // ...
-
-    // Converter 2-bit code para 8-bit value:
-    // Code 0 (00) -> 0
-    // Code 1 (01) -> 1
-    // Code 2 (10) -> -1 (0xFF)
-    // Code 3 (11) -> 0
-
-    // Lookup Table em registrador?
-    // LUT: 0x0001FF00 (na ordem 11 10 01 00 -> 0 -1 1 0) ??
-    // Bytes: 00, FF, 01, 00.
-    // Shift dinâmico é lento.
-
-    // Abordagem Aritmética sem branch:
-    // map(c): return (c == 2) ? -1 : c;
-    // ou: c - (c >= 2 ? 3 : 0) ? Nao.
-    // c=0->0, c=1->1, c=2->-1.
-    // (c & 1) - ((c >> 1) & 1) * 2 ???
-    // 00: 0 - 0 = 0. OK.
-    // 01: 1 - 0 = 1. OK.
-    // 10: 0 - 1*2 = -2. ERRADO (queremos -1).
-    // 10: c=2.
-
-    // Tentar: (c == 1) - (c == 2)
-    // Bitwise: (c & 1) - (c >> 1)
-    // 00: 0 - 0 = 0
-    // 01: 1 - 0 = 1
-    // 10: 0 - 1 = -1
-    // 11: 1 - 1 = 0
-    // BINGO! Formula: (c & 1) - (c >> 1)
-
-    // Agora aplicar SWAR para 4 pesos em 1 uint32.
-    // w: byte de entrada (4 pesos)
-    // w_expanded:
-
-    // Passo 1: Isolar bits baixos (bit 0 de cada par)
-    // mask_lo = 0b01010101 (0x55)
-    // lo = w & 0x55
-
-    // Passo 2: Isolar bits altos (bit 1 de cada par)
-    // hi = (w >> 1) & 0x55
-
-    // Agora temos lo e hi compactados. Precisamos espaçá-los para bytes.
-    // Padrão de bits atual: l3 l2 l1 l0 (cada l é 1 bit na posição certa... espera, estão a cada 2 bits)
-    // Temos 8 bits. Queremos espalhar para 32 bits.
-    // Podemos usar __prmt ou pdep (Pascal+).
-    // Mas vamos simplificar para loop unroll com __dp4a, compilador deve otimizar.
-
-    return 0; // Placeholder para especialização abaixo
+__device__ __forceinline__ int dot_product_ternary_int8(
+    uint32_t packed_weights_8, uint32_t packed_activations_32) {
+    // The low byte contains four 2-bit ternary codes.  The activation word
+    // contains four signed INT8 lanes in little-endian order.  Code 0b11 is
+    // deliberately decoded as zero, matching pack_ternary_weights' domain.
+    int result = 0;
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const uint32_t code = (packed_weights_8 >> (2 * lane)) & 0x3u;
+        const int weight = static_cast<int>(code & 1u) -
+                           static_cast<int>(code >> 1u);
+        const int activation = static_cast<int>(static_cast<int8_t>(
+            (packed_activations_32 >> (8 * lane)) & 0xffu));
+        result += weight * activation;
+    }
+    return result;
 }
 
 // Especialização __device__ completa

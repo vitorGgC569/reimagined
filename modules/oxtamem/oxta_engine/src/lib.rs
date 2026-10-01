@@ -3,26 +3,31 @@ pub mod server;
 pub mod sharding;
 
 use crate::engine::{GeodesicEngine, MAX_RECALL_BYTES, MAX_VALUE_BYTES};
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
-use std::ffi::{CStr, c_char};
+use std::cell::RefCell;
+use std::ffi::{CStr, CString, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
 use std::sync::Mutex;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
-pub const OXTAMEM_ABI_VERSION: u32 = 1;
+pub const OXTAMEM_ABI_VERSION: u32 = 2;
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGeodesicEngine>()?;
     Ok(())
 }
 
+#[cfg(feature = "python")]
 #[pyclass]
 struct PyGeodesicEngine {
     inner: GeodesicEngine,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyGeodesicEngine {
     #[new]
@@ -97,8 +102,21 @@ pub struct OxtaMemHandle {
     inner: Mutex<GeodesicEngine>,
 }
 
+thread_local! {
+    static LAST_ERROR: RefCell<CString> =
+        RefCell::new(CString::new("ok").expect("static error message has no NUL"));
+}
+
+fn set_last_error(message: impl AsRef<str>) {
+    let sanitized = message.as_ref().replace('\0', "\\0");
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = CString::new(sanitized).expect("sanitized error message has no NUL");
+    });
+}
+
 fn write_allocated_buffer(bytes: Vec<u8>, out_data: *mut *mut u8, out_len: *mut usize) -> bool {
     if out_data.is_null() || out_len.is_null() {
+        set_last_error("invalid output buffer pointers");
         return false;
     }
 
@@ -148,6 +166,11 @@ pub extern "C" fn oxtamem_abi_version() -> u32 {
     OXTAMEM_ABI_VERSION
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn oxtamem_last_error() -> *const c_char {
+    LAST_ERROR.with(|slot| slot.borrow().as_ptr())
+}
+
 /// # Safety
 ///
 /// `path` must be a valid, NUL-terminated C string pointer for the duration of the call.
@@ -155,16 +178,26 @@ pub extern "C" fn oxtamem_abi_version() -> u32 {
 pub unsafe extern "C" fn oxtamem_create(path: *const c_char, size_mb: u64) -> *mut OxtaMemHandle {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(path_string) = cstr_to_string(path) else {
+            set_last_error("invalid OxtaMem store path");
             return ptr::null_mut();
         };
         match GeodesicEngine::new(path_string, size_mb) {
-            Ok(engine) => Box::into_raw(Box::new(OxtaMemHandle {
-                inner: Mutex::new(engine),
-            })),
-            Err(_) => ptr::null_mut(),
+            Ok(engine) => {
+                set_last_error("ok");
+                Box::into_raw(Box::new(OxtaMemHandle {
+                    inner: Mutex::new(engine),
+                }))
+            }
+            Err(error) => {
+                set_last_error(error.to_string());
+                ptr::null_mut()
+            }
         }
     }))
-    .unwrap_or(ptr::null_mut())
+    .unwrap_or_else(|_| {
+        set_last_error("panic while creating OxtaMem store");
+        ptr::null_mut()
+    })
 }
 
 /// # Safety
@@ -192,11 +225,12 @@ pub unsafe extern "C" fn oxtamem_write(
     value_len: usize,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
-        if handle.is_null() || (value.is_null() && value_len != 0) ||
-            value_len > MAX_VALUE_BYTES {
+        if handle.is_null() || (value.is_null() && value_len != 0) || value_len > MAX_VALUE_BYTES {
+            set_last_error("invalid OxtaMem handle or value");
             return false;
         }
         let Some(token) = cstr_to_string(token_id) else {
+            set_last_error("invalid OxtaMem token id");
             return false;
         };
         let payload = if value_len == 0 {
@@ -206,11 +240,83 @@ pub unsafe extern "C" fn oxtamem_write(
         };
         let guard = unsafe { &*handle };
         match guard.inner.lock() {
-            Ok(mut engine) => engine.write(&token, payload).is_ok(),
-            Err(_) => false,
+            Ok(mut engine) => match engine.write(&token, payload) {
+                Ok(_) => {
+                    set_last_error("ok");
+                    true
+                }
+                Err(error) => {
+                    set_last_error(error);
+                    false
+                }
+            },
+            Err(_) => {
+                set_last_error("OxtaMem store lock is poisoned");
+                false
+            }
         }
     }))
-    .unwrap_or(false)
+    .unwrap_or_else(|_| {
+        set_last_error("panic while writing OxtaMem value");
+        false
+    })
+}
+
+/// # Safety
+///
+/// All pointers must remain valid for the duration of the call. `vector` must
+/// contain exactly `DEFAULT_VECTOR_DIMENSIONS` finite values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxtamem_write_with_vector(
+    handle: *mut OxtaMemHandle,
+    token_id: *const c_char,
+    value: *const u8,
+    value_len: usize,
+    vector: *const f32,
+    vector_len: usize,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null()
+            || (value.is_null() && value_len != 0)
+            || value_len > MAX_VALUE_BYTES
+            || vector.is_null()
+            || vector_len != crate::engine::DEFAULT_VECTOR_DIMENSIONS
+        {
+            set_last_error("invalid OxtaMem handle, value, or vector");
+            return false;
+        }
+        let Some(token) = cstr_to_string(token_id) else {
+            set_last_error("invalid OxtaMem token id");
+            return false;
+        };
+        let payload = if value_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(value, value_len) }.to_vec()
+        };
+        let embedding = unsafe { slice::from_raw_parts(vector, vector_len) }.to_vec();
+        let guard = unsafe { &*handle };
+        match guard.inner.lock() {
+            Ok(mut engine) => match engine.write_with_vector(&token, payload, embedding) {
+                Ok(_) => {
+                    set_last_error("ok");
+                    true
+                }
+                Err(error) => {
+                    set_last_error(error);
+                    false
+                }
+            },
+            Err(_) => {
+                set_last_error("OxtaMem store lock is poisoned");
+                false
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("panic while writing OxtaMem vector value");
+        false
+    })
 }
 
 /// # Safety
@@ -226,24 +332,43 @@ pub unsafe extern "C" fn oxtamem_read_latest(
     out_len: *mut usize,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
-        if !out_data.is_null() { unsafe { *out_data = ptr::null_mut() }; }
-        if !out_len.is_null() { unsafe { *out_len = 0 }; }
+        if !out_data.is_null() {
+            unsafe { *out_data = ptr::null_mut() };
+        }
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
         if handle.is_null() || out_data.is_null() || out_len.is_null() {
+            set_last_error("invalid OxtaMem read arguments");
             return false;
         }
         let Some(token) = cstr_to_string(token_id) else {
+            set_last_error("invalid OxtaMem token id");
             return false;
         };
         let guard = unsafe { &*handle };
         let Ok(engine) = guard.inner.lock() else {
+            set_last_error("OxtaMem store lock is poisoned");
             return false;
         };
         match engine.read_latest(&token) {
-            Some(node) => write_allocated_buffer(node.value, out_data, out_len),
-            None => false,
+            Some(node) => {
+                let ok = write_allocated_buffer(node.value, out_data, out_len);
+                if ok {
+                    set_last_error("ok");
+                }
+                ok
+            }
+            None => {
+                set_last_error("not found");
+                false
+            }
         }
     }))
-    .unwrap_or(false)
+    .unwrap_or_else(|_| {
+        set_last_error("panic while reading OxtaMem value");
+        false
+    })
 }
 
 /// # Safety
@@ -260,17 +385,27 @@ pub unsafe extern "C" fn oxtamem_recall(
     out_len: *mut usize,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
-        if !out_data.is_null() { unsafe { *out_data = ptr::null_mut() }; }
-        if !out_len.is_null() { unsafe { *out_len = 0 }; }
-        if handle.is_null() || out_data.is_null() || out_len.is_null() ||
-            depth > crate::engine::MAX_RECALL_DEPTH {
+        if !out_data.is_null() {
+            unsafe { *out_data = ptr::null_mut() };
+        }
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
+        if handle.is_null()
+            || out_data.is_null()
+            || out_len.is_null()
+            || depth > crate::engine::MAX_RECALL_DEPTH
+        {
+            set_last_error("invalid OxtaMem recall arguments");
             return false;
         }
         let Some(token) = cstr_to_string(token_id) else {
+            set_last_error("invalid OxtaMem token id");
             return false;
         };
         let guard = unsafe { &*handle };
         let Ok(engine) = guard.inner.lock() else {
+            set_last_error("OxtaMem store lock is poisoned");
             return false;
         };
         let payloads = engine
@@ -279,11 +414,85 @@ pub unsafe extern "C" fn oxtamem_recall(
             .map(|node| node.value)
             .collect::<Vec<_>>();
         match serialize_nodes(payloads) {
-            Some(encoded) => write_allocated_buffer(encoded, out_data, out_len),
-            None => false,
+            Some(encoded) => {
+                let ok = write_allocated_buffer(encoded, out_data, out_len);
+                if ok {
+                    set_last_error("ok");
+                }
+                ok
+            }
+            None => {
+                set_last_error("OxtaMem recall result exceeds the ABI limit");
+                false
+            }
         }
     }))
-    .unwrap_or(false)
+    .unwrap_or_else(|_| {
+        set_last_error("panic while recalling OxtaMem values");
+        false
+    })
+}
+
+/// # Safety
+///
+/// `vector` must point to `vector_len` readable floats. `out_data` and
+/// `out_len` must be valid writable pointers. Returned buffers must be released
+/// with `oxtamem_free_buffer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxtamem_search_similar(
+    handle: *mut OxtaMemHandle,
+    vector: *const f32,
+    vector_len: usize,
+    top_k: usize,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if !out_data.is_null() {
+            unsafe { *out_data = ptr::null_mut() };
+        }
+        if !out_len.is_null() {
+            unsafe { *out_len = 0 };
+        }
+        if handle.is_null()
+            || vector.is_null()
+            || vector_len != crate::engine::DEFAULT_VECTOR_DIMENSIONS
+            || top_k > crate::engine::MAX_SEARCH_RESULTS
+            || out_data.is_null()
+            || out_len.is_null()
+        {
+            set_last_error("invalid OxtaMem similarity-search arguments");
+            return false;
+        }
+        let embedding = unsafe { slice::from_raw_parts(vector, vector_len) }.to_vec();
+        let guard = unsafe { &*handle };
+        let Ok(engine) = guard.inner.lock() else {
+            set_last_error("OxtaMem store lock is poisoned");
+            return false;
+        };
+        let payloads = engine
+            .search_similar(embedding, top_k)
+            .into_iter()
+            .map(|node| node.value)
+            .collect::<Vec<_>>();
+        match serialize_nodes(payloads) {
+            Some(encoded) => {
+                let ok = write_allocated_buffer(encoded, out_data, out_len);
+                if ok {
+                    set_last_error("ok");
+                }
+                ok
+            }
+            None => {
+                set_last_error("OxtaMem search result exceeds the ABI limit");
+                false
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        set_last_error("panic while searching OxtaMem values");
+        false
+    })
 }
 
 /// # Safety

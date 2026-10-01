@@ -3,7 +3,6 @@
 #include "mamba2.h"
 #include "tensor.h"
 
-#include <cassert>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -12,7 +11,7 @@
 #include <stdexcept>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "gpu_backend.h"
 #endif
 
 using namespace nsos;
@@ -22,9 +21,21 @@ namespace {
 void assert_close(const Tensor& lhs, const Tensor& rhs, float tol = 1e-4f) {
   Tensor lhs_cpu = lhs.cpu();
   Tensor rhs_cpu = rhs.cpu();
-  assert(lhs_cpu.size == rhs_cpu.size);
+  if (lhs_cpu.shape.dims != rhs_cpu.shape.dims ||
+      lhs_cpu.size != rhs_cpu.size) {
+    throw std::runtime_error("GPU parity shape mismatch");
+  }
   for (int i = 0; i < lhs_cpu.size; ++i) {
-    assert(std::abs(lhs_cpu.data()[i] - rhs_cpu.data()[i]) <= tol);
+    const float left = lhs_cpu.data()[i];
+    const float right = rhs_cpu.data()[i];
+    if (!std::isfinite(left) || !std::isfinite(right) ||
+        std::abs(left - right) > tol) {
+      throw std::runtime_error(
+          "GPU parity mismatch at index " + std::to_string(i) +
+          ": cpu=" + std::to_string(left) +
+          " gpu=" + std::to_string(right) +
+          " tolerance=" + std::to_string(tol));
+    }
   }
 }
 
@@ -97,16 +108,25 @@ void assert_bitlinear_parity() {
 
 void assert_jamba_forward_ids_batch_parity() {
   ModelConfig config;
-  config.num_layers = 4;
+  config.architecture_schema_version = 2;
+  config.num_layers = 2;
   config.d_model = 64;
   config.vocab_size = 96;
   config.n_heads = 4;
   config.n_kv_heads = 2;
-  config.attention_period = 64;
-  config.attention_slot = 63;
+  config.attention_period = 2;
+  config.attention_slot = 1;
+  config.hybrid_composition = HybridComposition::ParallelGated;
+  config.force_mamba_last_layer = false;
+  config.faithful_attention_linears = true;
+  config.mamba2_faithful = true;
+  config.mamba_state_expansion = true;
+  config.mamba_d_state = 8;
+  config.mamba_head_dim = 32;
   config.use_moe = false;
   config.use_ttt = false;
-  config.use_exact_attention_training = false;
+  config.use_exact_attention_training = true;
+  config.use_gradient_checkpointing = true;
 
   JambaModel cpu_model(config, Device::CPU);
   JambaModel gpu_model(config, Device::GPU);
@@ -134,22 +154,31 @@ int main() {
   return 1;
 #else
   try {
-    int device_count = 0;
-    const cudaError_t count_status = cudaGetDeviceCount(&device_count);
-    if (count_status != cudaSuccess || device_count <= 0) {
+    int selected_device = -1;
+    std::string selection_error;
+    if (!gpu::select_preferred_device(
+            &selected_device, &selection_error)) {
       throw std::runtime_error(
-          "CUDA device is required but unavailable (cudaGetDeviceCount=" +
-          std::to_string(static_cast<int>(count_status)) + ")");
+          "GPU device is required but unavailable: " +
+          selection_error);
     }
     cudaDeviceProp props{};
-    const cudaError_t props_status = cudaGetDeviceProperties(&props, 0);
+    const cudaError_t props_status =
+        cudaGetDeviceProperties(&props, selected_device);
     if (props_status != cudaSuccess) {
       throw std::runtime_error(
           std::string("cudaGetDeviceProperties failed: ") +
           cudaGetErrorString(props_status));
     }
-    std::cout << "[GPUParity] device=" << props.name << " cc=" << props.major << "."
-              << props.minor << " runtime=" << CUDART_VERSION << std::endl;
+    std::cout << "[GPUParity] backend=" << gpu::backend_name()
+              << " device_index=" << selected_device
+              << " device=" << props.name;
+#if defined(NSOS_GPU_BACKEND_HIP)
+    std::cout << " arch=" << props.gcnArchName;
+#else
+    std::cout << " arch=sm_" << props.major << props.minor;
+#endif
+    std::cout << " runtime=" << CUDART_VERSION << std::endl;
     Tensor a({2, 3}, Device::CPU);
     Tensor b({3, 2}, Device::CPU);
     for (int i = 0; i < a.size; ++i) a.data()[i] = static_cast<float>(i + 1);

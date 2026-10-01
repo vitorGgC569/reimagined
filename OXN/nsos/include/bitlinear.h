@@ -3,6 +3,8 @@
 
 #include "autograd.h"
 #include "tensor.h"
+#include "gpu_linear_view.h"
+#include "tiled_cross_entropy.h"
 #include <atomic>
 #include <cstdint>
 #include <vector>
@@ -46,6 +48,32 @@ struct BitLinearPackedState {
 
 class BitLinear {
 public:
+  // Fully allocated, validated import transaction. Preparation may throw
+  // without touching a live layer; commit only moves already-owned buffers.
+  class PreparedPackedState {
+  public:
+    PreparedPackedState(PreparedPackedState&&) noexcept = default;
+    PreparedPackedState& operator=(PreparedPackedState&&) noexcept = default;
+    PreparedPackedState(const PreparedPackedState&) = delete;
+    PreparedPackedState& operator=(const PreparedPackedState&) = delete;
+
+  private:
+    friend class BitLinear;
+    PreparedPackedState() = default;
+
+    std::vector<uint32_t> packed_weights;
+    std::vector<int8_t> unpacked_weights;
+    std::vector<int32_t> row_sums;
+    float weight_scale = 1.0f;
+    Tensor magnitude;
+    Tensor bias;
+    Tensor flat_alpha;
+    Tensor flat_beta;
+    Tensor full_precision_weight;
+    bool keep_full_precision_weight = false;
+    bool preserve_existing_full_precision_storage = false;
+  };
+
   BitLinear(int in, int out, bool b = true);
   // Seeded variant — guarantees reproducible weight init for the same seed.
   // Required by TTTLayer (and any other consumer that needs determinism
@@ -65,13 +93,32 @@ public:
   bool reference_path_enabled() const { return use_reference_path; }
   // Make the float path numerically equivalent to a plain nn.Linear:
   // no implicit input RMSNorm and no trainable per-output magnitude.  The
-  // magnitude buffer remains fixed at one so existing packed kernels and pack
-  // formats stay compatible.  Weight ternarization remains available.
+  // magnitude buffer remains serialized for compatibility but is bypassed by
+  // forward/backward, so even a legacy non-unit value cannot change exact
+  // linear math. Weight ternarization remains available.
   void set_exact_linear_mode(bool enabled) {
+    if (exact_linear_mode_ != enabled) {
+      // A compatibility-mode magnitude gradient must never survive a switch
+      // into exact-linear mode and later leak into an optimizer state.
+      magnitude.grad = Tensor();
+    }
     exact_linear_mode_ = enabled;
+    magnitude.trainable = !enabled;
     norm_strategy = enabled ? NormStrategy::NONE : NormStrategy::RMS_PERI;
   }
   bool exact_linear_mode() const { return exact_linear_mode_; }
+  // Register every possible trainable expert parameter, including parameters
+  // temporarily excluded by exact-linear mode or a disabled adapter.
+  void track_gradient_contributions() noexcept {
+    weight.track_gradient_contributions();
+    magnitude.track_gradient_contributions();
+    bias.track_gradient_contributions();
+    flat_alpha.track_gradient_contributions();
+    flat_beta.track_gradient_contributions();
+    loqa.A.track_gradient_contributions();
+    loqa.B.track_gradient_contributions();
+  }
+  NormStrategy input_norm_strategy() const { return norm_strategy; }
 
   // Quantization-sensitive layers (e.g. Mamba's dt/B/C "sensitive" input
   // projection) are kept on the float reference path during quantization-aware
@@ -115,6 +162,7 @@ public:
     if (enabled != training_mode_) {
       qat_inference_cache_valid_ = false;
       qat_inference_w_eff_ = Tensor();
+      qat_inference_weight_version_ = 0;
       saved_qat_w_eff_ = Tensor();
       saved_qat_scale_ = Tensor();
       saved_qat_weight_version_ = 0;
@@ -130,7 +178,17 @@ public:
   void discard_backward_state();
 
   Tensor forward(const Tensor &input);
+  // Inference-only borrowed view for device-selected grouped experts. Returns
+  // false for unsupported adapters/precision rather than changing their math.
+  bool prepare_gpu_decode_view(GpuLinearView& view);
+  bool supports_gpu_grouped_training() const;
+  void prepare_gpu_grouped_training_view(GpuMoeTrainingLinearView& view,
+      Tensor& effective_weight, Tensor& qat_scale, bool defer_qat = false);
   Tensor backward(const Tensor &grad_output);
+  // Combined training operation. Recomputes bounded vocabulary/row tiles;
+  // publishes head gradients once all tiles have completed. Never saves logits.
+  TiledCrossEntropyResult cross_entropy_tiled(
+      const Tensor& input, const TiledCrossEntropyOptions& options);
   void to(Device dev);
   std::vector<Parameter *> parameters();
   void repack_weights();
@@ -140,6 +198,12 @@ public:
   int output_features() const { return out_features; }
   bool uses_bias() const { return use_bias; }
   BitLinearPackedState export_packed_state() const;
+  PreparedPackedState prepare_packed_state(
+      const BitLinearPackedState& state,
+      Device dev = Device::CPU,
+      bool release_full_precision = false,
+      const Tensor* exact_full_precision_weight = nullptr) const;
+  void commit_prepared_packed_state(PreparedPackedState&& prepared) noexcept;
   // Bytes owned by packed/inference caches, excluding public Parameters
   // (which callers account separately).
   size_t auxiliary_memory_usage_bytes() const;
@@ -180,6 +244,7 @@ private:
   bool qat_inference_cache_valid_ = false;
   float qat_inference_scale_ = 0.0f;
   Tensor qat_inference_w_eff_;
+  uint64_t qat_inference_weight_version_ = 0;
 
 public:
   Parameter weight;
@@ -187,8 +252,9 @@ public:
   Parameter bias;
 
   // Legacy identity buffers retained only for edge-pack compatibility.
-  // FlatQuant is not part of any forward path and these are intentionally
-  // excluded from parameters(), optimizer state, and training checkpoints.
+  // FlatQuant is not part of any forward path. They remain in the canonical
+  // registry/checkpoint inventory as non-trainable state, while Trainer
+  // excludes them from gradients and optimizer sidecars.
   Parameter flat_alpha;
   Parameter flat_beta;
 

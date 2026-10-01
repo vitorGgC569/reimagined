@@ -72,9 +72,9 @@ def log(msg: str) -> None:
     try:
         with SESSION_LOG.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except OSError:
-        # Disk full or permission issue — keep stdout going, don't crash.
-        pass
+    except OSError as exc:
+        # stdout remains available, but the loss of durable logging is visible.
+        print(f"[logger] session.log write failed: {exc}", file=sys.stderr)
 
 
 def banner(title: str) -> None:
@@ -133,8 +133,8 @@ def _query_compute_cap(name_hint: str) -> Optional[tuple]:
         if "." in first:
             major, minor = first.split(".", 1)
             return (int(major), int(minor))
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"  aviso: compute capability query failed: {exc}")
     return None
 
 
@@ -255,8 +255,8 @@ def _register_dll_search_paths() -> None:
         seen.add(resolved)
         try:
             os.add_dll_directory(str(resolved))
-        except (OSError, FileNotFoundError):
-            pass
+        except (OSError, FileNotFoundError) as exc:
+            log(f"  aviso: DLL directory registration failed for {resolved}: {exc}")
 
 
 def load_engine_module():
@@ -370,8 +370,8 @@ def log_gpu_status(tag=""):
         if out.returncode == 0 and out.stdout.strip():
             util, used, total = (p.strip() for p in out.stdout.strip().splitlines()[0].split(","))
             log(f"  [GPU{(' ' + tag) if tag else ''}] uso={util}%  VRAM={used}/{total} MB")
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"  aviso: GPU status query failed: {exc}")
 
 
 def _dump_gpu_processes():
@@ -387,8 +387,8 @@ def _dump_gpu_processes():
                 log(f"     VRAM em uso por: {line.strip()}")
         else:
             log("     (nenhum processo segurando a GPU agora)")
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"  aviso: GPU process query failed: {exc}")
 
 
 def log_ram_status(tag=""):
@@ -406,8 +406,8 @@ def log_ram_status(tag=""):
         used = (s.ullTotalPhys - s.ullAvailPhys) / 1024**3
         total = s.ullTotalPhys / 1024**3
         log(f"  [RAM{(' ' + tag) if tag else ''}] uso={s.dwMemoryLoad}%  ({used:.1f}/{total:.1f} GB)")
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"  aviso: RAM status query failed: {exc}")
 
 
 # ── Resume support ─────────────────────────────────────────────────────────
@@ -587,8 +587,8 @@ def install_signal_handlers() -> None:
     try:
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
-    except (ValueError, AttributeError):
-        pass  # not all platforms support all signals
+    except (ValueError, AttributeError) as exc:
+        log(f"  aviso: signal handlers unavailable: {exc}")
 
 
 def main() -> int:

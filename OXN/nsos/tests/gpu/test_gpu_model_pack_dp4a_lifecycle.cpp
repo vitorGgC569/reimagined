@@ -17,6 +17,7 @@ using nsos::Device;
 using nsos::InferenceEngine;
 using nsos::ModelConfig;
 using nsos::Tensor;
+using nsos::TrainPhaseScheduler;
 using nsos::gpu_parity_test::assert_close;
 using nsos::gpu_parity_test::cuda_sync_or_throw;
 using nsos::gpu_parity_test::run_parity;
@@ -86,9 +87,13 @@ int main() {
     require(author.load_model("", authoring_config),
             "failed to create authoring model");
     require(author.trainer != nullptr, "authoring trainer is missing");
-    author.trainer->phase_scheduler.progressive_qat_enabled = true;
+    TrainPhaseScheduler immediate_qat =
+        author.trainer->phase_scheduler;
+    immediate_qat.progressive_qat_enabled = true;
+    immediate_qat.semantic_warmup_steps = 0;
+    immediate_qat.qat_start_step = 1;
     author.trainer->global_step_count = 1;
-    author.model->set_reference_path(false);
+    author.trainer->configure_progressive_qat(immediate_qat);
     for (BitLinear* layer : author.model->collect_bitlinear_layers()) {
       if (layer && !layer->quantization_sensitive()) {
         layer->repack_weights();

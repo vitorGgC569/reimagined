@@ -5,26 +5,36 @@
 #include <cassert>
 #include <vector>
 #include <cmath>
+#include <stdexcept>
 
 using namespace nsos;
 
+void require(bool condition, const char* message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
 void test_arena() {
     std::cout << "[Test] Arena..." << std::endl;
-    ArenaAllocator::instance().init(1024 * 1024);
+    void* first = nullptr;
     {
         ArenaScope scope;
         void* p1 = ArenaAllocator::instance().alloc(100, Device::CPU);
-        assert(p1 != nullptr);
+        require(p1 != nullptr, "first arena allocation failed");
         void* p2 = ArenaAllocator::instance().alloc(100, Device::CPU);
-        assert(p2 != nullptr);
-        assert(p1 != p2);
+        require(p2 != nullptr, "second arena allocation failed");
+        require(p1 != p2, "arena returned overlapping allocations");
+        first = p1;
     }
-    // Scope exit rewinds offset.
     {
         ArenaScope scope;
         void* p3 = ArenaAllocator::instance().alloc(100, Device::CPU);
-        // Should reuse p1's address or similar start
+        require(p3 == first,
+                "ArenaScope did not rewind the thread-local allocation mark");
     }
+    require(ArenaAllocator::instance().alloc(0, Device::CPU) == nullptr,
+            "zero-byte arena allocation returned storage");
     std::cout << "PASS" << std::endl;
 }
 
@@ -40,15 +50,20 @@ void test_math_avx2() {
     
     for(float v : C) {
         if(std::abs(v - 32.0f) > 1e-5) {
-            std::cout << "FAIL: " << v << " != 32.0" << std::endl;
-            return;
+            throw std::runtime_error(
+                "MathOps::gemm did not produce the reference value");
         }
     }
     std::cout << "PASS" << std::endl;
 }
 
 int main() {
-    test_arena();
-    test_math_avx2();
-    return 0;
+    try {
+        test_arena();
+        test_math_avx2();
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "Core v2 test failed: " << error.what() << std::endl;
+        return 1;
+    }
 }

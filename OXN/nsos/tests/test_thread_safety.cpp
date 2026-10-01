@@ -232,6 +232,7 @@ void test_jamba_concurrent_inference() {
   try {
     // Single model, multiple inference threads
     JambaModel model(2, 64, 128, Device::CPU);
+    model.set_training_mode(false);
     std::atomic<int> error_count{0};
     std::atomic<int> success_count{0};
     std::vector<std::thread> threads;

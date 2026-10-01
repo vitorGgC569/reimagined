@@ -1,0 +1,27 @@
+{
+  "dataset": "Polygl0t/gigaverbo-v2-synth",
+  "revision": "e9744caa815fe48e0eba4c08a8647e259f9ae318",
+  "decision": "blocked",
+  "review_date": "2026-09-20",
+  "sample_size": 4,
+  "sampling": "First four candidates passing v2 structural/language filters, shuffled seed 20260730. Not a representative statistical estimate.",
+  "findings": [
+    {
+      "id": "99b422684d5f3ccea325ea6370b78027",
+      "problem": "Internal chemistry contradiction: prose says five hydrogen atoms for ethane while the displayed formula contains six; malformed technical terminology also present."
+    },
+    {
+      "id": "0a1f43a95d566fe3dc7ca6c840145d99",
+      "problem": "Residual external-links/category footer and invitation to comment survived structural filtering. Historical assertions not independently verified."
+    },
+    {
+      "id": "5a0b7607a0c337f2d8a41be146d4f3e4",
+      "problem": "Portuguese text degrades into malformed prose and Spanish phrases late in the document; first-4000-character language ID misses this."
+    },
+    {
+      "id": "3a81e8485241c696c04c1e7e2813231b",
+      "problem": "Synthetic summary of a civil case refers to criminal enforcement, mixing incompatible contexts."
+    }
+  ],
+  "conclusion": "Do not describe this synthetic selection as quality-approved or launch training automatically. Decide between a smaller independently verifiable subset and additional semantic review before spending the training budget."
+}

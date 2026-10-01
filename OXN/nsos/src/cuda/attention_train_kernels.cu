@@ -22,15 +22,25 @@
 //   permuted:    [B, H, S,  hd]   transposed: [B, H, hd, S]
 //   scores/P/dS: [B*H, S, S]
 
-#include <cuda_runtime.h>
+#include "gpu_backend.h"
+#include <climits>
+#include <cmath>
+#include <stdexcept>
+#if defined(NSOS_GPU_BACKEND_CUDA)
 #include <device_launch_parameters.h>
+#endif
 
 namespace {
 
 constexpr int kThreads = 256;
 
 inline int blocks_for(long long n) {
-  return static_cast<int>((n + kThreads - 1) / kThreads);
+  const long long blocks = nsos::gpu::ceil_div_positive(
+      n, static_cast<long long>(kThreads));
+  if (blocks > INT_MAX) {
+    throw std::overflow_error("attention GPU grid exceeds INT_MAX blocks");
+  }
+  return static_cast<int>(blocks);
 }
 
 // out[b,h,s,d] (or out[b,h,d,s] when transposed) = src[b,s,src_h,d]
@@ -241,14 +251,185 @@ __global__ void kv_concat_kernel(float* __restrict__ out,
   out[r * (2LL * kvd) + kvd + c] = v[idx];
 }
 
+// Logical subwaves of 32 work on both wave32 and wave64 HIP targets. No
+// atomics: dQ is query-owned; dK/dV are KV-row-owned and reduce heads in order.
+__device__ float tiled_sum32(float value) {
+  for (int offset = 16; offset; offset >>= 1) {
+#if defined(NSOS_GPU_BACKEND_HIP)
+    value += __shfl_down(value, offset, 32);
+#else
+    value += __shfl_down_sync(0xffffffffu, value, offset, 32);
+#endif
+  }
+  return value;
+}
+
+__device__ size_t attn_idx(int b, int s, int h, int S, int H, int hd) {
+  return ((static_cast<size_t>(b) * S + s) * H + h) * hd;
+}
+
+__global__ void attn_tiled_forward_kernel(const float* q, const float* k,
+    const float* v, const int* valid, float* out, float* lse,
+    int S, int H, int KV, int hd, int group, int window, float scale) {
+  __shared__ float scores[8], weights[8], alpha, maximum, denom;
+  const int h = blockIdx.x % H, i = (blockIdx.x / H) % S;
+  const int b = blockIdx.x / (H * S), kh = min(h / group, KV - 1);
+  const int lane = threadIdx.x % 32, slot = threadIdx.x / 32, d = threadIdx.x;
+  const size_t qi = attn_idx(b, i, h, S, H, hd);
+  if (i >= valid[b]) {
+    if (d < hd) out[qi + d] = 0.0f;
+    if (d == 0) lse[blockIdx.x] = -INFINITY;
+    return;
+  }
+  if (d == 0) { maximum = -INFINITY; denom = 0.0f; }
+  __syncthreads();
+  float accum = 0.0f;
+  for (int begin = max(0, i - window + 1); begin <= i; begin += 8) {
+    const int j = begin + slot;
+    const size_t ki = attn_idx(b, min(j, i), kh, S, KV, hd);
+    float dot = 0.0f;
+    for (int x = lane; x < hd; x += 32) dot += q[qi + x] * k[ki + x];
+    dot = tiled_sum32(dot);
+    if (lane == 0) scores[slot] = j <= i ? dot * scale : -INFINITY;
+    __syncthreads();
+    if (d == 0) {
+      float next = maximum;
+      for (int z = 0; z < 8; ++z) next = fmaxf(next, scores[z]);
+      alpha = expf(maximum - next);
+      float sum = 0.0f;
+      for (int z = 0; z < 8; ++z) { weights[z] = expf(scores[z] - next); sum += weights[z]; }
+      denom = denom * alpha + sum;
+      maximum = next;
+    }
+    __syncthreads();
+    if (d < hd) {
+      accum *= alpha;
+      for (int z = 0; z < 8 && begin + z <= i; ++z)
+        accum += weights[z] * v[attn_idx(b, begin + z, kh, S, KV, hd) + d];
+    }
+    __syncthreads();
+  }
+  if (d < hd) out[qi + d] = accum / denom;
+  if (d == 0) lse[blockIdx.x] = maximum + logf(denom);
+}
+
+__global__ void attn_tiled_dq_kernel(const float* q, const float* k,
+    const float* v, const float* out, const float* grad, const float* lse,
+    const int* valid, float* delta, float* dq,
+    int S, int H, int KV, int hd, int group, int window, float scale) {
+  __shared__ float ds[8], rowdot;
+  const int h = blockIdx.x % H, i = (blockIdx.x / H) % S;
+  const int b = blockIdx.x / (H * S), kh = min(h / group, KV - 1);
+  const int lane = threadIdx.x % 32, slot = threadIdx.x / 32, d = threadIdx.x;
+  const size_t qi = attn_idx(b, i, h, S, H, hd);
+  if (i >= valid[b]) {
+    if (d < hd) dq[qi + d] = 0.0f;
+    if (d == 0) delta[blockIdx.x] = 0.0f;
+    return;
+  }
+  float dot = 0.0f;
+  for (int x = lane; x < hd; x += 32) dot += grad[qi + x] * out[qi + x];
+  dot = tiled_sum32(dot);
+  if (d == 0) { rowdot = dot; delta[blockIdx.x] = dot; }
+  __syncthreads();
+  float accum = 0.0f;
+  for (int begin = max(0, i - window + 1); begin <= i; begin += 8) {
+    const int j = begin + slot;
+    const size_t ki = attn_idx(b, min(j, i), kh, S, KV, hd);
+    float score = 0.0f, dp = 0.0f;
+    for (int x = lane; x < hd; x += 32) {
+      score += q[qi + x] * k[ki + x];
+      dp += grad[qi + x] * v[ki + x];
+    }
+    score = tiled_sum32(score); dp = tiled_sum32(dp);
+    if (lane == 0) ds[slot] = j <= i
+        ? expf(score * scale - lse[blockIdx.x]) * (dp - rowdot) * scale : 0.0f;
+    __syncthreads();
+    if (d < hd)
+      for (int z = 0; z < 8 && begin + z <= i; ++z)
+        accum += ds[z] * k[attn_idx(b, begin + z, kh, S, KV, hd) + d];
+    __syncthreads();
+  }
+  if (d < hd) dq[qi + d] = accum;
+}
+
+__global__ void attn_tiled_dkv_kernel(const float* q, const float* k,
+    const float* v, const float* grad, const float* lse, const int* valid,
+    const float* delta, float* dk, float* dv,
+    int S, int H, int KV, int hd, int group, int window, float scale) {
+  __shared__ float ds[8], prob[8];
+  const int kh = blockIdx.x % KV, j = (blockIdx.x / KV) % S;
+  const int b = blockIdx.x / (KV * S);
+  const int lane = threadIdx.x % 32, slot = threadIdx.x / 32, d = threadIdx.x;
+  const size_t ki = attn_idx(b, j, kh, S, KV, hd);
+  float ak = 0.0f, av = 0.0f;
+  const int last = min(valid[b], j + min(window, S - j));
+  const int head_end = kh == KV - 1 ? H : min(H, (kh + 1) * group);
+  for (int h = kh * group; h < head_end; ++h) {
+    for (int begin = j; begin < last; begin += 8) {
+      const int i = begin + slot;
+      const size_t qi = attn_idx(b, min(i, S - 1), h, S, H, hd);
+      float score = 0.0f, dp = 0.0f;
+      for (int x = lane; x < hd; x += 32) {
+        score += q[qi + x] * k[ki + x];
+        dp += grad[qi + x] * v[ki + x];
+      }
+      score = tiled_sum32(score); dp = tiled_sum32(dp);
+      if (lane == 0) {
+        const size_t row = (static_cast<size_t>(b) * S + min(i, S - 1)) * H + h;
+        prob[slot] = i < last ? expf(score * scale - lse[row]) : 0.0f;
+        ds[slot] = i < last ? prob[slot] * (dp - delta[row]) * scale : 0.0f;
+      }
+      __syncthreads();
+      if (d < hd) {
+        for (int z = 0; z < 8 && begin + z < last; ++z) {
+          const size_t src = attn_idx(b, begin + z, h, S, H, hd) + d;
+          ak += ds[z] * q[src];
+          av += prob[z] * grad[src];
+        }
+      }
+      __syncthreads();
+    }
+  }
+  if (d < hd) { dk[ki + d] = ak; dv[ki + d] = av; }
+}
+
 }  // namespace
+
+extern "C" bool launch_attn_tiled_forward(const float* q, const float* k, const float* v,
+    const int* valid, float* out, float* lse, int B, int S, int H, int KV,
+    int hd, int group, int window, float scale) {
+  if (!q || !k || !v || !valid || !out || !lse || B <= 0 || S <= 0 || H <= 0 ||
+      KV <= 0 || KV > H || hd <= 0 || hd > 256 || group <= 0 || group > H ||
+      static_cast<long long>(KV - 1)*group > H || window <= 0 || !std::isfinite(scale) ||
+      static_cast<long long>(B) * S * H > INT_MAX) return false;
+  attn_tiled_forward_kernel<<<B*S*H, 256, 0, nsos::gpu::current_stream()>>>(
+      q, k, v, valid, out, lse, S, H, KV, hd, group, window, scale);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" bool launch_attn_tiled_backward(const float* q, const float* k, const float* v,
+    const float* out, const float* grad, const float* lse, const int* valid,
+    float* delta, float* dq, float* dk, float* dv, int B, int S, int H,
+    int KV, int hd, int group, int window, float scale) {
+  if (!q || !k || !v || !out || !grad || !lse || !valid || !delta || !dq || !dk || !dv ||
+      B <= 0 || S <= 0 || H <= 0 || KV <= 0 || KV > H || hd <= 0 || hd > 256 ||
+      group <= 0 || group > H || static_cast<long long>(KV - 1)*group > H ||
+      window <= 0 || !std::isfinite(scale) || static_cast<long long>(B)*S*H > INT_MAX) return false;
+  const auto stream = nsos::gpu::current_stream();
+  attn_tiled_dq_kernel<<<B*S*H, 256, 0, stream>>>(q, k, v, out, grad, lse, valid,
+      delta, dq, S, H, KV, hd, group, window, scale);
+  attn_tiled_dkv_kernel<<<B*S*KV, 256, 0, stream>>>(q, k, v, grad, lse, valid,
+      delta, dk, dv, S, H, KV, hd, group, window, scale);
+  return cudaGetLastError() == cudaSuccess;
+}
 
 extern "C" void launch_attn_gather_heads(float* out, const float* src, int B, int S,
                               int H_out, int hd, int src_heads, int group,
                               int transposed) {
   const long long total = static_cast<long long>(B) * H_out * S * hd;
   if (total <= 0) return;
-  attn_gather_heads_kernel<<<blocks_for(total), kThreads>>>(
+  attn_gather_heads_kernel<<<blocks_for(total), kThreads, 0, nsos::gpu::current_stream()>>>(
       out, src, B, S, H_out, hd, src_heads, group, transposed);
 }
 
@@ -256,21 +437,21 @@ extern "C" void launch_attn_unpermute_heads(float* out, const float* src, int B,
                                  int S, int hd) {
   const long long total = static_cast<long long>(B) * H * S * hd;
   if (total <= 0) return;
-  attn_unpermute_heads_kernel<<<blocks_for(total), kThreads>>>(out, src, B, H, S, hd);
+  attn_unpermute_heads_kernel<<<blocks_for(total), kThreads, 0, nsos::gpu::current_stream()>>>(out, src, B, H, S, hd);
 }
 
 extern "C" void launch_attn_reduce_group(float* out, const float* src, int B, int S,
                               int KV, int hd, int H, int group) {
   const long long total = static_cast<long long>(B) * S * KV * hd;
   if (total <= 0) return;
-  attn_reduce_group_kernel<<<blocks_for(total), kThreads>>>(out, src, B, S, KV, hd, H, group);
+  attn_reduce_group_kernel<<<blocks_for(total), kThreads, 0, nsos::gpu::current_stream()>>>(out, src, B, S, KV, hd, H, group);
 }
 
 extern "C" void launch_attn_masked_softmax(float* p, const int* valid, int B, int H,
                                 int S, float scale, int sliding_window) {
   const long long rows = static_cast<long long>(B) * H * S;
   if (rows <= 0) return;
-  attn_masked_softmax_kernel<<<blocks_for(rows), kThreads>>>(
+  attn_masked_softmax_kernel<<<blocks_for(rows), kThreads, 0, nsos::gpu::current_stream()>>>(
       p, valid, B, H, S, scale, sliding_window);
 }
 
@@ -278,14 +459,14 @@ extern "C" void launch_attn_softmax_backward(float* ds, const float* p, const fl
                                   int B, int H, int S, float scale) {
   const long long rows = static_cast<long long>(B) * H * S;
   if (rows <= 0) return;
-  attn_softmax_backward_kernel<<<blocks_for(rows), kThreads>>>(ds, p, dp, B, H, S, scale);
+  attn_softmax_backward_kernel<<<blocks_for(rows), kThreads, 0, nsos::gpu::current_stream()>>>(ds, p, dp, B, H, S, scale);
 }
 
 extern "C" void launch_batched_transpose_last2(float* out, const float* src, int N,
                                     int R, int C) {
   const long long total = static_cast<long long>(N) * R * C;
   if (total <= 0) return;
-  batched_transpose_last2_kernel<<<blocks_for(total), kThreads>>>(out, src, N, R, C);
+  batched_transpose_last2_kernel<<<blocks_for(total), kThreads, 0, nsos::gpu::current_stream()>>>(out, src, N, R, C);
 }
 
 extern "C" void launch_rope_apply(float* x, const float* cos_buf, const float* sin_buf,
@@ -294,19 +475,19 @@ extern "C" void launch_rope_apply(float* x, const float* cos_buf, const float* s
   const int half = hd / 2;
   const long long total = static_cast<long long>(B) * S * H * half;
   if (total <= 0) return;
-  rope_apply_kernel<<<blocks_for(total), kThreads>>>(x, cos_buf, sin_buf, B, S, H,
+  rope_apply_kernel<<<blocks_for(total), kThreads, 0, nsos::gpu::current_stream()>>>(x, cos_buf, sin_buf, B, S, H,
                                                      hd, start_pos, max_seq, dir);
 }
 
 extern "C" void launch_kv_split(float* k, float* v, const float* kv, long long rows, int kvd) {
   const long long total = rows * kvd;
   if (total <= 0) return;
-  kv_split_kernel<<<blocks_for(total), kThreads>>>(k, v, kv, rows, kvd);
+  kv_split_kernel<<<blocks_for(total), kThreads, 0, nsos::gpu::current_stream()>>>(k, v, kv, rows, kvd);
 }
 
 extern "C" void launch_kv_concat(float* out, const float* k, const float* v,
                       long long rows, int kvd) {
   const long long total = rows * kvd;
   if (total <= 0) return;
-  kv_concat_kernel<<<blocks_for(total), kThreads>>>(out, k, v, rows, kvd);
+  kv_concat_kernel<<<blocks_for(total), kThreads, 0, nsos::gpu::current_stream()>>>(out, k, v, rows, kvd);
 }

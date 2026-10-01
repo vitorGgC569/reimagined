@@ -2,13 +2,30 @@
 #define KAN_KERNELS_CUH
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "../gpu_backend.h"
 #endif
 
 namespace nsos {
 namespace cuda {
 
 #ifdef USE_CUDA
+// Ordered QAT: block-tree partials, fixed-order scale and quantization.
+// Caller owns partials[min(ceil(elements/256),4096)] and scale[1].
+bool launch_kan_prepare_ternary(const float* weight, float* effective,
+    float* scale, float* partials, int elements);
+// Implicit RBF GEMM. No global [rows,input_dim*grid] basis/gradient basis.
+// WMMA opt-in selects RDNA3 wave32 only for lowp rows>=16 and both dims>=32.
+// FP32/small shapes retain scalar; selected WMMA failures never fall back.
+bool launch_kan_rbf_projection(const float* input, const float* weight,
+    const float* centers, const float* widths, const float* base,
+    const float* bias, float* output, int rows, int inputs, int outputs,
+    int grid, int mode, bool wmma = false);
+bool launch_kan_rbf_weight_backward(const float* input, const float* upstream,
+    const float* centers, const float* widths, float* weight_gradient,
+    int rows, int inputs, int outputs, int grid, int mode, bool wmma = false);
+bool launch_kan_rbf_input_backward(const float* input, const float* upstream,
+    const float* weight, const float* centers, const float* widths,
+    float* input_gradient, int rows, int inputs, int outputs, int grid, int mode, bool wmma = false);
 // =====================================================================
 // KAN (Kolmogorov-Arnold) radial-basis evaluation — GPU equivalents of
 // the host loops in src/kan.cpp.  These match the CPU math 1:1 so the

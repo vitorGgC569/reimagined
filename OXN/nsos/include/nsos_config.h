@@ -4,26 +4,29 @@
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <stdexcept>
+#include <utility>
 
 namespace nsos {
 
 // Magic Numbers & Constants
 constexpr uint32_t NSOS_MODEL_MAGIC = 0x4E534F53; // "NSOS" in ASCII
-// v3 (2026-07): retains the v2 feature fingerprint and adds a complete
-// configuration digest plus an end-to-end payload checksum.
-// state-expansion / weight-tying flags + A-domain marker) so loading a
-// checkpoint into a mismatched architecture fails with an ACTIONABLE message
-// instead of a cryptic "parameter not found", and v1 checkpoints (whose Mamba
-// `A` values are decay RATES, not log-rates) are migrated exactly
-// (A_log = log(max(A, 1e-3))) instead of being silently misread as log-domain.
-constexpr uint32_t NSOS_MODEL_VERSION = 3;
+// v4 (2026-07): adds the explicit hybrid-composition contract,
+// exact-attention-linear/terminal-layer policy, canonical absolute parameter
+// identities, and SHA-256 configuration/payload integrity. v1-v3 remain
+// readable through their version-specific compatibility paths.
+constexpr uint32_t NSOS_MODEL_VERSION = 4;
 // Fingerprint bits (v2+ header, uint32 after version):
 constexpr uint32_t NSOS_FP_MAMBA_PROPER    = 1u << 0;
 constexpr uint32_t NSOS_FP_STATE_EXPANSION = 1u << 1;
 constexpr uint32_t NSOS_FP_TIE_EMBEDDINGS  = 1u << 2;
 constexpr uint32_t NSOS_FP_A_LOG_DOMAIN    = 1u << 3;  // always set by v2 saves
 constexpr uint32_t NSOS_FP_MAMBA2_FAITHFUL = 1u << 4;
+constexpr uint32_t NSOS_FP_HYBRID_PARALLEL = 1u << 5;
+constexpr uint32_t NSOS_FP_EXACT_ATTN_LINEAR = 1u << 6;
+constexpr uint32_t NSOS_FP_FORCE_MAMBA_LAST = 1u << 7;
+constexpr uint32_t NSOS_FP_MAMBA3 = 1u << 8;
 
 constexpr float NSOS_DEFAULT_EPSILON = 1e-6f;
 constexpr float NSOS_ROPE_THETA = 10000.0f;
@@ -35,8 +38,18 @@ enum class Device {
     GPU
 };
 
+enum class HybridComposition {
+    // Checkpoint-compatible historical behavior: an attention slot replaces
+    // the Mamba mixer and shares one LayerScale across attention and FFN.
+    LegacyReplacement = 0,
+    // Production behavior: every scheduled attention slot retains its Mamba
+    // branch and adds independently normalized/gated Attention and FFN paths.
+    ParallelGated = 1,
+};
+
 // Unified Model Configuration
 struct ModelConfig {
+    int architecture_schema_version = 2;
     int num_layers = 12;
     int d_model = 768;
     int vocab_size = 32000;
@@ -45,11 +58,18 @@ struct ModelConfig {
     int sliding_window = 4096;
     int attention_period = 8;
     int attention_slot = 7;
+    HybridComposition hybrid_composition =
+        HybridComposition::ParallelGated;
+    bool force_mamba_last_layer = false;
+    bool faithful_attention_linears = true;
+    float hybrid_mamba_gate_init = 1.0f;
+    float hybrid_attention_gate_init = 0.01f;
+    float hybrid_ffn_gate_init = 0.01f;
     // RoPE base frequency (theta).  Larger theta -> slower rotation -> more
     // position-invariant per-head dims (helps content-based associative recall,
     // at the cost of positional resolution); theta -> inf approaches NoPE.  Was
-    // hardcoded 10000 in Attention; now configurable so the recall-vs-RoPE
-    // hypothesis can be tested.  Env NSOS_ROPE_THETA overrides per construction.
+    // hardcoded 10000 in Attention; now an explicit serialized field so the
+    // recall-vs-RoPE hypothesis can be tested reproducibly.
     float rope_theta = 10000.0f;
     
     // MoE Settings
@@ -118,10 +138,8 @@ struct ModelConfig {
     // causal depthwise conv1d + single-C LINEAR readout + SiLU gate, with the
     // full N-dimensional SSD state h∈R^{H×P×N} (Gu & Dao 2024).  Hand-derived
     // gradients, gradchecked (test_gradcheck: check_mamba2_proper / _nstate) and
-    // GPU-parity validated (test_gpu_parity_mamba_proper / _nstate).  The env
-    // vars NSOS_MAMBA_PROPER_SSM / NSOS_MAMBA_STATE_EXPANSION still override
-    // per-construction (A/B harness).  Set false only to reload a pre-correction
-    // checkpoint that was trained on the legacy path.
+    // GPU-parity validated (test_gpu_parity_mamba_proper / _nstate). Set false
+    // only to reload a pre-correction checkpoint trained on the legacy path.
     bool mamba_proper_ssm = true;
     bool mamba_state_expansion = true;
     // Number of SSM states per Mamba head. This is an architectural field,
@@ -160,6 +178,17 @@ struct ModelConfig {
     // Legacy compatibility flag only. Runtime selection should be driven by
     // explicit backend policy, not by this name.
     bool use_flash_attn = false;
+    // New opt-in architecture; schema v3 records every Mamba3 field.
+    // Dense FP32 projections, no automatic Mamba2/checkpoint reinterpretation.
+    bool mamba3_enabled = false;
+    int mamba3_schema_version = 1;
+    int mamba3_state_dim = 128;
+    bool mamba3_mimo = false;
+    int mamba3_mimo_rank = 4;
+    bool mamba3_outproj_norm = false;
+    float mamba3_rope_fraction = 0.5f;
+    float mamba3_norm_eps = 1e-5f;
+    float mamba3_a_floor = 1e-4f;
 };
 
 inline void validate_model_config(const ModelConfig& config) {
@@ -202,20 +231,23 @@ inline void validate_model_config(const ModelConfig& config) {
                   "max_context_tokens");
     require_range(config.default_batch_size, 1, 4096,
                   "default_batch_size");
+    require_range(config.architecture_schema_version, 1, 3,
+                  "architecture_schema_version");
     require_slot(config.attention_period, config.attention_slot, "attention");
     require_slot(config.moe_period, config.moe_slot, "moe");
     require_slot(config.ttt_period, config.ttt_slot, "ttt");
     require_range(config.num_experts, 1, 4096, "num_experts");
     require_range(config.num_experts_per_token, 1, config.num_experts,
                   "num_experts_per_token");
-    if (config.moe_expert_hidden_dim < 0) {
-        throw std::invalid_argument(
-            "ModelConfig.moe_expert_hidden_dim cannot be negative");
-    }
+    require_range(config.moe_expert_hidden_dim, 0, 1'048'576,
+                  "moe_expert_hidden_dim");
+    require_range(config.mcts_simulations, 1, 1'000'000,
+                  "mcts_simulations");
+    require_range(config.mcts_depth, 1, 4096, "mcts_depth");
     require_range(config.mamba_d_state, 1, 64, "mamba_d_state");
     require_range(config.mamba_conv_kernel, 1, 16, "mamba_conv_kernel");
     require_range(config.mamba_expand, 1, 8, "mamba_expand");
-    if (config.mamba2_faithful) {
+    if (config.mamba2_faithful || config.mamba3_enabled) {
         const long long inner =
             static_cast<long long>(config.mamba_expand) * config.d_model;
         require_range(config.mamba_head_dim, 1,
@@ -235,6 +267,18 @@ inline void validate_model_config(const ModelConfig& config) {
                 "mamba_n_groups");
         }
     }
+    if (config.mamba3_enabled) {
+        if (config.architecture_schema_version != 3 || config.mamba3_schema_version != 1)
+            throw std::invalid_argument("Mamba3 requires architecture schema v3 / block schema v1");
+        require_range(config.mamba3_state_dim, 4, 128, "mamba3_state_dim");
+        require_range(config.mamba_head_dim, 1, 128, "mamba_head_dim");
+        require_range(config.mamba3_mimo_rank, 1, 8, "mamba3_mimo_rank");
+        if (config.mamba3_state_dim % 2 ||
+            (config.mamba3_rope_fraction != 0.5f && config.mamba3_rope_fraction != 1.0f) ||
+            !std::isfinite(config.mamba3_norm_eps) || config.mamba3_norm_eps < 1e-12f || config.mamba3_norm_eps > 1 ||
+            !std::isfinite(config.mamba3_a_floor) || config.mamba3_a_floor <= 0 || config.mamba3_a_floor > 64)
+            throw std::invalid_argument("Invalid Mamba3 state/rotary/normalization/floor configuration");
+    }
     if (!std::isfinite(config.dropout) || config.dropout < 0.0f ||
         config.dropout >= 1.0f) {
         throw std::invalid_argument(
@@ -243,6 +287,39 @@ inline void validate_model_config(const ModelConfig& config) {
     if (!std::isfinite(config.rope_theta) || config.rope_theta <= 0.0f) {
         throw std::invalid_argument(
             "ModelConfig.rope_theta must be finite and positive");
+    }
+    const int hybrid_mode =
+        static_cast<int>(config.hybrid_composition);
+    if (hybrid_mode <
+            static_cast<int>(HybridComposition::LegacyReplacement) ||
+        hybrid_mode >
+            static_cast<int>(HybridComposition::ParallelGated)) {
+        throw std::invalid_argument(
+            "ModelConfig.hybrid_composition is invalid");
+    }
+    if (config.architecture_schema_version == 1 &&
+        (config.hybrid_composition !=
+             HybridComposition::LegacyReplacement ||
+         !config.force_mamba_last_layer ||
+         config.faithful_attention_linears)) {
+        throw std::invalid_argument(
+            "ModelConfig architecture schema v1 requires the historical "
+            "LegacyReplacement hybrid, force_mamba_last_layer=true and "
+            "faithful_attention_linears=false");
+    }
+    for (const auto& [value, field] :
+         std::initializer_list<std::pair<float, const char*>>{
+             {config.hybrid_mamba_gate_init,
+              "hybrid_mamba_gate_init"},
+             {config.hybrid_attention_gate_init,
+              "hybrid_attention_gate_init"},
+             {config.hybrid_ffn_gate_init,
+              "hybrid_ffn_gate_init"}}) {
+        if (!std::isfinite(value) || value < 0.0f || value > 1.0f) {
+            throw std::invalid_argument(
+                std::string("ModelConfig.") + field +
+                " must be finite and in [0, 1]");
+        }
     }
     if (!std::isfinite(config.chrass_density) ||
         config.chrass_density < 0.0f || config.chrass_density > 1.0f) {

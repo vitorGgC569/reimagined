@@ -1,0 +1,383 @@
+{
+  "format": "nsos-runtime-gpu-final-gate-v2",
+  "date": "2026-08-01",
+  "backend": "hip",
+  "device": {
+    "name": "AMD Radeon RX 7600",
+    "architecture": "gfx1102",
+    "warp_size": 32
+  },
+  "build": {
+    "directory": "OXN/nsos/build-final-validation-hip-werror-1",
+    "configuration": "Release",
+    "warnings_as_errors": true,
+    "targets_built": 216,
+    "ctest_passed": 95,
+    "ctest_total": 95,
+    "ctest_seconds": 78.55
+  },
+  "protocol": {
+    "preset": "pilot",
+    "device": "gpu",
+    "max_train_steps": 1000,
+    "resume": false,
+    "warmup_steps_discarded": 100,
+    "measured_steps_per_run": 900,
+    "raw_tokens_per_second_p50_threshold": 1500.0,
+    "memory_policy": "device",
+    "precision": "fp32"
+  },
+  "historical_reference_runs": [
+    {
+      "name": "final-gate-1000-a-20260801",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-a-20260801",
+      "raw_tokens_per_second": {
+        "p10": 1570.215899431024,
+        "p50": 1575.9997402783524,
+        "p90": 1582.4456338732223
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal"
+    },
+    {
+      "name": "final-gate-1000-b-20260801",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-b-20260801",
+      "raw_tokens_per_second": {
+        "p10": 1572.98941245556,
+        "p50": 1578.2602054253318,
+        "p90": 1583.8528185302237
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal"
+    },
+    {
+      "name": "final-gate-1000-c-20260801",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-c-20260801",
+      "raw_tokens_per_second": {
+        "p10": 1570.125949673542,
+        "p50": 1575.6561130474895,
+        "p90": 1581.1460194984493
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal"
+    }
+  ],
+  "pre_transversal_hardening_candidate_runs": [
+    {
+      "name": "final-gate-1000-final-a-20260801",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-final-a-20260801",
+      "raw_tokens_per_second": {
+        "p10": 1569.9299060909664,
+        "p50": 1574.697804883344,
+        "p90": 1580.4594950906794
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "relative_loss_improvement": 0.589371888244135,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal",
+      "stderr_bytes": 0
+    },
+    {
+      "name": "final-gate-1000-final-b-20260801",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-final-b-20260801",
+      "raw_tokens_per_second": {
+        "p10": 1570.4475150156886,
+        "p50": 1575.8357892208483,
+        "p90": 1581.3814083166171
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "relative_loss_improvement": 0.589371888244135,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal",
+      "stderr_bytes": 0
+    },
+    {
+      "name": "final-gate-1000-final-c-20260801",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-final-c-20260801",
+      "raw_tokens_per_second": {
+        "p10": 1570.46962540571,
+        "p50": 1575.76110116126,
+        "p90": 1581.38995585146
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "relative_loss_improvement": 0.589371888244135,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal",
+      "stderr_bytes": 0
+    }
+  ],
+  "final_candidate_runs": [
+    {
+      "name": "final-gate-1000-final2-a-20260802",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-final2-a-20260802",
+      "raw_tokens_per_second": {
+        "p10": 1571.8777320261,
+        "p50": 1577.82490378363,
+        "p90": 1584.57274846551
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "relative_loss_improvement": 0.589371888244135,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal",
+      "stderr_bytes": 0
+    },
+    {
+      "name": "final-gate-1000-final2-b-20260802",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-final2-b-20260802",
+      "raw_tokens_per_second": {
+        "p10": 1570.00683477687,
+        "p50": 1575.64617275022,
+        "p90": 1581.35913628507
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "relative_loss_improvement": 0.589371888244135,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal",
+      "stderr_bytes": 0
+    },
+    {
+      "name": "final-gate-1000-final2-c-20260802",
+      "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-gate-1000-final2-c-20260802",
+      "raw_tokens_per_second": {
+        "p10": 1569.87700373163,
+        "p50": 1575.36692289359,
+        "p90": 1580.87121143265
+      },
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 4.084897173969252,
+      "relative_loss_improvement": 0.589371888244135,
+      "performance_gate": "pass",
+      "quality_gate": "pass_learning_signal",
+      "stderr_bytes": 0
+    }
+  ],
+  "aggregate": {
+    "scope": "final_candidate_runs",
+    "p50_mean": 1576.279333142478,
+    "p50_population_stddev": 1.0988134739172808,
+    "p50_coefficient_of_variation_percent": 0.06970931171993995,
+    "p50_range_spread_percent": 0.15593561612845336,
+    "all_performance_pass": true,
+    "all_quality_pass": true,
+    "all_zero_fallbacks": true,
+    "all_zero_pool_failures": true,
+    "deterministic": true
+  },
+  "bitwise": {
+    "trace_sha256": "ab386f4e9ec222292e0d40c4b78af2dad9576bbced3b9e7030ddeae5562c4265",
+    "model_sha256": "ba541feedee22119ce01c0953e10e8245b0aaeeb3b5d7bda92e875b1e89475d6",
+    "trainer_state_sha256": "78998269bf42f97111ce22f9da55475cdf2805306f0832590972d139e5664f1a",
+    "checkpoint_runtime_identity_sha256": "c7fcbe98b50618fb6d4bec7ae2d20c39c81be619a6f0966790c00331ef459fbb",
+    "semantic_execution_identity_sha256": "4ad0ed394b5db0eaa8ba9e8dd83b16b3f0a685177302b363347062ab8c25dcf1",
+    "semantic_execution_identity_fields": 66,
+    "runtime_module_sha256": "d3c138dce111b7d5c7a701f0eae1e6a641825640f2145670e36f9f838ba55167",
+    "runtime_module_bytes": 5174784,
+    "training_script_sha256": "8b8c495b98bb178e4305fd3f08a09509badbd54835f0a32f1e60a4981b46886a"
+  },
+  "resources": {
+    "peak_allocated_bytes": 5642256384,
+    "peak_reserved_bytes": 5712904192,
+    "managed_bytes": 0,
+    "device_synchronizations": 0,
+    "mamba_fallbacks": 0,
+    "host_fallbacks": 0,
+    "pool_failures": 0
+  },
+  "soak_reference": {
+    "name": "final-soak-10000-20260801",
+    "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-soak-10000-20260801",
+    "completed_steps": 10000,
+    "raw_tokens_per_second": {
+      "p10": 1571.406394676489,
+      "p50": 1577.2778341253934,
+      "p90": 1583.1571375387298
+    },
+    "initial_eval_loss": 9.94792381968697,
+    "final_eval_loss": 3.225418736199467,
+    "relative_loss_improvement": 0.6757696586079244,
+    "valid_checkpoints_retained": 4,
+    "invalid_checkpoints": 0,
+    "trace_first_1000_sha256": "ab386f4e9ec222292e0d40c4b78af2dad9576bbced3b9e7030ddeae5562c4265",
+    "final_model_sha256": "c379954d9a70ce218f3ff15278d7f1e5e95a0c239f82fce55bd5a3a00f6c18f0",
+    "final_trainer_state_sha256": "5bb1e9afa23c7df37fa3b542459a8118b8605192d788cb5f9aabe95248fad912",
+    "status": "complete"
+  },
+  "superseded_soak": {
+    "name": "final-soak-10000-rc1-20260801",
+    "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-soak-10000-rc1-20260801",
+    "last_logged_step": 5100,
+    "latest_verified_checkpoint_step": 5000,
+    "stderr_bytes": 0,
+    "status": "stopped_at_verified_checkpoint_after_additional_hardening"
+  },
+  "soak_pre_transversal_hardening": {
+    "name": "final-soak-10000-final-20260801",
+    "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-soak-10000-final-20260801",
+    "requested_steps": 10000,
+    "completed_steps": 10000,
+    "runtime_module_sha256": "071562c97e2ae18c616aa751602237d8ad0d0e85998b12beef51ed5cd4440b7a",
+    "first_1000_steps": {
+      "observed_steps": 1000,
+      "warmup_steps_discarded": 100,
+      "measured_steps": 900,
+      "raw_tokens_per_second": {
+        "p10": 1570.167360179284,
+        "p50": 1575.9817914168948,
+        "p90": 1581.1158928982036
+      },
+      "steps_per_second": {
+        "p10": 3.066733125350164,
+        "p50": 3.0780894363611226,
+        "p90": 3.088116978316804
+      },
+      "performance_gate": "pass"
+    },
+    "whole_run": {
+      "elapsed_training_seconds": 3245.367545298388,
+      "raw_tokens": 5120000,
+      "raw_tokens_per_second": 1577.6333276695948,
+      "steps_per_second": 3.0813150931046773,
+      "loss_first": 9.894630432128906,
+      "loss_last": 3.9176950454711914,
+      "loss_mean": 3.6163236274719237
+    },
+    "quality": {
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 3.225418736199467,
+      "absolute_improvement": 6.722505083487503,
+      "relative_improvement": 0.6757696586079244,
+      "gate": "pass_learning_signal"
+    },
+    "checkpoint": {
+      "latest": "step-000000010000-base-max-steps",
+      "latest_manifest_sha256": "19c7d28fe80c2cdf62a4597611c5efba5b960a25c4fdb56be0947ecc2b94fa69",
+      "valid_retained": 4,
+      "invalid": 0,
+      "formal_verify": "pass",
+      "snapshots_completed": 10,
+      "snapshot_pending": false
+    },
+    "bitwise": {
+      "trace_first_1000_sha256": "ab386f4e9ec222292e0d40c4b78af2dad9576bbced3b9e7030ddeae5562c4265",
+      "final_model_sha256": "c379954d9a70ce218f3ff15278d7f1e5e95a0c239f82fce55bd5a3a00f6c18f0",
+      "final_trainer_state_sha256": "5bb1e9afa23c7df37fa3b542459a8118b8605192d788cb5f9aabe95248fad912",
+      "checkpoint_runtime_identity_sha256": "2fd19641beecc35fd9fd25a9ee3dce7dc986cdc3991e9b1cc43dad603b732bf7",
+      "semantic_execution_identity_sha256": "4ad0ed394b5db0eaa8ba9e8dd83b16b3f0a685177302b363347062ab8c25dcf1",
+      "matches_soak_reference_model": true,
+      "matches_soak_reference_trainer_state": true,
+      "matches_soak_reference_first_1000_trace": true
+    },
+    "resources": {
+      "peak_allocated_bytes": 5642256384,
+      "peak_reserved_bytes": 5712904192,
+      "managed_live_bytes": 0,
+      "managed_cached_bytes": 0,
+      "managed_advice_failures": 0,
+      "device_synchronizations": 0,
+      "mamba_host_fallbacks": 0,
+      "mamba_fast_path_fallbacks": 0,
+      "pool_release_failures": 0,
+      "pool_unknown_deallocation_attempts": 0,
+      "pool_capture_contract_violations": 0,
+      "quarantined_blocks": 0
+    },
+    "shard_transitions": [3907, 7813],
+    "stderr_bytes": 0,
+    "status": "complete"
+  },
+  "soak_final": {
+    "name": "final-soak-10000-final2-20260802",
+    "path": "OXN/nsos/artifacts/ptbr_conversational/pilot/runs/final-soak-10000-final2-20260802",
+    "requested_steps": 10000,
+    "completed_steps": 10000,
+    "runtime_module_sha256": "d3c138dce111b7d5c7a701f0eae1e6a641825640f2145670e36f9f838ba55167",
+    "first_1000_steps": {
+      "observed_steps": 1000,
+      "warmup_steps_discarded": 100,
+      "measured_steps": 900,
+      "raw_tokens_per_second": {
+        "p10": 1567.4414975546774,
+        "p50": 1576.628211265826,
+        "p90": 1583.3299598956075
+      },
+      "steps_per_second": {
+        "p10": 3.0614091749114793,
+        "p50": 3.0793519751285663,
+        "p90": 3.0924413279211085
+      },
+      "performance_gate": "pass"
+    },
+    "whole_run": {
+      "elapsed_training_seconds": 3247.2477504994895,
+      "raw_tokens": 5120000,
+      "raw_tokens_per_second": 1576.7198542865863,
+      "steps_per_second": 3.079530965403489,
+      "loss_first": 9.894630432128906,
+      "loss_last": 3.9176950454711914,
+      "loss_mean": 3.6163236274719237
+    },
+    "quality": {
+      "initial_eval_loss": 9.94792381968697,
+      "final_eval_loss": 3.225418736199467,
+      "absolute_improvement": 6.722505083487503,
+      "relative_improvement": 0.6757696586079244,
+      "gate": "pass_learning_signal"
+    },
+    "checkpoint": {
+      "latest": "step-000000010000-base-max-steps",
+      "latest_manifest_sha256": "05c1feb2a894aca9141a1f0880a37fdb53ca86acb5d55e3528f861f40993b33d",
+      "valid_retained": 4,
+      "invalid": 0,
+      "formal_verify": "pass",
+      "snapshots_completed": 10,
+      "snapshot_pending": false
+    },
+    "bitwise": {
+      "trace_first_1000_sha256": "ab386f4e9ec222292e0d40c4b78af2dad9576bbced3b9e7030ddeae5562c4265",
+      "final_model_sha256": "c379954d9a70ce218f3ff15278d7f1e5e95a0c239f82fce55bd5a3a00f6c18f0",
+      "final_trainer_state_sha256": "5bb1e9afa23c7df37fa3b542459a8118b8605192d788cb5f9aabe95248fad912",
+      "checkpoint_runtime_identity_sha256": "c7fcbe98b50618fb6d4bec7ae2d20c39c81be619a6f0966790c00331ef459fbb",
+      "semantic_execution_identity_sha256": "4ad0ed394b5db0eaa8ba9e8dd83b16b3f0a685177302b363347062ab8c25dcf1",
+      "matches_pre_transversal_model": true,
+      "matches_pre_transversal_trainer_state": true,
+      "matches_pre_transversal_first_1000_trace": true
+    },
+    "resources": {
+      "peak_allocated_bytes": 5642256384,
+      "peak_reserved_bytes": 5712904192,
+      "managed_live_bytes": 0,
+      "device_synchronizations": 0,
+      "mamba_host_fallbacks": 0,
+      "mamba_fast_path_fallbacks": 0,
+      "pool_failures": 0,
+      "stderr_bytes": 0
+    },
+    "shard_transitions": [3907, 7813],
+    "external_contention": {
+      "process": "RobloxPlayerBeta",
+      "approx_gpu_engine_percent": 15.64,
+      "steps_affected": "2800-3200",
+      "resolved_before_step": 3300,
+      "training_fallback_or_numeric_error": false
+    },
+    "status": "complete"
+  },
+  "external_limitations": {
+    "nvidia_cuda_hardware_available": false,
+    "amd_wave64_hardware_available": false,
+    "rocprofiler_available": false,
+    "mpi_toolchain_available": false,
+    "mpi_multirank_runtime_available": false
+  }
+}

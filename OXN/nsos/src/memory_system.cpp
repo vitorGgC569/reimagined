@@ -7,6 +7,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <set>
 
 namespace nsos {
 
@@ -394,227 +395,139 @@ void MemorySystem::add_instruction(const std::string &instr) {
   instructional_memory.push_back(instr);
 }
 
-Tensor MemorySystem::retrieve(const Tensor &query) {
-  validate_state_shape(query, "retrieve");
-  Tensor query_cpu = query.get_device() == Device::GPU ? query.cpu() : query;
-  std::lock_guard<std::mutex> lock(memory_mutex);
-
-  const float *query_ptr = query_cpu.data();
-  if (query_cpu.size == 0) {
-    return Tensor::zeros(query_cpu.shape.dims, Device::CPU).to(query.get_device());
+std::vector<Tensor> MemorySystem::retrieval_candidates_locked(
+    const Tensor& query_cpu, size_t top_k) {
+  if (top_k == 0) return {};
+  constexpr size_t max_candidate_bytes = 64ull * 1024ull * 1024ull;
+  const size_t state_bytes = static_cast<size_t>(chunk_size) * sizeof(float);
+  if (top_k > max_candidate_bytes / state_bytes) {
+    throw std::length_error("Requested memory results exceed 64 MiB");
   }
-  if (clusters.empty()) {
-    if (!oxtamem_store) {
-      return Tensor::zeros(query_cpu.shape.dims, Device::CPU)
-          .to(query.get_device());
+  struct Candidate {
+    double score;
+    uint64_t hash;
+    Tensor state;
+    mutable Cluster* owner;
+  };
+  auto better = [state_bytes](const Candidate& a, const Candidate& b) {
+    if (a.score != b.score) return a.score > b.score;
+    if (a.hash != b.hash) return a.hash < b.hash;
+    return std::memcmp(a.state.data(), b.state.data(), state_bytes) < 0;
+  };
+  // Keep only the best K unique tensors: retrieval scratch does not grow
+  // with the number of clusters or the durable history being considered.
+  std::set<Candidate, decltype(better)> candidates(better);
+  double query_norm = 0;
+  for (int64_t i = 0; i < query_cpu.size; ++i) {
+    query_norm += double(query_cpu.data()[i]) * query_cpu.data()[i];
+  }
+  auto add = [&](const Tensor& state, Cluster* owner = nullptr) {
+    if (state.size != query_cpu.size) return;
+    Tensor host = state.get_device() == Device::GPU ? state.cpu() : state;
+    uint64_t hash = 14695981039346656037ull;
+    double dot = 0, norm = 0;
+    for (int64_t i = 0; i < host.size; ++i) {
+      const float value = host.data()[i];
+      if (!std::isfinite(value)) throw std::runtime_error("Non-finite retrieved memory");
+      uint32_t bits;
+      std::memcpy(&bits, &value, sizeof(bits));
+      hash = (hash ^ bits) * 1099511628211ull;
+      dot += double(query_cpu.data()[i]) * value;
+      norm += double(value) * value;
     }
-    Tensor context_cpu = Tensor::zeros(query_cpu.shape.dims, Device::CPU);
-    float total_weight = 0.0f;
-    float query_norm_sq = 0.0f;
-    for (int64_t index = 0; index < query_cpu.size; ++index) {
-      query_norm_sq += query_ptr[index] * query_ptr[index];
+    const double score = dot / std::sqrt(std::max(query_norm * norm, 1e-16));
+    Candidate candidate{score, hash, host.reshape(query_cpu.shape.dims), owner};
+    const auto duplicate = candidates.find(candidate);
+    if (duplicate != candidates.end()) {
+      if (owner) duplicate->owner = owner;
+      return;
     }
-    const float query_norm =
-        std::sqrt(std::max(query_norm_sq, 1e-8f));
-    const auto payloads = oxtamem_store->search_similar(
-        oxtamem_embedding(query_cpu), 8);
-    for (const auto& payload : payloads) {
-      Tensor memory = deserialize_tensor_state(payload);
-      if (memory.size != query_cpu.size) {
-        continue;
+    if (candidates.size() == top_k) {
+      const auto worst = std::prev(candidates.end());
+      if (!better(candidate, *worst)) return;
+      candidates.erase(worst);
+    }
+    candidates.insert(std::move(candidate));
+  };
+
+  // Durable candidates are always consulted, including after the first new
+  // write following a restart. Runtime entries supplement rather than mask it.
+  if (oxtamem_store) {
+    const size_t shortlist = std::min(max_candidate_bytes / (state_bytes + 40),
+        std::min<size_t>(4096, std::max<size_t>(8, top_k * 4)));
+    for (const auto& payload : oxtamem_store->search_similar(
+             oxtamem_embedding(query_cpu), shortlist)) {
+      add(deserialize_tensor_state(payload));
+    }
+  } else if (causal_store) {
+    const size_t depth = std::min<size_t>(1024,
+        max_candidate_bytes / (state_bytes + 40));
+    for (const auto& payload : causal_store->read_history("episodic", depth)) {
+      add(deserialize_tensor_state(payload));
+    }
+  }
+
+  for (auto& cluster : clusters) {
+    for (const auto& state : cluster.items) add(state, &cluster);
+    if (tq_engine) {
+      for (const auto& packed : cluster.compressed_items) {
+        const auto values = tq_engine->decode(packed);
+        if (values.size() != static_cast<size_t>(chunk_size)) continue;
+        Tensor state = Tensor::uninitialized(query_cpu.shape.dims, Device::CPU);
+        std::memcpy(state.data(), values.data(), state_bytes);
+        add(state, &cluster);
       }
-      const float* memory_ptr = memory.data();
-      float dot = 0.0f;
-      float memory_norm_sq = 0.0f;
-      for (int64_t index = 0; index < query_cpu.size; ++index) {
-        dot += query_ptr[index] * memory_ptr[index];
-        memory_norm_sq += memory_ptr[index] * memory_ptr[index];
-      }
-      const float cosine =
-          dot / (query_norm *
-                 std::sqrt(std::max(memory_norm_sq, 1e-8f)));
-      const float weight = bounded_similarity_weight(cosine);
-      for (int64_t index = 0; index < query_cpu.size; ++index) {
-        context_cpu.data()[index] += memory_ptr[index] * weight;
-      }
-      total_weight += weight;
-    }
-    if (std::isfinite(total_weight) && total_weight > 1e-6f) {
-      for (int64_t index = 0; index < context_cpu.size; ++index) {
-        context_cpu.data()[index] /= total_weight;
-      }
-    }
-    return context_cpu.to(query.get_device());
-  }
-
-  std::vector<std::pair<float, int>> centroid_scores;
-  centroid_scores.reserve(clusters.size());
-  float query_norm_sq = 0.0f;
-  for (int i = 0; i < query_cpu.size; ++i) {
-    query_norm_sq += query_ptr[i] * query_ptr[i];
-  }
-  const float query_norm = std::sqrt(std::max(query_norm_sq, 1e-8f));
-
-  for (size_t i = 0; i < clusters.size(); ++i) {
-    float dot = 0.0f;
-    float centroid_norm_sq = 0.0f;
-    Tensor centroid_cpu =
-        clusters[i].centroid.get_device() == Device::GPU ? clusters[i].centroid.cpu()
-                                                         : clusters[i].centroid;
-    const float *c = centroid_cpu.data();
-    if (centroid_cpu.size != query_cpu.size) continue;
-    for (int k = 0; k < query_cpu.size; ++k) {
-      dot += c[k] * query_ptr[k];
-      centroid_norm_sq += c[k] * c[k];
-    }
-    const float centroid_norm = std::sqrt(std::max(centroid_norm_sq, 1e-8f));
-    const float cosine = dot / (query_norm * centroid_norm);
-    centroid_scores.push_back({cosine, static_cast<int>(i)});
-  }
-
-  const size_t shortlist =
-      std::min<size_t>(std::max<size_t>(1, std::min<size_t>(clusters.size(), 8)), centroid_scores.size());
-  std::partial_sort(
-      centroid_scores.begin(),
-      centroid_scores.begin() + shortlist,
-      centroid_scores.end(),
-      [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
-
-  std::vector<int> relevant_clusters;
-  relevant_clusters.reserve(shortlist);
-  for (size_t idx = 0; idx < shortlist; ++idx) {
-    relevant_clusters.push_back(centroid_scores[idx].second);
-    clusters[static_cast<size_t>(centroid_scores[idx].second)].last_access =
-        std::chrono::system_clock::now();
-  }
-
-  Tensor context_cpu = Tensor::zeros(query_cpu.shape.dims, Device::CPU);
-  float total_weight = 0.0f;
-
-  std::vector<float> query_vec;
-  if (!clusters.empty()) {
-     query_vec.assign(query_ptr, query_ptr + query_cpu.size);
-  }
-
-  for (int idx : relevant_clusters) {
-    // Process uncompressed items
-    for (const auto &mem : clusters[idx].items) {
-      Tensor mem_cpu = mem.get_device() == Device::GPU ? mem.cpu() : mem;
-      float dot = 0;
-      const float *mem_ptr = mem_cpu.data();
-      if (mem_cpu.size != query_cpu.size) continue;
-      float memory_norm_sq = 0.0f;
-      for (int i = 0; i < query_cpu.size; ++i) {
-        dot += query_ptr[i] * mem_ptr[i];
-        memory_norm_sq += mem_ptr[i] * mem_ptr[i];
-      }
-
-      const float cosine = dot /
-          (query_norm * std::sqrt(std::max(memory_norm_sq, 1e-8f)));
-      const float weight = bounded_similarity_weight(cosine);
-
-      for (int i = 0; i < query_cpu.size; ++i)
-        context_cpu.data()[i] += mem_ptr[i] * weight;
-      total_weight += weight;
-    }
-
-    // Process compressed items via TurboQuant Dot
-    if (tq_engine && !clusters[idx].compressed_items.empty()) {
-        for (const auto &compressed_mem : clusters[idx].compressed_items) {
-            // Decode entirely to reconstruct the state as we need it for weighting.
-            std::vector<float> decoded = tq_engine->decode(compressed_mem);
-            if (decoded.size() != static_cast<size_t>(query_cpu.size)) continue;
-            float dot = 0.0f;
-            float memory_norm_sq = 0.0f;
-            bool finite = true;
-            for (size_t i = 0; i < decoded.size(); ++i) {
-                finite = finite && std::isfinite(decoded[i]);
-                dot += query_vec[i] * decoded[i];
-                memory_norm_sq += decoded[i] * decoded[i];
-            }
-            if (!finite) continue;
-            const float cosine = dot /
-                (query_norm * std::sqrt(std::max(memory_norm_sq, 1e-8f)));
-            const float weight = bounded_similarity_weight(cosine);
-            for (size_t i = 0; i < decoded.size(); ++i) {
-                context_cpu.data()[i] += decoded[i] * weight;
-            }
-            total_weight += weight;
-        }
     }
   }
-
-  if (std::isfinite(total_weight) && total_weight > 1e-6f) {
-    for (int i = 0; i < context_cpu.size; ++i)
-      context_cpu.data()[i] /= total_weight;
+  // Re-rank with the original full-dimensional tensors, not the 128-D index
+  // projection. Stable content ties give the same order after reopening.
+  std::vector<Tensor> result;
+  result.reserve(candidates.size());
+  const auto accessed = std::chrono::system_clock::now();
+  for (const auto& candidate : candidates) {
+    if (candidate.owner) candidate.owner->last_access = accessed;
+    result.push_back(candidate.state);
   }
-
-  return context_cpu.to(query.get_device());
+  return result;
 }
 
-std::vector<Tensor> MemorySystem::retrieve(const Tensor &query, size_t top_k) {
-  validate_state_shape(query, "retrieve(top_k)");
-  if (top_k > 4096) {
-    throw std::invalid_argument("retrieve top_k exceeds 4096");
-  }
-  Tensor query_cpu = query.get_device() == Device::GPU ? query.cpu() : query;
+Tensor MemorySystem::retrieve(const Tensor& query) {
+  Tensor host = query.get_device() == Device::GPU ? query.cpu() : query;
+  validate_state_shape(host, "retrieve");
   std::lock_guard<std::mutex> lock(memory_mutex);
-  if (clusters.empty() && oxtamem_store && top_k > 0) {
-    std::vector<Tensor> results;
-    for (const auto& payload : oxtamem_store->search_similar(
-             oxtamem_embedding(query_cpu), top_k)) {
-      Tensor state = deserialize_tensor_state(payload);
-      if (state.size != query_cpu.size) {
-        continue;
-      }
-      results.push_back(query.get_device() == Device::GPU
-                            ? state.to(Device::GPU)
-                            : std::move(state));
+  const auto memories = retrieval_candidates_locked(host, 8);
+  Tensor context = Tensor::zeros(host.shape.dims, Device::CPU);
+  double query_norm = 0;
+  for (int64_t i = 0; i < host.size; ++i) query_norm += double(host.data()[i]) * host.data()[i];
+  std::vector<double> accumulated(static_cast<size_t>(host.size), 0.0);
+  double total = 0;
+  for (const auto& state : memories) {
+    double dot = 0, norm = 0;
+    for (int64_t i = 0; i < host.size; ++i) {
+      dot += double(host.data()[i]) * state.data()[i];
+      norm += double(state.data()[i]) * state.data()[i];
     }
-    return results;
+    const float cosine = static_cast<float>(dot / std::sqrt(std::max(query_norm * norm, 1e-16)));
+    const double weight = bounded_similarity_weight(cosine);
+    for (int64_t i = 0; i < host.size; ++i) accumulated[static_cast<size_t>(i)] += state.data()[i] * weight;
+    total += weight;
   }
-  std::vector<std::pair<float, Tensor>> ranked;
-  ranked.reserve(clusters.size());
-
-  const float *query_ptr = query_cpu.data();
-  float query_norm_sq = 0.0f;
-  for (int64_t i = 0; i < query_cpu.size; ++i) {
-    query_norm_sq += query_ptr[i] * query_ptr[i];
+  if (total > 0) {
+    for (int64_t i = 0; i < host.size; ++i) context.data()[i] = static_cast<float>(accumulated[static_cast<size_t>(i)] / total);
   }
-  const float query_norm = std::sqrt(std::max(query_norm_sq, 1e-8f));
+  return query.get_device() == Device::GPU ? context.to(Device::GPU) : context;
+}
 
-  for (const auto &cluster : clusters) {
-    Tensor centroid_cpu =
-        cluster.centroid.get_device() == Device::GPU ? cluster.centroid.cpu()
-                                                     : cluster.centroid;
-    const float *centroid_ptr = centroid_cpu.data();
-    if (centroid_cpu.size != query_cpu.size) continue;
-    float dot = 0.0f;
-    float centroid_norm_sq = 0.0f;
-    for (int i = 0; i < query_cpu.size; ++i) {
-      dot += query_ptr[i] * centroid_ptr[i];
-      centroid_norm_sq += centroid_ptr[i] * centroid_ptr[i];
-    }
-    const float cosine = dot /
-        (query_norm * std::sqrt(std::max(centroid_norm_sq, 1e-8f)));
-    ranked.push_back({cosine, centroid_cpu});
+std::vector<Tensor> MemorySystem::retrieve(const Tensor& query, size_t top_k) {
+  if (top_k > 4096) throw std::invalid_argument("retrieve top_k exceeds 4096");
+  Tensor host = query.get_device() == Device::GPU ? query.cpu() : query;
+  validate_state_shape(host, "retrieve(top_k)");
+  std::lock_guard<std::mutex> lock(memory_mutex);
+  auto result = retrieval_candidates_locked(host, top_k);
+  for (auto& state : result) {
+    state = query.get_device() == Device::GPU ? state.to(Device::GPU) : state.clone();
   }
-
-  std::partial_sort(
-      ranked.begin(),
-      ranked.begin() + std::min(top_k, ranked.size()),
-      ranked.end(),
-      [](const auto &a, const auto &b) { return a.first > b.first; });
-
-  std::vector<Tensor> results;
-  const size_t limit = std::min(top_k, ranked.size());
-  results.reserve(limit);
-  for (size_t i = 0; i < limit; ++i) {
-    results.push_back(query.get_device() == Device::GPU
-                          ? ranked[i].second.to(Device::GPU)
-                          : ranked[i].second.clone());
-  }
-  return results;
+  return result;
 }
 
 void MemorySystem::run_auto_dream() {

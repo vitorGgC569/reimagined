@@ -61,7 +61,7 @@ def main() -> int:
     for lbl, r in reports.items():
         all_l = r["loss"]["all"]
         if not all_l or r.get("skipped"):
-            # Skipped run (e.g., Slender + GPU): write placeholder row.
+            # Skipped run (e.g., Slender + GPU): write an explicit unsupported row.
             print(f"  [SKIP row for {lbl}: " + r.get("reason", "no loss data") + "]")
             rows.append({"label": lbl, "init": float("nan"), "final": float("nan"),
                          "min": float("nan"), "msps": 0.0, "delta_pct": float("nan"),

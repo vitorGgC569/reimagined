@@ -13,9 +13,10 @@ the target model:
      adjusted distribution at that position and stop.
   4. Repeat from the new accepted prefix.
 
-Acceptance rate depends on draft-target agreement.  For NSOS 40M as
-target + 4M draft, agreement is high on common tokens (~70% in
-English text), giving ~2.5x effective speedup.
+This is an opt-in, stateless reference experiment. Acceptance and speedup
+must be measured with the actual target, draft, tokenizer and corpus. No
+acceptance rate or throughput is assumed. Full-prefix evaluation rebuilds
+SSM/conv/KV state, so rejected branches cannot leak state into later rounds.
 
 This script wraps two NSOS InferenceEngine instances:
   * target_engine: the full SFT-trained 40M model
@@ -25,7 +26,7 @@ The draft is trained by:
     softmax matching, KL divergence loss).
   * OR by training a smaller-but-same-arch model on the same SFT
     data (cheaper but less aligned).
-We provide a `train_draft.py` companion that does the first option.
+Draft training is not performed by this script.
 
 CLI usage:
   python speculative_decode.py \\
@@ -34,6 +35,7 @@ CLI usage:
       --tokenizer <path>/tokenizer.nsos \\
       --target-config <path>/effective_model_config.json \\
       --draft-config  <path>/draft_model_config.json \\
+      --eos-token-id <verified-tokenizer-eos-id> \\
       --prompt "Explain in one sentence what list comprehension does:" \\
       --max-new-tokens 64 \\
       --gamma 4
@@ -42,7 +44,7 @@ CLI usage:
 Optimal gamma depends on acceptance rate alpha:
   Expected tokens per round = (1 - alpha^(gamma+1)) / (1 - alpha)
   Maximize over gamma given measured alpha.
-For alpha ~0.7 (typical English): gamma=4 is near optimal.
+Tune gamma only after measuring acceptance on the intended workload.
 
 Output: the generated text + speedup metrics (acceptance rate,
 average tokens/round, wallclock vs naive baseline).
@@ -95,6 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=50,
                         help="Top-K cutoff (applied before top-p).")
     parser.add_argument("--seed", type=int, default=20260516)
+    parser.add_argument("--eos-token-id", type=int, required=True,
+                        help="Verified EOS id from the supplied tokenizer/model pack.")
     parser.add_argument("--build-dir", type=Path, default=None)
     parser.add_argument("--device", choices=["auto", "cpu", "gpu"], default="auto")
     parser.add_argument("--baseline-comparison", action="store_true",
@@ -109,7 +113,7 @@ def detect_build_dir(explicit: Optional[Path]) -> Path:
         candidates.extend([explicit, explicit / "Release"])
     repo_root = Path(__file__).resolve().parents[3]
     nsos_root = repo_root / "OXN" / "nsos"
-    for name in ["build-cuda-validation", "build-colab", "build-mvp",
+    for name in ["build-codex-hip", "build-codex-cpu", "build-cuda-validation", "build-colab", "build-mvp",
                  "build_cuda129", "build_v1", "build_full", "build"]:
         candidates.extend([nsos_root / name / "Release", nsos_root / name])
     patterns = ("nsos_ext*.pyd", "nsos_ext*.so")
@@ -136,6 +140,10 @@ def load_engine_with_config(nsos, ckpt: Path, cfg_path: Path, use_cuda: bool):
 
 def softmax_temperature(logits: List[float], temperature: float) -> List[float]:
     """Stable softmax with temperature.  Returns probabilities."""
+    if not logits or not all(math.isfinite(v) for v in logits):
+        raise ValueError("Speculation requires finite, non-empty logits")
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("Temperature must be finite and nonnegative")
     if temperature <= 0.0:
         # Greedy: one-hot on argmax
         m = max(range(len(logits)), key=lambda i: logits[i])
@@ -159,6 +167,11 @@ def apply_top_k_top_p(probs: List[float], top_k: int,
         masked = [p if i in keep_set else 0.0 for i, p in enumerate(probs)]
     else:
         masked = list(probs)
+    # Nucleus thresholds apply to the renormalized top-k distribution.
+    total = sum(masked)
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("Invalid sampling distribution")
+    masked = [p / total for p in masked]
     if top_p > 0.0 and top_p < 1.0:
         ranked = sorted(range(n), key=lambda i: masked[i], reverse=True)
         cum = 0.0
@@ -183,29 +196,27 @@ def sample_from(probs: List[float], rng: random.Random) -> int:
         cum += p
         cdf.append(cum)
     r = rng.random() * cdf[-1]
-    return bisect.bisect_left(cdf, r)
+    return min(bisect.bisect_right(cdf, r), len(probs) - 1)
 
 
 def get_logits(engine, token_history: List[int]) -> List[float]:
-    """Returns the next-token logits for the given history.  Requires
-    the engine to expose `next_token_logits(history) -> List[float]`.
-    If unavailable, falls back to `generate(..., 1, ...)` and decoding
-    a single token (loses the full distribution — speculative decoding
-    needs the full distribution to do the rejection-sampling step
-    correctly)."""
-    try:
-        logits = engine.next_token_logits(token_history)
-        return list(logits)
-    except AttributeError:
-        # Fallback: emit a one-hot at the greedy token.  This makes
-        # speculative decoding degenerate to greedy and disables
-        # rejection sampling — useful as a smoke test only.
-        gen_id = engine.next_token_greedy(token_history)
-        n = engine.model.model_config.vocab_size if hasattr(
-            engine.model, "model_config") else 32000
-        out = [0.0] * n
-        out[gen_id] = 1.0
-        return out
+    """Read real logits. Never substitute a one-hot or reuse rejected state."""
+    if not token_history:
+        raise ValueError("An explicit non-empty token prefix is required")
+    if hasattr(engine, "forward_logits"):
+        return get_all_logits(engine, token_history)[-1]
+    if hasattr(engine, "next_token_logits"):
+        # Test/reference adapters must implement a stateless full-prefix API.
+        return list(engine.next_token_logits(token_history))
+    raise TypeError("Engine must expose full logits; greedy fallback is not equivalent")
+
+
+def get_all_logits(engine, history: List[int]) -> List[List[float]]:
+    values = engine.forward_logits(history).cpu().numpy()
+    rows = values.reshape(-1, values.shape[-1]).tolist()
+    if len(rows) != len(history):
+        raise ValueError("Verifier must return one logit row per input token")
+    return rows
 
 
 def speculative_decode(target_engine, draft_engine, tokenizer,
@@ -228,6 +239,10 @@ def speculative_decode(target_engine, draft_engine, tokenizer,
         4. If all gamma accepted, sample one BONUS token from target's
            distribution at position gamma+1 (target was already computed).
     """
+    if gamma < 1 or max_new < 0 or not prompt_tokens:
+        raise ValueError("Require gamma>=1, max_new>=0 and a non-empty prefix")
+    if top_k < 0 or not 0 < top_p <= 1:
+        raise ValueError("Require top_k>=0 and 0<top_p<=1")
     current = list(prompt_tokens)
     generated: List[int] = []
     rounds = 0
@@ -241,7 +256,7 @@ def speculative_decode(target_engine, draft_engine, tokenizer,
         draft_tokens: List[int] = []
         draft_probs: List[List[float]] = []
         draft_history = list(current)
-        for _ in range(gamma):
+        for _ in range(min(gamma, max_new - len(generated))):
             d_logits = get_logits(draft_engine, draft_history)
             d_probs = softmax_temperature(d_logits, temperature)
             d_probs = apply_top_k_top_p(d_probs, top_k, top_p)
@@ -262,23 +277,28 @@ def speculative_decode(target_engine, draft_engine, tokenizer,
         # for each prefix length.  This is the FALLBACK path; a future
         # binding upgrade should expose a single forward that returns
         # logits at every position so we get all gamma+1 in one call.
+        proposed_total += len(draft_tokens)
+        verified_rows = (get_all_logits(target_engine, current + draft_tokens)
+                         if hasattr(target_engine, "forward_logits") else None)
         target_probs: List[List[float]] = []
         target_history = list(current)
         for i in range(len(draft_tokens)):
-            t_logits = get_logits(target_engine, target_history)
+            t_logits = (verified_rows[len(current) - 1 + i] if verified_rows is not None
+                        else get_logits(target_engine, target_history))
             t_probs = softmax_temperature(t_logits, temperature)
             t_probs = apply_top_k_top_p(t_probs, top_k, top_p)
             target_probs.append(t_probs)
+            if len(t_probs) != len(draft_probs[i]):
+                raise ValueError("Draft and verifier vocabularies differ")
             target_history.append(draft_tokens[i])
         # Bonus position
-        bonus_logits = get_logits(target_engine, target_history)
+        bonus_logits = verified_rows[-1] if verified_rows is not None else get_logits(target_engine, target_history)
         bonus_probs = softmax_temperature(bonus_logits, temperature)
         bonus_probs = apply_top_k_top_p(bonus_probs, top_k, top_p)
 
         # Step 3: rejection sampling
         accepted_this_round = 0
         for i, tok in enumerate(draft_tokens):
-            proposed_total += 1
             p = target_probs[i][tok]
             q = draft_probs[i][tok]
             if q <= 0.0:
@@ -332,6 +352,9 @@ def speculative_decode(target_engine, draft_engine, tokenizer,
         "acceptance_rate": accepted_total / max(proposed_total, 1),
         "tokens_per_round": len(generated) / max(rounds, 1),
         "gamma": gamma,
+        "verification": "full_prefix_stateless",
+        "parallel_verification": hasattr(target_engine, "forward_logits"),
+        "quality_claim": "rejection_sampling_reference_not_trained_draft",
     }
     return generated, metrics
 
@@ -368,13 +391,19 @@ def main() -> int:
     print(f"[spec] loading target: {args.target_checkpoint}")
     target = load_engine_with_config(nsos, args.target_checkpoint,
                                        args.target_config, use_cuda)
+    target.load_tokenizer(str(args.tokenizer))
     print(f"[spec] loading draft:  {args.draft_checkpoint}")
     draft = load_engine_with_config(nsos, args.draft_checkpoint,
                                       args.draft_config, use_cuda)
+    draft.load_tokenizer(str(args.tokenizer))
+    if target.model_config().vocab_size != draft.model_config().vocab_size:
+        raise ValueError("Target and draft must have the same vocabulary")
 
     tok = nsos.Tokenizer()
     tok.load(str(args.tokenizer))
-    eos = tok.encode("<|endoftext|>")[0]
+    eos = args.eos_token_id
+    if not 0 <= eos < target.model_config().vocab_size:
+        raise ValueError("EOS is outside the model vocabulary")
     prompt_tokens = tok.encode(args.prompt)
     print(f"[spec] prompt tokens: {len(prompt_tokens)}")
     print()

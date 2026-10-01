@@ -48,7 +48,7 @@ std::vector<float> linear(const std::vector<float>& input, int rows, int in,
 
 }  // namespace
 
-int main() {
+int run_reference_test() {
   constexpr int D = 4;
   constexpr int N = 3;
   constexpr int I = D * 2;
@@ -184,6 +184,8 @@ int main() {
   model_cfg.use_kan = false;
   model_cfg.use_chrass = false;
   model_cfg.mamba2_faithful = true;
+  model_cfg.mamba_head_dim = 4;
+  model_cfg.mamba_n_groups = 1;
   model_cfg.tie_word_embeddings = false;
   JambaModel faithful_stack(model_cfg, Device::CPU);
   bool found_layer_norm = false;
@@ -206,4 +208,17 @@ int main() {
   }
   std::cout << "Mamba2 official-formula parity OK (max_abs=" << max_abs << ")\n";
   return 0;
+}
+
+int main() {
+  try {
+    return run_reference_test();
+  } catch (const std::exception& error) {
+    std::cerr << "Mamba2 reference test failed with exception: "
+              << error.what() << '\n';
+    return 1;
+  } catch (...) {
+    std::cerr << "Mamba2 reference test failed with an unknown exception\n";
+    return 1;
+  }
 }

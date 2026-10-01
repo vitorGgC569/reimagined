@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 // MSVC doesn't support __int128, use uint64_t fallback
@@ -71,8 +72,11 @@ public:
   int write_head;
   int capacity;
 
-  IsomorphicBuffer(int cap = 16) : capacity(cap), write_head(0) {
-    buffer.reserve(cap);
+  explicit IsomorphicBuffer(int cap = 16) : write_head(0), capacity(cap) {
+    if (capacity <= 0) {
+      throw std::invalid_argument("IsomorphicBuffer capacity must be positive");
+    }
+    buffer.reserve(static_cast<size_t>(capacity));
   }
 
   void write(const Tensor &thought) {
@@ -83,10 +87,8 @@ public:
         buffer[write_head] = thought.clone();
       write_head++;
     } else {
-      // WDD Logic: "Drop" or "Overwrite" based on weight?
-      // For "Scratchpad", we treat it as a Ring or Stop.
-      // Stopping prevents corruption (Overflow protection).
-      // std::cout << "[WDD] Buffer Full. Dropping thought." << std::endl;
+      throw std::overflow_error(
+          "IsomorphicBuffer capacity exhausted; thought was not stored");
     }
   }
 
@@ -96,22 +98,37 @@ public:
   }
 
   Tensor read_linear() {
-    // Return concatenated linear view
     if (buffer.empty())
       return Tensor();
-    // Simplified: return average or last for prototype hook
-    return buffer.back();
+    Tensor sequence = get_sequence();
+    return sequence.reshape({1, static_cast<int>(sequence.size)});
   }
 
   // Returns the full sequence as a Tensor [Seq, Dim]
   Tensor get_sequence() {
     if (buffer.empty())
       return Tensor();
-    // Assuming all same shape [1, D]
-    int seq = buffer.size();
-    int dim = buffer[0].shape.back(); // shape size
-    // Construct... (Mocking Tensor concat logic for brevity)
-    return buffer.back(); // Placeholder
+    const Tensor &first = buffer.front();
+    if (first.shape.size() != 2 || first.shape[0] != 1 || first.size <= 0) {
+      throw std::invalid_argument(
+          "IsomorphicBuffer expects every thought to have shape [1, D]");
+    }
+    const int seq = static_cast<int>(buffer.size());
+    const int dim = static_cast<int>(first.size);
+    Tensor result = Tensor::uninitialized({seq, dim}, first.get_device());
+    for (int index = 0; index < seq; ++index) {
+      const Tensor &thought = buffer[static_cast<size_t>(index)];
+      if (thought.shape.size() != 2 || thought.shape[0] != 1 ||
+          thought.size != dim || thought.get_device() != first.get_device()) {
+        throw std::invalid_argument(
+            "IsomorphicBuffer thoughts must share shape and device");
+      }
+      nsos::copy_tensor_bytes(
+          result.raw_data() + static_cast<size_t>(index) * dim,
+          result.get_device(), thought.raw_data(), thought.get_device(),
+          static_cast<size_t>(dim) * sizeof(float));
+    }
+    return result;
   }
 };
 

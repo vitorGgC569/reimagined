@@ -2,23 +2,29 @@
 #include "../include/nsos_arena.h"
 #include "../include/nsos_math.h"
 #include "../include/nsos/determinism.h"
+#include "../include/runtime_execution_identity.h"
+#include "../include/gpu_gemm_provider.h"
 #include "../include/tensor_iterator.h"
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
 #include "../include/cuda/device_buffer.h"
+#include "../include/cuda/pinned_buffer.h"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <set>
-#include <mutex>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,16 +35,33 @@
 #endif
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
+#include "../include/gpu_backend.h"
 #endif
 
 namespace nsos {
 
 namespace {
 
+struct AtomicGpuTransferStats {
+    std::atomic<uint64_t> h2d_calls{0};
+    std::atomic<uint64_t> h2d_bytes{0};
+    std::atomic<uint64_t> d2h_calls{0};
+    std::atomic<uint64_t> d2h_bytes{0};
+    std::atomic<uint64_t> d2d_calls{0};
+    std::atomic<uint64_t> d2d_bytes{0};
+    std::atomic<uint64_t> h2h_calls{0};
+    std::atomic<uint64_t> h2h_bytes{0};
+    std::atomic<uint64_t> device_synchronizations{0};
+    std::atomic<uint64_t> stream_synchronizations{0};
+};
+
+AtomicGpuTransferStats& gpu_transfer_counters() {
+    static AtomicGpuTransferStats counters;
+    return counters;
+}
+
 int checked_tensor_size(const TensorShape& shape) {
-    // Ponto ÚNICO de validação de shape (chamado por TODO construtor de Tensor
+    // Ponto ÚNICO de validação de shape (chamado por todo construtor de Tensor
     // e por from_blob).  Acumula com guarda de overflow em vez de confiar no
     // wraparound de numel(): uma dimensão negativa convertida para size_t vira
     // um valor gigante e só estouraria o limite int DEPOIS — aqui rejeitamos a
@@ -52,13 +75,28 @@ int checked_tensor_size(const TensorShape& shape) {
             throw std::invalid_argument(
                 "Tensor dimension is negative (shape invalido na construcao)");
         }
-        numel *= static_cast<size_t>(d);
-        if (numel > kMaxElements) {
+        const size_t dim = static_cast<size_t>(d);
+        if (dim != 0 && numel > kMaxElements / dim) {
             throw std::overflow_error(
                 "Tensor element count exceeds NSOS v1 int storage limit");
         }
+        numel *= dim;
     }
     return static_cast<int>(numel);
+}
+
+int checked_int_product(int lhs, int rhs, const char* label) {
+    if (lhs < 0 || rhs < 0) {
+        throw std::invalid_argument(
+            std::string(label) + " received a negative factor");
+    }
+    const int64_t product =
+        static_cast<int64_t>(lhs) * static_cast<int64_t>(rhs);
+    if (product > std::numeric_limits<int>::max()) {
+        throw std::overflow_error(
+            std::string(label) + " exceeds the tensor index range");
+    }
+    return static_cast<int>(product);
 }
 
 int normalize_dim(int dim, int rank) {
@@ -122,6 +160,23 @@ std::mt19937& tensor_rng() {
     return gen;
 }
 
+}  // namespace
+
+TensorRandomState capture_tensor_random_state() {
+    return tensor_rng();
+}
+
+void restore_tensor_random_state(const TensorRandomState& state) {
+    tensor_rng() = state;
+}
+
+namespace {
+
+std::atomic<uint64_t>& matmul_precision_policy_epoch_storage() {
+    static std::atomic<uint64_t> epoch{1};
+    return epoch;
+}
+
 #ifdef USE_CUDA
 void cublas_check(cublasStatus_t status, const char* op) {
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -138,6 +193,8 @@ void cublas_check(cublasStatus_t status, const char* op) {
 struct ThreadBlasState {
     int availability = -1;
     cublasHandle_t handle = nullptr;
+    cudaStream_t stream = nullptr;
+    bool stream_bound = false;
 
     ~ThreadBlasState() noexcept {
         if (handle != nullptr) {
@@ -191,10 +248,19 @@ bool gpu_blas_supported() {
 }
 
 cublasHandle_t cublas_handle() {
+    gpu::require_classic_gemm_provider();
     if (!gpu_blas_supported()) {
         return nullptr;
     }
-    return gpu_blas_state().handle;
+    auto& state = gpu_blas_state();
+    const auto stream = gpu::current_stream();
+    if (!state.stream_bound || state.stream != stream) {
+        if (cublasSetStream(state.handle, stream) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("Cannot bind BLAS to the execution stream");
+        state.stream = stream;
+        state.stream_bound = true;
+    }
+    return state.handle;
 }
 
 // AUDIT (post BATCH 4): the mixed-precision GEMM path used to do
@@ -205,66 +271,25 @@ cublasHandle_t cublas_handle() {
 // allocator overhead, completely masking the Tensor Core speedup that
 // the user enabled with NSOS_MIXED_PRECISION=bf16.
 //
-// This workspace caches the BF16/FP16 staging buffers across all
-// matmul calls and only reallocates when a larger tensor shape comes
-// through (geometric 2× growth so we don't churn on minor changes).
-// Single static instance is safe because the training loop is single-
-// threaded; if we ever go multi-threaded we'd promote to thread_local.
+// This workspace caches the BF16/FP16 staging buffers across matmul calls and
+// only reallocates when a larger tensor shape comes through. Each host thread
+// owns one instance because inference replicas execute concurrently.
 struct GemmLowpWorkspace {
-    void* a_ptr = nullptr;
-    void* b_ptr = nullptr;
-    size_t a_capacity = 0;  // bytes
-    size_t b_capacity = 0;  // bytes
+    cuda_detail::DeviceBuffer<unsigned char> a;
+    cuda_detail::DeviceBuffer<unsigned char> b;
 
-    GemmLowpWorkspace() = default;
-    GemmLowpWorkspace(const GemmLowpWorkspace&) = delete;
-    GemmLowpWorkspace& operator=(const GemmLowpWorkspace&) = delete;
-
-    ~GemmLowpWorkspace() noexcept {
-        if (a_ptr != nullptr) {
-            const cudaError_t status = cudaFree(a_ptr);
-            if (status != cudaSuccess) (void)cudaGetLastError();
-            a_ptr = nullptr;
-        }
-        if (b_ptr != nullptr) {
-            const cudaError_t status = cudaFree(b_ptr);
-            if (status != cudaSuccess) (void)cudaGetLastError();
-            b_ptr = nullptr;
-        }
-        a_capacity = 0;
-        b_capacity = 0;
-    }
-
-    // Ensure both buffers hold at least the requested bytes.  Returns
-    // false if cudaMalloc failed (caller should fall through to FP32
-    // for this single call rather than crash).
+    // Ensure both buffers hold at least the requested bytes. The caller treats
+    // false as a hard mixed-precision contract failure.
     bool ensure(size_t a_bytes, size_t b_bytes) {
-        if (a_bytes > a_capacity) {
-            if (a_ptr) { cudaFree(a_ptr); a_ptr = nullptr; }
-            const size_t cap = (a_capacity == 0)
-                ? a_bytes
-                : std::max(a_bytes, a_capacity * 2);
-            if (cudaMalloc(&a_ptr, cap) != cudaSuccess) {
-                a_ptr = nullptr;
-                a_capacity = 0;
-                return false;
-            }
-            a_capacity = cap;
-        }
-        if (b_bytes > b_capacity) {
-            if (b_ptr) { cudaFree(b_ptr); b_ptr = nullptr; }
-            const size_t cap = (b_capacity == 0)
-                ? b_bytes
-                : std::max(b_bytes, b_capacity * 2);
-            if (cudaMalloc(&b_ptr, cap) != cudaSuccess) {
-                b_ptr = nullptr;
-                b_capacity = 0;
-                return false;
-            }
-            b_capacity = cap;
-        }
-        return true;
+        return a.ensure(a_bytes) != nullptr &&
+               b.ensure(b_bytes) != nullptr;
     }
+
+    bool ensure_a(size_t bytes) { return a.ensure(bytes) != nullptr; }
+    bool ensure_b(size_t bytes) { return b.ensure(bytes) != nullptr; }
+
+    void* a_pointer() noexcept { return a.get(); }
+    void* b_pointer() noexcept { return b.get(); }
 };
 // thread_local (not a single static): the HTTP server runs concurrent
 // inference replicas, each on its own worker thread.  A shared static would let
@@ -274,6 +299,257 @@ struct GemmLowpWorkspace {
 GemmLowpWorkspace& gemm_lowp_workspace() {
     thread_local GemmLowpWorkspace ws;
     return ws;
+}
+
+struct AtomicLowpWeightCacheStats {
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> misses{0};
+    std::atomic<uint64_t> version_refreshes{0};
+    std::atomic<uint64_t> evictions{0};
+    std::atomic<uint64_t> budget_bypasses{0};
+    std::atomic<uint64_t> allocation_failures{0};
+    std::atomic<size_t> resident_bytes{0};
+    std::atomic<size_t> peak_resident_bytes{0};
+    std::atomic<uint64_t> access_clock{1};
+};
+
+AtomicLowpWeightCacheStats& lowp_weight_cache_counters() {
+    static AtomicLowpWeightCacheStats counters;
+    return counters;
+}
+
+size_t configured_lowp_weight_cache_budget_bytes() {
+    static const size_t budget = [] {
+        // 192 MiB covers the audited ~135 MiB converted training set while
+        // remaining explicitly bounded. Operators may lower it to zero or
+        // raise it deliberately; malformed/overflowing values fail closed.
+        constexpr uint64_t kDefaultMiB = 192;
+        constexpr uint64_t kMaximumMiB = 16ULL * 1024ULL;
+        const char* value = std::getenv("NSOS_LOWP_WEIGHT_CACHE_MIB");
+        uint64_t mib = kDefaultMiB;
+        if (value != nullptr && *value != '\0') {
+            const char* end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value, end, mib);
+            if (parsed.ec != std::errc() || parsed.ptr != end ||
+                mib > kMaximumMiB) {
+                throw std::invalid_argument(
+                    "NSOS_LOWP_WEIGHT_CACHE_MIB must be an integer in "
+                    "[0, 16384]");
+            }
+        }
+        constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+        return static_cast<size_t>(mib * kMiB);
+    }();
+    return budget;
+}
+
+bool same_storage_owner(const std::weak_ptr<float>& lhs,
+                        const std::shared_ptr<float>& rhs) {
+    return !lhs.owner_before(rhs) && !rhs.owner_before(lhs);
+}
+
+class LowpWeightCache {
+ public:
+    ~LowpWeightCache() noexcept {
+        while (!entries_.empty()) {
+            release_entry(entries_.size() - 1, false);
+        }
+    }
+
+    void* find_or_convert(const Tensor& weight, int mixed_mode,
+                          uint64_t content_version) {
+        auto& counters = lowp_weight_cache_counters();
+        const size_t bytes = static_cast<size_t>(weight.size) * 2u;
+        const size_t budget = configured_lowp_weight_cache_budget_bytes();
+        if (bytes == 0 || budget == 0 || bytes > budget) {
+            counters.budget_bypasses.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        int device_id = -1;
+        if (cudaGetDevice(&device_id) != cudaSuccess) {
+            throw std::runtime_error(
+                "Cannot resolve active device for low-precision weight cache");
+        }
+        const uint64_t policy_epoch =
+            matmul_precision_policy_epoch_storage().load(
+                std::memory_order_relaxed);
+        const uint64_t now = counters.access_clock.fetch_add(
+            1, std::memory_order_relaxed);
+
+        for (size_t index = entries_.size(); index-- > 0;) {
+            if (entries_[index]->storage.expired()) {
+                release_entry(index, true);
+            }
+        }
+        for (const auto& candidate : entries_) {
+            Entry& entry = *candidate;
+            if (!same_storage_owner(entry.storage, weight.data_ptr) ||
+                entry.view_start != weight.raw_data() ||
+                entry.elements != static_cast<size_t>(weight.size) ||
+                entry.shape != weight.shape.dims ||
+                entry.device_id != device_id ||
+                entry.mixed_mode != mixed_mode ||
+                entry.policy_epoch != policy_epoch) {
+                continue;
+            }
+            entry.last_use = now;
+            if (entry.content_version == content_version) {
+                counters.hits.fetch_add(1, std::memory_order_relaxed);
+                return entry.buffer.get();
+            }
+            launch_cast_f32_to_lowp_kernel(
+                entry.buffer.get(), weight.raw_data(), entry.elements,
+                mixed_mode);
+            const cudaError_t status = cudaGetLastError();
+            if (status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("Low-precision weight cache refresh failed: ") +
+                    cudaGetErrorString(status));
+            }
+            entry.content_version = content_version;
+            counters.version_refreshes.fetch_add(
+                1, std::memory_order_relaxed);
+            return entry.buffer.get();
+        }
+
+        counters.misses.fetch_add(1, std::memory_order_relaxed);
+        while (!reserve(bytes, budget)) {
+            if (entries_.empty()) {
+                counters.budget_bypasses.fetch_add(
+                    1, std::memory_order_relaxed);
+                return nullptr;
+            }
+            size_t oldest = 0;
+            for (size_t index = 1; index < entries_.size(); ++index) {
+                if (entries_[index]->last_use < entries_[oldest]->last_use) {
+                    oldest = index;
+                }
+            }
+            release_entry(oldest, true);
+        }
+
+        // reserve() publishes the byte budget before any C++ metadata or
+        // device allocation. Keep that publication transactional as well:
+        // bad_alloc while constructing the entry/vector must not permanently
+        // inflate resident_bytes and disable future cache fills.
+        bool owns_budget_reservation = true;
+        std::unique_ptr<Entry> entry;
+        const auto release_uncommitted = [&]() noexcept {
+            if (!owns_budget_reservation) return;
+            bool storage_released = true;
+            if (entry && entry->buffer.get() != nullptr) {
+                storage_released = entry->buffer.release();
+                if (!storage_released) {
+                    // Ambiguous in-flight storage is intentionally leaked; its
+                    // reservation remains charged so the configured budget is
+                    // still a hard upper bound on reusable cache allocations.
+                    entry->buffer.abandon();
+                }
+            }
+            if (storage_released) {
+                counters.resident_bytes.fetch_sub(
+                    bytes, std::memory_order_relaxed);
+            }
+            owns_budget_reservation = false;
+        };
+        try {
+            entry = std::make_unique<Entry>();
+            entry->storage = weight.data_ptr;
+            entry->view_start = weight.raw_data();
+            entry->elements = static_cast<size_t>(weight.size);
+            entry->shape = weight.shape.dims;
+            entry->device_id = device_id;
+            entry->mixed_mode = mixed_mode;
+            entry->policy_epoch = policy_epoch;
+            entry->content_version = content_version;
+            entry->last_use = now;
+            if (entry->buffer.ensure(bytes) == nullptr) {
+                counters.allocation_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+                release_uncommitted();
+                return nullptr;
+            }
+            launch_cast_f32_to_lowp_kernel(
+                entry->buffer.get(), weight.raw_data(), entry->elements,
+                mixed_mode);
+            const cudaError_t status = cudaGetLastError();
+            if (status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("Low-precision weight cache fill failed: ") +
+                    cudaGetErrorString(status));
+            }
+            void* pointer = entry->buffer.get();
+            entries_.push_back(std::move(entry));
+            owns_budget_reservation = false;
+            return pointer;
+        } catch (...) {
+            release_uncommitted();
+            throw;
+        }
+    }
+
+ private:
+    struct Entry {
+        std::weak_ptr<float> storage;
+        const float* view_start = nullptr;
+        size_t elements = 0;
+        std::vector<int> shape;
+        int device_id = -1;
+        int mixed_mode = 0;
+        uint64_t policy_epoch = 0;
+        uint64_t content_version = 0;
+        uint64_t last_use = 0;
+        cuda_detail::DeviceBuffer<unsigned char> buffer;
+    };
+
+    bool reserve(size_t bytes, size_t budget) {
+        auto& resident = lowp_weight_cache_counters().resident_bytes;
+        size_t current = resident.load(std::memory_order_relaxed);
+        while (current <= budget && bytes <= budget - current) {
+            if (resident.compare_exchange_weak(
+                    current, current + bytes,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                auto& peak =
+                    lowp_weight_cache_counters().peak_resident_bytes;
+                size_t observed = peak.load(std::memory_order_relaxed);
+                while (observed < current + bytes &&
+                       !peak.compare_exchange_weak(
+                           observed, current + bytes,
+                           std::memory_order_relaxed,
+                           std::memory_order_relaxed)) {
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void release_entry(size_t index, bool count_eviction) noexcept {
+        auto& entry = entries_[index];
+        const size_t bytes = entry->elements * 2u;
+        if (entry->buffer.release()) {
+            lowp_weight_cache_counters().resident_bytes.fetch_sub(
+                bytes, std::memory_order_relaxed);
+        } else {
+            // A failed runtime release means the allocation may still be in
+            // flight. Relinquish it and retain its budget reservation forever
+            // rather than reusing/freeing ambiguous storage.
+            entry->buffer.abandon();
+        }
+        entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
+        if (count_eviction) {
+            lowp_weight_cache_counters().evictions.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+
+    std::vector<std::unique_ptr<Entry>> entries_;
+};
+
+LowpWeightCache& lowp_weight_cache() {
+    thread_local LowpWeightCache cache;
+    return cache;
 }
 
 void sync_cuda() {
@@ -292,6 +568,7 @@ void sync_cuda() {
             throw std::runtime_error(std::string("CUDA synchronize failed: ") +
                                      cudaGetErrorString(sync_status));
         }
+        record_gpu_device_synchronization();
     }
 }
 
@@ -307,55 +584,22 @@ bool use_gpu_fast_path(const Tensor& a, const Tensor& b) {
 template <typename T>
 T copy_scalar_from_device(const T* device_ptr) {
     T value{};
-    cudaMemcpy(&value, device_ptr, sizeof(T), cudaMemcpyDeviceToHost);
+    const cudaError_t status =
+        cudaMemcpy(&value, device_ptr, sizeof(T), cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("GPU scalar download failed on ") +
+            NSOS_GPU_BACKEND_NAME + ": " +
+            cudaGetErrorString(status));
+    }
+    record_gpu_transfer(Device::CPU, Device::GPU, sizeof(T));
     return value;
 }
 
-template <typename T>
-class CudaBuffer {
-public:
-    CudaBuffer() = default;
-    explicit CudaBuffer(size_t count) { allocate(count); }
-    ~CudaBuffer() {
-        if (ptr_ != nullptr) {
-            cudaFree(ptr_);
-        }
-    }
-
-    CudaBuffer(const CudaBuffer&) = delete;
-    CudaBuffer& operator=(const CudaBuffer&) = delete;
-
-    CudaBuffer(CudaBuffer&& other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr; }
-    CudaBuffer& operator=(CudaBuffer&& other) noexcept {
-        if (this != &other) {
-            if (ptr_ != nullptr) {
-                cudaFree(ptr_);
-            }
-            ptr_ = other.ptr_;
-            other.ptr_ = nullptr;
-        }
-        return *this;
-    }
-
-    void allocate(size_t count) {
-        if (ptr_ != nullptr) {
-            cudaFree(ptr_);
-            ptr_ = nullptr;
-        }
-        if (count == 0) {
-            return;
-        }
-        if (cudaMalloc(&ptr_, count * sizeof(T)) != cudaSuccess) {
-            throw std::runtime_error("CUDA allocation failed");
-        }
-    }
-
-    T* get() const { return ptr_; }
-    operator T*() const { return ptr_; }
-
-private:
-    T* ptr_ = nullptr;
-};
+float* scalar_reduction_scratch() {
+    thread_local cuda_detail::DeviceBuffer<float> buffer;
+    return buffer.ensure(1);
+}
 #else
 void sync_cuda() {}
 bool use_gpu_fast_path(const Tensor&) {
@@ -378,6 +622,26 @@ T copy_scalar_from_device(const T*) {
 #endif
 
 #ifdef USE_CUDA
+std::atomic<int>& pool_release_failure_countdown() {
+    static std::atomic<int> countdown{-1};
+    return countdown;
+}
+
+bool inject_pool_release_failure() noexcept {
+#ifdef NSOS_ENABLE_TEST_HOOKS
+    auto& countdown = pool_release_failure_countdown();
+    int current = countdown.load(std::memory_order_relaxed);
+    while (current >= 0) {
+        const int next = current == 0 ? -1 : current - 1;
+        if (countdown.compare_exchange_weak(
+                current, next, std::memory_order_relaxed)) {
+            return current == 0;
+        }
+    }
+#endif
+    return false;
+}
+
 // Process-wide dedicated stream for host<->device / device<->device tensor
 // copies, created once on first use.  Keeping copies off the default (compute)
 // stream lets a copy synchronize only ITSELF instead of draining the whole
@@ -392,26 +656,82 @@ T copy_scalar_from_device(const T*) {
 // path is always correct even on a driver that refuses the stream.
 struct TensorCopyStream {
     cudaStream_t stream = nullptr;
+    cudaEvent_t producer_ready = nullptr;
+    int device_id = -1;
+    std::mutex mutex;
 
     TensorCopyStream() {
-        if (cudaStreamCreate(&stream) != cudaSuccess) {
+        std::string selection_error;
+        if (!gpu::select_preferred_device(
+                &device_id, &selection_error)) {
+            std::fprintf(
+                stderr,
+                "[GPU] tensor copy stream unavailable; using checked "
+                "blocking copies: %s\n",
+                selection_error.c_str());
             stream = nullptr;
+            device_id = -1;
+            return;
         }
-        (void)cudaGetLastError();
+        const cudaError_t stream_status = cudaStreamCreate(&stream);
+        if (stream_status != cudaSuccess) {
+            std::fprintf(
+                stderr,
+                "[GPU] tensor copy stream creation failed; using checked "
+                "blocking copies on %s: %s\n",
+                NSOS_GPU_BACKEND_NAME, cudaGetErrorString(stream_status));
+            stream = nullptr;
+            device_id = -1;
+            (void)cudaGetLastError();
+            return;
+        }
+        const cudaError_t event_status = cudaEventCreate(&producer_ready);
+        if (event_status != cudaSuccess) {
+            std::fprintf(
+                stderr,
+                "[GPU] tensor copy producer event creation failed; using "
+                "checked blocking copies on %s: %s\n",
+                NSOS_GPU_BACKEND_NAME, cudaGetErrorString(event_status));
+            gpu::report_cleanup_status(
+                cudaStreamDestroy(stream),
+                "tensor copy stream rollback destruction");
+            stream = nullptr;
+            producer_ready = nullptr;
+            device_id = -1;
+        }
     }
 
     ~TensorCopyStream() noexcept {
+        const cudaError_t selection_status =
+            device_id >= 0 ? cudaSetDevice(device_id) : cudaSuccess;
+        if (selection_status != cudaSuccess) {
+            std::fprintf(
+                stderr,
+                "[GPU] tensor copy stream cleanup could not select device "
+                "%d on %s: %s\n",
+                device_id, NSOS_GPU_BACKEND_NAME,
+                cudaGetErrorString(selection_status));
+            (void)cudaGetLastError();
+            return;
+        }
+        if (producer_ready != nullptr) {
+            gpu::report_cleanup_status(
+                cudaEventDestroy(producer_ready),
+                "tensor copy producer event destruction");
+            producer_ready = nullptr;
+        }
         if (stream != nullptr) {
-            const cudaError_t status = cudaStreamDestroy(stream);
-            if (status != cudaSuccess) (void)cudaGetLastError();
+            gpu::report_cleanup_status(
+                cudaStreamDestroy(stream),
+                "tensor copy stream destruction");
             stream = nullptr;
         }
     }
 };
 
-static cudaStream_t tensor_copy_stream() {
+static TensorCopyStream& tensor_copy_stream() {
     static TensorCopyStream owned_stream;
-    return owned_stream.stream;
+    return owned_stream;
 }
 
 // (movida p/ escopo de namespace — ver apos Tensor::uninitialized)
@@ -438,6 +758,109 @@ namespace {
 // hits only the free list -> no driver alloc inside the captured region).
 // Disable with NSOS_GPU_POOL=0 (falls back to raw driver allocation/free).
 class ManagedPool {
+private:
+    enum class MemoryPolicy {
+        Automatic,
+        Device,
+        Managed,
+    };
+
+    struct Allocation {
+        size_t bytes = 0;
+        bool managed = false;
+        uint64_t stream_domain = 0;
+        bool quarantined = false;
+        bool retained_release = false;
+        bool retryable_release = false;
+        bool cached = false;
+    };
+
+    struct CachedBlock {
+        void* pointer = nullptr;
+        uint64_t stream_domain = 0;
+    };
+
+    static size_t cache_key(size_t bytes, bool managed) {
+        // bin_bytes() always returns a 64 KiB multiple, so the low bit is free
+        // to distinguish allocation provenance without changing capacity math.
+        return bytes | (managed ? size_t{1} : size_t{0});
+    }
+
+    static uint64_t current_stream_domain() noexcept {
+        const auto stream = gpu::current_stream();
+        if (stream != nullptr && stream != cudaStreamPerThread)
+            return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(stream));
+#ifdef NSOS_CUDA_PTDS
+        // Under per-thread default-stream semantics, stream 0 work from two
+        // host threads is not mutually ordered. A cached address may therefore
+        // be reused only by the thread/domain that last checked it out.
+        static std::atomic<uint64_t> next_domain{1};
+        thread_local const uint64_t domain =
+            next_domain.fetch_add(1, std::memory_order_relaxed);
+        return (domain << 1) | 1;
+#else
+        // The legacy default stream globally orders all users.
+        return 0;
+#endif
+    }
+
+    void update_peaks_locked() noexcept {
+        peak_live_bytes_ = std::max(peak_live_bytes_, live_bytes_);
+        const size_t reserved =
+            cached_bytes_ > std::numeric_limits<size_t>::max() - live_bytes_
+                ? std::numeric_limits<size_t>::max()
+                : cached_bytes_ + live_bytes_;
+        peak_reserved_bytes_ = std::max(peak_reserved_bytes_, reserved);
+    }
+
+    bool release_owned_locked(
+        std::unordered_map<void*, Allocation>::iterator allocation,
+        bool was_cached) noexcept {
+        void* pointer = allocation->first;
+        const size_t bytes = allocation->second.bytes;
+        const bool injected_failure = inject_pool_release_failure();
+        cudaError_t status = static_cast<cudaError_t>(1);
+        if (!injected_failure) {
+            // Attribute the following status to the release itself instead of
+            // a stale launch error left in the calling thread's runtime slot.
+            // A prior error is itself a hard failure: retain the pointer
+            // without calling cudaFree because its ownership would otherwise
+            // become ambiguous.
+            status = cudaGetLastError();
+            if (status == cudaSuccess) {
+                status = cudaFree(pointer);
+            }
+        }
+        if (status != cudaSuccess) {
+            if (!injected_failure) {
+                (void)cudaGetLastError();
+            }
+            ++release_failures_;
+            allocation->second.retained_release = true;
+            allocation->second.retryable_release = injected_failure;
+            if (was_cached) {
+                cached_bytes_ -=
+                    cached_bytes_ >= bytes ? bytes : cached_bytes_;
+                if (bytes <=
+                    std::numeric_limits<size_t>::max() - live_bytes_) {
+                    live_bytes_ += bytes;
+                    update_peaks_locked();
+                }
+                allocation->second.cached = false;
+            }
+            return false;
+        }
+        if (was_cached) {
+            cached_bytes_ -=
+                cached_bytes_ >= bytes ? bytes : cached_bytes_;
+        } else {
+            live_bytes_ -=
+                live_bytes_ >= bytes ? bytes : live_bytes_;
+        }
+        live_.erase(allocation);
+        return true;
+    }
+
 public:
     static ManagedPool& instance() {
         static ManagedPool pool;
@@ -445,24 +868,41 @@ public:
     }
 
     ~ManagedPool() noexcept {
+        bool device_bound = device_id_ < 0;
+        if (device_id_ >= 0) {
+            const cudaError_t select_status =
+                cudaSetDevice(device_id_);
+            if (select_status != cudaSuccess) {
+                (void)cudaGetLastError();
+            } else {
+                device_bound = true;
+            }
+        }
         // live_ is the authoritative ownership registry and contains cached,
         // quarantined, and checked-out blocks exactly once each.
-        for (const auto& entry : live_) {
-            if (entry.first != nullptr) {
-                const cudaError_t status = cudaFree(entry.first);
-                if (status != cudaSuccess) (void)cudaGetLastError();
+        if (device_bound) {
+            for (const auto& entry : live_) {
+                if (entry.first != nullptr) {
+                    const cudaError_t status = cudaFree(entry.first);
+                    if (status != cudaSuccess) (void)cudaGetLastError();
+                }
             }
         }
         live_.clear();
         free_.clear();
         captured_.clear();
-        quarantine_.clear();
+        quarantined_blocks_ = 0;
         cached_bytes_ = 0;
         live_bytes_ = 0;
     }
 
-    bool host_accessible() const noexcept {
-        return managed_memory_;
+    bool use_managed_memory() const noexcept {
+        // Strict execution is a hard safety/performance contract: an
+        // environment preference must never silently turn a production model
+        // back into page-faulting Unified Memory.
+        if (strict_gpu_execution()) return false;
+        if (memory_policy_ == MemoryPolicy::Device) return false;
+        return true;
     }
 
     // Size-class binning (estilo PyTorch caching allocator).  Cachear por
@@ -476,10 +916,13 @@ public:
     static size_t bin_bytes(size_t bytes) {
         constexpr size_t k64 = 64ull << 10;
         constexpr size_t k2m = 2ull << 20;
-        if (bytes < (1ull << 20)) {
-            return ((bytes + k64 - 1) / k64) * k64;
+        const size_t quantum =
+            bytes < (1ull << 20) ? k64 : k2m;
+        if (bytes >
+            std::numeric_limits<size_t>::max() - (quantum - 1)) {
+            return 0;
         }
-        return ((bytes + k2m - 1) / k2m) * k2m;
+        return ((bytes + quantum - 1) / quantum) * quantum;
     }
 
     // ── CUDA-graph capture guard ─────────────────────────────────────────
@@ -493,41 +936,157 @@ public:
     // destroyed, at which point the quarantine is returned to the driver.
     void begin_capture() {
         std::lock_guard<std::mutex> lk(mtx_);
+        if (capturing_ || !captured_.empty() ||
+            quarantined_blocks_ != 0) {
+            ++capture_contract_violations_;
+            throw std::logic_error(
+                "GPU pool capture cannot be nested or replaced before "
+                "the prior capture is released");
+        }
         capturing_ = true;
     }
     void end_capture() {
         std::lock_guard<std::mutex> lk(mtx_);
-        capturing_ = false;  // captured_ + quarantine_ persist until release
-    }
-    void release_capture() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        capturing_ = false;
-        for (void* p : quarantine_) {
-            auto it = live_.find(p);
-            const size_t sz = (it != live_.end()) ? it->second : 0;
-            cudaFree(p);
-            if (it != live_.end()) live_.erase(it);
-            live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
+        if (!capturing_) {
+            ++capture_contract_violations_;
+            throw std::logic_error(
+                "GPU pool capture end has no matching begin");
         }
-        quarantine_.clear();
+        capturing_ = false;  // captured addresses persist until release
+    }
+    void release_capture() noexcept {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (capturing_) {
+            ++capture_contract_violations_;
+            return;
+        }
+        if (cudaSetDevice(device_id_) != cudaSuccess) {
+            (void)cudaGetLastError();
+            for (auto& entry : live_) {
+                if (!entry.second.quarantined) {
+                    continue;
+                }
+                ++release_failures_;
+                entry.second.quarantined = false;
+                entry.second.retained_release = true;
+                entry.second.retryable_release = false;
+            }
+            quarantined_blocks_ = 0;
+            captured_.clear();
+            return;
+        }
+        capturing_ = false;
+        for (auto allocation = live_.begin();
+             allocation != live_.end();) {
+            auto current = allocation++;
+            if (current->second.quarantined) {
+                current->second.quarantined = false;
+                if (quarantined_blocks_ > 0) {
+                    --quarantined_blocks_;
+                }
+                (void)release_owned_locked(current, false);
+            }
+        }
+        quarantined_blocks_ = 0;
         captured_.clear();
     }
 
-    void* allocate(size_t bytes) {
+    void* allocate(size_t bytes, bool managed_memory) {
         if (bytes == 0) return nullptr;
-        if (!enabled_) return raw_alloc(bytes);
+        bind_selected_device();
+        if (!enabled_) {
+            void* pointer = raw_alloc(bytes, managed_memory);
+            if (pointer != nullptr) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (bytes >
+                    std::numeric_limits<size_t>::max() - live_bytes_) {
+                    const cudaError_t status = cudaFree(pointer);
+                    if (status != cudaSuccess) {
+                        (void)cudaGetLastError();
+                    }
+                    return nullptr;
+                }
+                try {
+                    const auto inserted = live_.emplace(
+                        pointer,
+                        Allocation{
+                            bytes, managed_memory,
+                            current_stream_domain()});
+                    if (!inserted.second) {
+                        throw std::logic_error(
+                            "GPU driver returned an already-owned address");
+                    }
+                    live_bytes_ += bytes;
+                    update_peaks_locked();
+                } catch (...) {
+                    const cudaError_t status = cudaFree(pointer);
+                    if (status != cudaSuccess) {
+                        (void)cudaGetLastError();
+                    }
+                    throw;
+                }
+            }
+            return pointer;
+        }
         bytes = bin_bytes(bytes);
+        if (bytes == 0) return nullptr;
         std::lock_guard<std::mutex> lk(mtx_);
+        if (bytes >
+            std::numeric_limits<size_t>::max() - live_bytes_) {
+            return nullptr;
+        }
+        auto& bin = free_[cache_key(bytes, managed_memory)];
         live_bytes_ += bytes;
-        auto& bin = free_[bytes];
-        if (!bin.empty()) {
-            void* p = bin.back();
+        const uint64_t stream_domain = current_stream_domain();
+        auto cached = std::find_if(
+            bin.rbegin(), bin.rend(),
+            [stream_domain](const CachedBlock& block) {
+                return block.stream_domain == stream_domain;
+            });
+        if (cached != bin.rend()) {
+            const size_t index =
+                static_cast<size_t>(
+                    std::distance(cached, bin.rend()) - 1);
+            void* p = bin[index].pointer;
+            auto live_allocation = live_.find(p);
+            if (live_allocation == live_.end()) {
+                if (index + 1 != bin.size()) {
+                    bin[index] = bin.back();
+                }
+                bin.pop_back();
+                cached_bytes_ -=
+                    cached_bytes_ >= bytes ? bytes : cached_bytes_;
+                ++unknown_deallocation_attempts_;
+                live_bytes_ -=
+                    live_bytes_ >= bytes ? bytes : live_bytes_;
+                throw std::logic_error(
+                    "GPU pool free-list contains an unowned block");
+            }
+            if (capturing_) {
+                try {
+                    const auto inserted = captured_.insert(p);
+                    if (!inserted.second) {
+                        throw std::logic_error(
+                            "GPU pool attempted to reuse an address still "
+                            "referenced by a captured graph");
+                    }
+                } catch (...) {
+                    live_bytes_ -=
+                        live_bytes_ >= bytes ? bytes : live_bytes_;
+                    throw;
+                }
+            }
+            if (index + 1 != bin.size()) {
+                bin[index] = bin.back();
+            }
             bin.pop_back();
             cached_bytes_ -= bytes;
-            if (capturing_) captured_.insert(p);
+            live_allocation->second.stream_domain = stream_domain;
+            live_allocation->second.cached = false;
+            update_peaks_locked();
             return p;
         }
-        void* p = raw_alloc(bytes);
+        void* p = raw_alloc(bytes, managed_memory);
         if (!p && !capturing_) {
             // Out of memory: return every cached free block to the driver and
             // retry once (mirrors a caching allocator's empty-cache-on-OOM).
@@ -535,52 +1094,148 @@ public:
             // mid-capture); a capture-time OOM fails the capture cleanly and
             // the decode falls back to eager.
             trim_locked();
-            p = raw_alloc(bytes);
+            p = raw_alloc(bytes, managed_memory);
         }
         if (p) {
-            live_[p] = bytes;
-            if (capturing_) captured_.insert(p);
+            auto registered = live_.end();
+            bool owns_new_registration = false;
+            bool owns_new_capture_record = false;
+            try {
+                const auto inserted = live_.emplace(
+                    p,
+                    Allocation{
+                        bytes, managed_memory, stream_domain});
+                registered = inserted.first;
+                owns_new_registration = inserted.second;
+                if (!inserted.second) {
+                    throw std::logic_error(
+                        "GPU driver returned an already-owned address");
+                }
+                if (capturing_) {
+                    const auto captured = captured_.insert(p);
+                    owns_new_capture_record = captured.second;
+                    if (!captured.second) {
+                        throw std::logic_error(
+                            "GPU driver returned an address still referenced "
+                            "by a captured graph");
+                    }
+                }
+                update_peaks_locked();
+            } catch (...) {
+                if (owns_new_capture_record) {
+                    captured_.erase(p);
+                }
+                if (owns_new_registration) {
+                    (void)release_owned_locked(registered, false);
+                } else if (registered != live_.end()) {
+                    live_bytes_ -=
+                        live_bytes_ >= bytes ? bytes : live_bytes_;
+                    ++unknown_deallocation_attempts_;
+                } else {
+                    live_bytes_ -=
+                        live_bytes_ >= bytes ? bytes : live_bytes_;
+                    const cudaError_t status = cudaFree(p);
+                    if (status != cudaSuccess) {
+                        (void)cudaGetLastError();
+                    }
+                }
+                throw;
+            }
         } else {
             live_bytes_ -= (live_bytes_ >= bytes ? bytes : live_bytes_);
         }
         return p;
     }
 
-    void deallocate(void* p) {
+    void deallocate(void* p) noexcept {
         if (!p) return;
-        if (!enabled_) {
-            cudaFree(p);
+        // Shared-pointer deleters must never throw. Rebind this host thread to
+        // the owning pool device directly; on an unrecoverable runtime failure
+        // retain the allocation for process teardown rather than terminating
+        // during stack unwinding.
+        if (cudaSetDevice(device_id_) != cudaSuccess) {
+            (void)cudaGetLastError();
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = live_.find(p);
+            if (it == live_.end()) {
+                ++unknown_deallocation_attempts_;
+            } else {
+                ++release_failures_;
+                it->second.retained_release = true;
+                it->second.retryable_release = false;
+            }
             return;
         }
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = live_.find(p);
         if (it == live_.end()) {
-            cudaFree(p);  // not pool-owned (shouldn't happen) — be safe
+            ++unknown_deallocation_attempts_;
             return;
         }
-        const size_t sz = it->second;
+        // A cached/quarantined/retained entry is still present in live_
+        // because that map is the pool's ownership registry, but it is no
+        // longer checked out to a Tensor.  Treat a second deleter invocation
+        // as an invalid deallocation instead of inserting the same address in
+        // the free list twice (which would corrupt byte/block accounting and
+        // could later hand one physical allocation to two tensors).
+        if (it->second.cached || it->second.quarantined ||
+            it->second.retained_release) {
+            ++unknown_deallocation_attempts_;
+            return;
+        }
+        if (!enabled_) {
+            (void)release_owned_locked(it, false);
+            return;
+        }
+        const Allocation allocation = it->second;
+        const size_t sz = allocation.bytes;
         // Captured buffer: the graph still references this address on every
         // replay.  Quarantine it (keep live_[p] so release_capture can size
         // the free) — never cache/free it until the graph is destroyed.
         auto cap_it = captured_.find(p);
         if (cap_it != captured_.end()) {
             captured_.erase(cap_it);
-            quarantine_.push_back(p);
+            it->second.quarantined = true;
+            ++quarantined_blocks_;
             return;
         }
-        if (cap_bytes_ != 0 && cached_bytes_ + sz > cap_bytes_) {
+#ifdef NSOS_CUDA_PTDS
+        if (allocation.stream_domain != current_stream_domain()) {
+            // Cross-thread destruction has no stream-ordering relationship
+            // with the allocation's per-thread default stream. cudaFree is the
+            // conservative synchronization boundary; caching here would permit
+            // a use-after-free/reuse race.
+            ++cross_stream_domain_frees_;
+            (void)release_owned_locked(it, false);
+            return;
+        }
+#endif
+        const bool cache_size_overflow =
+            sz > std::numeric_limits<size_t>::max() - cached_bytes_;
+        if (cache_size_overflow ||
+            (cap_bytes_ != 0 &&
+             (sz > cap_bytes_ ||
+              cached_bytes_ > cap_bytes_ - sz))) {
             // Cache is full: return this block to the driver instead of caching
             // it, so total managed footprint stays bounded.  During capture
             // cudaFree is illegal, so cache it instead (bounded growth for the
             // duration of a single capture is acceptable).
             if (!capturing_) {
-                cudaFree(p);
-                live_.erase(it);
-                live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
+                (void)release_owned_locked(it, false);
                 return;
             }
         }
-        free_[sz].push_back(p);
+        try {
+            free_[cache_key(sz, allocation.managed)].push_back(
+                CachedBlock{p, allocation.stream_domain});
+        } catch (...) {
+            // A deleter cannot propagate allocation failure. Returning the
+            // block to the driver is safe and preserves the original
+            // exception, if any, that triggered stack unwinding.
+            (void)release_owned_locked(it, false);
+            return;
+        }
+        it->second.cached = true;
         cached_bytes_ += sz;
         live_bytes_ -= (live_bytes_ >= sz ? sz : live_bytes_);
         // Guarda de oversubscription UM (auditoria #27): checagem barata por
@@ -588,7 +1243,13 @@ public:
         // 6->8s antes do binning).  Acima de 88% de uso do device: poda o
         // cache e avisa uma vez por episódio.  Pulada durante captura
         // (cudaMemGetInfo/cudaFree sincronizam o device -> ilegal).
-        if (!capturing_ && ((++dealloc_probe_) & 511u) == 0) {
+        // Device-only allocations already fail explicitly and allocate()
+        // performs trim+retry. Probe pressure only for Unified Memory; calling
+        // cudaMemGetInfo for ordinary device blocks periodically synchronized
+        // the strict-GPU training hot path without adding a safety guarantee.
+        if (allocation.managed && !capturing_ &&
+            ((++dealloc_probe_) & 511u) == 0) {
+            ++managed_pressure_probes_;
             size_t free_b = 0, total_b = 0;
             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b > 0) {
                 const double used = 1.0 - static_cast<double>(free_b) /
@@ -614,37 +1275,127 @@ public:
     PoolStats stats() {
         std::lock_guard<std::mutex> lk(mtx_);
         PoolStats s;
-        s.cached_bytes = cached_bytes_;
-        s.live_bytes = live_bytes_;
-        s.bins = free_.size();
+        size_t owned_device_bytes = 0;
+        size_t owned_managed_bytes = 0;
+        for (const auto& entry : live_) {
+            if (entry.second.managed) {
+                owned_managed_bytes += entry.second.bytes;
+            } else {
+                owned_device_bytes += entry.second.bytes;
+            }
+            if (entry.second.quarantined) {
+                s.quarantined_bytes += entry.second.bytes;
+                ++s.quarantined_blocks;
+            }
+            if (entry.second.retained_release) {
+                s.retained_release_bytes += entry.second.bytes;
+                ++s.retained_release_blocks;
+            }
+            if (entry.second.cached) {
+                s.largest_cached_block_bytes =
+                    std::max(s.largest_cached_block_bytes,
+                             entry.second.bytes);
+            } else {
+                s.largest_live_block_bytes =
+                    std::max(s.largest_live_block_bytes,
+                             entry.second.bytes);
+                ++s.live_blocks;
+            }
+        }
+        for (const auto& bin : free_) {
+            if (bin.second.empty()) continue;
+            const size_t bytes = bin.first & ~size_t{1};
+            const size_t aggregate = bytes * bin.second.size();
+            if ((bin.first & size_t{1}) != 0) {
+                s.managed_cached_bytes += aggregate;
+            } else {
+                s.device_cached_bytes += aggregate;
+            }
+            s.cached_blocks += bin.second.size();
+            ++s.bins;
+        }
+        s.cached_bytes =
+            s.device_cached_bytes + s.managed_cached_bytes;
+        s.device_live_bytes =
+            owned_device_bytes >= s.device_cached_bytes
+                ? owned_device_bytes - s.device_cached_bytes
+                : 0;
+        s.managed_live_bytes =
+            owned_managed_bytes >= s.managed_cached_bytes
+                ? owned_managed_bytes - s.managed_cached_bytes
+                : 0;
+        s.live_bytes = s.device_live_bytes + s.managed_live_bytes;
+        s.allocated_bytes = s.live_bytes;
+        if (s.cached_bytes >
+            std::numeric_limits<size_t>::max() - s.live_bytes) {
+            throw std::overflow_error(
+                "GPU pool reserved-byte telemetry overflow");
+        }
+        s.reserved_bytes = s.cached_bytes + s.live_bytes;
+        s.peak_allocated_bytes = peak_live_bytes_;
+        s.peak_reserved_bytes = peak_reserved_bytes_;
+        s.cached_fragmentation_ratio =
+            s.cached_bytes == 0
+                ? 0.0
+                : 1.0 - static_cast<double>(
+                            s.largest_cached_block_bytes) /
+                            static_cast<double>(s.cached_bytes);
+        s.managed_pressure_probes = managed_pressure_probes_;
+        s.managed_advice_failures = managed_advice_failures_;
+        s.cross_stream_domain_frees = cross_stream_domain_frees_;
+        s.release_failures = release_failures_;
+        s.unknown_deallocation_attempts =
+            unknown_deallocation_attempts_;
+        s.capture_contract_violations =
+            capture_contract_violations_;
+        s.pool_enabled = enabled_;
+        s.capture_active = capturing_;
+
+        // Keep allocator-accounting regressions fail-closed: telemetry must
+        // never report a plausible but internally inconsistent footprint.
+        if (s.cached_bytes != cached_bytes_ || s.live_bytes != live_bytes_ ||
+            owned_device_bytes < s.device_cached_bytes ||
+            owned_managed_bytes < s.managed_cached_bytes ||
+            s.retained_release_bytes > s.live_bytes ||
+            s.quarantined_bytes > s.live_bytes ||
+            s.quarantined_blocks != quarantined_blocks_ ||
+            s.cached_blocks + s.live_blocks != live_.size()) {
+            throw std::logic_error(
+                "GPU pool accounting invariant violated");
+        }
         return s;
     }
     void trim() {
+        bind_selected_device();
         std::lock_guard<std::mutex> lk(mtx_);
         trim_locked();
     }
 
 private:
     ManagedPool() {
+        std::string selection_error;
+        if (!gpu::select_preferred_device(
+                &device_id_, &selection_error)) {
+            throw std::runtime_error(
+                "GPU memory pool cannot select a device: " +
+                selection_error);
+        }
         const char* env = std::getenv("NSOS_GPU_POOL");
         enabled_ = !(env && std::string(env) == "0");
         // Explicit GPU models enable strict execution before their first device
-        // allocation. They therefore receive true device memory (cudaMalloc),
-        // which cannot page-fault into host execution. Legacy callers that
-        // explicitly allow host fallbacks keep Unified Memory compatibility.
+        // allocation and always receive true device memory. This policy only
+        // controls non-strict legacy/interop callers.
         const char* memory_env = std::getenv("NSOS_GPU_MEMORY");
         if (memory_env != nullptr) {
             const std::string mode(memory_env);
             if (mode == "device") {
-                managed_memory_ = false;
+                memory_policy_ = MemoryPolicy::Device;
             } else if (mode == "managed") {
-                managed_memory_ = true;
+                memory_policy_ = MemoryPolicy::Managed;
             } else {
                 throw std::runtime_error(
                     "NSOS_GPU_MEMORY must be 'device' or 'managed'");
             }
-        } else {
-            managed_memory_ = !strict_gpu_execution();
         }
         // Cap on CACHED (free-list) bytes.  Unified Memory oversubscribes
         // SILENTLY (no OOM — it just thrashes via page eviction), so an
@@ -653,8 +1404,25 @@ private:
         // 60% of device memory; NSOS_GPU_POOL_MAX_MB overrides; "0" = unlimited.
         const char* cap_env = std::getenv("NSOS_GPU_POOL_MAX_MB");
         if (cap_env) {
-            cap_bytes_ = static_cast<size_t>(std::strtoull(cap_env, nullptr, 10))
-                         * 1024ull * 1024ull;
+            uint64_t cap_megabytes = 0;
+            const char* cap_end = cap_env + std::strlen(cap_env);
+            const auto parsed = std::from_chars(
+                cap_env, cap_end, cap_megabytes);
+            constexpr uint64_t kBytesPerMegabyte = 1024ull * 1024ull;
+            if (cap_env == cap_end ||
+                parsed.ec != std::errc{} ||
+                parsed.ptr != cap_end ||
+                cap_megabytes >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<size_t>::max()) /
+                        kBytesPerMegabyte) {
+                throw std::runtime_error(
+                    "NSOS_GPU_POOL_MAX_MB must be a non-negative integer "
+                    "that fits the host address space");
+            }
+            cap_bytes_ =
+                static_cast<size_t>(
+                    cap_megabytes * kBytesPerMegabyte);
         } else {
             size_t free_b = 0, total_b = 0;
             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b > 0) {
@@ -664,29 +1432,59 @@ private:
         }
     }
 
+    void bind_selected_device() const {
+        int selected = -1;
+        std::string selection_error;
+        if (!gpu::select_preferred_device(
+                &selected, &selection_error) ||
+            selected != device_id_) {
+            throw std::runtime_error(
+                "GPU memory pool device binding failed: " +
+                selection_error);
+        }
+    }
+
     // Return all currently-cached (free) blocks to the driver.  Live blocks
     // still owned by a Tensor are untouched.
     void trim_locked() {
+        for (auto allocation = live_.begin();
+             allocation != live_.end();) {
+            auto current = allocation++;
+            if (current->second.retained_release &&
+                current->second.retryable_release) {
+                current->second.retained_release = false;
+                current->second.retryable_release = false;
+                (void)release_owned_locked(current, false);
+            }
+        }
         for (auto& kv : free_) {
-            for (void* p : kv.second) {
-                cudaFree(p);
-                live_.erase(p);
+            for (const CachedBlock& block : kv.second) {
+                auto allocation = live_.find(block.pointer);
+                if (allocation == live_.end()) {
+                    ++unknown_deallocation_attempts_;
+                    const size_t bytes = kv.first & ~size_t{1};
+                    cached_bytes_ -=
+                        cached_bytes_ >= bytes
+                            ? bytes
+                            : cached_bytes_;
+                    continue;
+                }
+                (void)release_owned_locked(allocation, true);
             }
             kv.second.clear();
         }
-        cached_bytes_ = 0;
     }
 
-    void* raw_alloc(size_t bytes) const {
+    void* raw_alloc(size_t bytes, bool managed_memory) {
         void* raw = nullptr;
-        const cudaError_t allocation_status = managed_memory_
+        const cudaError_t allocation_status = managed_memory
                                                   ? cudaMallocManaged(&raw, bytes)
                                                   : cudaMalloc(&raw, bytes);
         if (allocation_status != cudaSuccess) {
             (void)cudaGetLastError();
             return nullptr;
         }
-        if (!managed_memory_) return raw;
+        if (!managed_memory) return raw;
         // Pascal+Windows hardening, applied ONCE per physical block (it then
         // persists across every pooled reuse): hint the driver that this UM
         // block is accessed by host and device so pages stay migratable rather
@@ -697,7 +1495,11 @@ private:
         // correctness requirement, so skipping it is safe.
         static const bool skip_advise = std::getenv("NSOS_NO_MEMADVISE") != nullptr;
         int device_id = 0;
-        if (!skip_advise && cudaGetDevice(&device_id) == cudaSuccess) {
+        const cudaError_t device_status =
+            skip_advise ? cudaSuccess : cudaGetDevice(&device_id);
+        if (!skip_advise && device_status == cudaSuccess) {
+            cudaError_t device_advice_status = cudaSuccess;
+            cudaError_t host_advice_status = cudaSuccess;
 #if CUDART_VERSION >= 13000
             cudaMemLocation loc_dev;
             loc_dev.type = cudaMemLocationTypeDevice;
@@ -705,40 +1507,119 @@ private:
             cudaMemLocation loc_host;
             loc_host.type = cudaMemLocationTypeHost;
             loc_host.id = 0;
-            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, loc_dev);
-            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, loc_host);
+            device_advice_status =
+                cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, loc_dev);
+            host_advice_status =
+                cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, loc_host);
 #else
-            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, device_id);
-            cudaMemAdvise(raw, bytes, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId);
+            device_advice_status = cudaMemAdvise(
+                raw, bytes, cudaMemAdviseSetAccessedBy, device_id);
+            host_advice_status = cudaMemAdvise(
+                raw, bytes, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId);
 #endif
+            if (device_advice_status != cudaSuccess) {
+                ++managed_advice_failures_;
+            }
+            if (host_advice_status != cudaSuccess) {
+                ++managed_advice_failures_;
+            }
+            if ((device_advice_status != cudaSuccess ||
+                 host_advice_status != cudaSuccess) &&
+                !um_advice_warned_) {
+                std::fprintf(
+                    stderr,
+                    "[pool] WARN: managed-memory advice rejected; "
+                    "continuing without the optional residency hint\n");
+                um_advice_warned_ = true;
+            }
+        } else if (!skip_advise) {
+            ++managed_advice_failures_;
+            if (!um_advice_warned_) {
+                std::fprintf(
+                    stderr,
+                    "[pool] WARN: active device query failed before "
+                    "managed-memory advice\n");
+                um_advice_warned_ = true;
+            }
         }
         (void)cudaGetLastError();
         return raw;
     }
 
     bool enabled_ = true;
-    bool managed_memory_ = true;
+    MemoryPolicy memory_policy_ = MemoryPolicy::Automatic;
     size_t cached_bytes_ = 0;  // current sum of free-list block sizes
     size_t live_bytes_ = 0;    // soma dos blocos atualmente entregues a Tensors
+    size_t peak_live_bytes_ = 0;
+    size_t peak_reserved_bytes_ = 0;
     unsigned dealloc_probe_ = 0;        // cadência da guarda de pressão UM
+    uint64_t managed_pressure_probes_ = 0;
+    uint64_t managed_advice_failures_ = 0;
+    uint64_t cross_stream_domain_frees_ = 0;
+    uint64_t release_failures_ = 0;
+    uint64_t unknown_deallocation_attempts_ = 0;
+    uint64_t capture_contract_violations_ = 0;
     bool um_pressure_warned_ = false;   // 1 aviso por episódio de pressão
+    bool um_advice_warned_ = false;
     size_t cap_bytes_ = 0;     // max cached bytes (0 = unlimited)
+    int device_id_ = -1;
     std::mutex mtx_;
-    std::unordered_map<size_t, std::vector<void*>> free_;  // exact bytes -> free blocks
-    std::unordered_map<void*, size_t> live_;               // ptr -> its byte size
+    std::unordered_map<size_t, std::vector<CachedBlock>> free_;
+    std::unordered_map<void*, Allocation> live_;
     bool capturing_ = false;                 // inside a CUDA-graph capture
     std::unordered_set<void*> captured_;     // alive buffers touched by the capture
-    std::vector<void*> quarantine_;          // freed captured buffers, held until release
+    size_t quarantined_blocks_ = 0;
 };
 
 }  // namespace
 #endif  // USE_CUDA
 
-void TensorDeleter::operator()(float* ptr) {
+void TensorDeleter::operator()(float* ptr) noexcept {
     if (!ptr) return;
     if (device == Device::GPU) {
 #ifdef USE_CUDA
-        ManagedPool::instance().deallocate(ptr);
+        if (pool_owned) {
+            ManagedPool::instance().deallocate(ptr);
+        } else {
+            int owner = gpu_device;
+            if (owner < 0) {
+                try {
+                    if (!gpu::select_preferred_device(
+                            &owner, nullptr)) {
+                        std::fprintf(
+                            stderr,
+                            "[nsos][ERROR] external GPU tensor release could "
+                            "not select an owning device; allocation retained\n");
+                        return;
+                    }
+                } catch (...) {
+                    std::fprintf(
+                        stderr,
+                        "[nsos][ERROR] external GPU tensor release failed "
+                        "while selecting its owning device; allocation retained\n");
+                    return;
+                }
+            }
+            const cudaError_t select_status = cudaSetDevice(owner);
+            if (select_status != cudaSuccess) {
+                std::fprintf(
+                    stderr,
+                    "[nsos][ERROR] external GPU tensor release could not "
+                    "select device %d: %s; allocation retained\n",
+                    owner, cudaGetErrorString(select_status));
+                (void)cudaGetLastError();
+                return;
+            }
+            const cudaError_t status = cudaFree(ptr);
+            if (status != cudaSuccess) {
+                std::fprintf(
+                    stderr,
+                    "[nsos][ERROR] external GPU tensor release failed on "
+                    "device %d: %s; allocation retained\n",
+                    owner, cudaGetErrorString(status));
+                (void)cudaGetLastError();
+            }
+        }
 #endif
     } else {
 #ifdef _WIN32
@@ -782,11 +1663,57 @@ static std::atomic<bool>& strict_gpu_execution_storage() {
 }
 
 void set_strict_gpu_execution(bool enabled) {
+    RuntimeExecutionPolicyMutationGuard mutation;
     strict_gpu_execution_storage().store(enabled, std::memory_order_relaxed);
 }
 
 bool strict_gpu_execution() {
     return strict_gpu_execution_storage().load(std::memory_order_relaxed);
+}
+
+LowpWeightCacheStats lowp_weight_cache_stats() {
+    LowpWeightCacheStats snapshot;
+#ifdef USE_CUDA
+    auto& counters = lowp_weight_cache_counters();
+    snapshot.hits = counters.hits.load(std::memory_order_relaxed);
+    snapshot.misses = counters.misses.load(std::memory_order_relaxed);
+    snapshot.version_refreshes =
+        counters.version_refreshes.load(std::memory_order_relaxed);
+    snapshot.evictions = counters.evictions.load(std::memory_order_relaxed);
+    snapshot.budget_bypasses =
+        counters.budget_bypasses.load(std::memory_order_relaxed);
+    snapshot.allocation_failures =
+        counters.allocation_failures.load(std::memory_order_relaxed);
+    snapshot.resident_bytes =
+        counters.resident_bytes.load(std::memory_order_relaxed);
+    snapshot.peak_resident_bytes =
+        counters.peak_resident_bytes.load(std::memory_order_relaxed);
+    snapshot.budget_bytes = configured_lowp_weight_cache_budget_bytes();
+#endif
+    return snapshot;
+}
+
+void reset_lowp_weight_cache_stats() {
+#ifdef USE_CUDA
+    auto& counters = lowp_weight_cache_counters();
+    counters.hits.store(0, std::memory_order_relaxed);
+    counters.misses.store(0, std::memory_order_relaxed);
+    counters.version_refreshes.store(0, std::memory_order_relaxed);
+    counters.evictions.store(0, std::memory_order_relaxed);
+    counters.budget_bypasses.store(0, std::memory_order_relaxed);
+    counters.allocation_failures.store(0, std::memory_order_relaxed);
+    counters.peak_resident_bytes.store(
+        counters.resident_bytes.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+#endif
+}
+
+size_t lowp_weight_cache_budget_bytes() {
+#ifdef USE_CUDA
+    return configured_lowp_weight_cache_budget_bytes();
+#else
+    return 0;
+#endif
 }
 
 
@@ -812,9 +1739,10 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value)
         // compatible callers may select managed memory. Both share the same
         // size-classed caching allocator and stable-address graph semantics.
         ManagedPool& pool = ManagedPool::instance();
-        host_accessible_storage_ = pool.host_accessible();
+        host_accessible_storage_ = pool.use_managed_memory();
         raw_ptr = static_cast<float*>(
-            pool.allocate(static_cast<size_t>(size) * sizeof(float)));
+            pool.allocate(static_cast<size_t>(size) * sizeof(float),
+                          host_accessible_storage_));
 #endif
     } else {
 #ifdef _WIN32
@@ -831,7 +1759,8 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value)
     }
     // Install ownership before initialization so every CUDA initialization
     // failure below releases the allocation during stack unwinding.
-    data_ptr = std::shared_ptr<float>(raw_ptr, TensorDeleter(device));
+    data_ptr =
+        std::shared_ptr<float>(raw_ptr, TensorDeleter(device));
 
     if (tensor_skip_fill_flag()) {
         // Tensor::uninitialized: produtor garante sobrescrita total; pular o
@@ -850,7 +1779,7 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value)
             // zero-filled GPU allocation -> dozens of pipeline stalls per train
             // step, a dominant cause of low GPU utilization.
             const cudaError_t status =
-                cudaMemsetAsync(raw_ptr, 0, size * sizeof(float), 0);
+                cudaMemsetAsync(raw_ptr, 0, size * sizeof(float), nsos::gpu::current_stream());
             if (status != cudaSuccess) {
                 throw std::runtime_error(
                     std::string("CUDA tensor memset failed: ") +
@@ -877,6 +1806,9 @@ Tensor::Tensor(std::vector<int> s, Device dev, float fill_value)
                     std::string("CUDA tensor fill copy failed: ") +
                     cudaGetErrorString(status));
             }
+            record_gpu_transfer(
+                Device::GPU, Device::CPU,
+                static_cast<size_t>(size) * sizeof(float));
 #endif
         } else {
             std::fill_n(raw_ptr, size, fill_value);
@@ -898,17 +1830,16 @@ struct SkipFillGuard {
 bool tensor_skip_fill_flag() { return g_tensor_skip_fill; }
 
 Tensor Tensor::uninitialized(const std::vector<int>& s, Device dev) {
-    // TRIAGEM 2026-06-11 (T4): a bissecção por kill-switch isolou ESTA elisão
-    // como causa de grads zero/NaN/explosão no harness de paridade (pisos
-    // voltaram a ~0,2 com uninit=0; fused=0 e async=0 continuaram doentes).
-    // Algum produtor da lista "provadamente 100% sobrescrito" não cobre tudo
-    // em alguma condição.  Default invertido para SEGURO: a elisão agora é
-    // OPT-IN (NSOS_UNINIT=1) até a prova de cobertura ser fechada site a site
-    // com o instrumento de paridade.  Custo de manter zero-fill: ~1 memset
-    // assíncrono por alocação — nunca foi medido como gargalo isolado.
+    // Static coverage audit: every current caller is a whole-buffer producer
+    // (GEMM beta=0, memcpy, a full CUDA kernel, or an exhaustive CPU loop).
+    // The earlier safety default had remained enabled after the incomplete
+    // producers were corrected and inserted a redundant memset in hot paths.
     static const bool uninit_enabled = [] {
         const char* e = std::getenv("NSOS_UNINIT");
-        return e && e[0] == '1';
+        // All callers are whole-buffer producers. Keep =0 as an explicit
+        // sanitizer/parity bisection arm without paying an unconditional
+        // pre-write memset in production.
+        return e == nullptr || e[0] != '0';
     }();
     if (!uninit_enabled) {
         return Tensor(s, dev);
@@ -928,6 +1859,13 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
         return;
     }
     if (dst_device == Device::GPU || src_device == Device::GPU) {
+        std::string selection_error;
+        if (!gpu::select_preferred_device(
+                nullptr, &selection_error)) {
+            throw std::runtime_error(
+                "GPU tensor copy cannot bind the selected device: " +
+                selection_error);
+        }
         static const bool async_d2d_enabled = [] {
             const char* e = std::getenv("NSOS_ASYNC_D2D");
             return !(e && e[0] == '0');
@@ -944,22 +1882,44 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
             // como o overhead uniforme por camada na T4.  Opt-in por call
             // site: cópias de/para ponteiros EXTERNOS (__cuda_array_interface__)
             // e H2D/D2H mantêm o sync (lifetime do buffer de origem).
-            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, nullptr);
-            const cudaError_t launch = cudaGetLastError();
+            const cudaError_t launch =
+                cudaMemcpyAsync(
+                    dst, src, bytes, cudaMemcpyDefault, nsos::gpu::current_stream());
             if (launch != cudaSuccess) {
                 throw std::runtime_error(std::string("CUDA async D2D memcpy failed: ") +
                                          cudaGetErrorString(launch));
             }
+            record_gpu_transfer(dst_device, src_device, bytes);
             return;
         }
-        cudaStream_t stream = tensor_copy_stream();
+        TensorCopyStream& copy_state = tensor_copy_stream();
+        std::lock_guard<std::mutex> copy_lock(copy_state.mutex);
+        cudaStream_t stream = copy_state.stream;
         if (stream) {
+            // A blocking stream has no implicit ordering relationship with a
+            // per-thread default stream. Fence the producer explicitly before
+            // the shared copy stream reads device storage.
+            cudaError_t fence_status =
+                cudaEventRecord(
+                    copy_state.producer_ready,
+                    gpu::current_stream());
+            if (fence_status == cudaSuccess) {
+                fence_status =
+                    cudaStreamWaitEvent(
+                        stream, copy_state.producer_ready, 0);
+            }
+            if (fence_status != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("GPU copy-stream producer fence failed: ") +
+                    cudaGetErrorString(fence_status));
+            }
             // Async copy on the dedicated stream, then wait on JUST this stream.
             // Equivalent ordering to the legacy blocking cudaMemcpy (blocking
             // stream serializes with stream 0), but does not stall unrelated
             // device work the way cudaDeviceSynchronize would.
-            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, stream);
-            const cudaError_t launch = cudaGetLastError();
+            const cudaError_t launch =
+                cudaMemcpyAsync(
+                    dst, src, bytes, cudaMemcpyDefault, stream);
             if (launch != cudaSuccess) {
                 throw std::runtime_error(std::string("CUDA async memcpy failed: ") +
                                          cudaGetErrorString(launch));
@@ -969,37 +1929,145 @@ void copy_tensor_bytes(float* dst, Device dst_device, const float* src,
                 throw std::runtime_error(std::string("CUDA copy-stream sync failed: ") +
                                          cudaGetErrorString(sync));
             }
+            record_gpu_transfer(dst_device, src_device, bytes);
+            record_gpu_stream_synchronization();
         } else {
-            cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
-            const cudaError_t status = cudaGetLastError();
+            const cudaError_t status =
+                cudaMemcpy(dst, src, bytes, cudaMemcpyDefault);
             if (status != cudaSuccess) {
                 throw std::runtime_error(std::string("CUDA memcpy failed: ") +
                                          cudaGetErrorString(status));
             }
+            record_gpu_transfer(dst_device, src_device, bytes);
         }
         return;
     }
     std::memcpy(dst, src, bytes);
+    record_gpu_transfer(dst_device, src_device, bytes);
 
 #else
     (void)dst_device; (void)src_device; (void)async_d2d;
     if (bytes > 0) {
         std::memcpy(dst, src, bytes);
+        record_gpu_transfer(dst_device, src_device, bytes);
     }
 #endif
 }
 
-Tensor matmul_nt(const Tensor& a, const Tensor& b_rowmajor) {
+GpuTransferStats gpu_transfer_stats() {
+    const auto& counters = gpu_transfer_counters();
+    GpuTransferStats snapshot;
+    snapshot.h2d_calls =
+        counters.h2d_calls.load(std::memory_order_relaxed);
+    snapshot.h2d_bytes =
+        counters.h2d_bytes.load(std::memory_order_relaxed);
+    snapshot.d2h_calls =
+        counters.d2h_calls.load(std::memory_order_relaxed);
+    snapshot.d2h_bytes =
+        counters.d2h_bytes.load(std::memory_order_relaxed);
+    snapshot.d2d_calls =
+        counters.d2d_calls.load(std::memory_order_relaxed);
+    snapshot.d2d_bytes =
+        counters.d2d_bytes.load(std::memory_order_relaxed);
+    snapshot.h2h_calls =
+        counters.h2h_calls.load(std::memory_order_relaxed);
+    snapshot.h2h_bytes =
+        counters.h2h_bytes.load(std::memory_order_relaxed);
+    snapshot.device_synchronizations =
+        counters.device_synchronizations.load(std::memory_order_relaxed);
+    snapshot.stream_synchronizations =
+        counters.stream_synchronizations.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+void reset_gpu_transfer_stats() {
+    auto& counters = gpu_transfer_counters();
+    counters.h2d_calls.store(0, std::memory_order_relaxed);
+    counters.h2d_bytes.store(0, std::memory_order_relaxed);
+    counters.d2h_calls.store(0, std::memory_order_relaxed);
+    counters.d2h_bytes.store(0, std::memory_order_relaxed);
+    counters.d2d_calls.store(0, std::memory_order_relaxed);
+    counters.d2d_bytes.store(0, std::memory_order_relaxed);
+    counters.h2h_calls.store(0, std::memory_order_relaxed);
+    counters.h2h_bytes.store(0, std::memory_order_relaxed);
+    counters.device_synchronizations.store(0, std::memory_order_relaxed);
+    counters.stream_synchronizations.store(0, std::memory_order_relaxed);
+}
+
+void record_gpu_transfer(Device dst_device, Device src_device, size_t bytes) {
+    if (bytes == 0) return;
+    auto& counters = gpu_transfer_counters();
+    if (dst_device == Device::GPU && src_device == Device::CPU) {
+        counters.h2d_calls.fetch_add(1, std::memory_order_relaxed);
+        counters.h2d_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else if (dst_device == Device::CPU && src_device == Device::GPU) {
+        counters.d2h_calls.fetch_add(1, std::memory_order_relaxed);
+        counters.d2h_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else if (dst_device == Device::GPU &&
+               src_device == Device::GPU) {
+        counters.d2d_calls.fetch_add(1, std::memory_order_relaxed);
+        counters.d2d_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        counters.h2h_calls.fetch_add(1, std::memory_order_relaxed);
+        counters.h2h_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+void record_gpu_device_synchronization() {
+    gpu_transfer_counters().device_synchronizations.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+void record_gpu_stream_synchronization() {
+    gpu_transfer_counters().stream_synchronizations.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+#ifdef USE_CUDA
+Tensor matmul_nt_mixed_gpu(const Tensor& a,
+                           const Tensor& b_rowmajor,
+                           const uint64_t* content_version);
+#endif
+
+bool matmul_nt_mixed_materialization_enabled() {
+    static const bool enabled = [] {
+        const char* value =
+            std::getenv("NSOS_MATMUL_NT_MIXED_MATERIALIZE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+bool matmul_tn_materialization_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NSOS_MATMUL_TN_MATERIALIZE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+Tensor matmul_nt_impl(const Tensor& a, const Tensor& b_rowmajor,
+                      const uint64_t* content_version) {
     // Contrato estrito: b é uma matriz de pesos rank-2 [n, k] (o caso BitLinear/
     // KAN); a é [..., m, k].  Resultado [..., m, n].
     if (b_rowmajor.shape.size() != 2 || a.shape.size() < 2 ||
         a.shape.back() != b_rowmajor.shape[1]) {
         throw std::runtime_error("matmul_nt expects a[..,m,k] and b[n,k]");
     }
+    if (a.get_device() != b_rowmajor.get_device()) {
+        throw std::invalid_argument(
+            "matmul_nt requires tensors on the same device");
+    }
 #ifdef USE_CUDA
-    // Só o caminho FP32 GPU usa OP_T nativo; precisão mista (BF16/FP16) e CPU
-    // caem no caminho existente (transpose materializada + matmul) — byte-
-    // compatível com o comportamento anterior nesses modos.
+    if (a.get_device() == Device::GPU &&
+        b_rowmajor.get_device() == Device::GPU && a.size > 0 &&
+        b_rowmajor.size > 0 && gpu_blas_supported() &&
+        matmul_precision_mode() != 0 &&
+        !matmul_nt_mixed_materialization_enabled()) {
+        return matmul_nt_mixed_gpu(a, b_rowmajor, content_version);
+    }
+    // FP32 GPU uses native OP_T below. Mixed GPU dispatches above to GemmEx
+    // with the same transpose flag; only the CPU reference materializes B^T.
     if (a.get_device() == Device::GPU && b_rowmajor.get_device() == Device::GPU &&
         a.size > 0 && b_rowmajor.size > 0 && gpu_blas_supported() &&
         matmul_precision_mode() == 0) {
@@ -1045,17 +2113,42 @@ Tensor matmul_nt(const Tensor& a, const Tensor& b_rowmajor) {
     return a.matmul(b_rowmajor.transpose());
 }
 
+Tensor matmul_nt(const Tensor& a, const Tensor& b_rowmajor) {
+    return matmul_nt_impl(a, b_rowmajor, nullptr);
+}
+
+Tensor matmul_nt_cached_weight(const Tensor& a,
+                               const Tensor& b_rowmajor,
+                               uint64_t content_version) {
+    if (content_version == 0) {
+        throw std::invalid_argument(
+            "matmul_nt_cached_weight requires a non-zero content version");
+    }
+    return matmul_nt_impl(a, b_rowmajor, &content_version);
+}
+
 float tensor_abs_mean(const Tensor& t) {
     if (t.size <= 0) {
         return 0.0f;
     }
 #ifdef USE_CUDA
     if (t.get_device() == Device::GPU && gpu_custom_kernels_supported()) {
-        CudaBuffer<float> d_sum(1);
-        cudaMemset(d_sum.get(), 0, sizeof(float));
-        launch_abs_sum_kernel(d_sum.get(), t.raw_data(), t.size);
+        float* d_sum = scalar_reduction_scratch();
+        if (d_sum == nullptr) {
+            throw std::runtime_error(
+                "tensor_abs_mean could not allocate GPU reduction scratch");
+        }
+        const cudaError_t clear_status =
+            cudaMemsetAsync(d_sum, 0, sizeof(float), nsos::gpu::current_stream());
+        if (clear_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("tensor_abs_mean GPU clear failed on ") +
+                NSOS_GPU_BACKEND_NAME + ": " +
+                cudaGetErrorString(clear_status));
+        }
+        launch_abs_sum_kernel(d_sum, t.raw_data(), t.size);
         sync_cuda();
-        const float total = copy_scalar_from_device(d_sum.get());
+        const float total = copy_scalar_from_device(d_sum);
         return total / static_cast<float>(t.size);
     }
 #endif
@@ -1093,11 +2186,23 @@ void gpu_pool_end_capture() {
 #endif
 }
 
-void gpu_pool_release_capture() {
+void gpu_pool_release_capture() noexcept {
 #ifdef USE_CUDA
     ManagedPool::instance().release_capture();
 #endif
 }
+
+#ifdef NSOS_ENABLE_TEST_HOOKS
+void set_gpu_pool_release_failure_countdown(int countdown) {
+#ifdef USE_CUDA
+    pool_release_failure_countdown().store(
+        countdown < 0 ? -1 : countdown,
+        std::memory_order_relaxed);
+#else
+    (void)countdown;
+#endif
+}
+#endif
 
 Tensor Tensor::random(const std::vector<int>& s, Device dev) {
     Tensor t(s, Device::CPU);
@@ -1213,9 +2318,17 @@ void Tensor::clip_grad_norm_(std::vector<Tensor>& params, float max_norm) {
 }
 
 Tensor Tensor::add(const Tensor& other) const {
+    if (device != other.device) {
+        throw std::invalid_argument(
+            "Tensor::add requires tensors on the same device");
+    }
     TensorShape out_shape;
-    TensorIterator::compute_broadcast_shape(shape, other.shape, out_shape);
-    Tensor result(out_shape.dims, device);
+    if (!TensorIterator::compute_broadcast_shape(
+            shape, other.shape, out_shape)) {
+        throw std::invalid_argument(
+            "Tensor::add received non-broadcastable shapes");
+    }
+    Tensor result = Tensor::uninitialized(out_shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, other) && gpu_custom_kernels_supported()) {
         if (shape == other.shape) {
@@ -1224,10 +2337,45 @@ Tensor Tensor::add(const Tensor& other) const {
             sync_cuda();
             return result;
         }
-        if (!shape.empty() && other.shape.size() == 1 &&
-            other.shape.back() == shape.back() && size == result.size) {
+        if (size == result.size && other.shape.size() == 1 &&
+            other.size > 0 &&
+            (other.size == 1 || shape.back() == other.size)) {
             launch_add_broadcast_kernel(result.raw_data(), raw_data(),
-                                         other.raw_data(), size, shape.back());
+                                         other.raw_data(), size, other.size);
+            sync_cuda();
+            return result;
+        }
+        if (other.size == result.size && shape.size() == 1 &&
+            size > 0 &&
+            (size == 1 || other.shape.back() == size)) {
+            launch_add_broadcast_kernel(result.raw_data(), other.raw_data(),
+                                         raw_data(), other.size, size);
+            sync_cuda();
+            return result;
+        }
+        if (size == result.size && shape.size() == other.shape.size() &&
+            other.shape.back() == 1 &&
+            other.size == size / shape.back()) {
+            if (!launch_add_trailing_broadcast_kernel(
+                result.raw_data(), raw_data(), other.raw_data(),
+                size, shape.back())) {
+                throw std::runtime_error(
+                    "Tensor::add trailing GPU broadcast rejected invalid "
+                    "arguments");
+            }
+            sync_cuda();
+            return result;
+        }
+        if (other.size == result.size &&
+            shape.size() == other.shape.size() && shape.back() == 1 &&
+            size == other.size / other.shape.back()) {
+            if (!launch_add_trailing_broadcast_kernel(
+                result.raw_data(), other.raw_data(), raw_data(),
+                other.size, other.shape.back())) {
+                throw std::runtime_error(
+                    "Tensor::add reverse trailing GPU broadcast rejected "
+                    "invalid arguments");
+            }
             sync_cuda();
             return result;
         }
@@ -1239,17 +2387,107 @@ Tensor Tensor::add(const Tensor& other) const {
     return result;
 }
 
+void Tensor::add_inplace_(const Tensor& other) {
+    if (shape != other.shape || size != other.size) {
+        throw std::invalid_argument(
+            "Tensor::add_inplace_ requires identical shapes");
+    }
+    if (device != other.device) {
+        throw std::invalid_argument(
+            "Tensor::add_inplace_ requires identical devices");
+    }
+    if (size == 0) {
+        return;
+    }
+#ifdef USE_CUDA
+    if (device == Device::GPU) {
+        if (!gpu_custom_kernels_supported()) {
+            throw std::runtime_error(
+                "Tensor::add_inplace_ requires supported GPU kernels for a "
+                "GPU tensor");
+        }
+        launch_add_kernel(raw_data(), raw_data(), other.raw_data(), size);
+        sync_cuda();
+        return;
+    }
+#endif
+    float* dst = data();
+    const float* src = other.data();
+    for (int i = 0; i < size; ++i) {
+        dst[i] += src[i];
+    }
+}
+
 Tensor Tensor::sub(const Tensor& other) const {
+    if (device != other.device) {
+        throw std::invalid_argument(
+            "Tensor::sub requires tensors on the same device");
+    }
     TensorShape out_shape;
-    TensorIterator::compute_broadcast_shape(shape, other.shape, out_shape);
-    Tensor result(out_shape.dims, device);
+    if (!TensorIterator::compute_broadcast_shape(
+            shape, other.shape, out_shape)) {
+        throw std::invalid_argument(
+            "Tensor::sub received non-broadcastable shapes");
+    }
+    Tensor result = Tensor::uninitialized(out_shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, other) && gpu_custom_kernels_supported() &&
-        shape == other.shape) {
-        launch_sub_kernel(result.raw_data(), raw_data(), other.raw_data(),
-                          size);
-        sync_cuda();
-        return result;
+        size > 0 && other.size > 0) {
+        if (shape == other.shape) {
+            launch_sub_kernel(result.raw_data(), raw_data(), other.raw_data(),
+                              size);
+            sync_cuda();
+            return result;
+        }
+        if (size == result.size && other.shape.size() == 1 &&
+            (other.size == 1 || shape.back() == other.size)) {
+            if (!launch_sub_broadcast_kernel(
+                result.raw_data(), raw_data(), other.raw_data(),
+                size, other.size, false)) {
+                throw std::runtime_error(
+                    "Tensor::sub GPU broadcast rejected invalid arguments");
+            }
+            sync_cuda();
+            return result;
+        }
+        if (other.size == result.size && shape.size() == 1 &&
+            (size == 1 || other.shape.back() == size)) {
+            if (!launch_sub_broadcast_kernel(
+                result.raw_data(), other.raw_data(), raw_data(),
+                other.size, size, true)) {
+                throw std::runtime_error(
+                    "Tensor::sub reverse GPU broadcast rejected invalid "
+                    "arguments");
+            }
+            sync_cuda();
+            return result;
+        }
+        if (size == result.size && shape.size() == other.shape.size() &&
+            other.shape.back() == 1 &&
+            other.size == size / shape.back()) {
+            if (!launch_sub_trailing_broadcast_kernel(
+                result.raw_data(), raw_data(), other.raw_data(),
+                size, shape.back(), false)) {
+                throw std::runtime_error(
+                    "Tensor::sub trailing GPU broadcast rejected invalid "
+                    "arguments");
+            }
+            sync_cuda();
+            return result;
+        }
+        if (other.size == result.size &&
+            shape.size() == other.shape.size() && shape.back() == 1 &&
+            size == other.size / other.shape.back()) {
+            if (!launch_sub_trailing_broadcast_kernel(
+                result.raw_data(), other.raw_data(), raw_data(),
+                other.size, other.shape.back(), true)) {
+                throw std::runtime_error(
+                    "Tensor::sub reverse trailing GPU broadcast rejected "
+                    "invalid arguments");
+            }
+            sync_cuda();
+            return result;
+        }
     }
 #endif
     warn_host_fallback_once("sub(broadcast nao-padrao)", device);
@@ -1259,9 +2497,17 @@ Tensor Tensor::sub(const Tensor& other) const {
 }
 
 Tensor Tensor::mul(const Tensor& other) const {
+    if (device != other.device) {
+        throw std::invalid_argument(
+            "Tensor::mul requires tensors on the same device");
+    }
     TensorShape out_shape;
-    TensorIterator::compute_broadcast_shape(shape, other.shape, out_shape);
-    Tensor result(out_shape.dims, device);
+    if (!TensorIterator::compute_broadcast_shape(
+            shape, other.shape, out_shape)) {
+        throw std::invalid_argument(
+            "Tensor::mul received non-broadcastable shapes");
+    }
+    Tensor result = Tensor::uninitialized(out_shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, other) && gpu_custom_kernels_supported()) {
         if (shape == other.shape) {
@@ -1270,12 +2516,41 @@ Tensor Tensor::mul(const Tensor& other) const {
             sync_cuda();
             return result;
         }
-        if (!shape.empty() && other.shape.size() == 1 &&
-            other.shape.back() == shape.back() && size == result.size) {
-            const int cols = shape.back();
+        if (size == result.size && other.shape.size() == 1 &&
+            other.size > 0 &&
+            (other.size == 1 || shape.back() == other.size)) {
+            const int cols = other.size;
             const int rows = size / std::max(cols, 1);
             launch_mul_vector_broadcast_kernel(result.raw_data(), raw_data(),
                                                 other.raw_data(), rows, cols);
+            sync_cuda();
+            return result;
+        }
+        if (other.size == result.size && shape.size() == 1 &&
+            size > 0 &&
+            (size == 1 || other.shape.back() == size)) {
+            const int cols = size;
+            const int rows = other.size / cols;
+            launch_mul_vector_broadcast_kernel(
+                result.raw_data(), other.raw_data(), raw_data(), rows, cols);
+            sync_cuda();
+            return result;
+        }
+        if (size == result.size && shape.size() == other.shape.size() &&
+            other.shape.back() == 1 &&
+            other.size == size / shape.back()) {
+            launch_mul_broadcast_kernel(
+                result.raw_data(), raw_data(), other.raw_data(),
+                size, shape.back());
+            sync_cuda();
+            return result;
+        }
+        if (other.size == result.size &&
+            shape.size() == other.shape.size() && shape.back() == 1 &&
+            size == other.size / other.shape.back()) {
+            launch_mul_broadcast_kernel(
+                result.raw_data(), other.raw_data(), raw_data(),
+                other.size, other.shape.back());
             sync_cuda();
             return result;
         }
@@ -1288,7 +2563,7 @@ Tensor Tensor::mul(const Tensor& other) const {
 }
 
 Tensor Tensor::mul(float scalar) const {
-    Tensor result(shape.dims, device);
+    Tensor result = Tensor::uninitialized(shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
         launch_mul_scalar_kernel(result.raw_data(), raw_data(), scalar, size);
@@ -1333,7 +2608,19 @@ void set_matmul_precision_mode(int mode) {
         throw std::invalid_argument(
             "matmul precision mode must be 0 (FP32), 1 (BF16), or 2 (FP16)");
     }
-    matmul_precision_mode_storage().store(mode, std::memory_order_relaxed);
+    RuntimeExecutionPolicyMutationGuard mutation;
+    const int current =
+        matmul_precision_mode_storage().load(std::memory_order_relaxed);
+    if (current != mode) {
+        auto& epoch = matmul_precision_policy_epoch_storage();
+        if (epoch.load(std::memory_order_relaxed) ==
+            std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error(
+                "matmul precision policy epoch is exhausted");
+        }
+        matmul_precision_mode_storage().store(mode, std::memory_order_relaxed);
+        epoch.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 int matmul_precision_mode() {
@@ -1346,8 +2633,34 @@ void validate_matmul_precision_for_active_device(int mode) {
     int device_id = 0;
     if (cudaGetDevice(&device_id) != cudaSuccess) {
         throw std::runtime_error(
-            "Cannot resolve active CUDA device for mixed precision");
+            std::string("Cannot resolve active ") +
+            NSOS_GPU_BACKEND_NAME +
+            " device for mixed precision");
     }
+#if defined(NSOS_GPU_BACKEND_HIP)
+    const std::vector<gpu::DeviceInfo> devices =
+        gpu::enumerate_devices();
+    const auto active = std::find_if(
+        devices.begin(), devices.end(),
+        [device_id](const gpu::DeviceInfo& info) {
+            return info.index == device_id;
+        });
+    if (active == devices.end()) {
+        throw std::runtime_error(
+            "Cannot query active HIP device capabilities for mixed "
+            "precision");
+    }
+    if (mode == 1 && !active->bf16) {
+        throw std::runtime_error(
+            "BF16 GEMM is not validated for active AMD architecture " +
+            active->architecture + "; select FP16 or FP32");
+    }
+    if (mode == 2 && !active->fp16) {
+        throw std::runtime_error(
+            "FP16 GEMM is not validated for active AMD architecture " +
+            active->architecture + "; select FP32");
+    }
+#else
     thread_local int cached_device = -1;
     thread_local int cached_major = -1;
     thread_local int cached_minor = -1;
@@ -1372,12 +2685,185 @@ void validate_matmul_precision_for_active_device(int mode) {
         throw std::runtime_error(
             "FP16 Tensor-Core GEMM requires sm_70 or newer");
     }
+#endif
 }
 #endif
+
+#ifdef USE_CUDA
+Tensor matmul_nt_mixed_gpu(const Tensor& a,
+                           const Tensor& b_rowmajor,
+                           const uint64_t* content_version) {
+    const int rank = static_cast<int>(a.shape.size());
+    const int m = a.shape[rank - 2];
+    const int k = a.shape[rank - 1];
+    const int n = b_rowmajor.shape[0];
+    const int64_t matrix_elements =
+        static_cast<int64_t>(m) * k;
+    if (m <= 0 || k <= 0 || n <= 0 || matrix_elements <= 0 ||
+        a.size % matrix_elements != 0 ||
+        a.size / matrix_elements >
+            std::numeric_limits<int>::max()) {
+        throw std::overflow_error(
+            "matmul_nt mixed shape exceeds the supported range");
+    }
+    const int batch = static_cast<int>(a.size / matrix_elements);
+    std::vector<int> output_shape = a.shape.dims;
+    output_shape.back() = n;
+    Tensor result =
+        Tensor::uninitialized(output_shape, Device::GPU);
+
+    const int mixed_mode = matmul_precision_mode();
+    validate_matmul_precision_for_active_device(mixed_mode);
+    const cudaDataType_t input_type =
+        mixed_mode == 1 ? CUDA_R_16BF : CUDA_R_16F;
+    const size_t a_elements = static_cast<size_t>(a.size);
+    const size_t b_elements =
+        static_cast<size_t>(b_rowmajor.size);
+    GemmLowpWorkspace& workspace = gemm_lowp_workspace();
+    if (!workspace.ensure_a(a_elements * 2u)) {
+        throw std::runtime_error(
+            "matmul_nt mixed-precision workspace allocation failed");
+    }
+    void* a_low = workspace.a_pointer();
+    launch_cast_f32_to_lowp_kernel(
+        a_low, a.raw_data(), a_elements, mixed_mode);
+    void* b_low = nullptr;
+    if (content_version != nullptr) {
+        b_low = lowp_weight_cache().find_or_convert(
+            b_rowmajor, mixed_mode, *content_version);
+    }
+    if (b_low == nullptr) {
+        if (!workspace.ensure_b(b_elements * 2u)) {
+            throw std::runtime_error(
+                "matmul_nt mixed-precision weight workspace allocation "
+                "failed");
+        }
+        b_low = workspace.b_pointer();
+        launch_cast_f32_to_lowp_kernel(
+            b_low, b_rowmajor.raw_data(), b_elements, mixed_mode);
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublas_check(
+        cublasGemmStridedBatchedEx(
+            cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+            n, m, k, &alpha, b_low, input_type, k, 0LL,
+            a_low, input_type, k,
+            static_cast<long long>(m) * k, &beta,
+            result.raw_data(), CUDA_R_32F, n,
+            static_cast<long long>(m) * n, batch,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+        "cublasGemmStridedBatchedEx(NT)");
+    sync_cuda();
+    return result;
+}
+#endif
+
+Tensor matmul_tn(const Tensor& a_rowmajor, const Tensor& b) {
+    if (a_rowmajor.shape.size() != 2 || b.shape.size() != 2 ||
+        a_rowmajor.shape[0] != b.shape[0]) {
+        throw std::runtime_error(
+            "matmul_tn expects a[m,k] and b[m,n]");
+    }
+    if (a_rowmajor.get_device() != b.get_device()) {
+        throw std::invalid_argument(
+            "matmul_tn requires tensors on the same device");
+    }
+    const int m = a_rowmajor.shape[0];
+    const int k = a_rowmajor.shape[1];
+    const int n = b.shape[1];
+    if (m <= 0 || k <= 0 || n <= 0) {
+        throw std::invalid_argument(
+            "matmul_tn requires non-empty matrix dimensions");
+    }
+    if (matmul_tn_materialization_enabled()) {
+        return a_rowmajor.transpose().matmul(b);
+    }
+#ifdef USE_CUDA
+    if (a_rowmajor.get_device() == Device::GPU &&
+        gpu_blas_supported()) {
+        Tensor result =
+            Tensor::uninitialized({k, n}, Device::GPU);
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const int mixed_mode = matmul_precision_mode();
+        if (mixed_mode != 0) {
+            validate_matmul_precision_for_active_device(mixed_mode);
+            const cudaDataType_t input_type =
+                mixed_mode == 1 ? CUDA_R_16BF : CUDA_R_16F;
+            const size_t a_elements =
+                static_cast<size_t>(a_rowmajor.size);
+            const size_t b_elements = static_cast<size_t>(b.size);
+            GemmLowpWorkspace& workspace = gemm_lowp_workspace();
+            if (!workspace.ensure(a_elements * 2u, b_elements * 2u)) {
+                throw std::runtime_error(
+                    "matmul_tn mixed-precision workspace allocation failed");
+            }
+            void* a_low = workspace.a_pointer();
+            void* b_low = workspace.b_pointer();
+#if defined(NSOS_GPU_BACKEND_HIP)
+            // rocBLAS lowp OP_T can select an invalid RDNA3 code object.
+            // Fuse the required transpose with the FP32->lowp conversion so
+            // no FP32 transpose, host fallback, or false-stride view exists.
+            launch_cast_transpose_f32_to_lowp_kernel(
+                a_low, a_rowmajor.raw_data(), m, k, mixed_mode);
+#else
+            launch_cast_f32_to_lowp_kernel(
+                a_low, a_rowmajor.raw_data(), a_elements, mixed_mode);
+#endif
+            launch_cast_f32_to_lowp_kernel(
+                b_low, b.raw_data(), b_elements, mixed_mode);
+#if defined(NSOS_GPU_BACKEND_HIP)
+            // A_transposed is [k,m] row-major and therefore [m,k]
+            // column-major. NN computes C_cm[n,k] = B_cm[n,m] * A_t_cm[m,k].
+            cublas_check(
+                cublasGemmStridedBatchedEx(
+                    cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+                    n, k, m, &alpha,
+                    b_low, input_type, n, 0LL,
+                    a_low, input_type, m, 0LL,
+                    &beta, result.raw_data(), CUDA_R_32F, n, 0LL,
+                    1, CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "hipblasGemmStridedBatchedEx(TN-cast-transpose)");
+#else
+            cublas_check(
+                cublasGemmStridedBatchedEx(
+                    cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_T,
+                    n, k, m, &alpha,
+                    b_low, input_type, n, 0LL,
+                    a_low, input_type, k, 0LL,
+                    &beta, result.raw_data(), CUDA_R_32F, n, 0LL,
+                    1, CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublasGemmStridedBatchedEx(TN)");
+#endif
+            sync_cuda();
+            return result;
+        }
+        cublas_check(
+            cublasSgemm(
+                cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_T,
+                n, k, m, &alpha, b.raw_data(), n,
+                a_rowmajor.raw_data(), k, &beta,
+                result.raw_data(), n),
+            "cublasSgemm(TN)");
+        sync_cuda();
+        return result;
+    }
+#endif
+    return a_rowmajor.transpose().matmul(b);
+}
 
 Tensor Tensor::matmul(const Tensor& other) const {
     if (shape.size() < 2 || other.shape.size() < 2) {
         throw std::runtime_error("matmul requires rank >= 2 tensors");
+    }
+    if (device != other.device) {
+        throw std::invalid_argument(
+            "Tensor::matmul requires tensors on the same device");
     }
 
     int rank_a = static_cast<int>(shape.size());
@@ -1387,15 +2873,65 @@ Tensor Tensor::matmul(const Tensor& other) const {
     int k_other = other.shape[rank_b - 2];
     int n = other.shape[rank_b - 1];
 
+    if (m <= 0 || k <= 0 || k_other <= 0 || n <= 0) {
+        throw std::invalid_argument(
+            "Tensor::matmul requires non-empty matrix dimensions");
+    }
     if (k != k_other) {
         throw std::runtime_error("matmul shape mismatch");
     }
 
-    std::vector<int> out_dims = shape.dims;
-    out_dims.back() = n;
-    if (rank_b > 2) {
-        out_dims.assign(other.shape.dims.begin(), other.shape.dims.end());
-        out_dims[rank_b - 2] = m;
+    const int batch_rank_a = rank_a - 2;
+    const int batch_rank_b = rank_b - 2;
+    const int batch_rank = std::max(batch_rank_a, batch_rank_b);
+    std::vector<int> out_dims(static_cast<size_t>(batch_rank), 1);
+    for (int index = 0; index < batch_rank; ++index) {
+        const int a_index = index - (batch_rank - batch_rank_a);
+        const int b_index = index - (batch_rank - batch_rank_b);
+        const int a_dim =
+            a_index >= 0 ? shape[static_cast<size_t>(a_index)] : 1;
+        const int b_dim =
+            b_index >= 0 ? other.shape[static_cast<size_t>(b_index)] : 1;
+        if (a_dim != b_dim && a_dim != 1 && b_dim != 1) {
+            throw std::invalid_argument(
+                "Tensor::matmul received non-broadcastable batch dimensions");
+        }
+        out_dims[static_cast<size_t>(index)] = std::max(a_dim, b_dim);
+    }
+    out_dims.push_back(m);
+    out_dims.push_back(n);
+
+    const int64_t matrix_a =
+        static_cast<int64_t>(m) * static_cast<int64_t>(k);
+    const int64_t matrix_b =
+        static_cast<int64_t>(k) * static_cast<int64_t>(n);
+    if (size % matrix_a != 0 || other.size % matrix_b != 0) {
+        throw std::logic_error(
+            "Tensor::matmul storage size is inconsistent with its shape");
+    }
+    const int64_t batch_a_64 = size / matrix_a;
+    const int64_t batch_b_64 = other.size / matrix_b;
+    int64_t batch_64 = 1;
+    for (int index = 0; index < batch_rank; ++index) {
+        const int dim = out_dims[static_cast<size_t>(index)];
+        if (dim <= 0 ||
+            batch_64 > std::numeric_limits<int>::max() / dim) {
+            throw std::overflow_error(
+                "Tensor::matmul batch element count exceeds the supported "
+                "integer range");
+        }
+        batch_64 *= dim;
+    }
+    const int batch_a = static_cast<int>(batch_a_64);
+    const int batch_b = static_cast<int>(batch_b_64);
+    const int batch = static_cast<int>(batch_64);
+    // The strided implementation can broadcast a whole matrix batch (stride
+    // zero), but not an arbitrary partially-broadcast batch grid.
+    if ((batch_a != 1 && batch_a != batch) ||
+        (batch_b != 1 && batch_b != batch)) {
+        throw std::invalid_argument(
+            "Tensor::matmul only supports identical batch grids or a "
+            "single-matrix batch broadcast");
     }
 
 #ifdef USE_CUDA
@@ -1405,13 +2941,7 @@ Tensor Tensor::matmul(const Tensor& other) const {
     const bool matmul_gpu_path = false;
 #endif
     // GPU: GEMM beta=0 sobrescreve 100% de C -> alocação sem zero-fill.
-    Tensor result = matmul_gpu_path ? Tensor::uninitialized(out_dims, device)
-                                    : Tensor(out_dims, device);
-    int batch = size / (m * k);
-    int other_batch = other.size / (k * n);
-    if (other_batch != 1 && other_batch != batch) {
-        throw std::runtime_error("Unsupported batched matmul shape mismatch");
-    }
+    Tensor result = Tensor::uninitialized(out_dims, device);
 
 #ifdef USE_CUDA
     if (matmul_gpu_path) {
@@ -1475,12 +3005,11 @@ Tensor Tensor::matmul(const Tensor& other) const {
 
             const size_t bytes_per_lp = 2;  // both bf16 and fp16 are 2 bytes
             const size_t total_a_elems =
-                static_cast<size_t>(batch) * static_cast<size_t>(m) * static_cast<size_t>(k);
+                static_cast<size_t>(batch_a) * static_cast<size_t>(m) *
+                static_cast<size_t>(k);
             const size_t total_b_elems =
-                (other_batch == 1
-                     ? static_cast<size_t>(k) * static_cast<size_t>(n)
-                     : static_cast<size_t>(batch) * static_cast<size_t>(k) *
-                           static_cast<size_t>(n));
+                static_cast<size_t>(batch_b) * static_cast<size_t>(k) *
+                static_cast<size_t>(n);
 
             // Get cached staging buffers from the workspace (resized
             // on demand, reused across calls).  Replaces the per-
@@ -1489,8 +3018,8 @@ Tensor Tensor::matmul(const Tensor& other) const {
             GemmLowpWorkspace& ws = gemm_lowp_workspace();
             if (ws.ensure(total_a_elems * bytes_per_lp,
                           total_b_elems * bytes_per_lp)) {
-                void* a_low_ptr = ws.a_ptr;
-                void* b_low_ptr = ws.b_ptr;
+                void* a_low_ptr = ws.a_pointer();
+                void* b_low_ptr = ws.b_pointer();
 
                 // Cast A and B to lower precision.  Reuse our
                 // existing float->bf16 / float->fp16 cast kernel if
@@ -1503,8 +3032,10 @@ Tensor Tensor::matmul(const Tensor& other) const {
                 launch_cast_f32_to_lowp_kernel(
                     b_low_ptr, b_ptr, total_b_elems, mixed_mode);
 
-                const long long stride_a = static_cast<long long>(m) * k;
-                const long long stride_b = (other_batch == 1)
+                const long long stride_a = (batch_a == 1)
+                                                ? 0LL
+                                                : static_cast<long long>(m) * k;
+                const long long stride_b = (batch_b == 1)
                                                 ? 0LL
                                                 : static_cast<long long>(k) * n;
                 const long long stride_c = static_cast<long long>(m) * n;
@@ -1561,15 +3092,16 @@ Tensor Tensor::matmul(const Tensor& other) const {
         // cublasSgemmStridedBatched does a single launch that runs
         // all batches in parallel across SMs.  The strides are the
         // gap between consecutive batch matrices in memory:
-        //   strideA = m*k       (always)
-        //   strideB = 0 if other has no batch dim (broadcast),
-        //             k*n if other has batch dim (no broadcast)
+        //   strideA = 0 for a single lhs matrix, otherwise m*k
+        //   strideB = 0 for a single rhs matrix, otherwise k*n
         //   strideC = m*n       (always)
         //
         // The math is IDENTICAL to the loop above.  Speedup is 1.2-2x
         // for matmul-heavy paths; combined with sync removal, more.
-        const long long stride_a = static_cast<long long>(m) * k;
-        const long long stride_b = (other_batch == 1)
+        const long long stride_a = (batch_a == 1)
+                                       ? 0LL
+                                       : static_cast<long long>(m) * k;
+        const long long stride_b = (batch_b == 1)
                                        ? 0LL
                                        : static_cast<long long>(k) * n;
         const long long stride_c = static_cast<long long>(m) * n;
@@ -1600,6 +3132,7 @@ Tensor Tensor::matmul(const Tensor& other) const {
 
     // Fallback host: o fetch via data() (com sync_host_access) vive SÓ aqui —
     // o branch GPU acima usa raw_data() sem drenos.
+    warn_host_fallback_once("matmul", device);
     const float* a_ptr = data();
     const float* b_ptr = other.data();
     float* out_ptr = result.data();
@@ -1610,9 +3143,14 @@ Tensor Tensor::matmul(const Tensor& other) const {
     // kept as a fallback for any non-CPU data that reaches here.
     if (device == Device::CPU) {
         for (int batch_idx = 0; batch_idx < batch; ++batch_idx) {
-            const float* a_batch = a_ptr + static_cast<size_t>(batch_idx) * m * k;
+            const float* a_batch =
+                a_ptr + (batch_a == 1
+                             ? 0
+                             : static_cast<size_t>(batch_idx) * m * k);
             const float* b_batch =
-                b_ptr + (other_batch == 1 ? 0 : static_cast<size_t>(batch_idx) * k * n);
+                b_ptr + (batch_b == 1
+                             ? 0
+                             : static_cast<size_t>(batch_idx) * k * n);
             float* out_batch = out_ptr + static_cast<size_t>(batch_idx) * m * n;
             MathOps::gemm(m, n, k, 1.0f, a_batch, k, b_batch, n, 0.0f, out_batch, n);
         }
@@ -1623,8 +3161,10 @@ Tensor Tensor::matmul(const Tensor& other) const {
     for (int row_index = 0; row_index < batch * m; ++row_index) {
         const int batch_idx = row_index / m;
         const int row = row_index % m;
-        const float* a_batch = a_ptr + batch_idx * m * k;
-        const float* b_batch = b_ptr + (other_batch == 1 ? 0 : batch_idx * k * n);
+        const float* a_batch =
+            a_ptr + (batch_a == 1 ? 0 : batch_idx * m * k);
+        const float* b_batch =
+            b_ptr + (batch_b == 1 ? 0 : batch_idx * k * n);
         float* out_row = out_ptr + row_index * n;
         std::fill_n(out_row, n, 0.0f);
 
@@ -1655,7 +3195,7 @@ Tensor Tensor::transpose(int dim0, int dim1) const {
 
     std::vector<int> out_dims = shape.dims;
     std::swap(out_dims[dim0], out_dims[dim1]);
-    Tensor result(out_dims, device);
+    Tensor result = Tensor::uninitialized(out_dims, device);
 
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported() &&
@@ -1701,7 +3241,7 @@ Tensor Tensor::transpose() const {
 }
 
 Tensor Tensor::relu() const {
-    Tensor result(shape.dims, device);
+    Tensor result = Tensor::uninitialized(shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
         launch_relu_kernel(result.raw_data(), raw_data(), size);
@@ -1725,7 +3265,7 @@ Tensor Tensor::relu() const {
 // training.  Squared ReLU is numerically stable in quantized regimes
 // and gives comparable expressive power to SwiGLU at moderate scale.
 Tensor Tensor::squared_relu() const {
-    Tensor result(shape.dims, device);
+    Tensor result = Tensor::uninitialized(shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
         launch_squared_relu_kernel(result.raw_data(), raw_data(), size);
@@ -1753,7 +3293,8 @@ Tensor Tensor::squared_relu_backward(const Tensor& dy,
         throw std::runtime_error(
             "squared_relu_backward: dy and pre_activation must be on same device");
     }
-    Tensor result(dy.shape.dims, dy.get_device());
+    Tensor result =
+        Tensor::uninitialized(dy.shape.dims, dy.get_device());
 #ifdef USE_CUDA
     if (use_gpu_fast_path(dy, pre_activation) && gpu_custom_kernels_supported()) {
         launch_squared_relu_backward_kernel(result.raw_data(),
@@ -1775,8 +3316,127 @@ Tensor Tensor::squared_relu_backward(const Tensor& dy,
     return result;
 }
 
+Tensor Tensor::silu() const {
+    Tensor result = Tensor::uninitialized(shape.dims, device);
+#ifdef USE_CUDA
+    if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
+        launch_silu_kernel(result.raw_data(), raw_data(), size);
+        sync_cuda();
+        return result;
+    }
+#endif
+    const float* source = data();
+    float* destination = result.data();
+#pragma omp parallel for if(size > 1024)
+    for (int index = 0; index < size; ++index) {
+        const float value = source[index];
+        const float sigmoid =
+            value >= 0.0f
+                ? 1.0f / (1.0f + std::exp(-value))
+                : std::exp(value) / (1.0f + std::exp(value));
+        destination[index] = value * sigmoid;
+    }
+    return result;
+}
+
+Tensor Tensor::silu_backward(const Tensor& dy,
+                             const Tensor& pre_activation) {
+    if (dy.shape != pre_activation.shape) {
+        throw std::invalid_argument(
+            "silu_backward: dy and pre_activation must have same shape");
+    }
+    if (dy.get_device() != pre_activation.get_device()) {
+        throw std::invalid_argument(
+            "silu_backward: dy and pre_activation must be on same device");
+    }
+    Tensor result =
+        Tensor::uninitialized(dy.shape.dims, dy.get_device());
+#ifdef USE_CUDA
+    if (use_gpu_fast_path(dy, pre_activation) &&
+        gpu_custom_kernels_supported()) {
+        launch_silu_backward_kernel(
+            result.raw_data(), dy.raw_data(),
+            pre_activation.raw_data(), dy.size);
+        sync_cuda();
+        return result;
+    }
+#endif
+    const float* gradient = dy.data();
+    const float* pre = pre_activation.data();
+    float* destination = result.data();
+#pragma omp parallel for if(dy.size > 1024)
+    for (int index = 0; index < dy.size; ++index) {
+        const float value = pre[index];
+        const float sigmoid =
+            value >= 0.0f
+                ? 1.0f / (1.0f + std::exp(-value))
+                : std::exp(value) / (1.0f + std::exp(value));
+        destination[index] =
+            gradient[index] * sigmoid *
+            (1.0f + value * (1.0f - sigmoid));
+    }
+    return result;
+}
+
+Tensor Tensor::silu_gate(const Tensor& value, const Tensor& gate) {
+    if (value.shape != gate.shape ||
+        value.get_device() != gate.get_device()) {
+        throw std::invalid_argument(
+            "silu_gate requires identical shapes and devices");
+    }
+#ifdef USE_CUDA
+    if (use_gpu_fast_path(value, gate) && gpu_custom_kernels_supported()) {
+        Tensor result = Tensor::uninitialized(
+            value.shape.dims, value.get_device());
+        if (!launch_silu_gate_forward_kernel(
+                result.raw_data(), value.raw_data(), gate.raw_data(),
+                value.size)) {
+            throw std::runtime_error(
+                "silu_gate GPU launcher rejected invalid arguments");
+        }
+        sync_cuda();
+        return result;
+    }
+#endif
+    return value.mul(gate.silu());
+}
+
+std::pair<Tensor, Tensor> Tensor::silu_gate_backward(
+    const Tensor& grad_out, const Tensor& value, const Tensor& gate) {
+    if (grad_out.shape != value.shape || value.shape != gate.shape ||
+        grad_out.get_device() != value.get_device() ||
+        value.get_device() != gate.get_device()) {
+        throw std::invalid_argument(
+            "silu_gate_backward requires identical shapes and devices");
+    }
+#ifdef USE_CUDA
+    if (use_gpu_fast_path(grad_out, value) &&
+        gate.get_device() == Device::GPU &&
+        gpu_custom_kernels_supported()) {
+        Tensor value_grad = Tensor::uninitialized(
+            value.shape.dims, Device::GPU);
+        Tensor gate_grad = Tensor::uninitialized(
+            gate.shape.dims, Device::GPU);
+        if (!launch_silu_gate_backward_kernel(
+            value_grad.raw_data(), gate_grad.raw_data(),
+            grad_out.raw_data(), value.raw_data(), gate.raw_data(),
+            value.size)) {
+            throw std::runtime_error(
+                "silu_gate_backward GPU launcher rejected invalid arguments");
+        }
+        sync_cuda();
+        return {std::move(value_grad), std::move(gate_grad)};
+    }
+#endif
+    Tensor activated_gate = gate.silu();
+    Tensor value_grad = grad_out.mul(activated_gate);
+    Tensor gate_grad = Tensor::silu_backward(
+        grad_out.mul(value), gate);
+    return {std::move(value_grad), std::move(gate_grad)};
+}
+
 Tensor Tensor::sigmoid() const {
-    Tensor result(shape.dims, device);
+    Tensor result = Tensor::uninitialized(shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
         launch_sigmoid_kernel(result.raw_data(), raw_data(), size);
@@ -1788,7 +3448,11 @@ Tensor Tensor::sigmoid() const {
     float* dst = result.data();
 #pragma omp parallel for
     for (int i = 0; i < size; ++i) {
-        dst[i] = 1.0f / (1.0f + std::exp(-src[i]));
+        const float value = src[i];
+        dst[i] =
+            value >= 0.0f
+                ? 1.0f / (1.0f + std::exp(-value))
+                : std::exp(value) / (1.0f + std::exp(value));
     }
     return result;
 }
@@ -1797,8 +3461,12 @@ Tensor Tensor::softmax(int dim) const {
     int rank = static_cast<int>(shape.size());
     dim = normalize_dim(dim, rank);
 
-    Tensor result(shape.dims, device);
     int axis = shape[dim];
+    if (axis <= 0 || size <= 0) {
+        throw std::invalid_argument(
+            "Tensor::softmax requires a non-empty reduction axis");
+    }
+    Tensor result = Tensor::uninitialized(shape.dims, device);
     int inner = 1;
     for (int i = dim + 1; i < rank; ++i) {
         inner *= shape[i];
@@ -1843,9 +3511,14 @@ Tensor Tensor::softmax(int dim) const {
 }
 
 Tensor Tensor::rmsnorm(float eps) const {
-    Tensor result(shape.dims, device);
+    if (!std::isfinite(eps) || eps <= 0.0f ||
+        shape.empty() || shape.back() <= 0 || size <= 0) {
+        throw std::invalid_argument(
+            "Tensor::rmsnorm requires a non-empty tensor and finite eps > 0");
+    }
     int inner = shape.back();
     int outer = size / inner;
+    Tensor result = Tensor::uninitialized(shape.dims, device);
 
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
@@ -1875,7 +3548,12 @@ Tensor Tensor::rmsnorm(float eps) const {
 }
 
 Tensor Tensor::clamp(float min_val, float max_val) const {
-    Tensor result(shape.dims, device);
+    if (!std::isfinite(min_val) || !std::isfinite(max_val) ||
+        min_val > max_val) {
+        throw std::invalid_argument(
+            "Tensor::clamp requires finite bounds with min <= max");
+    }
+    Tensor result = Tensor::uninitialized(shape.dims, device);
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
         launch_clamp_kernel(result.raw_data(), raw_data(), min_val, max_val,
@@ -1898,7 +3576,7 @@ Tensor Tensor::sum(int dim, bool keepdim) const {
     dim = normalize_dim(dim, rank);
 
     if (rank == 1) {
-        Tensor result({1}, device);
+        Tensor result = Tensor::uninitialized({1}, device);
 #ifdef USE_CUDA
         if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
             launch_mean_kernel(result.raw_data(), raw_data(), 1, size, 1);
@@ -1929,7 +3607,7 @@ Tensor Tensor::sum(int dim, bool keepdim) const {
                 gpu_out_dims.push_back(1);
             }
         }
-        Tensor result(gpu_out_dims, device);
+        Tensor result = Tensor::uninitialized(gpu_out_dims, device);
         if (dim == 0) {
             launch_mean_kernel(result.raw_data(), raw_data(), 1, rows, cols);
             launch_scale_inplace_kernel(result.raw_data(),
@@ -1985,11 +3663,22 @@ Tensor Tensor::sum(int dim, bool keepdim) const {
 float Tensor::norm() const {
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        CudaBuffer<float> d_sum_sq(1);
-        cudaMemset(d_sum_sq.get(), 0, sizeof(float));
-        launch_norm_kernel(d_sum_sq.get(), raw_data(), size);
+        float* d_sum_sq = scalar_reduction_scratch();
+        if (d_sum_sq == nullptr) {
+            throw std::runtime_error(
+                "Tensor::norm could not allocate GPU reduction scratch");
+        }
+        const cudaError_t clear_status =
+            cudaMemsetAsync(d_sum_sq, 0, sizeof(float), nsos::gpu::current_stream());
+        if (clear_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("Tensor::norm GPU clear failed on ") +
+                NSOS_GPU_BACKEND_NAME + ": " +
+                cudaGetErrorString(clear_status));
+        }
+        launch_norm_kernel(d_sum_sq, raw_data(), size);
         sync_cuda();
-        const float sum_sq = copy_scalar_from_device(d_sum_sq.get());
+        const float sum_sq = copy_scalar_from_device(d_sum_sq);
         return std::sqrt(sum_sq);
     }
 #endif
@@ -2039,11 +3728,38 @@ Tensor Tensor::cpu() const {
     return to(Device::CPU);
 }
 
+Tensor Tensor::storage_view(
+    size_t element_offset, const std::vector<int>& view_shape) const {
+    Tensor view;
+    view.shape = TensorShape(view_shape);
+    view.size = checked_tensor_size(view.shape);
+    view.device = device;
+    const size_t source_size =
+        size < 0 ? 0U : static_cast<size_t>(size);
+    const size_t view_size = static_cast<size_t>(view.size);
+    if (element_offset > source_size ||
+        view_size > source_size - element_offset) {
+        throw std::out_of_range(
+            "Tensor::storage_view exceeds the source storage");
+    }
+    if (view_size > 0 && data_ptr == nullptr) {
+        throw std::logic_error(
+            "Tensor::storage_view cannot alias null storage");
+    }
+    if (data_ptr != nullptr) {
+        view.data_ptr =
+            std::shared_ptr<float>(
+                data_ptr, data_ptr.get() + element_offset);
+    }
+    view.host_accessible_storage_ = host_accessible_storage_;
+    return view;
+}
+
 void Tensor::sync_host_access() const {
 #ifdef USE_CUDA
     if (device == Device::GPU && size > 0) {
         // Cheap-when-idle barrier:
-        //   * cudaStreamQuery(0) returns cudaSuccess in microseconds when
+        //   * cudaStreamQuery( nsos::gpu::current_stream()) returns cudaSuccess in microseconds when
         //     the default stream has no in-flight work — the common case
         //     for back-to-back data() reads after the first sync.
         //   * Only when there IS pending work (cudaErrorNotReady) do we
@@ -2051,7 +3767,7 @@ void Tensor::sync_host_access() const {
         // This lets eager-sync mode stay viable for production: a chain
         // of data() reads after a single kernel launch syncs once and
         // then no-ops, instead of bottlenecking on N cudaDeviceSync.
-        const cudaError_t pending = cudaStreamQuery(0);
+        const cudaError_t pending = cudaStreamQuery( nsos::gpu::current_stream());
         if (pending == cudaErrorNotReady) {
             const cudaError_t sync_status = cudaDeviceSynchronize();
             if (sync_status != cudaSuccess) {
@@ -2059,6 +3775,7 @@ void Tensor::sync_host_access() const {
                     std::string("CUDA host-access synchronization failed: ") +
                     cudaGetErrorString(sync_status));
             }
+            record_gpu_device_synchronization();
         } else if (pending != cudaSuccess) {
             throw std::runtime_error(
                 std::string("CUDA stream query failed before host access: ") +
@@ -2223,18 +3940,52 @@ Tensor Tensor::slice(int dim, int start, int end) const {
     // Ambos os caminhos (memcpy dim-0 e loop genérico) escrevem todo elemento.
     Tensor result = Tensor::uninitialized(out_dims, device);
 
+#ifdef USE_CUDA
+    if (device == Device::GPU && gpu_custom_kernels_supported()) {
+        const int inner =
+            static_cast<int>(shape.strides[static_cast<size_t>(dim)]);
+        const int axis_size = shape[dim];
+        const int axis_span =
+            checked_int_product(axis_size, inner, "slice axis span");
+        if (axis_span <= 0 || size % axis_span != 0) {
+            throw std::logic_error(
+                "Tensor::slice source storage is inconsistent with shape");
+        }
+        const int outer = size / axis_span;
+        const int slice_size = end - start;
+        const int expected =
+            checked_int_product(
+                checked_int_product(outer, slice_size,
+                                    "slice output rows"),
+                inner, "slice output elements");
+        if (expected != result.size) {
+            throw std::logic_error(
+                "Tensor::slice output storage is inconsistent with shape");
+        }
+        if (!launch_slice_contiguous_kernel(
+            result.raw_data(), raw_data(), outer, axis_size, inner, start,
+            slice_size, result.size)) {
+            throw std::runtime_error(
+                "Tensor::slice GPU launcher rejected invalid arguments");
+        }
+        sync_cuda();
+        return result;
+    }
+    if (device == Device::GPU) {
+        throw std::runtime_error(
+            "Tensor::slice requires the compiled GPU kernel for a GPU tensor");
+    }
+#elif !defined(USE_CUDA)
+    if (device == Device::GPU) {
+        throw std::runtime_error(
+            "Tensor::slice received a GPU tensor in a CPU-only build");
+    }
+#endif
+
     if (dim == 0 && rank >= 1) {
         const int inner = size / shape[0];
         const size_t bytes =
             static_cast<size_t>((end - start) * inner) * sizeof(float);
-#ifdef USE_CUDA
-        if (device == Device::GPU) {
-            copy_tensor_bytes(result.raw_data(), result.device,
-                              raw_data() + static_cast<size_t>(start * inner), device,
-                              bytes, /*async_d2d=*/true);
-            return result;
-        }
-#endif
         const float* src_ptr = data() + static_cast<size_t>(start * inner);
         copy_tensor_bytes(result.data(), result.device, src_ptr, device, bytes);
         return result;
@@ -2285,9 +4036,24 @@ float Tensor::get(const std::vector<int>& indices) const {
 
 Tensor Tensor::rmsnorm_backward(const Tensor& grad, const Tensor& x_norm,
                                 float eps) const {
-    Tensor dx(shape.dims, device);
+    if (shape != grad.shape || shape != x_norm.shape ||
+        size != grad.size || size != x_norm.size) {
+        throw std::invalid_argument(
+            "Tensor::rmsnorm_backward requires identical tensor shapes");
+    }
+    if (device != grad.device || device != x_norm.device) {
+        throw std::invalid_argument(
+            "Tensor::rmsnorm_backward requires identical devices");
+    }
+    if (!std::isfinite(eps) || eps <= 0.0f ||
+        shape.empty() || shape.back() <= 0 || size <= 0) {
+        throw std::invalid_argument(
+            "Tensor::rmsnorm_backward requires a non-empty tensor and "
+            "finite eps > 0");
+    }
     int inner = shape.back();
     int outer = size / inner;
+    Tensor dx = Tensor::uninitialized(shape.dims, device);
 
 #ifdef USE_CUDA
     if (use_gpu_fast_path(*this, grad) && x_norm.get_device() == Device::GPU &&
@@ -2339,15 +4105,279 @@ static float* ce_loss_scratch() {
     thread_local cuda_detail::DeviceBuffer<float> buffer;
     return buffer.ensure(1);
 }
-static int* ce_target_scratch(int rows) {
-    if (rows <= 0) return nullptr;
-    thread_local cuda_detail::DeviceBuffer<int> buffer;
-    return buffer.ensure(static_cast<size_t>(rows));
-}
-static float* ce_weight_scratch(int rows) {
-    if (rows <= 0) return nullptr;
-    thread_local cuda_detail::DeviceBuffer<float> buffer;
-    return buffer.ensure(static_cast<size_t>(rows));
+
+class CrossEntropyRowWorkspace {
+public:
+    struct DeviceRows {
+        int* targets = nullptr;
+        float* weights = nullptr;
+    };
+
+    ~CrossEntropyRowWorkspace() {
+        if (!wait_for_consumer_noexcept() ||
+            awaiting_completion_record_ || poisoned_) {
+            // The runtime could not prove completion. Retain every allocation
+            // rather than freeing pinned/device memory that an async copy may
+            // still reference.
+            device_targets_.abandon();
+            device_weights_.abandon();
+            host_targets_.abandon();
+            host_weights_.abandon();
+            copy_complete_ = nullptr;
+            return;
+        }
+        if (copy_complete_ != nullptr) {
+            const cudaError_t status =
+                cudaEventDestroy(copy_complete_);
+            if (status != cudaSuccess) {
+                (void)cudaGetLastError();
+            }
+        }
+    }
+
+    DeviceRows stage(const std::vector<int>& targets,
+                     const std::vector<float>* weights) {
+        if (targets.empty()) {
+            throw std::invalid_argument(
+                "cross-entropy GPU staging requires at least one row");
+        }
+        if (weights != nullptr && weights->size() != targets.size()) {
+            throw std::invalid_argument(
+                "cross-entropy target/weight staging size mismatch");
+        }
+        wait_for_consumer();
+        ensure(targets.size());
+        std::copy(
+            targets.begin(), targets.end(), host_targets_.get());
+        if (weights != nullptr) {
+            std::copy(
+                weights->begin(), weights->end(), host_weights_.get());
+        }
+        check(cudaMemcpyAsync(
+                  device_targets_.get(), host_targets_.get(),
+                  targets.size() * sizeof(int),
+                  cudaMemcpyHostToDevice, nsos::gpu::current_stream()),
+              "cross-entropy target upload");
+        awaiting_completion_record_ = true;
+        record_gpu_transfer(
+            Device::GPU, Device::CPU,
+            targets.size() * sizeof(int));
+        if (weights != nullptr) {
+            const cudaError_t weight_status =
+                cudaMemcpyAsync(
+                    device_weights_.get(), host_weights_.get(),
+                    weights->size() * sizeof(float),
+                    cudaMemcpyHostToDevice, nsos::gpu::current_stream());
+            if (weight_status != cudaSuccess) {
+                fail_after_unrecorded_work(
+                    weight_status,
+                    "cross-entropy weight upload");
+            }
+            record_gpu_transfer(
+                Device::GPU, Device::CPU,
+                weights->size() * sizeof(float));
+        }
+        const cudaError_t event_status =
+            cudaEventRecord(copy_complete_, nsos::gpu::current_stream());
+        if (event_status != cudaSuccess) {
+            fail_after_unrecorded_work(
+                event_status,
+                "cross-entropy staging event record");
+        }
+        awaiting_completion_record_ = false;
+        copy_pending_ = true;
+        consumer_pending_ = true;
+        return {
+            device_targets_.get(),
+            weights != nullptr ? device_weights_.get() : nullptr};
+    }
+
+    void complete_consumer() {
+        if (!consumer_pending_) {
+            throw std::logic_error(
+                "cross-entropy GPU consumer completion was not pending");
+        }
+        // The caller reached a blocking default-stream D2H boundary after
+        // every consumer kernel. That proves both upload and consumption.
+        consumer_pending_ = false;
+        copy_pending_ = false;
+    }
+
+    void record_consumer_completion() {
+        if (!consumer_pending_) {
+            throw std::logic_error(
+                "cross-entropy GPU consumer completion was not pending");
+        }
+        const cudaError_t status = cudaEventRecord(copy_complete_, nsos::gpu::current_stream());
+        if (status != cudaSuccess) {
+            fail_consumer_completion(
+                status, "cross-entropy consumer event record");
+        }
+        // The event now represents the last consumer, not merely the upload.
+        // A subsequent stage waits/query-checks it before overwriting buffers.
+        consumer_pending_ = false;
+        copy_pending_ = true;
+    }
+
+    [[noreturn]] void fail_consumer_completion(
+        cudaError_t original_status,
+        const char* operation) {
+        const cudaError_t sync_status =
+            cudaStreamSynchronize( nsos::gpu::current_stream());
+        record_gpu_stream_synchronization();
+        if (sync_status != cudaSuccess) {
+            poisoned_ = true;
+            throw std::runtime_error(
+                std::string(operation) + " failed on " +
+                NSOS_GPU_BACKEND_NAME + ": " +
+                cudaGetErrorString(original_status) +
+                "; consumer completion recovery also failed: " +
+                cudaGetErrorString(sync_status));
+        }
+        consumer_pending_ = false;
+        copy_pending_ = false;
+        check(original_status, operation);
+        throw std::logic_error(
+            "unreachable cross-entropy consumer failure path");
+    }
+
+private:
+    static void check(cudaError_t status, const char* operation) {
+        if (status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string(operation) + " failed on " +
+                NSOS_GPU_BACKEND_NAME + ": " +
+                cudaGetErrorString(status));
+        }
+    }
+
+    void wait_for_consumer() {
+        if (poisoned_) {
+            throw std::runtime_error(
+                "cross-entropy GPU staging is poisoned after an "
+                "unrecoverable completion error");
+        }
+        if (consumer_pending_) {
+            const cudaError_t status =
+                cudaStreamSynchronize( nsos::gpu::current_stream());
+            record_gpu_stream_synchronization();
+            if (status != cudaSuccess) {
+                poisoned_ = true;
+                check(status,
+                      "cross-entropy consumer synchronization");
+            }
+            consumer_pending_ = false;
+            copy_pending_ = false;
+            return;
+        }
+        if (!copy_pending_) {
+            return;
+        }
+        cudaError_t status = cudaEventQuery(copy_complete_);
+        if (status == cudaErrorNotReady) {
+            status = cudaEventSynchronize(copy_complete_);
+            record_gpu_stream_synchronization();
+        }
+        if (status != cudaSuccess) {
+            poisoned_ = true;
+            check(status,
+                  "cross-entropy staging reuse synchronization");
+        }
+        copy_pending_ = false;
+    }
+
+    bool wait_for_consumer_noexcept() noexcept {
+        if (consumer_pending_) {
+            const cudaError_t status =
+                cudaStreamSynchronize( nsos::gpu::current_stream());
+            record_gpu_stream_synchronization();
+            if (status != cudaSuccess) {
+                poisoned_ = true;
+                return false;
+            }
+            consumer_pending_ = false;
+            copy_pending_ = false;
+        }
+        if (copy_pending_ && copy_complete_ != nullptr) {
+            cudaError_t status =
+                cudaEventQuery(copy_complete_);
+            if (status == cudaErrorNotReady) {
+                status =
+                    cudaEventSynchronize(copy_complete_);
+                record_gpu_stream_synchronization();
+            }
+            if (status != cudaSuccess) {
+                poisoned_ = true;
+                return false;
+            }
+            copy_pending_ = false;
+        }
+        return !poisoned_ && !awaiting_completion_record_;
+    }
+
+    [[noreturn]] void fail_after_unrecorded_work(
+        cudaError_t original_status,
+        const char* operation) {
+        const cudaError_t sync_status =
+            cudaStreamSynchronize( nsos::gpu::current_stream());
+        record_gpu_stream_synchronization();
+        if (sync_status != cudaSuccess) {
+            poisoned_ = true;
+            throw std::runtime_error(
+                std::string(operation) + " failed on " +
+                NSOS_GPU_BACKEND_NAME + ": " +
+                cudaGetErrorString(original_status) +
+                "; completion recovery also failed: " +
+                cudaGetErrorString(sync_status));
+        }
+        awaiting_completion_record_ = false;
+        check(original_status, operation);
+        throw std::logic_error(
+            "unreachable cross-entropy staging failure path");
+    }
+
+    void ensure(size_t requested) {
+        const size_t minimum = std::max<size_t>(requested, 256);
+        if (device_targets_.ensure(minimum) == nullptr) {
+            throw std::runtime_error(
+                "cross-entropy device target allocation failed");
+        }
+        if (device_weights_.ensure(minimum) == nullptr) {
+            throw std::runtime_error(
+                "cross-entropy device weight allocation failed");
+        }
+        if (host_targets_.ensure(minimum) == nullptr) {
+            throw std::runtime_error(
+                "cross-entropy pinned target allocation failed");
+        }
+        if (host_weights_.ensure(minimum) == nullptr) {
+            throw std::runtime_error(
+                "cross-entropy pinned weight allocation failed");
+        }
+        if (copy_complete_ == nullptr) {
+            const cudaError_t status =
+                cudaEventCreate(&copy_complete_);
+            if (status != cudaSuccess) {
+                check(status,
+                      "cross-entropy staging event creation");
+            }
+        }
+    }
+
+    cuda_detail::DeviceBuffer<int> device_targets_;
+    cuda_detail::DeviceBuffer<float> device_weights_;
+    cuda_detail::PinnedHostBuffer<int> host_targets_;
+    cuda_detail::PinnedHostBuffer<float> host_weights_;
+    cudaEvent_t copy_complete_ = nullptr;
+    bool copy_pending_ = false;
+    bool consumer_pending_ = false;
+    bool awaiting_completion_record_ = false;
+    bool poisoned_ = false;
+};
+
+CrossEntropyRowWorkspace& ce_row_workspace() {
+    thread_local CrossEntropyRowWorkspace workspace;
+    return workspace;
 }
 #endif
 
@@ -2357,8 +4387,13 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
         throw std::runtime_error("cross_entropy expects rank >= 2 logits");
     }
 
-    int classes = shape.back();
-    int rows = size / classes;
+    const int classes = shape.back();
+    if (classes <= 0 || size % classes != 0 ||
+        size / classes > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(
+            "cross_entropy has an invalid logits shape");
+    }
+    const int rows = static_cast<int>(size / classes);
     if (static_cast<int>(target.size()) != rows) {
         throw std::runtime_error("cross_entropy target size mismatch");
     }
@@ -2368,28 +4403,63 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
         }
     }
 
-    Tensor grad(shape.dims, device);
+    // Every validated row is written exhaustively by both the GPU and CPU
+    // producers below.
+    Tensor grad = Tensor::uninitialized(shape.dims, device);
     float loss = 0.0f;
 
 #ifdef USE_CUDA
-    if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        // Reused device scratch instead of per-call cudaMalloc/cudaFree.
-        float* d_loss = ce_loss_scratch();
-        int* d_target = ce_target_scratch(rows);
-        if (d_loss != nullptr && d_target != nullptr) {
-            cudaMemset(d_loss, 0, sizeof(float));
-            cudaMemcpy(d_target, target.data(),
-                       static_cast<size_t>(rows) * sizeof(int),
-                       cudaMemcpyHostToDevice);
-            launch_fused_cross_entropy(d_loss, grad.raw_data(), raw_data(),
-                                        d_target, rows, classes);
-            sync_cuda();
-            const float inv_rows = 1.0f / std::max(rows, 1);
-            launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
-            sync_cuda();
-            loss = copy_scalar_from_device(d_loss) * inv_rows;
-            return {loss, grad};
+    if (use_gpu_fast_path(*this)) {
+        if (!gpu_custom_kernels_supported()) {
+            throw std::runtime_error(
+                "cross_entropy has no supported GPU kernel for this backend");
         }
+        float* d_loss = ce_loss_scratch();
+        if (d_loss == nullptr) {
+            throw std::runtime_error(
+                "cross_entropy could not allocate GPU loss scratch");
+        }
+        const cudaError_t clear_status =
+            cudaMemsetAsync(d_loss, 0, sizeof(float), nsos::gpu::current_stream());
+        if (clear_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cross_entropy GPU loss clear failed: ") +
+                cudaGetErrorString(clear_status));
+        }
+        auto& row_workspace = ce_row_workspace();
+        const auto staged = row_workspace.stage(target, nullptr);
+        Tensor row_losses;
+        if (determinism::deterministic_reductions_enabled()) {
+            row_losses = Tensor::uninitialized({rows}, Device::GPU);
+            if (!launch_fused_cross_entropy_deterministic(
+                d_loss, row_losses.raw_data(), grad.raw_data(), raw_data(),
+                staged.targets, nullptr, rows, classes)) {
+                throw std::runtime_error(
+                    "Deterministic cross-entropy launcher rejected invalid "
+                    "arguments");
+            }
+        } else {
+            launch_fused_cross_entropy(d_loss, grad.raw_data(), raw_data(),
+                                       staged.targets, rows, classes);
+        }
+        sync_cuda();
+        const float inv_rows = 1.0f / std::max(rows, 1);
+        launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
+        sync_cuda();
+        float downloaded_loss = 0.0f;
+        const cudaError_t download_status =
+            cudaMemcpy(&downloaded_loss, d_loss, sizeof(float),
+                       cudaMemcpyDeviceToHost);
+        record_gpu_stream_synchronization();
+        if (download_status != cudaSuccess) {
+            row_workspace.fail_consumer_completion(
+                download_status, "cross_entropy GPU loss download");
+        }
+        record_gpu_transfer(
+            Device::CPU, Device::GPU, sizeof(float));
+        row_workspace.complete_consumer();
+        loss = downloaded_loss * inv_rows;
+        return {loss, grad};
         // scratch alloc failed (rare) — fall through to the host CE path.
     }
 #endif
@@ -2434,6 +4504,72 @@ std::pair<float, Tensor> Tensor::cross_entropy(const std::vector<int>& target) c
     return {loss * inv_rows, grad};
 }
 
+std::pair<Tensor, Tensor> Tensor::cross_entropy_device(
+    const std::vector<int>& target) const {
+    const int rank = static_cast<int>(shape.size());
+    if (rank < 2) {
+        throw std::runtime_error("cross_entropy_device expects rank >= 2 logits");
+    }
+    const int classes = shape.back();
+    if (classes <= 0 || size % classes != 0 ||
+        size / classes > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(
+            "cross_entropy_device has an invalid logits shape");
+    }
+    const int rows = static_cast<int>(size / classes);
+    if (static_cast<int>(target.size()) != rows) {
+        throw std::runtime_error("cross_entropy_device target size mismatch");
+    }
+    for (int row = 0; row < rows; ++row) {
+        if (target[static_cast<size_t>(row)] < 0 ||
+            target[static_cast<size_t>(row)] >= classes) {
+            throw std::out_of_range(
+                "cross_entropy_device target out of range");
+        }
+    }
+
+#ifdef USE_CUDA
+    if (use_gpu_fast_path(*this)) {
+        if (!gpu_custom_kernels_supported()) {
+            throw std::runtime_error(
+                "cross_entropy_device has no supported GPU kernel for this backend");
+        }
+        Tensor device_loss = Tensor::zeros({1}, Device::GPU);
+        Tensor grad = Tensor::uninitialized(shape.dims, Device::GPU);
+        auto& row_workspace = ce_row_workspace();
+        const auto staged = row_workspace.stage(target, nullptr);
+        Tensor row_losses;
+        if (determinism::deterministic_reductions_enabled()) {
+            row_losses = Tensor::uninitialized({rows}, Device::GPU);
+            if (!launch_fused_cross_entropy_deterministic(
+                device_loss.raw_data(), row_losses.raw_data(),
+                grad.raw_data(), raw_data(), staged.targets, nullptr,
+                rows, classes)) {
+                throw std::runtime_error(
+                    "Deterministic device cross-entropy launcher rejected "
+                    "invalid arguments");
+            }
+        } else {
+            launch_fused_cross_entropy(
+                device_loss.raw_data(), grad.raw_data(), raw_data(),
+                staged.targets, rows, classes);
+        }
+        sync_cuda();
+        const float inv_rows = 1.0f / std::max(rows, 1);
+        launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
+        launch_scale_inplace_kernel(device_loss.raw_data(), inv_rows, 1);
+        sync_cuda();
+        row_workspace.record_consumer_completion();
+        return {std::move(device_loss), std::move(grad)};
+    }
+#endif
+
+    auto [loss, grad] = cross_entropy(target);
+    Tensor loss_tensor({1}, Device::CPU);
+    loss_tensor.data()[0] = loss;
+    return {std::move(loss_tensor), std::move(grad)};
+}
+
 std::pair<float, Tensor> Tensor::cross_entropy_weighted(
     const std::vector<int>& target,
     const std::vector<float>& row_weights) const {
@@ -2442,7 +4578,12 @@ std::pair<float, Tensor> Tensor::cross_entropy_weighted(
         throw std::runtime_error("cross_entropy_weighted expects rank >= 2 logits");
     }
     const int classes = shape.back();
-    const int rows = size / classes;
+    if (classes <= 0 || size % classes != 0 ||
+        size / classes > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(
+            "cross_entropy_weighted has an invalid logits shape");
+    }
+    const int rows = static_cast<int>(size / classes);
     if (static_cast<int>(target.size()) != rows ||
         static_cast<int>(row_weights.size()) != rows) {
         throw std::runtime_error("cross_entropy_weighted row count mismatch");
@@ -2459,32 +4600,67 @@ std::pair<float, Tensor> Tensor::cross_entropy_weighted(
         }
     }
 
-    Tensor grad(shape.dims, device);
+    // Targets were validated above, so every gradient row is overwritten.
+    Tensor grad = Tensor::uninitialized(shape.dims, device);
     float loss = 0.0f;
 
 #ifdef USE_CUDA
-    if (use_gpu_fast_path(*this) && gpu_custom_kernels_supported()) {
-        float* d_loss = ce_loss_scratch();
-        int* d_target = ce_target_scratch(rows);
-        float* d_weights = ce_weight_scratch(rows);
-        if (d_loss != nullptr && d_target != nullptr && d_weights != nullptr) {
-            cudaMemset(d_loss, 0, sizeof(float));
-            cudaMemcpy(d_target, target.data(),
-                       static_cast<size_t>(rows) * sizeof(int),
-                       cudaMemcpyHostToDevice);
-            cudaMemcpy(d_weights, row_weights.data(),
-                       static_cast<size_t>(rows) * sizeof(float),
-                       cudaMemcpyHostToDevice);
-            launch_fused_cross_entropy_weighted(
-                d_loss, grad.raw_data(), raw_data(), d_target, d_weights,
-                rows, classes);
-            sync_cuda();
-            const float inv_rows = 1.0f / std::max(rows, 1);
-            launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
-            sync_cuda();
-            loss = copy_scalar_from_device(d_loss) * inv_rows;
-            return {loss, grad};
+    if (use_gpu_fast_path(*this)) {
+        if (!gpu_custom_kernels_supported()) {
+            throw std::runtime_error(
+                "cross_entropy_weighted has no supported GPU kernel for "
+                "this backend");
         }
+        float* d_loss = ce_loss_scratch();
+        if (d_loss == nullptr) {
+            throw std::runtime_error(
+                "cross_entropy_weighted could not allocate GPU loss scratch");
+        }
+        const cudaError_t clear_status =
+            cudaMemsetAsync(d_loss, 0, sizeof(float), nsos::gpu::current_stream());
+        if (clear_status != cudaSuccess) {
+            throw std::runtime_error(
+                std::string(
+                    "cross_entropy_weighted GPU loss clear failed: ") +
+                cudaGetErrorString(clear_status));
+        }
+        auto& row_workspace = ce_row_workspace();
+        const auto staged =
+            row_workspace.stage(target, &row_weights);
+        Tensor row_losses;
+        if (determinism::deterministic_reductions_enabled()) {
+            row_losses = Tensor::uninitialized({rows}, Device::GPU);
+            if (!launch_fused_cross_entropy_deterministic(
+                d_loss, row_losses.raw_data(), grad.raw_data(), raw_data(),
+                staged.targets, staged.weights, rows, classes)) {
+                throw std::runtime_error(
+                    "Deterministic weighted cross-entropy launcher rejected "
+                    "invalid arguments");
+            }
+        } else {
+            launch_fused_cross_entropy_weighted(
+                d_loss, grad.raw_data(), raw_data(), staged.targets,
+                staged.weights, rows, classes);
+        }
+        sync_cuda();
+        const float inv_rows = 1.0f / std::max(rows, 1);
+        launch_scale_inplace_kernel(grad.raw_data(), inv_rows, grad.size);
+        sync_cuda();
+        float downloaded_loss = 0.0f;
+        const cudaError_t download_status =
+            cudaMemcpy(&downloaded_loss, d_loss, sizeof(float),
+                       cudaMemcpyDeviceToHost);
+        record_gpu_stream_synchronization();
+        if (download_status != cudaSuccess) {
+            row_workspace.fail_consumer_completion(
+                download_status,
+                "cross_entropy_weighted GPU loss download");
+        }
+        record_gpu_transfer(
+            Device::CPU, Device::GPU, sizeof(float));
+        row_workspace.complete_consumer();
+        loss = downloaded_loss * inv_rows;
+        return {loss, grad};
     }
 #endif
 
@@ -2522,14 +4698,157 @@ std::pair<float, Tensor> Tensor::cross_entropy_weighted(
     return {loss * inv_rows, grad};
 }
 
+std::pair<Tensor, Tensor> Tensor::cross_entropy_weighted_masked_sum_device(
+    const std::vector<int>& target,
+    const std::vector<float>& row_weights) const {
+    const int rank = static_cast<int>(shape.size());
+    if (rank < 2) {
+        throw std::runtime_error(
+            "cross_entropy_weighted_masked_sum expects rank >= 2 logits");
+    }
+    const int classes = shape.back();
+    if (classes <= 0 || size % classes != 0 ||
+        size / classes > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(
+            "cross_entropy_weighted_masked_sum has an invalid logits shape");
+    }
+    const int rows = static_cast<int>(size / classes);
+    if (static_cast<int>(target.size()) != rows ||
+        static_cast<int>(row_weights.size()) != rows) {
+        throw std::runtime_error(
+            "cross_entropy_weighted_masked_sum row count mismatch");
+    }
+    for (int row = 0; row < rows; ++row) {
+        const int target_value = target[static_cast<size_t>(row)];
+        if (target_value < -1 || target_value >= classes) {
+            throw std::out_of_range(
+                "cross_entropy_weighted_masked_sum target out of range");
+        }
+        const float weight_value = row_weights[static_cast<size_t>(row)];
+        if (!std::isfinite(weight_value) || weight_value < 0.0f) {
+            throw std::invalid_argument(
+                "cross_entropy_weighted_masked_sum requires finite "
+                "non-negative row weights");
+        }
+        if (target_value == -1 && weight_value != 0.0f) {
+            throw std::invalid_argument(
+                "cross_entropy_weighted_masked_sum ignored rows require "
+                "zero weight");
+        }
+    }
+
+    Tensor grad = Tensor::zeros(shape.dims, device);
+    float loss = 0.0f;
+
+#ifdef USE_CUDA
+    if (use_gpu_fast_path(*this)) {
+        if (!gpu_custom_kernels_supported()) {
+            throw std::runtime_error(
+                "cross_entropy_weighted_masked_sum has no supported GPU "
+                "kernel for this backend");
+        }
+        Tensor device_loss = Tensor::zeros({1}, Device::GPU);
+        float* d_loss = device_loss.raw_data();
+        auto& row_workspace = ce_row_workspace();
+        const auto staged =
+            row_workspace.stage(target, &row_weights);
+        Tensor row_losses;
+        if (determinism::deterministic_reductions_enabled()) {
+            row_losses = Tensor::uninitialized({rows}, Device::GPU);
+            if (!launch_fused_cross_entropy_deterministic(
+                d_loss, row_losses.raw_data(), grad.raw_data(), raw_data(),
+                staged.targets, staged.weights, rows, classes)) {
+                throw std::runtime_error(
+                    "Deterministic masked cross-entropy launcher rejected "
+                    "invalid arguments");
+            }
+        } else {
+            launch_fused_cross_entropy_weighted(
+                d_loss, grad.raw_data(), raw_data(), staged.targets,
+                staged.weights, rows, classes);
+        }
+        sync_cuda();
+        row_workspace.record_consumer_completion();
+        return {std::move(device_loss), std::move(grad)};
+    }
+#endif
+
+    const float* logits = data();
+    float* grad_ptr = grad.data();
+    for (int row = 0; row < rows; ++row) {
+        const int target_class = target[static_cast<size_t>(row)];
+        const float row_weight = row_weights[static_cast<size_t>(row)];
+        if (target_class < 0 || row_weight == 0.0f) {
+            continue;
+        }
+        const float* row_ptr =
+            logits + static_cast<size_t>(row) * classes;
+        float* grad_row =
+            grad_ptr + static_cast<size_t>(row) * classes;
+        float max_logit = row_ptr[0];
+        for (int col = 1; col < classes; ++col) {
+            max_logit = std::max(max_logit, row_ptr[col]);
+        }
+        double sum_exp = 0.0;
+        for (int col = 0; col < classes; ++col) {
+            const float value = std::exp(row_ptr[col] - max_logit);
+            grad_row[col] = value;
+            sum_exp += value;
+        }
+        const double inv_sum = 1.0 / sum_exp;
+        for (int col = 0; col < classes; ++col) {
+            grad_row[col] = row_weight *
+                static_cast<float>(grad_row[col] * inv_sum);
+        }
+        grad_row[target_class] -= row_weight;
+        loss += row_weight * static_cast<float>(
+            max_logit + std::log(sum_exp) - row_ptr[target_class]);
+    }
+    Tensor loss_tensor({1}, Device::CPU);
+    loss_tensor.data()[0] = loss;
+    return {std::move(loss_tensor), std::move(grad)};
+}
+
+std::pair<float, Tensor> Tensor::cross_entropy_weighted_masked_sum(
+    const std::vector<int>& target,
+    const std::vector<float>& row_weights) const {
+    auto result = cross_entropy_weighted_masked_sum_device(
+        target, row_weights);
+    Tensor host_loss = result.first.get_device() == Device::GPU
+                           ? result.first.cpu()
+                           : result.first;
+    if (host_loss.size != 1) {
+        throw std::logic_error(
+            "cross_entropy_weighted_masked_sum returned invalid loss scalar");
+    }
+    return {host_loss.data()[0], std::move(result.second)};
+}
+
 std::pair<float, Tensor> Tensor::mse_loss(const Tensor& target) const {
     if (size != target.size) {
         throw std::runtime_error("mse_loss shape mismatch");
     }
 
+    Tensor aligned_target =
+        target.shape == shape ? target : target.reshape(shape.dims);
+    if (aligned_target.get_device() != device) {
+        aligned_target = aligned_target.to(device);
+    }
+
+#ifdef USE_CUDA
+    if (device == Device::GPU && gpu_custom_kernels_supported()) {
+        Tensor diff = sub(aligned_target);
+        const float l2_norm = diff.norm();
+        const float inv_size =
+            1.0f / static_cast<float>(std::max<int64_t>(size, 1));
+        return {l2_norm * l2_norm * inv_size,
+                diff.mul(2.0f * inv_size)};
+    }
+#endif
+
     Tensor grad(shape.dims, device);
     const float* src = data();
-    const float* tgt = target.data();
+    const float* tgt = aligned_target.data();
     float* grad_ptr = grad.data();
     float loss = 0.0f;
 
@@ -2582,6 +4901,7 @@ Tensor Tensor::from_blob(void* ptr, std::vector<int> s, Device d, bool take_owne
         throw std::runtime_error("from_blob received null pointer for non-empty tensor");
     }
     bool source_host_accessible = d == Device::CPU;
+    int source_gpu_device = -1;
     if (t.size > 0 && d == Device::GPU) {
 #ifdef USE_CUDA
         cudaPointerAttributes attributes{};
@@ -2598,14 +4918,44 @@ Tensor Tensor::from_blob(void* ptr, std::vector<int> s, Device d, bool take_owne
             throw std::invalid_argument(
                 "from_blob Device::GPU rejects host-pointer storage");
         }
+        int selected_device = -1;
+        std::string selection_error;
+        if (!gpu::select_preferred_device(
+                &selected_device, &selection_error)) {
+            throw std::runtime_error(
+                "from_blob could not select a GPU: " +
+                selection_error);
+        }
+        if (attributes.type == cudaMemoryTypeDevice &&
+            attributes.device != selected_device) {
+            throw std::invalid_argument(
+                "from_blob rejects device storage owned by a different "
+                "GPU than the immutable NSOS device selection");
+        }
         source_host_accessible = attributes.type == cudaMemoryTypeManaged;
+        source_gpu_device = attributes.device;
 #else
         if (attributes.memoryType != cudaMemoryTypeDevice &&
             attributes.isManaged == 0) {
             throw std::invalid_argument(
                 "from_blob Device::GPU rejects host-pointer storage");
         }
+        int selected_device = -1;
+        std::string selection_error;
+        if (!gpu::select_preferred_device(
+                &selected_device, &selection_error)) {
+            throw std::runtime_error(
+                "from_blob could not select a GPU: " +
+                selection_error);
+        }
+        if (attributes.memoryType == cudaMemoryTypeDevice &&
+            attributes.device != selected_device) {
+            throw std::invalid_argument(
+                "from_blob rejects device storage owned by a different "
+                "GPU than the immutable NSOS device selection");
+        }
         source_host_accessible = attributes.isManaged != 0;
+        source_gpu_device = attributes.device;
 #endif
 #else
         throw std::runtime_error(
@@ -2613,7 +4963,9 @@ Tensor Tensor::from_blob(void* ptr, std::vector<int> s, Device d, bool take_owne
 #endif
     }
     if (take_ownership) {
-        t.data_ptr = std::shared_ptr<float>(static_cast<float*>(ptr), TensorDeleter(d));
+        t.data_ptr = std::shared_ptr<float>(
+            static_cast<float*>(ptr),
+            TensorDeleter(d, false, source_gpu_device));
         t.host_accessible_storage_ = source_host_accessible;
     } else {
         t = Tensor(s, d);

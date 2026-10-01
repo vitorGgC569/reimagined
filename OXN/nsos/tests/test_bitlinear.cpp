@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 using namespace nsos;
@@ -68,6 +69,22 @@ void test_forward() {
   assert(y.shape[1] == 2);
 
   std::cout << "Forward test passed!" << std::endl;
+}
+
+void test_precision_mode_validation() {
+  BitLinear layer(4, 2);
+  layer.set_precision_mode(2);
+  layer.set_precision_mode(8);
+  for (const int invalid : {1, 9}) {
+    bool rejected = false;
+    try {
+      layer.set_precision_mode(invalid);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+  std::cout << "Precision-mode validation test passed!" << std::endl;
 }
 
 void test_packed_fused_affine_matches_unfused_release() {
@@ -283,7 +300,7 @@ void test_supervised_batch_qat_heterogeneous_regression() {
             << std::endl;
 }
 
-void test_progressive_qat_gpu_training_keeps_reference_path() {
+void test_progressive_qat_gpu_training_uses_fake_quant_path() {
   if (!gpu_custom_kernels_supported()) {
     std::cout << "GPU not available; skipping GPU QAT reference-path test."
               << std::endl;
@@ -319,8 +336,14 @@ void test_progressive_qat_gpu_training_keeps_reference_path() {
   auto layers = model.collect_bitlinear_layers();
   assert(trainer.progressive_qat_active());
   assert(!layers.empty());
-  assert(layers.front()->reference_path_enabled());
-  std::cout << "GPU training keeps reference path under QAT test passed!"
+  assert(any_layer_quantized(model));
+  for (BitLinear* layer : layers) {
+    if (layer && layer->quantization_sensitive()) {
+      assert(layer->reference_path_enabled());
+    }
+  }
+  std::cout << "GPU QAT uses fake-quant path and preserves sensitive layers "
+               "test passed!"
             << std::endl;
 }
 
@@ -507,6 +530,7 @@ void test_reference_path_gradcheck() {
 int main() {
   test_quantization();
   test_forward();
+  test_precision_mode_validation();
   test_packed_fused_affine_matches_unfused_release();
   test_packed_loqa_backward_uses_normalized_input();
   test_canonical_ternary_rule_consistency();
@@ -515,7 +539,7 @@ int main() {
   test_progressive_qat_scheduler();
   test_progressive_qat_short_run_scaling();
   test_supervised_batch_qat_heterogeneous_regression();
-  test_progressive_qat_gpu_training_keeps_reference_path();
+  test_progressive_qat_gpu_training_uses_fake_quant_path();
   test_supervised_batch_qat_phase6_pattern_regression();
   return 0;
 }

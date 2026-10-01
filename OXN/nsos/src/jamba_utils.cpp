@@ -59,6 +59,9 @@ void prefix_parameter_names(std::vector<Parameter*>& params, const std::string& 
         if (!param) {
             continue;
         }
+        if (param->name_frozen()) {
+            continue;
+        }
         // Primeira visita nesta época: descarta o absoluto da passada anterior
         // e reconstrói do base_name (folha).  Visitas seguintes (níveis acima
         // na MESMA época) compõem o relativo já construído.  (Chamadas

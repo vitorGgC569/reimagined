@@ -3,9 +3,12 @@
 
 #include "autograd.h"
 #include "tensor.h"
+#include <memory>
 #include <vector>
 
 namespace nsos {
+
+struct EmbeddingGpuWorkspace;
 
 class Embedding {
 public:
@@ -51,7 +54,8 @@ public:
                       const std::vector<std::vector<int>>& indices_batch);
   void to(Device dev);
   std::vector<Parameter *> parameters() {
-    weight.name = weight.base_name;
+    weight.assign_relative_name(
+        weight.base_name.empty() ? std::string("weight") : weight.base_name);
     return {&weight};
   }
 
@@ -132,6 +136,13 @@ public:
   mutable std::vector<int8_t> slender_cached_weights_;
   mutable float slender_cached_beta_ = 0.0f;
   mutable uint64_t slender_cached_weight_version_ = 0;
+
+  // Persistent GPU ID staging. A forward/backward pair reuses the same pinned
+  // host and device buffers; capacity grows geometrically and never performs
+  // cudaMalloc/cudaFree in the steady-state training loop. shared_ptr keeps the
+  // GPU implementation type out of this public header and permits CPU-only
+  // builds without vendor runtime types leaking into the ABI.
+  std::shared_ptr<EmbeddingGpuWorkspace> gpu_workspace_;
 };
 
 } // namespace nsos

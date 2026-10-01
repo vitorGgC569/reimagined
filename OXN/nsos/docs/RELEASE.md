@@ -8,7 +8,7 @@ Run from the repository root:
 
 ```powershell
 cmake -S .\OXN\nsos -B .\OXN\nsos\build-mvp `
-  -DNSOS_ENABLE_CUDA=OFF `
+  -DNSOS_GPU_BACKEND=NONE `
   -DNSOS_BUILD_PYTHON=ON `
   -DNSOS_BUILD_TESTS=ON `
   -DNSOS_BUILD_CLI=ON `
@@ -38,7 +38,7 @@ python .\OXN\nsos\scripts\fuzz_surface_smoke.py `
 ```powershell
 cargo test --manifest-path .\modules\oxtamem\oxta_engine\Cargo.toml --all-targets
 cargo clippy --manifest-path .\modules\oxtamem\oxta_engine\Cargo.toml --all-targets -- -D warnings
-python -m compileall -q .\modules\oxtamem\python .\modules\oxtamem\oxta_engine\python .\modules\oxtamem\nn
+python -m compileall -q .\modules\oxtamem\python .\modules\oxtamem\nn
 ```
 
 ## Docker Gate
@@ -62,4 +62,7 @@ A product release is ready only when:
 - `git status --short` is clean except ignored local build artifacts
 - no build/cache/checkpoint/log artifacts are staged
 
-GPU lanes are optional until `NSOS_GPU_CI=true` is enabled and consistently green.
+GPU remains experimental until the real-hardware and backend-appropriate
+memory-checker lanes in `PRODUCT.md` are closed. CPU/Rust release gates do not
+certify either HIP or CUDA. Opt-in training redesign results and unresolved
+limits are recorded in `GPU_TRAINING_REDESIGN_2026-09-29.md`.

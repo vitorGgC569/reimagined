@@ -2,8 +2,10 @@
 
 #ifdef USE_CUDA
 
-#include <cuda_runtime.h>
+#include "gpu_backend.h"
+#include <climits>
 #include <math.h>
+#include <stdexcept>
 
 namespace nsos {
 namespace cuda {
@@ -434,11 +436,15 @@ __global__ void sparse_selector_distill_deterministic_kernel(
 }  // namespace
 
 void launch_sparse_block_means(const float* k, float* bm, int n, int d, int B) {
-    const int nb = (n + B - 1) / B;
+    if (n <= 0 || d <= 0 || B <= 0) return;
+    const int nb = gpu::ceil_div_positive(n, B);
+    if (nb > INT_MAX / d) {
+        throw std::overflow_error(
+            "sparse block-means grid exceeds INT_MAX elements");
+    }
     const int total = nb * d;
-    if (total <= 0) return;
-    const int blocks = (total + 255) / 256;
-    sparse_block_means_kernel<<<blocks, 256>>>(k, bm, n, d, B, nb);
+    const int blocks = gpu::ceil_div_positive(total, 256);
+    sparse_block_means_kernel<<<blocks, 256, 0, nsos::gpu::current_stream()>>>(k, bm, n, d, B, nb);
 }
 
 void launch_sparse_selective_attention(const float* q, const float* k,
@@ -447,8 +453,8 @@ void launch_sparse_selective_attention(const float* q, const float* k,
                                        int B, int top_k, int local_blocks,
                                        int sink_blocks, float scale) {
     if (n <= 0) return;
-    const int blocks = (n + 127) / 128;
-    sparse_selective_attention_kernel<<<blocks, 128>>>(
+    const int blocks = gpu::ceil_div_positive(n, 128);
+    sparse_selective_attention_kernel<<<blocks, 128, 0, nsos::gpu::current_stream()>>>(
         q, k, v, route, bm, out, n, d, B, top_k, local_blocks, sink_blocks, scale);
 }
 
@@ -459,7 +465,7 @@ void launch_sparse_selective_attention_decode(
     int sink_blocks, float scale) {
     if (cached_tokens <= 0 || d <= 0 || d > kSparseDimMax ||
         top_k < 0 || top_k > kSparseTopKMax) return;
-    sparse_selective_attention_decode_kernel<<<1, 1>>>(
+    sparse_selective_attention_decode_kernel<<<1, 1, 0, nsos::gpu::current_stream()>>>(
         q_current, k_cache, v_cache, route_current, block_means, out,
         cached_tokens, d, B, top_k, local_blocks, sink_blocks, scale);
 }
@@ -472,13 +478,13 @@ void launch_sparse_selective_attention_backward(
     if (n <= 0 || d <= 0 || d > kSparseDimMax ||
         top_k < 0 || top_k > kSparseTopKMax) return;
     if (deterministic) {
-        sparse_selective_attention_backward_deterministic_kernel<<<1, 1>>>(
+        sparse_selective_attention_backward_deterministic_kernel<<<1, 1, 0, nsos::gpu::current_stream()>>>(
             q, k, v, route, bm, d_out, d_q, d_k, d_v, n, d, B, top_k,
             local_blocks, sink_blocks, scale);
         return;
     }
-    const int blocks = (n + 127) / 128;
-    sparse_selective_attention_backward_kernel<<<blocks, 128>>>(
+    const int blocks = gpu::ceil_div_positive(n, 128);
+    sparse_selective_attention_backward_kernel<<<blocks, 128, 0, nsos::gpu::current_stream()>>>(
         q, k, v, route, bm, d_out, d_q, d_k, d_v, n, d, B, top_k,
         local_blocks, sink_blocks, scale);
 }
@@ -487,16 +493,16 @@ void launch_sparse_selector_distill(
     const float* q, const float* k, const float* block_means,
     const float* w_selector, float* d_w, float* loss, float* count,
     int n, int d, int B, float scale, bool deterministic) {
-    const int blocks_per_sequence = (n + max(B, 1) - 1) / max(B, 1);
-    if (n <= 0 || d <= 0 || d > kSparseDimMax || B <= 0 ||
-        blocks_per_sequence > kSparseBlockMax) return;
+    if (n <= 0 || d <= 0 || d > kSparseDimMax || B <= 0) return;
+    const int blocks_per_sequence = gpu::ceil_div_positive(n, B);
+    if (blocks_per_sequence > kSparseBlockMax) return;
     if (deterministic) {
-        sparse_selector_distill_deterministic_kernel<<<1, 1>>>(
+        sparse_selector_distill_deterministic_kernel<<<1, 1, 0, nsos::gpu::current_stream()>>>(
             q, k, block_means, w_selector, d_w, loss, count, n, d, B, scale);
         return;
     }
-    const int blocks = (n + 127) / 128;
-    sparse_selector_distill_kernel<<<blocks, 128>>>(
+    const int blocks = gpu::ceil_div_positive(n, 128);
+    sparse_selector_distill_kernel<<<blocks, 128, 0, nsos::gpu::current_stream()>>>(
         q, k, block_means, w_selector, d_w, loss, count, n, d, B, scale);
 }
 

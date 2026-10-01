@@ -5,6 +5,8 @@
 #include <cmath>
 #include <iostream>
 #include <queue>
+#include <stdexcept>
+#include <string>
 
 namespace nsos {
 
@@ -20,10 +22,13 @@ uint64_t hash_tensor_state(const Tensor& tensor) {
   constexpr uint64_t kOffset = 1469598103934665603ull;
   constexpr uint64_t kPrime = 1099511628211ull;
   uint64_t hash = kOffset;
-  const float* data = tensor.data();
+  // Tensor::data() is a device pointer for GPU tensors. Dereferencing it on
+  // the host caused Windows fast-fail 0xC0000409 during GPU E2E reasoning.
+  Tensor host_tensor =
+      tensor.get_device() == Device::GPU ? tensor.cpu() : tensor;
+  const float* data = host_tensor.data();
   if (data != nullptr) {
-    const int sample_count = static_cast<int>(std::min<int64_t>(tensor.size, 128));
-    for (int i = 0; i < sample_count; ++i) {
+    for (int64_t i = 0; i < host_tensor.size; ++i) {
       const auto* bytes = reinterpret_cast<const unsigned char*>(&data[i]);
       for (size_t j = 0; j < sizeof(float); ++j) {
         hash ^= static_cast<uint64_t>(bytes[j]);
@@ -43,6 +48,192 @@ uint64_t hash_tensor_state(const Tensor& tensor) {
 
 } // namespace
 
+void ReasoningPolicy::validate() const {
+  if (policy_id.empty() || verifier_id.empty() || !propose || !verify) {
+    throw std::logic_error(
+        "Verified reasoning requires versioned proposal and correctness-verifier callbacks; "
+        "LM confidence is not a correctness verifier");
+  }
+}
+
+ReasoningPolicy::Verifier exact_token_verifier(
+    std::vector<int> expected,
+    std::function<std::vector<int>(const Tensor&)> decode) {
+  if (expected.empty() || !decode) {
+    throw std::invalid_argument("Exact-token verification requires an answer and decoder");
+  }
+  return [expected = std::move(expected), decode = std::move(decode)](
+             const std::vector<Tensor>& states) {
+    std::vector<ReasoningVerification> values;
+    values.reserve(states.size());
+    for (const auto& state : states) {
+      const bool correct = decode(state) == expected;
+      values.push_back({correct ? 1.0f : 0.0f,
+                        correct ? "exact_token_match" : "exact_token_mismatch"});
+    }
+    return values;
+  };
+}
+
+VerifiedReasoningResult run_verified_reasoning(
+    const Tensor& root, const ReasoningPolicy& policy, const MCTSConfig& config) {
+  policy.validate();
+  if (root.size == 0 || config.num_simulations < 1 || config.max_depth < 1 ||
+      config.num_children_per_expansion < 1 || config.max_nodes < 1 ||
+      config.time_limit.count() < 0 || !std::isfinite(config.c_puct_init) ||
+      config.c_puct_init < 0) {
+    throw std::invalid_argument("Invalid verified reasoning state/budget");
+  }
+  const auto start = std::chrono::steady_clock::now();
+  VerifiedReasoningResult result;
+  result.report.policy_id = policy.policy_id;
+  result.report.verifier_id = policy.verifier_id;
+  struct Node {
+    Tensor state;
+    Tensor host; // one download for validation and exact cycle/dedup checks
+    uint64_t hash;
+    int parent;
+    int depth;
+    float prior;
+    float value;
+    int visits = 0;
+    double value_sum = 0;
+    bool expanded = false;
+    std::vector<size_t> children;
+  };
+  std::vector<Node> nodes;
+  const size_t budget = std::min(static_cast<size_t>(config.num_simulations),
+                                 config.max_nodes);
+  nodes.reserve(std::min<size_t>(budget, 4096));
+  auto host_state = [&](const Tensor& state) {
+    if (state.shape != root.shape || state.get_device() != root.get_device()) {
+      throw std::runtime_error("Reasoning proposal changed shape/device");
+    }
+    Tensor host = state.get_device() == Device::GPU ? state.cpu() : state.clone();
+    for (int64_t i = 0; i < host.size; ++i) {
+      if (!std::isfinite(host.data()[i])) {
+        throw std::runtime_error("Reasoning state contains non-finite values");
+      }
+    }
+    return host;
+  };
+  auto verify = [&](const std::vector<Tensor>& states) {
+    // Isolate search-owned tensors from callback mutation, including on CPU.
+    std::vector<Tensor> inputs;
+    for (const auto& state : states) inputs.push_back(state.clone());
+    auto values = policy.verify(inputs);
+    if (values.size() != states.size()) {
+      throw std::runtime_error("Correctness verifier cardinality mismatch");
+    }
+    for (const auto& value : values) {
+      if (!std::isfinite(value.score) || value.score < 0 || value.score > 1 ||
+          value.evidence.empty()) {
+        throw std::runtime_error("Correctness verifier requires score in [0,1] and evidence");
+      }
+    }
+    result.report.evaluated_states += static_cast<int>(states.size());
+    return values;
+  };
+  Tensor root_copy = root.clone();
+  Tensor root_host = host_state(root_copy);
+  auto initial = verify({root_copy}).front();
+  nodes.push_back({root_copy, root_host, hash_tensor_state(root_host), -1, 0,
+                   1.0f, initial.score});
+  result.state = root_copy.clone();
+  result.report.baseline_score = initial.score;
+  result.report.best_score = initial.score;
+  result.report.evidence = initial.evidence;
+  auto expired = [&] {
+    return config.time_limit.count() > 0 &&
+           std::chrono::steady_clock::now() - start >= config.time_limit;
+  };
+  auto backpropagate = [&](size_t index, float value) {
+    for (int current = static_cast<int>(index); current >= 0; current = nodes[current].parent) {
+      ++nodes[current].visits;
+      nodes[current].value_sum += value;
+    }
+  };
+  backpropagate(0, initial.score);
+  // One deterministic, correctness-scored tree. Each state is verified once;
+  // root is a candidate and the final result can never score below it.
+  for (int simulation = 0; simulation < config.num_simulations &&
+       nodes.size() < budget && result.report.best_score < 1.0f && !expired(); ++simulation) {
+    size_t index = 0;
+    while (nodes[index].expanded && !nodes[index].children.empty()) {
+      size_t best = nodes[index].children.front();
+      double best_uct = -std::numeric_limits<double>::infinity();
+      for (size_t child : nodes[index].children) {
+        const auto& c = nodes[child];
+        const double uct = c.value_sum / std::max(c.visits, 1) +
+            config.c_puct_init * c.prior * std::sqrt(double(nodes[index].visits)) /
+            (1.0 + c.visits);
+        if (uct > best_uct) { best_uct = uct; best = child; }
+      }
+      index = best;
+    }
+    if (nodes[index].expanded || nodes[index].depth >= config.max_depth) {
+      backpropagate(index, nodes[index].value);
+      continue;
+    }
+    const int limit = static_cast<int>(std::min<size_t>(
+        config.num_children_per_expansion, budget - nodes.size()));
+    auto proposed = policy.propose(nodes[index].state.clone(), nodes[index].depth, limit);
+    ++result.report.proposal_calls;
+    if (proposed.size() > static_cast<size_t>(limit)) {
+      throw std::runtime_error("Proposal policy exceeded candidate budget");
+    }
+    nodes[index].expanded = true;
+    std::vector<Tensor> states, hosts;
+    std::vector<uint64_t> hashes;
+    std::vector<float> priors;
+    double prior_sum = 0;
+    for (const auto& candidate : proposed) {
+      if (!std::isfinite(candidate.prior) || candidate.prior < 0) {
+        throw std::runtime_error("Proposal prior must be finite and nonnegative");
+      }
+      Tensor host = host_state(candidate.state);
+      const uint64_t hash = hash_tensor_state(host);
+      auto equal = [&](uint64_t other_hash, const Tensor& other) {
+        if (hash != other_hash) return false;
+        return std::equal(host.data(), host.data() + host.size, other.data());
+      };
+      bool duplicate = false;
+      for (const auto& node : nodes) duplicate |= equal(node.hash, node.host);
+      for (size_t i = 0; i < hosts.size(); ++i) duplicate |= equal(hashes[i], hosts[i]);
+      if (duplicate) continue;
+      states.push_back(candidate.state.clone());
+      hosts.push_back(std::move(host));
+      hashes.push_back(hash);
+      priors.push_back(candidate.prior);
+      prior_sum += candidate.prior;
+    }
+    if (states.empty() || expired()) {
+      backpropagate(index, nodes[index].value);
+      continue;
+    }
+    if (!(prior_sum > 0) || !std::isfinite(prior_sum)) {
+      throw std::runtime_error("Proposal priors must have positive finite mass");
+    }
+    const auto verified = verify(states);
+    for (size_t i = 0; i < states.size(); ++i) {
+      const size_t child = nodes.size();
+      const int depth = nodes[index].depth + 1;
+      nodes.push_back({states[i], hosts[i], hashes[i], static_cast<int>(index), depth,
+                       static_cast<float>(priors[i] / prior_sum), verified[i].score});
+      nodes[index].children.push_back(child);
+      backpropagate(child, verified[i].score);
+      if (verified[i].score > result.report.best_score) {
+        result.state = states[i].clone();
+        result.report.best_score = verified[i].score;
+        result.report.evidence = verified[i].evidence;
+      }
+    }
+  }
+  result.report.elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start).count();
+  return result;
+}
+
 // ============================================================================
 // ReasoningNode Implementation
 // ============================================================================
@@ -57,13 +248,7 @@ void ReasoningNode::init(const Tensor &s, float p, ReasoningNode *par, int d) {
   children.clear();
 
   // Hash simples do estado para detecção de ciclos
-  state_hash = 0;
-  const float *data = s.data();
-  if (data) {
-    for (int i = 0; i < std::min<int64_t>(s.size, 100); ++i) { // Sample para eficiência
-      state_hash = state_hash * 31 + std::hash<float>{}(data[i]);
-    }
-  }
+  state_hash = hash_tensor_state(s);
 }
 
 bool ReasoningNode::is_fully_expanded() const {
@@ -260,7 +445,7 @@ void MCTSReasoning::search() {
         node->depth < config_.max_depth) {
       value = expand_and_evaluate(node);
     } else {
-      value = evaluator_(node->state);
+      value = evaluate_state(node->state);
     }
 
     backpropagate(node, value);
@@ -368,13 +553,25 @@ Tensor MCTSReasoning::search_ultraplan(int num_agents) {
 
   float global_best_score = -std::numeric_limits<float>::infinity();
   Tensor global_best_state;
+  int aggregate_root_visits = 0;
+  float aggregate_root_value = 0.0f;
   for (const auto& agent : agents) {
+    aggregate_root_visits +=
+        agent->root_->visits.load(std::memory_order_relaxed);
+    aggregate_root_value +=
+        agent->root_->value_sum.load(std::memory_order_relaxed);
     const float value = agent->get_best_value();
     if (value > global_best_score) {
       global_best_score = value;
       global_best_state = agent->get_best_state();
     }
   }
+  // UltraPlan performs the search in isolated agent-owned trees. Reflect the
+  // completed work in the public root statistics before those trees are
+  // destroyed; otherwise root_visits() incorrectly reports zero after a
+  // successful parallel search.
+  root_->visits.fetch_add(aggregate_root_visits, std::memory_order_relaxed);
+  root_->value_sum.store(aggregate_root_value, std::memory_order_relaxed);
 
   return global_best_state.size > 0 ? global_best_state : root_->state.clone();
 }
@@ -437,7 +634,7 @@ float MCTSReasoning::uct_score(const ReasoningNode *child,
 float MCTSReasoning::expand_and_evaluate(ReasoningNode *node) {
   auto evaluable_children = expand_children(node);
   if (evaluable_children.empty()) {
-    return evaluator_(node->state);
+    return evaluate_state(node->state);
   }
 
   std::vector<Tensor> batch_states;
@@ -466,20 +663,6 @@ void MCTSReasoning::backpropagate(ReasoningNode *node, float value) {
 
     node = node->parent;
   }
-}
-
-float MCTSReasoning::rollout(ReasoningNode *node, int depth) {
-  if (depth >= config_.max_depth) {
-    return evaluator_(node->state);
-  }
-
-  auto random_states = expansion_strategy_->expand(node->state, 1, depth, rng_);
-
-  if (random_states.empty()) {
-    return evaluator_(node->state);
-  }
-
-  return evaluator_(random_states[0]);
 }
 
 bool MCTSReasoning::is_cycle(const ReasoningNode *node,
@@ -550,6 +733,15 @@ void MCTSReasoning::set_batch_evaluator(BatchEvaluator evaluator) {
   batch_evaluator_ = std::move(evaluator);
 }
 
+float MCTSReasoning::evaluate_state(const Tensor& state) const {
+  const float value = evaluator_(state);
+  if (!std::isfinite(value)) {
+    throw std::runtime_error(
+        "MCTS scalar evaluator returned a non-finite value");
+  }
+  return value;
+}
+
 std::vector<ReasoningNode *> MCTSReasoning::expand_children(ReasoningNode *node) {
   auto child_states = expansion_strategy_->expand(
       node->state, config_.num_children_per_expansion, node->depth, rng_);
@@ -558,13 +750,7 @@ std::vector<ReasoningNode *> MCTSReasoning::expand_children(ReasoningNode *node)
   std::vector<ReasoningNode *> evaluable_children;
   evaluable_children.reserve(child_states.size());
   for (size_t k = 0; k < child_states.size(); ++k) {
-    uint64_t hash = 0;
-    const float *data = child_states[k].data();
-    if (data) {
-      for (int i = 0; i < std::min<int64_t>(child_states[k].size, 100); ++i) {
-        hash = hash * 31 + std::hash<float>{}(data[i]);
-      }
-    }
+    const uint64_t hash = hash_tensor_state(child_states[k]);
 
     if (is_cycle(node, hash)) {
       continue;
@@ -589,13 +775,24 @@ std::vector<float> MCTSReasoning::evaluate_states(const std::vector<Tensor>& sta
 
   if (batch_evaluator_) {
     values = batch_evaluator_(states);
-  }
-
-  if (values.size() != states.size()) {
-    values.clear();
+    if (values.size() != states.size()) {
+      throw std::runtime_error(
+          "MCTS batch evaluator contract violation: expected " +
+          std::to_string(states.size()) + " values, received " +
+          std::to_string(values.size()));
+    }
+  } else {
     values.reserve(states.size());
     for (const Tensor& state : states) {
-      values.push_back(evaluator_(state));
+      values.push_back(evaluate_state(state));
+    }
+  }
+
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (!std::isfinite(values[index])) {
+      throw std::runtime_error(
+          "MCTS evaluator returned a non-finite value at batch index " +
+          std::to_string(index));
     }
   }
 

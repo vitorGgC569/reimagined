@@ -3,11 +3,23 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <stdexcept>
+#include <limits>
 
 using namespace nsos;
 
 int main() {
+  for (int invalid : {0,-1,std::numeric_limits<int>::max()}) {
+    bool rejected=false;
+    try { BitFastKANLayer malformed(invalid,3,6); }
+    catch (const std::invalid_argument&) { rejected=true; }
+    if (!rejected) throw std::runtime_error("KAN invalid/overflow geometry accepted");
+  }
   BitFastKANLayer layer(4, 3, 6);
+  bool wrong_feature_rejected=false;
+  try { layer.forward(Tensor::ones({2,4,5},Device::CPU)); }
+  catch (const std::invalid_argument&) { wrong_feature_rejected=true; }
+  if (!wrong_feature_rejected) throw std::runtime_error("KAN reinterpreted rank3 feature mismatch");
 
   Tensor x({2, 5, 4}, Device::CPU);
   for (int i = 0; i < x.size; ++i) {

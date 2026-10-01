@@ -28,7 +28,7 @@
       "release_gates": [
         "cargo test --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets",
         "cargo clippy --manifest-path modules/oxtamem/oxta_engine/Cargo.toml --all-targets -- -D warnings",
-        "python -m compileall over modules/oxtamem/python, modules/oxtamem/oxta_engine/python, and modules/oxtamem/nn"
+        "python -m compileall over modules/oxtamem/python and modules/oxtamem/nn"
       ]
     }
   ],

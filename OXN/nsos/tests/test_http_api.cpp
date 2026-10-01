@@ -42,6 +42,15 @@ void require(bool condition, const std::string& message) {
     }
 }
 
+void set_ipv4_address(sockaddr_in& address, const std::string& host) {
+#ifdef _WIN32
+    const int status = InetPtonA(AF_INET, host.c_str(), &address.sin_addr);
+#else
+    const int status = inet_pton(AF_INET, host.c_str(), &address.sin_addr);
+#endif
+    require(status == 1, "invalid IPv4 address: " + host);
+}
+
 void send_all_or_throw(SOCKET socket_fd, const std::string& bytes) {
     size_t sent_total = 0;
     while (sent_total < bytes.size()) {
@@ -66,7 +75,7 @@ std::string send_http_request(const std::string& host, int port, const std::stri
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
-    address.sin_addr.s_addr = inet_addr(host.c_str());
+    set_ipv4_address(address, host);
     require(connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
             "connect failed");
 
@@ -119,7 +128,7 @@ std::string send_chunked_http_request(const std::string& host, int port, const s
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
-    address.sin_addr.s_addr = inet_addr(host.c_str());
+    set_ipv4_address(address, host);
     require(connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
             "connect failed");
 
@@ -190,7 +199,11 @@ int main() {
         server_config.max_train_steps = 8;
 
         HttpApiServer server(engine, server_config);
+        engine.request_training_cancellation();
         require(server.start(), "server.start failed");
+        require(!engine.training_cancellation_requested(),
+                "server.start retained a cancellation request from an old "
+                "lifecycle");
 
         std::thread server_thread([&]() { server.serve_forever(); });
         ServerThreadGuard server_thread_guard{&server, &server_thread};
@@ -446,6 +459,33 @@ int main() {
         require(disabled_train.find("403 Forbidden") != std::string::npos,
                 "train-text should be disabled without admin flag");
         locked_server.stop();
+
+        HttpApiServerConfig tls_config = locked_config;
+        tls_config.auth_token = "container-health-secret";
+        tls_config.allow_unauthenticated_health = false;
+        tls_config.trust_proxy_headers = true;
+        tls_config.require_tls_proxy_header = true;
+        tls_config.trusted_proxy_ips = {"127.0.0.2"};
+        HttpApiServer tls_server(locked_engine, tls_config);
+        require(tls_server.start(), "TLS proxy server did not start");
+        std::thread tls_thread([&]() { tls_server.serve_forever(); });
+        ServerThreadGuard tls_guard{&tls_server, &tls_thread};
+        const std::vector<std::string> tls_auth = {
+            "Authorization: Bearer container-health-secret"};
+        const auto local_ready = send_http_request("127.0.0.1", tls_server.port(),
+            "GET", "/ready", {}, tls_auth);
+        require(local_ready.find("200 OK") != std::string::npos,
+                "authenticated loopback readiness must not require a proxy header");
+        const auto no_auth_ready = send_http_request("127.0.0.1", tls_server.port(),
+            "GET", "/ready", {}, {});
+        require(no_auth_ready.find("401 Unauthorized") != std::string::npos,
+                "loopback readiness must still require authentication");
+        const auto insecure_info = send_http_request("127.0.0.1", tls_server.port(),
+            "GET", "/info", {}, tls_auth);
+        require(insecure_info.find("426 Upgrade Required") != std::string::npos &&
+                    insecure_info.find("https_required") != std::string::npos,
+                "health exception must not bypass TLS enforcement on other routes");
+        tls_server.stop();
 
         std::cout << "HTTP API hardening test passed!" << std::endl;
         return 0;

@@ -78,6 +78,7 @@ def run(adapter: ModelAdapter, *, split: str = "test",
         primary_metric=PRIMARY_METRIC,
         metrics={
             "ppl": result["ppl"],
+            "nll_sum": result["nll_sum"],
             "nll_per_token": result["nll_sum"] / max(result["n_tokens"], 1),
             "n_tokens": float(result["n_tokens"]),
             "n_windows": float(result["n_windows"]),

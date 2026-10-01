@@ -2,9 +2,10 @@
 """Fail-closed NSOS GPU release validation.
 
 This runner is intentionally stricter than the ordinary developer CTest flow.
-It requires a real CUDA device, builds only CUDA release-gate targets, executes
+It requires a real CUDA device, builds the configured target graph, executes
 the complete GPU suite, proves the DP4A/checkpoint/mixed-precision contracts,
-runs Compute Sanitizer memcheck, and emits a hash-addressed evidence bundle.
+runs the synchronized microbenchmark and Compute Sanitizer memcheck, and emits
+a hash-addressed evidence bundle.
 
 The process exits non-zero on every missing prerequisite, unsupported device,
 failed assertion, skipped test, sanitizer finding, or incomplete evidence file.
@@ -16,6 +17,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -24,43 +26,20 @@ import shutil
 import subprocess
 import sys
 import traceback
+import xml.etree.ElementTree as ET
 from typing import Any, Iterable, Sequence
 
+from oxta_contabil.benchmark_policy import configured_test_inventory
 
-GPU_TEST_TARGETS = (
-    "test_gpu_parity",
-    "test_mamba_parallel_scan_parity",
-    "test_gpu_parity_basic",
-    "test_gpu_parity_bitlinear",
-    "test_gpu_parity_mamba_stream",
-    "test_gpu_parity_mamba_scan",
-    "test_gpu_parity_mamba_proper",
-    "test_gpu_parity_mamba_proper_stream",
-    "test_gpu_parity_mamba_nstate_stream",
-    "test_gpu_parity_decode_incremental",
-    "test_gpu_parity_mamba_nstate",
-    "test_gpu_parity_mamba_faithful",
-    "test_gpu_parity_jamba",
-    "test_gpu_parity_moe_router",
-    "test_gpu_parity_moe_batched",
-    "test_gpu_parity_bitnet_dispatch",
-    "test_gpu_parity_kan",
-    "test_gpu_parity_sparse_attention",
-    "test_gpu_parity_jamba_sparse",
-    "test_gpu_parity_bitlinear_dp4a",
-    "test_gpu_model_pack_dp4a_lifecycle",
-    "test_gpu_device_memory_contract",
-    "test_gpu_checkpoint_v8_continuation",
-    "test_gpu_mixed_precision_contract",
-)
 
-GPU_BUILD_TARGETS = (*GPU_TEST_TARGETS, "bench_gpu_vs_cpu")
+# CTest uses CMake/POSIX-style capture groups, not Python-only (?:...).
+GPU_CTEST_PATTERN = r"^(test_gpu_.*|test_mamba_parallel_scan_parity)$"
 
 SANITIZER_TARGETS = (
     "test_gpu_device_memory_contract",
     "test_gpu_model_pack_dp4a_lifecycle",
     "test_gpu_parity_decode_incremental",
-    "test_gpu_checkpoint_v8_continuation",
+    "test_gpu_checkpoint_continuation",
     "test_gpu_mixed_precision_contract",
 )
 
@@ -74,6 +53,17 @@ STRICT_GPU_ENV = {
 
 class ValidationFailure(RuntimeError):
     """An expected fail-closed validation failure."""
+
+
+def configured_gpu_test_names(build_dir: pathlib.Path) -> list[str]:
+    try:
+        inventory = configured_test_inventory(build_dir)
+    except RuntimeError as error:
+        raise ValidationFailure(str(error)) from error
+    names = sorted(name for name in inventory["tests"] if re.fullmatch(GPU_CTEST_PATTERN, name))
+    if not names:
+        raise ValidationFailure("configured GPU CTest inventory is empty")
+    return names
 
 
 def utc_now() -> str:
@@ -332,8 +322,6 @@ def configure_and_build(
             str(build_dir),
             "--parallel",
             str(jobs),
-            "--target",
-            *GPU_BUILD_TARGETS,
         ],
         cwd=source_dir,
         env=env,
@@ -341,29 +329,37 @@ def configure_and_build(
     )
 
 
-def verify_junit(junit_path: pathlib.Path) -> dict[str, int]:
-    text = junit_path.read_text(encoding="utf-8")
+def verify_junit(junit_path: pathlib.Path, expected_tests: Sequence[str]) -> dict[str, int]:
+    """Require each configured GPU test to have actually run and passed once."""
+    try:
+        suite = ET.parse(junit_path).getroot()
+        if suite.tag != "testsuite":
+            raise ValueError("expected a CTest testsuite root")
 
-    def required_attribute(name: str) -> int:
-        match = re.search(rf'\b{name}="(\d+)"', text)
-        if not match:
-            raise ValidationFailure(f"JUnit lacks required attribute {name!r}")
-        return int(match.group(1))
+        def count(name: str, default: str | None = None) -> int:
+            value = suite.attrib[name] if default is None else suite.get(name, default)
+            if re.fullmatch(r"[0-9]+", value) is None:
+                raise ValueError(f"invalid JUnit {name} count: {value!r}")
+            return int(value)
 
-    counts = {
-        "tests": required_attribute("tests"),
-        "failures": required_attribute("failures"),
-        "disabled": required_attribute("disabled"),
-        "skipped": required_attribute("skipped"),
-    }
-    expected = len(GPU_TEST_TARGETS)
-    if counts != {
-        "tests": expected,
-        "failures": 0,
-        "disabled": 0,
-        "skipped": 0,
-    }:
-        raise ValidationFailure(f"GPU JUnit is not fail-closed green: {counts}")
+        counts = {key: count(key) for key in ("tests", "failures", "disabled", "skipped")}
+        # CTest does not always emit errors; if present it must also be zero.
+        errors = count("errors", "0")
+    except (OSError, ET.ParseError, KeyError, ValueError) as error:
+        raise ValidationFailure(f"invalid GPU JUnit: {error}") from error
+
+    cases = suite.findall("testcase")
+    actual = [case.get("name", "") for case in cases]
+    expected = sorted(expected_tests)
+    green = {"tests": len(expected), "failures": 0, "disabled": 0, "skipped": 0}
+    if (not expected or len(expected) != len(set(expected)) or sorted(actual) != expected or
+            suite.findall(".//testcase") != cases or counts != green or errors != 0 or
+            any(case.get("status") != "run" for case in cases) or
+            any(node.tag in {"failure", "error", "skipped"} for node in suite.iter())):
+        raise ValidationFailure(
+            "GPU JUnit is not fail-closed green for configured inventory: "
+            f"counts={counts}, errors={errors}, expected={expected}, actual={actual}"
+        )
     return counts
 
 
@@ -373,6 +369,7 @@ def run_gpu_suite(
     output_dir: pathlib.Path,
     env: dict[str, str],
 ) -> tuple[dict[str, int], dict[str, str]]:
+    expected_tests = configured_gpu_test_names(build_dir)
     junit_path = output_dir / "gpu-ctest.xml"
     ctest_log = output_dir / "gpu-ctest.log"
     run_capture(
@@ -381,7 +378,7 @@ def run_gpu_suite(
             "--test-dir",
             str(build_dir),
             "-R",
-            r"^(test_gpu_|test_mamba_parallel_scan_parity$)",
+            GPU_CTEST_PATTERN,
             "--output-on-failure",
             "--output-junit",
             str(junit_path),
@@ -390,12 +387,12 @@ def run_gpu_suite(
         env=env,
         log_path=ctest_log,
     )
-    counts = verify_junit(junit_path)
+    counts = verify_junit(junit_path, expected_tests)
 
     contract_outputs: dict[str, str] = {}
     for target in (
         "test_gpu_model_pack_dp4a_lifecycle",
-        "test_gpu_checkpoint_v8_continuation",
+        "test_gpu_checkpoint_continuation",
         "test_gpu_mixed_precision_contract",
     ):
         _, output = run_capture(
@@ -412,9 +409,9 @@ def run_gpu_suite(
             "DP4A lifecycle evidence is missing load_dispatches=1 "
             "and clone_dispatches=1"
         )
-    checkpoint_output = contract_outputs["test_gpu_checkpoint_v8_continuation"]
-    if "version=8" not in checkpoint_output or "PASS" not in checkpoint_output:
-        raise ValidationFailure("checkpoint v8 CUDA evidence is incomplete")
+    checkpoint_output = contract_outputs["test_gpu_checkpoint_continuation"]
+    if "version=10" not in checkpoint_output or "PASS" not in checkpoint_output:
+        raise ValidationFailure("checkpoint v10 GPU evidence is incomplete")
     mixed_output = contract_outputs["test_gpu_mixed_precision_contract"]
     if "fp16=executed" not in mixed_output:
         raise ValidationFailure(
@@ -426,6 +423,89 @@ def run_gpu_suite(
     if "PASS" not in mixed_output:
         raise ValidationFailure("mixed-precision CUDA contract did not pass")
     return counts, contract_outputs
+
+
+def run_microbenchmark(
+    source_dir: pathlib.Path,
+    build_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    report = output_dir / "gpu-microbenchmark.json"
+    run_capture(
+        [
+            str(build_dir / "bench_gpu_vs_cpu"),
+            "--repeat",
+            "20",
+            "--report",
+            str(report),
+        ],
+        cwd=source_dir,
+        env=env,
+        log_path=output_dir / "gpu-microbenchmark.log",
+    )
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValidationFailure(
+            "GPU microbenchmark report is missing or malformed"
+        ) from error
+    if (
+        payload.get("schema_version") != 2
+        or payload.get("backend") != "cuda"
+        or int(payload.get("repeat", 0)) != 20
+        or int(payload.get("warmup", -1)) != 3
+        or not isinstance(payload.get("device"), str)
+        or not payload["device"]
+        or not isinstance(payload.get("architecture"), str)
+        or not payload["architecture"].startswith("sm_")
+    ):
+        raise ValidationFailure(
+            "GPU microbenchmark provenance contract is incomplete"
+        )
+    results = payload.get("results")
+    if not isinstance(results, list) or len(results) != 18:
+        raise ValidationFailure(
+            "GPU microbenchmark did not emit the complete operation matrix"
+        )
+    for index, result in enumerate(results):
+        if not isinstance(result, dict):
+            raise ValidationFailure(
+                f"GPU microbenchmark result {index} is malformed"
+            )
+        for side in ("cpu", "gpu"):
+            timing = result.get(side)
+            if not isinstance(timing, dict):
+                raise ValidationFailure(
+                    f"GPU microbenchmark result {index} lacks {side} timing"
+                )
+            for field in ("mean_s", "min_s", "max_s"):
+                value = timing.get(field)
+                if (
+                    not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0.0
+                ):
+                    raise ValidationFailure(
+                        f"GPU microbenchmark result {index} has invalid "
+                        f"{side}.{field}"
+                    )
+        speedup = result.get("speedup_cpu_div_gpu")
+        if (
+            not isinstance(speedup, (int, float))
+            or not math.isfinite(float(speedup))
+            or float(speedup) <= 0.0
+        ):
+            raise ValidationFailure(
+                f"GPU microbenchmark result {index} has invalid speedup"
+            )
+    return {
+        "path": report.name,
+        "sha256": sha256_file(report),
+        "results": len(results),
+        "device": payload["device"],
+        "architecture": payload["architecture"],
+    }
 
 
 def run_sanitizer(
@@ -497,6 +577,27 @@ def artifact_hashes(output_dir: pathlib.Path) -> list[dict[str, Any]]:
             }
         )
     return artifacts
+
+
+def capture_test_inventory(
+    build_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+) -> dict[str, Any]:
+    try:
+        inventory = configured_test_inventory(build_dir)
+    except RuntimeError as error:
+        raise ValidationFailure(str(error)) from error
+    source = pathlib.Path(inventory["path"])
+    payload = source.read_bytes()
+    destination = output_dir / "nsos_test_inventory.txt"
+    destination.write_bytes(payload)
+    return {
+        "path": destination.name,
+        "sha256": inventory["sha256"],
+        "test_count": int(inventory["test_count"]),
+        "quarantined_count": int(inventory["quarantined_count"]),
+        "gpu_backend": inventory["gpu_backend"],
+    }
 
 
 def write_evidence(
@@ -648,7 +749,7 @@ def main(argv: Iterable[str] = ()) -> int:
             "minimum_compute_capability": args.minimum_compute_capability,
             "cuda_architecture": args.cuda_architecture,
             "strict_gpu_environment": STRICT_GPU_ENV,
-            "expected_gpu_tests": len(GPU_TEST_TARGETS),
+            "expected_gpu_tests": None,  # resolved after configure
             "expected_sanitizer_targets": list(SANITIZER_TARGETS),
         },
     }
@@ -671,7 +772,16 @@ def main(argv: Iterable[str] = ()) -> int:
                 architecture=args.cuda_architecture,
                 generator=state["preflight"]["software"]["cmake_generator"],
             )
+        state["configured_test_inventory"] = capture_test_inventory(
+            build_dir, output_dir
+        )
+        expected_tests = configured_gpu_test_names(build_dir)
+        state["requirements"]["expected_gpu_tests"] = len(expected_tests)
+        state["requirements"]["expected_gpu_test_names"] = expected_tests
         state["gpu_ctest"], state["contract_outputs"] = run_gpu_suite(
+            source_dir, build_dir, output_dir, env
+        )
+        state["microbenchmark"] = run_microbenchmark(
             source_dir, build_dir, output_dir, env
         )
         state["compute_sanitizer"] = run_sanitizer(

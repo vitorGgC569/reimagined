@@ -3,13 +3,9 @@
 
 import argparse
 import hashlib
-import importlib.util
 import os
 import sys
 from pathlib import Path
-
-_DLL_HANDLES = []
-
 
 def _candidate_build_paths(explicit_build_dir: str | None) -> list[Path]:
     script_dir = Path(__file__).resolve().parent
@@ -31,40 +27,15 @@ def _candidate_build_paths(explicit_build_dir: str | None) -> list[Path]:
     return candidates
 
 
-def _bootstrap_build_path(explicit_build_dir: str | None) -> None:
-    for candidate in _candidate_build_paths(explicit_build_dir):
-        candidate = candidate.resolve()
-        for path in (candidate, candidate / "Release"):
-            if path.exists():
-                if hasattr(os, "add_dll_directory"):
-                    _DLL_HANDLES.append(os.add_dll_directory(str(path)))
-                sys.path.insert(0, str(path))
-
-
 def _import_nsos_ext(explicit_build_dir: str | None):
-    candidates = _candidate_build_paths(explicit_build_dir)
-    _bootstrap_build_path(explicit_build_dir)
-    try:
-        import nsos_ext  # type: ignore
-        return nsos_ext
-    except ImportError as exc:
-        for candidate in candidates:
-            candidate = candidate.resolve()
-            search_roots = [candidate, candidate / "Release"]
-            for root in search_roots:
-                if not root.exists():
-                    continue
-                matches = sorted(root.glob("nsos_ext*.pyd"))
-                if not matches:
-                    continue
-                spec = importlib.util.spec_from_file_location("nsos_ext", matches[0])
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules["nsos_ext"] = module
-                    spec.loader.exec_module(module)
-                    return module
-        print(f"Falha ao importar nsos_ext. Verifique se o build foi gerado. Detalhe: {exc}")
-        raise SystemExit(1) from exc
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "nsos" / "scripts"))
+    from native_module import load_native_module, resolve_native_build_dir
+    explicit = explicit_build_dir or os.environ.get("NSOS_BUILD_DIR")
+    directory = resolve_native_build_dir(Path(explicit) if explicit else None,
+                                         _candidate_build_paths(None))
+    module = load_native_module(directory)
+    print(f"Native artifact: {module.__file__}; sha256={hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()}")
+    return module
 
 
 def _hash_result(result):

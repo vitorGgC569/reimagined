@@ -16,6 +16,15 @@
 namespace nsos {
 
 namespace {
+int ceil_div_nonnegative(int numerator, int denominator) {
+  if (numerator < 0 || denominator <= 0) {
+    throw std::invalid_argument(
+        "sparse attention requires a non-negative length and positive block size");
+  }
+  return numerator / denominator +
+         static_cast<int>(numerator % denominator != 0);
+}
+
 void select_sparse_positions(
     int query_index, int sequence_length, int head_dim, int block_size,
     const SparseAttentionConfig& cfg, const float* route,
@@ -41,7 +50,7 @@ SparseAttentionBackwardResult sparse_selective_attention_backward(
     const int n = Q.shape[0];
     const int d = Q.shape[1];
     const int B = std::max(cfg.block_size, 1);
-    const int nb = (n + B - 1) / B;
+    const int nb = ceil_div_nonnegative(n, B);
     const float scale = cfg.scale > 0.0f
                             ? cfg.scale
                             : 1.0f / std::sqrt(static_cast<float>(d));
@@ -99,7 +108,7 @@ SparseAttentionBackwardResult sparse_selective_attention_backward(
   const int n = q_host.shape[0];
   const int d = q_host.shape[1];
   const int B = std::max(cfg.block_size, 1);
-  const int nb = (n + B - 1) / B;
+  const int nb = ceil_div_nonnegative(n, B);
   const float scale =
       cfg.scale > 0.0f ? cfg.scale : 1.0f / std::sqrt(static_cast<float>(d));
 
@@ -329,7 +338,7 @@ Tensor sparse_selective_attention(const Tensor& Q, const Tensor& K,
   const int n = Q.shape[0];
   const int d = Q.shape[1];
   const int B = std::max(cfg.block_size, 1);
-  const int nb = (n + B - 1) / B;
+  const int nb = ceil_div_nonnegative(n, B);
   float scale = cfg.scale;
   if (scale <= 0.0f) {
     scale = 1.0f / std::sqrt(static_cast<float>(d));
@@ -469,7 +478,7 @@ namespace {
 
 // Per-block mean key: [nb, d].
 Tensor compute_block_means(const Tensor& K, int B, int n, int d) {
-  const int nb = (n + B - 1) / B;
+  const int nb = ceil_div_nonnegative(n, B);
   Tensor bm({nb, d}, Device::CPU);  // zero-filled
   float* m = bm.data();
   const float* k = K.data();
@@ -642,7 +651,7 @@ float block_selector_distill_step(const Tensor& Q, const Tensor& K, Tensor& Wsel
   const int n = Q.shape[0];
   const int d = Q.shape[1];
   const int B = std::max(block_size, 1);
-  const int nb = (n + B - 1) / B;
+  const int nb = ceil_div_nonnegative(n, B);
   if (nb < 2) return 0.0f;
   const float scale = 1.0f / std::sqrt(static_cast<float>(d));
 

@@ -61,10 +61,9 @@ def microbench(nsos, B: int, K: int, N: int, iters: int = 50, zero_density: floa
     # Build a BitLinear layer
     layer = nsos.BitLinear(K, N) if hasattr(nsos, "BitLinear") else None
     if layer is None:
-        # No direct BitLinear binding; we can still bench the raw lut path
-        # via JambaModel construction, but that's heavier.  For MVP just
-        # report a placeholder.
-        return None
+        raise RuntimeError(
+            "BitLinear binding is required for the LUT-TMAC benchmark"
+        )
 
     # Random input
     x = nsos.Tensor([B, K], nsos.Device.CPU, 0.0)
@@ -73,8 +72,10 @@ def microbench(nsos, B: int, K: int, N: int, iters: int = 50, zero_density: floa
     try:
         np_view = x.numpy()
         np_view[:] = arr
-    except Exception:
-        pass  # Tensor doesn't support numpy() writeback; bench still meaningful
+    except Exception as exc:
+        raise RuntimeError(
+            "Benchmark input could not be copied into the NSOS tensor"
+        ) from exc
 
     # ── Path A: default kernel (NSOS_TMAC_LUT_GEMM not set) ─────────
     os.environ.pop("NSOS_TMAC_LUT_GEMM", None)

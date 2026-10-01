@@ -11,9 +11,11 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -578,6 +580,10 @@ std::string generation_metrics_json(const GenerationMetrics& metrics) {
         "\"loaded_from_pack\":" + json_bool(metrics.loaded_from_pack),
         "\"mamba_fast_path_hits\":" + std::to_string(metrics.mamba_fast_path_hits),
         "\"mamba_fast_path_fallbacks\":" + std::to_string(metrics.mamba_fast_path_fallbacks),
+        "\"mamba_stream_priming_gpu_calls\":" +
+            std::to_string(metrics.mamba_stream_priming_gpu_calls),
+        "\"mamba_stream_priming_host_fallbacks\":" +
+            std::to_string(metrics.mamba_stream_priming_host_fallbacks),
         "\"mamba_last_fallback_reason\":\"" + json_escape(metrics.mamba_last_fallback_reason) + "\"",
     });
 }
@@ -938,6 +944,15 @@ bool request_declares_https(const HttpRequest& request,
                             const HttpApiServerConfig& config) {
     if (!config.require_tls_proxy_header) {
         return true;
+    }
+    // A local container readiness probe has no TLS proxy hop. Only these two
+    // GET endpoints may bypass transport checks; normal auth still applies.
+    if (request.method == "GET" &&
+        (request.path == "/health" || request.path == "/ready")) {
+        const std::string peer = socket_peer_ip(client_socket);
+        if (peer == "127.0.0.1" || peer == "::1" || peer == "::ffff:127.0.0.1") {
+            return true;
+        }
     }
     if (!is_trusted_proxy_peer(client_socket, config)) {
         return false;
@@ -1596,6 +1611,10 @@ bool HttpApiServer::start() {
 
     started_at_ = std::chrono::steady_clock::now();
     stop_requested_.store(false);
+    // stop() sets this flag to interrupt an in-flight administrative job.
+    // A successful restart begins a new server lifecycle and must not inherit
+    // that old cooperative-cancellation request.
+    engine_.clear_training_cancellation();
     try {
         initialize_inference_replicas();
     } catch (...) {
@@ -1655,6 +1674,18 @@ void HttpApiServer::serve_forever() {
 
 void HttpApiServer::stop() {
     const bool was_stopping = stop_requested_.exchange(true);
+    engine_.request_training_cancellation();
+    {
+        std::lock_guard<std::mutex> lock(
+            active_training_mutex_);
+        for (InferenceEngine* training_engine :
+             active_training_engines_) {
+            if (training_engine) {
+                training_engine->
+                    request_training_cancellation();
+            }
+        }
+    }
     if (!was_stopping && server_socket_ != kInvalidSocket) {
         close_socket(server_socket_);
         server_socket_ = kInvalidSocket;
@@ -1848,9 +1879,77 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
             // full operation succeeds with finite outputs. Any exception leaves
             // the serving model and its replicas byte-for-byte untouched.
             std::unique_ptr<InferenceEngine> staged = engine_.clone_for_training();
-            fn(*staged);
-            engine_ = std::move(*staged);
-            sync_inference_replicas_locked();
+            {
+                std::lock_guard<std::mutex> lock(
+                    active_training_mutex_);
+                if (stop_requested_.load()) {
+                    throw AbortException();
+                }
+                active_training_engines_.insert(staged.get());
+            }
+            try {
+                fn(*staged);
+                std::vector<std::unique_ptr<InferenceEngine>>
+                    next_replicas;
+                const size_t replica_count =
+                    desired_inference_replica_count();
+                next_replicas.reserve(replica_count);
+                for (size_t index = 0;
+                     index < replica_count; ++index) {
+                    if (stop_requested_.load()) {
+                        throw AbortException();
+                    }
+                    next_replicas.push_back(
+                        staged->clone_for_inference());
+                }
+                std::vector<size_t> next_idle_replicas(
+                    replica_count);
+                std::iota(
+                    next_idle_replicas.begin(),
+                    next_idle_replicas.end(), size_t{0});
+                GenerationMetrics next_metrics =
+                    staged->last_generation_metrics();
+                static_assert(
+                    std::is_nothrow_move_assignable_v<
+                        InferenceEngine>,
+                    "Transactional HTTP publication requires noexcept "
+                    "InferenceEngine move assignment");
+                static_assert(
+                    std::is_nothrow_move_assignable_v<
+                        GenerationMetrics>,
+                    "Transactional HTTP publication requires noexcept "
+                    "GenerationMetrics move assignment");
+                {
+                    std::lock_guard<std::mutex> lock(
+                        active_training_mutex_);
+                    if (stop_requested_.load()) {
+                        throw AbortException();
+                    }
+                    engine_ = std::move(*staged);
+                    {
+                        std::lock_guard<std::mutex> replica_lock(
+                            replica_mutex_);
+                        inference_replicas_ =
+                            std::move(next_replicas);
+                        idle_replicas_ =
+                            std::move(next_idle_replicas);
+                    }
+                    {
+                        std::lock_guard<std::mutex> metrics_lock(
+                            latest_metrics_mutex_);
+                        latest_generation_metrics_ =
+                            std::move(next_metrics);
+                    }
+                    active_training_engines_.erase(
+                        staged.get());
+                }
+                replica_cv_.notify_all();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(
+                    active_training_mutex_);
+                active_training_engines_.erase(staged.get());
+                throw;
+            }
         };
         auto with_inference_replica = [&](const auto& fn) {
             std::shared_lock<std::shared_mutex> state_lock(model_state_mutex_);
@@ -2425,6 +2524,19 @@ void HttpApiServer::handle_client(SOCKET client_socket) {
 
         const HttpResponse response = make_error_response(
             404, "Not Found", request_id, "unknown_endpoint", "requested endpoint was not found");
+        send_all(client_socket, build_http_response(response));
+    } catch (const AbortException& ex) {
+        rejected_requests_.fetch_add(1);
+        const HttpResponse response = make_error_response(
+            503, "Service Unavailable", request_id,
+            "training_cancelled", ex.what());
+        send_all(client_socket, build_http_response(response));
+    } catch (const OptimizerStatePoisonedException&) {
+        internal_errors_.fetch_add(1);
+        const HttpResponse response = make_error_response(
+            503, "Service Unavailable", request_id,
+            "optimizer_state_requires_recovery",
+            "training is unavailable until a validated checkpoint recovery");
         send_all(client_socket, build_http_response(response));
     } catch (const BadRequest& ex) {
         // Explicit client-input error: surface the message with 400 (the

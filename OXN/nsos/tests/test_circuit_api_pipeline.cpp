@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -34,6 +35,15 @@ void require(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+void set_ipv4_address(sockaddr_in& address, const std::string& host) {
+#ifdef _WIN32
+    const int status = InetPtonA(AF_INET, host.c_str(), &address.sin_addr);
+#else
+    const int status = inet_pton(AF_INET, host.c_str(), &address.sin_addr);
+#endif
+    require(status == 1, "invalid IPv4 address: " + host);
 }
 
 std::string json_escape(const std::string& text) {
@@ -120,7 +130,7 @@ std::string send_http_request(const std::string& host, int port, const std::stri
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
-    address.sin_addr.s_addr = inet_addr(host.c_str());
+    set_ipv4_address(address, host);
     require(connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
             "connect failed");
 
@@ -224,10 +234,12 @@ int evaluate_examples(const std::string& host, int port, const std::vector<std::
 } // namespace
 
 int main() {
+    InferenceEngine engine;
+    InferenceEngine reloaded;
+    std::unique_ptr<HttpApiServer> server;
+    std::unique_ptr<HttpApiServer> reloaded_server;
     std::thread server_thread;
     std::thread reloaded_thread;
-    HttpApiServer* active_server = nullptr;
-    HttpApiServer* active_reloaded_server = nullptr;
     try {
         // Determinism: a fixed global seed makes the tiny circuit model's init
         // reproducible (the tensor_rng() fix makes a global seed honor-able),
@@ -256,7 +268,6 @@ int main() {
         config.n_kv_heads = 4;
         config.max_context_tokens = 256;
 
-        InferenceEngine engine;
         require(engine.load_model("", config), "initial load_model failed");
 
         HttpApiServerConfig server_config;
@@ -271,14 +282,16 @@ int main() {
         server_config.max_train_batch_size = 4;
         server_config.max_train_seq_len = 64;
 
-        HttpApiServer server(engine, server_config);
-        active_server = &server;
-        require(server.start(), "server.start failed");
-        server_thread = std::thread([&]() { server.serve_forever(); });
+        server = std::make_unique<HttpApiServer>(
+            engine, server_config);
+        require(server->start(), "server.start failed");
+        server_thread =
+            std::thread([&]() { server->serve_forever(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        std::cout << "[CircuitAPI] server started on " << server.port() << std::endl;
+        std::cout << "[CircuitAPI] server started on "
+                  << server->port() << std::endl;
 
-        const int port = server.port();
+        const int port = server->port();
         require(port > 0, "invalid server port");
 
         const std::string corpus_json =
@@ -310,21 +323,23 @@ int main() {
         require(pack_response.find("200 OK") != std::string::npos, "pack endpoint failed");
         require(std::filesystem::exists(pack_dir / "manifest.nsos"), "manifest not written");
 
-        server.stop();
+        server->stop();
         server_thread.join();
+        server.reset();
         std::cout << "[CircuitAPI] first server stopped" << std::endl;
 
-        InferenceEngine reloaded;
         require(reloaded.load_model(pack_dir.string(), ModelConfig{}), "reload from pack failed");
 
-        HttpApiServer reloaded_server(reloaded, server_config);
-        active_reloaded_server = &reloaded_server;
-        require(reloaded_server.start(), "reloaded_server.start failed");
-        reloaded_thread = std::thread([&]() { reloaded_server.serve_forever(); });
+        reloaded_server = std::make_unique<HttpApiServer>(
+            reloaded, server_config);
+        require(reloaded_server->start(), "reloaded_server.start failed");
+        reloaded_thread =
+            std::thread([&]() { reloaded_server->serve_forever(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        std::cout << "[CircuitAPI] reloaded server started on " << reloaded_server.port() << std::endl;
+        std::cout << "[CircuitAPI] reloaded server started on "
+                  << reloaded_server->port() << std::endl;
 
-        const int reloaded_port = reloaded_server.port();
+        const int reloaded_port = reloaded_server->port();
         require(reloaded_port > 0, "invalid reloaded server port");
 
         std::string batch_payload = "{\"prompts\":[";
@@ -361,26 +376,29 @@ int main() {
                     std::to_string(reload_hits));
         std::cout << "[CircuitAPI] reload hits=" << reload_hits << std::endl;
 
-        reloaded_server.stop();
+        reloaded_server->stop();
         reloaded_thread.join();
+        reloaded_server.reset();
         std::filesystem::remove_all(pack_dir);
 
         std::cout << "Circuit API pipeline test passed! prepack_hits=" << prepack_hits
                   << " reload_hits=" << reload_hits << std::endl;
         return 0;
     } catch (const std::exception& ex) {
-        if (active_reloaded_server) {
-            active_reloaded_server->stop();
+        if (reloaded_server) {
+            reloaded_server->stop();
         }
         if (reloaded_thread.joinable()) {
             reloaded_thread.join();
         }
-        if (active_server) {
-            active_server->stop();
+        reloaded_server.reset();
+        if (server) {
+            server->stop();
         }
         if (server_thread.joinable()) {
             server_thread.join();
         }
+        server.reset();
         std::cerr << "Circuit API pipeline test failed: " << ex.what() << std::endl;
         return 1;
     }

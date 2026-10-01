@@ -5,12 +5,17 @@
 #include <algorithm>                  // std::max for Slender per-token reductions
 #include <cmath>
 #include <cstdint>                    // int8_t for Slender ternary weights
+#include <cstdlib>
 #include <memory>
+#include <limits>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 #ifdef USE_CUDA
+#include "../include/cuda/device_buffer.h"
 #include "../include/cuda/kernels.cuh"
-#include <cuda_runtime.h>
+#include "../include/cuda/pinned_buffer.h"
+#include "../include/gpu_backend.h"
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -25,35 +30,317 @@ typedef unsigned __int128 uint128_compat;
 
 namespace nsos {
 
-namespace {
-
 #ifdef USE_CUDA
-struct CudaIntBuffer {
-  int* ptr = nullptr;
+struct EmbeddingGpuWorkspace {
+  struct Slot {
+    cuda_detail::DeviceBuffer<int> device_ids;
+    cuda_detail::PinnedHostBuffer<int> pinned_ids;
+    cuda_detail::DeviceBuffer<int> device_unique_ids;
+    cuda_detail::PinnedHostBuffer<int> pinned_unique_ids;
+    cuda_detail::DeviceBuffer<int> device_offsets;
+    cuda_detail::PinnedHostBuffer<int> pinned_offsets;
+    cuda_detail::DeviceBuffer<int> device_positions;
+    cuda_detail::PinnedHostBuffer<int> pinned_positions;
+    cudaEvent_t consumption_complete = nullptr;
+    bool in_flight = false;
+    bool awaiting_consumption_record = false;
+    bool poisoned = false;
+  };
 
-  explicit CudaIntBuffer(size_t count) {
-    if (count == 0) {
+  Slot slots[2];
+  size_t next_slot = 0;
+
+  ~EmbeddingGpuWorkspace() {
+    for (auto& slot : slots) {
+      bool completion_proven = !slot.poisoned;
+      if (slot.awaiting_consumption_record) {
+        // A launch exception between upload() and record_consumed() must never
+        // permit the backing ID buffer to be freed while stream 0 may still
+        // reference it.
+        const cudaError_t status =
+            cudaStreamSynchronize( nsos::gpu::current_stream());
+        record_gpu_stream_synchronization();
+        completion_proven =
+            completion_proven && status == cudaSuccess;
+      } else if (slot.in_flight && slot.consumption_complete != nullptr) {
+        const cudaError_t status =
+            cudaEventSynchronize(slot.consumption_complete);
+        record_gpu_stream_synchronization();
+        completion_proven =
+            completion_proven && status == cudaSuccess;
+      }
+      if (!completion_proven) {
+        slot.device_ids.abandon();
+        slot.pinned_ids.abandon();
+        slot.device_unique_ids.abandon();
+        slot.pinned_unique_ids.abandon();
+        slot.device_offsets.abandon();
+        slot.pinned_offsets.abandon();
+        slot.device_positions.abandon();
+        slot.pinned_positions.abandon();
+        slot.consumption_complete = nullptr;
+        continue;
+      }
+      if (slot.consumption_complete != nullptr) {
+        const cudaError_t status =
+            cudaEventDestroy(slot.consumption_complete);
+        if (status != cudaSuccess) {
+          (void)cudaGetLastError();
+        }
+      }
+    }
+  }
+
+  void reserve(Slot& slot, size_t requested_ids,
+               size_t requested_unique_ids = 0,
+               size_t requested_offsets = 0,
+               size_t requested_positions = 0) {
+    if (slot.poisoned) {
+      throw std::runtime_error(
+          "Embedding GPU staging is poisoned after an unrecoverable "
+          "completion error");
+    }
+    const auto ready = [](size_t requested, size_t device_capacity,
+                          size_t pinned_capacity, const int* device,
+                          const int* pinned) {
+      return requested == 0 ||
+             (requested <= device_capacity && requested <= pinned_capacity &&
+              device != nullptr && pinned != nullptr);
+    };
+    if (ready(requested_ids, slot.device_ids.capacity(),
+              slot.pinned_ids.capacity(), slot.device_ids.get(),
+              slot.pinned_ids.get()) &&
+        ready(requested_unique_ids, slot.device_unique_ids.capacity(),
+              slot.pinned_unique_ids.capacity(),
+              slot.device_unique_ids.get(), slot.pinned_unique_ids.get()) &&
+        ready(requested_offsets, slot.device_offsets.capacity(),
+              slot.pinned_offsets.capacity(), slot.device_offsets.get(),
+              slot.pinned_offsets.get()) &&
+        ready(requested_positions, slot.device_positions.capacity(),
+              slot.pinned_positions.capacity(), slot.device_positions.get(),
+              slot.pinned_positions.get())) {
       return;
     }
-    if (cudaMalloc(&ptr, count * sizeof(int)) != cudaSuccess) {
-      throw std::runtime_error("Embedding CUDA allocation failed");
+    if (slot.awaiting_consumption_record) {
+      throw std::logic_error(
+          "Embedding GPU staging slot has an uncommitted consumer");
+    }
+    if (slot.in_flight) {
+      const cudaError_t status =
+          cudaEventSynchronize(slot.consumption_complete);
+      if (status != cudaSuccess) {
+        slot.poisoned = true;
+        throw std::runtime_error(
+            std::string("Embedding ID upload synchronization failed: ") +
+            cudaGetErrorString(status));
+      }
+      slot.in_flight = false;
+      record_gpu_stream_synchronization();
+    }
+    const auto ensure_pair = [](size_t requested,
+                                cuda_detail::DeviceBuffer<int>& device,
+                                cuda_detail::PinnedHostBuffer<int>& pinned,
+                                const char* label) {
+      if (requested == 0) {
+        return;
+      }
+      const size_t capacity = std::max(requested, size_t{256});
+      if (device.ensure(capacity) == nullptr) {
+        throw std::runtime_error(
+            std::string("Embedding GPU ") + label + " allocation failed");
+      }
+      if (pinned.ensure(capacity) == nullptr) {
+        throw std::runtime_error(
+            std::string("Embedding pinned ") + label +
+            " allocation failed");
+      }
+    };
+    ensure_pair(requested_ids, slot.device_ids, slot.pinned_ids, "ID");
+    ensure_pair(requested_unique_ids, slot.device_unique_ids,
+                slot.pinned_unique_ids, "unique-ID");
+    ensure_pair(requested_offsets, slot.device_offsets,
+                slot.pinned_offsets, "offset");
+    ensure_pair(requested_positions, slot.device_positions,
+                slot.pinned_positions, "position");
+    if (slot.consumption_complete == nullptr) {
+      const cudaError_t status =
+          cudaEventCreate(&slot.consumption_complete);
+      if (status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("Embedding upload event creation failed: ") +
+            cudaGetErrorString(status));
+      }
     }
   }
 
-  ~CudaIntBuffer() {
-    if (ptr != nullptr) {
-      cudaFree(ptr);
+  Slot& upload(const std::vector<int>& ids) {
+    if (ids.empty()) {
+      throw std::invalid_argument(
+          "Embedding GPU staging cannot upload an empty ID vector");
     }
+    Slot& slot = slots[next_slot];
+    next_slot = (next_slot + 1) % 2;
+    reserve(slot, ids.size());
+    if (slot.awaiting_consumption_record) {
+      throw std::logic_error(
+          "Embedding GPU staging slot has an uncommitted consumer");
+    }
+    if (slot.in_flight) {
+      cudaError_t wait_status =
+          cudaEventQuery(slot.consumption_complete);
+      if (wait_status == cudaErrorNotReady) {
+        wait_status =
+            cudaEventSynchronize(slot.consumption_complete);
+        record_gpu_stream_synchronization();
+      }
+      if (wait_status != cudaSuccess) {
+        slot.poisoned = true;
+        throw std::runtime_error(
+            std::string("Embedding staging reuse synchronization failed: ") +
+            cudaGetErrorString(wait_status));
+      }
+      slot.in_flight = false;
+    }
+    std::copy(
+        ids.begin(), ids.end(), slot.pinned_ids.get());
+    cudaError_t status =
+        cudaMemcpyAsync(slot.device_ids.get(), slot.pinned_ids.get(),
+                        ids.size() * sizeof(int),
+                        cudaMemcpyHostToDevice, nsos::gpu::current_stream());
+    if (status != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("Embedding GPU ID upload failed: ") +
+          cudaGetErrorString(status));
+    }
+    record_gpu_transfer(
+        Device::GPU, Device::CPU, ids.size() * sizeof(int));
+    slot.awaiting_consumption_record = true;
+    return slot;
   }
 
-  int* get() const { return ptr; }
+  Slot& upload_sparse(const std::vector<int>& unique_ids,
+                      const std::vector<int>& offsets,
+                      const std::vector<int>& positions) {
+    if (unique_ids.empty() || offsets.size() != unique_ids.size() + 1 ||
+        positions.empty()) {
+      throw std::invalid_argument(
+          "Embedding sparse staging requires non-empty canonical CSR data");
+    }
+    Slot& slot = slots[next_slot];
+    next_slot = (next_slot + 1) % 2;
+    reserve(slot, 0, unique_ids.size(), offsets.size(), positions.size());
+    if (slot.awaiting_consumption_record) {
+      throw std::logic_error(
+          "Embedding GPU staging slot has an uncommitted consumer");
+    }
+    if (slot.in_flight) {
+      cudaError_t wait_status =
+          cudaEventQuery(slot.consumption_complete);
+      if (wait_status == cudaErrorNotReady) {
+        wait_status = cudaEventSynchronize(slot.consumption_complete);
+        record_gpu_stream_synchronization();
+      }
+      if (wait_status != cudaSuccess) {
+        slot.poisoned = true;
+        throw std::runtime_error(
+            std::string("Embedding sparse staging reuse failed: ") +
+            cudaGetErrorString(wait_status));
+      }
+      slot.in_flight = false;
+    }
+
+    std::copy(unique_ids.begin(), unique_ids.end(),
+              slot.pinned_unique_ids.get());
+    std::copy(offsets.begin(), offsets.end(), slot.pinned_offsets.get());
+    std::copy(positions.begin(), positions.end(),
+              slot.pinned_positions.get());
+
+    const auto upload_array = [&](int* destination, const int* source,
+                                  size_t count, const char* label) {
+      const cudaError_t status = cudaMemcpyAsync(
+          destination, source, count * sizeof(int), cudaMemcpyHostToDevice, nsos::gpu::current_stream());
+      if (status != cudaSuccess) {
+        if (slot.awaiting_consumption_record) {
+          cancel_pending(slot);
+        }
+        throw std::runtime_error(
+            std::string("Embedding sparse ") + label +
+            " upload failed: " + cudaGetErrorString(status));
+      }
+      slot.awaiting_consumption_record = true;
+      record_gpu_transfer(Device::GPU, Device::CPU,
+                          count * sizeof(int));
+    };
+    upload_array(slot.device_unique_ids.get(),
+                 slot.pinned_unique_ids.get(), unique_ids.size(),
+                 "unique-ID");
+    upload_array(slot.device_offsets.get(), slot.pinned_offsets.get(),
+                 offsets.size(), "offset");
+    upload_array(slot.device_positions.get(), slot.pinned_positions.get(),
+                 positions.size(), "position");
+    return slot;
+  }
+
+  void record_consumed(Slot& slot) {
+    if (!slot.awaiting_consumption_record) {
+      throw std::logic_error(
+          "Embedding GPU staging consumer was already committed");
+    }
+    const cudaError_t status =
+        cudaEventRecord(slot.consumption_complete, nsos::gpu::current_stream());
+    if (status != cudaSuccess) {
+      // Preserve memory safety even when event creation/recording fails.
+      const cudaError_t sync_status =
+          cudaStreamSynchronize( nsos::gpu::current_stream());
+      record_gpu_stream_synchronization();
+      if (sync_status != cudaSuccess) {
+        slot.poisoned = true;
+        throw std::runtime_error(
+            std::string("Embedding consumer event record failed: ") +
+            cudaGetErrorString(status) +
+            "; completion recovery also failed: " +
+            cudaGetErrorString(sync_status));
+      }
+      slot.awaiting_consumption_record = false;
+      slot.in_flight = false;
+      throw std::runtime_error(
+          std::string("Embedding consumer event record failed: ") +
+          cudaGetErrorString(status));
+    }
+    slot.awaiting_consumption_record = false;
+    slot.in_flight = true;
+  }
+
+  void cancel_pending(Slot& slot) noexcept {
+    if (!slot.awaiting_consumption_record) {
+      return;
+    }
+    const cudaError_t status =
+        cudaStreamSynchronize( nsos::gpu::current_stream());
+    record_gpu_stream_synchronization();
+    if (status != cudaSuccess) {
+      slot.poisoned = true;
+      return;
+    }
+    slot.awaiting_consumption_record = false;
+    slot.in_flight = false;
+  }
 };
 #endif
+
+namespace {
 
 std::vector<int> flatten_embedding_ids(const std::vector<std::vector<int>>& indices_batch,
                                        int batch_size,
                                        int seq_len) {
-  std::vector<int> flat(static_cast<size_t>(batch_size * seq_len), -1);
+  if (batch_size < 0 || seq_len < 0 ||
+      (seq_len != 0 &&
+       batch_size > std::numeric_limits<int>::max() / seq_len)) {
+    throw std::overflow_error(
+        "Embedding flattened ID plane exceeds the supported range");
+  }
+  std::vector<int> flat(
+      static_cast<size_t>(batch_size) * static_cast<size_t>(seq_len), -1);
   for (int batch = 0; batch < batch_size; ++batch) {
     const auto& indices = indices_batch[static_cast<size_t>(batch)];
     const int valid = std::min(seq_len, static_cast<int>(indices.size()));
@@ -65,11 +352,92 @@ std::vector<int> flatten_embedding_ids(const std::vector<std::vector<int>>& indi
   return flat;
 }
 
+struct EmbeddingSparseMetadata {
+  std::vector<int> unique_ids;
+  std::vector<int> offsets;
+  std::vector<int> positions;
+};
+
+EmbeddingSparseMetadata build_embedding_sparse_metadata(
+    const std::vector<int>& flat_ids, int vocab_size) {
+  if (flat_ids.size() >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error(
+        "Embedding sparse metadata exceeds 32-bit kernel indexing");
+  }
+
+  EmbeddingSparseMetadata metadata;
+  metadata.unique_ids.reserve(
+      std::min(flat_ids.size(), static_cast<size_t>(vocab_size)));
+  std::vector<int> counts;
+  counts.reserve(metadata.unique_ids.capacity());
+  std::unordered_map<int, size_t> unique_index;
+  unique_index.reserve(metadata.unique_ids.capacity());
+
+  for (int token_id : flat_ids) {
+    if (token_id < 0 || token_id >= vocab_size) {
+      continue;
+    }
+    const auto [found, inserted] = unique_index.emplace(
+        token_id, metadata.unique_ids.size());
+    if (inserted) {
+      metadata.unique_ids.push_back(token_id);
+      counts.push_back(0);
+    }
+    ++counts[found->second];
+  }
+
+  metadata.offsets.resize(metadata.unique_ids.size() + 1, 0);
+  for (size_t index = 0; index < counts.size(); ++index) {
+    if (counts[index] < 0 ||
+        metadata.offsets[index] >
+            std::numeric_limits<int>::max() - counts[index]) {
+      throw std::overflow_error(
+          "Embedding sparse offsets exceed 32-bit kernel indexing");
+    }
+    metadata.offsets[index + 1] =
+        metadata.offsets[index] + counts[index];
+  }
+  metadata.positions.resize(
+      static_cast<size_t>(metadata.offsets.back()));
+  std::vector<int> cursor = metadata.offsets;
+  for (size_t position = 0; position < flat_ids.size(); ++position) {
+    const int token_id = flat_ids[position];
+    if (token_id < 0 || token_id >= vocab_size) {
+      continue;
+    }
+    const auto found = unique_index.find(token_id);
+    if (found == unique_index.end()) {
+      throw std::logic_error(
+          "Embedding sparse metadata lost a valid token ID");
+    }
+    const size_t index = found->second;
+    metadata.positions[static_cast<size_t>(cursor[index]++)] =
+        static_cast<int>(position);
+  }
+  for (size_t index = 0; index < counts.size(); ++index) {
+    if (cursor[index] != metadata.offsets[index + 1]) {
+      throw std::logic_error(
+          "Embedding sparse metadata count mismatch");
+    }
+  }
+  return metadata;
+}
+
+bool dense_deterministic_embedding_enabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("NSOS_EMBEDDING_DENSE_DETERMINISTIC");
+    return value != nullptr && value[0] == '1';
+  }();
+  return enabled;
+}
+
 } // namespace
 
 Embedding::Embedding(int vocab, int dim)
     : vocab_size(vocab), embedding_dim(dim),
-      weight(Tensor::xavier_uniform({vocab, dim}), "embedding.weight") {
+      weight(Tensor::xavier_uniform({vocab, dim}), "weight") {
   // Sin table disabled for baseline stability
 }
 
@@ -264,7 +632,10 @@ Tensor Embedding::forward_device_ids(const int* device_ids, int count) {
     throw std::runtime_error(
         "Embedding::forward_device_ids requires GPU-resident weights");
   }
-  Tensor out({count, embedding_dim}, Device::GPU);
+  // The gather kernel writes every output element, including explicit zeros
+  // for invalid IDs, so a pre-launch full-buffer memset is redundant.
+  Tensor out =
+      Tensor::uninitialized({count, embedding_dim}, Device::GPU);
   launch_embedding_gather_kernel(out.raw_data(), weight.data.raw_data(),
                                  device_ids, count, vocab_size, embedding_dim);
   return out;
@@ -272,7 +643,7 @@ Tensor Embedding::forward_device_ids(const int* device_ids, int count) {
   (void)device_ids;
   (void)count;
   throw std::runtime_error(
-      "Embedding::forward_device_ids requires a CUDA build");
+      "Embedding::forward_device_ids requires a GPU build");
 #endif
 }
 
@@ -303,18 +674,25 @@ Tensor Embedding::forward_batch(const std::vector<std::vector<int>>& indices_bat
 
 #ifdef USE_CUDA
   if (weight.data.get_device() == Device::GPU) {
-    Tensor out({batch_size, max_seq_len, embedding_dim}, Device::GPU);
+    Tensor out = Tensor::uninitialized(
+        {batch_size, max_seq_len, embedding_dim}, Device::GPU);
     std::vector<int> flat_ids =
         flatten_embedding_ids(indices_batch, batch_size, max_seq_len);
-    CudaIntBuffer d_ids(flat_ids.size());
-    if (cudaMemcpy(d_ids.get(), flat_ids.data(), flat_ids.size() * sizeof(int),
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
-      throw std::runtime_error("Embedding GPU id upload failed");
+    if (!gpu_workspace_) {
+      gpu_workspace_ = std::make_shared<EmbeddingGpuWorkspace>();
     }
-    launch_embedding_gather_kernel(out.raw_data(), weight.data.raw_data(),
-                                   d_ids.get(),
-                                   batch_size * max_seq_len, vocab_size,
-                                   embedding_dim);
+    EmbeddingGpuWorkspace::Slot& slot =
+        gpu_workspace_->upload(flat_ids);
+    try {
+      launch_embedding_gather_kernel(out.raw_data(), weight.data.raw_data(),
+                                     slot.device_ids.get(),
+                                     batch_size * max_seq_len, vocab_size,
+                                     embedding_dim);
+      gpu_workspace_->record_consumed(slot);
+    } catch (...) {
+      gpu_workspace_->cancel_pending(slot);
+      throw;
+    }
     return out;
   }
 #endif
@@ -406,24 +784,73 @@ void Embedding::backward_batch(const Tensor& grad_output,
   }
 
 #ifdef USE_CUDA
-  // Deterministic mode skips the atomicAdd scatter kernel and uses the ordered
-  // host accumulation below (device-safe: it copies the grad to host first).
-  if (weight.data.get_device() == Device::GPU &&
-      !determinism::deterministic_reductions_enabled()) {
+  if (weight.data.get_device() == Device::GPU) {
     Tensor grad_device =
         grad_output.get_device() == Device::GPU ? grad_output : grad_output.to(Device::GPU);
     Tensor d_w = Tensor::zeros(weight.data.shape, Device::GPU);
     std::vector<int> flat_ids =
         flatten_embedding_ids(indices_batch, batch_size, seq_len);
-    CudaIntBuffer d_ids(flat_ids.size());
-    if (cudaMemcpy(d_ids.get(), flat_ids.data(), flat_ids.size() * sizeof(int),
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
-      throw std::runtime_error("Embedding GPU id upload failed");
+    if (!gpu_workspace_) {
+      gpu_workspace_ = std::make_shared<EmbeddingGpuWorkspace>();
     }
-    launch_embedding_scatter_add_kernel(d_w.raw_data(), grad_device.raw_data(),
-                                        d_ids.get(),
-                                        batch_size * seq_len, vocab_size,
-                                        embedding_dim);
+    const bool deterministic =
+        determinism::deterministic_reductions_enabled();
+    if (deterministic &&
+        !dense_deterministic_embedding_enabled()) {
+      EmbeddingSparseMetadata metadata =
+          build_embedding_sparse_metadata(flat_ids, vocab_size);
+      if (metadata.unique_ids.empty()) {
+        weight.add_grad(d_w);
+        return;
+      }
+      EmbeddingGpuWorkspace::Slot& slot =
+          gpu_workspace_->upload_sparse(
+              metadata.unique_ids, metadata.offsets,
+              metadata.positions);
+      try {
+        const bool launch_enqueued =
+            launch_embedding_scatter_add_deterministic_sparse_kernel(
+            d_w.raw_data(), grad_device.raw_data(),
+            slot.device_unique_ids.get(), slot.device_offsets.get(),
+            slot.device_positions.get(),
+            static_cast<int>(metadata.unique_ids.size()),
+            batch_size * seq_len, vocab_size, embedding_dim);
+        if (!launch_enqueued) {
+          throw std::runtime_error(
+              "Deterministic sparse embedding backward rejected invalid "
+              "arguments");
+        }
+        const cudaError_t launch_status = cudaGetLastError();
+        if (launch_status != cudaSuccess) {
+          throw std::runtime_error(
+              std::string(
+                  "Deterministic sparse embedding backward launch failed: ") +
+              cudaGetErrorString(launch_status));
+        }
+        gpu_workspace_->record_consumed(slot);
+      } catch (...) {
+        gpu_workspace_->cancel_pending(slot);
+        throw;
+      }
+    } else {
+      EmbeddingGpuWorkspace::Slot& slot =
+          gpu_workspace_->upload(flat_ids);
+      try {
+        if (deterministic) {
+        launch_embedding_scatter_add_deterministic_kernel(
+            d_w.raw_data(), grad_device.raw_data(), slot.device_ids.get(),
+            batch_size * seq_len, vocab_size, embedding_dim);
+        } else {
+          launch_embedding_scatter_add_kernel(
+              d_w.raw_data(), grad_device.raw_data(), slot.device_ids.get(),
+              batch_size * seq_len, vocab_size, embedding_dim);
+        }
+        gpu_workspace_->record_consumed(slot);
+      } catch (...) {
+        gpu_workspace_->cancel_pending(slot);
+        throw;
+      }
+    }
     weight.add_grad(d_w);
     return;
   }
@@ -432,6 +859,13 @@ void Embedding::backward_batch(const Tensor& grad_output,
   // Device-safe: copy a GPU grad to host so the ordered (deterministic) scatter
   // loop below can read it.  weight.add_grad(d_w_host) moves the result back to
   // the weight's device.
+  if ((grad_output.get_device() == Device::GPU ||
+       weight.data.get_device() == Device::GPU) &&
+      strict_gpu_execution()) {
+    throw std::runtime_error(
+        "Strict GPU embedding backward cannot use the deterministic host "
+        "scatter path");
+  }
   Tensor grad_host =
       grad_output.get_device() == Device::GPU ? grad_output.cpu() : grad_output;
   Tensor d_w_host = Tensor::zeros(weight.data.shape, Device::CPU);

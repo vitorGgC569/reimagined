@@ -454,6 +454,15 @@ static bool lut_simd_enabled() {
 
 } // namespace
 
+// Single source of truth for the AVX2 runtime check. NSOS_ENABLE_AVX2_KERNELS
+// is a *build* switch (default ON for x86_64) and says nothing about the CPU
+// that will actually execute the binary, so every AVX2 entry point outside
+// this translation unit must consult this before dispatching.
+bool avx2_runtime_supported() {
+    static const bool supported = cpu_supports_avx2();
+    return supported;
+}
+
 void BitNetAdapter::gemm_158bit_lut(const Tensor& input,
                                     const std::vector<uint32_t>& packed_weights,
                                     const std::vector<float>& act_scales,

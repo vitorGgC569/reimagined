@@ -74,7 +74,10 @@ impl RespServer {
         }
         if !is_loopback_host(&config.host)
             && (!config.allow_insecure_remote
-                || config.auth_token.as_ref().map_or(true, |token| token.len() < 16))
+                || config
+                    .auth_token
+                    .as_ref()
+                    .is_none_or(|token| token.len() < 16))
         {
             return Err(
                 "remote RESP binding requires allow_insecure_remote=true and an auth token of at least 16 bytes"
@@ -374,11 +377,12 @@ async fn handle_command(
             let max_response_bytes = config.max_response_bytes;
             let items = tokio::task::spawn_blocking(move || {
                 let eng = engine.lock().map_err(|_| ())?;
-                Ok::<Vec<Vec<u8>>, ()>(eng
-                    .recall_bounded(&key, depth, max_response_bytes)
-                    .into_iter()
-                    .map(|node| node.value)
-                    .collect())
+                Ok::<Vec<Vec<u8>>, ()>(
+                    eng.recall_bounded(&key, depth, max_response_bytes)
+                        .into_iter()
+                        .map(|node| node.value)
+                        .collect(),
+                )
             })
             .await;
             match items {

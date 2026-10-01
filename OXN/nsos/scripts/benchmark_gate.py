@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
 import tempfile
 from pathlib import Path
-
-from cuda_env import add_windows_runtime_dirs, parse_preferred_cuda_root
-
+from native_module import load_native_module, native_artifact_identity, resolve_native_build_dir
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a lightweight NSOS runtime benchmark gate.")
@@ -16,8 +12,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
     parser.add_argument("--profile", choices=["mamba_small", "hybrid_pilot"], default="mamba_small")
     parser.add_argument("--max-tokens", type=int, default=24)
-    parser.add_argument("--min-prompt-tok-s", type=float, default=0.0)
-    parser.add_argument("--min-decode-tok-s", type=float, default=0.0)
+    # Defaults are the thresholds PRODUCT.md declares for the release gate.
+    # They used to be 0.0, which silently turned the throughput budget into a
+    # no-op for every invocation that did not pass the flags explicitly --
+    # including the one documented in docs/RELEASE.md. Lower them per run only
+    # with a recorded reason.
+    parser.add_argument("--min-prompt-tok-s", type=float, default=1.0)
+    parser.add_argument("--min-decode-tok-s", type=float, default=0.1)
     parser.add_argument("--max-sampler-share", type=float, default=1.0)
     parser.add_argument("--max-memory-bytes", type=int, default=0)
     parser.add_argument("--report-path", type=Path, default=None)
@@ -26,30 +27,15 @@ def parse_args() -> argparse.Namespace:
 
 def detect_build_dir(explicit: Path | None) -> Path:
     candidates: list[Path] = []
-    if explicit is not None:
-        explicit = explicit.expanduser().resolve()
-        candidates.extend([explicit, explicit / "Release"])
     repo_root = Path(__file__).resolve().parents[3]
     nsos_root = repo_root / "OXN" / "nsos"
     for name in ["build-mvp", "build_cuda129", "build_v1", "build_full", "build_codex", "build-ci-local", "build"]:
         candidates.extend([nsos_root / name / "Release", nsos_root / name])
-    for candidate in candidates:
-        if candidate.is_dir() and any(candidate.glob("nsos_ext*.pyd")):
-            return candidate.resolve()
-    raise RuntimeError("Could not find a build directory with nsos_ext.")
+    return resolve_native_build_dir(explicit, candidates)
 
 
 def load_nsos(build_dir: Path):
-    if str(build_dir) not in sys.path:
-        sys.path.insert(0, str(build_dir))
-    if os.name == "nt":
-        add_windows_runtime_dirs(
-            build_dir,
-            parse_preferred_cuda_root(os.environ.get("NSOS_CUDA_ROOT")),
-        )
-    import nsos_ext as nsos  # type: ignore
-
-    return nsos
+    return load_native_module(build_dir)
 
 
 def build_config(nsos, profile_name: str, device):
@@ -72,7 +58,7 @@ def build_config(nsos, profile_name: str, device):
         config.n_heads = 4
         config.n_kv_heads = 2
         config.attention_period = 2
-        config.attention_slot = 2
+        config.attention_slot = 1
         config.use_moe = False
         config.use_ttt = False
         config.use_exact_attention_training = True
@@ -167,6 +153,7 @@ def main() -> int:
 
         report = {
             "build_dir": str(build_dir),
+            "native_artifact": native_artifact_identity(nsos),
             "device": args.device,
             "profile": args.profile,
             "metrics": first_metrics,

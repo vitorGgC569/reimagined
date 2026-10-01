@@ -32,11 +32,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 def _import_nsos_ext():
+    import_errors: List[str] = []
     try:
         import nsos_ext  # noqa
         return nsos_ext
-    except ImportError:
-        pass
+    except ImportError as exc:
+        import_errors.append(f"default sys.path: {exc}")
     here = Path(__file__).resolve().parent
     candidates = [
         here.parent / "build-chrass-validation" / "Release",
@@ -52,9 +53,12 @@ def _import_nsos_ext():
             try:
                 import nsos_ext  # noqa
                 return nsos_ext
-            except ImportError:
-                continue
-    raise ImportError("nsos_ext not found. Build with NSOS_BUILD_PYTHON=ON.")
+            except ImportError as exc:
+                import_errors.append(f"{p}: {exc}")
+    raise ImportError(
+        "nsos_ext not found. Build with NSOS_BUILD_PYTHON=ON. Attempts: "
+        + " | ".join(import_errors)
+    )
 
 
 def build_model(eng_mod, args):
@@ -190,15 +194,15 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Slender GPU guard ────────────────────────────────────────────────
-    # Slender ensure_slender_cache_ requires weight.data on CPU; GPU path is
-    # Phase 7 (unimplemented).  If --cuda + --use-slender, the loop produces
-    # NaN every step.  Detect and abort early with a clear message so the
-    # report is honest about the skip rather than a wall of identical errors.
+    # Slender ensure_slender_cache_ requires weight.data on CPU. The research
+    # probe therefore defines --cuda + --use-slender as an unsupported
+    # combination. Detect it before loading the extension so no invalid run can
+    # produce a report that resembles a completed benchmark.
     if args.use_slender and args.cuda:
         skip_report = {
             "label": args.label,
             "skipped": True,
-            "reason": "Slender GPU path not implemented (Phase 7).  Rerun without --cuda or without --use-slender.",
+            "reason": "Slender GPU is outside this probe's supported contract. Rerun without --cuda or without --use-slender.",
             "config": {
                 "use_chrass": args.use_chrass, "use_ttt": args.use_ttt,
                 "vib_beta": args.vib_beta, "use_slender": args.use_slender,
@@ -275,8 +279,10 @@ def main() -> int:
                     el = float(engine.train_text(et[:args.max_doc_chars // 2]))
                     if el == el:
                         esum += el; ec += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Evaluation failed at training step {step}"
+                    ) from exc
             em = esum / max(ec, 1)
             eval_records.append({"step": step, "eval_loss": em, "n": ec})
             print(f"    [eval @ {step}] eval_loss={em:.4f}")

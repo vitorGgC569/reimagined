@@ -3,7 +3,9 @@
 
 #include "autograd.h"
 #include "bitlinear.h"
+#include "gpu_projection_group.h"
 #include "tensor.h"
+#include <array>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -73,6 +75,9 @@ struct MambaStreamSnapshot {
   std::vector<float> proper_state;
   std::vector<float> proper_ring;
   bool proper_active = false;
+  // Optional inference-only snapshots; checkpoint callers retain host vectors.
+  Tensor proper_state_device;
+  Tensor proper_ring_device;
 };
 
 class Mamba2SSD {
@@ -94,9 +99,9 @@ public:
   bool proper_selective_ssm_enabled() const {
     return config_.proper_selective_ssm || config_.faithful_mamba2;
   }
-  MambaStreamSnapshot snapshot_streaming_state() const;
+  MambaStreamSnapshot snapshot_streaming_state(bool device_resident = false) const;
   void restore_streaming_state(const MambaStreamSnapshot& snapshot);
-  std::vector<MambaStreamSnapshot> snapshot_streaming_state_batch() const;
+  std::vector<MambaStreamSnapshot> snapshot_streaming_state_batch(bool device_resident = false) const;
   void restore_streaming_state_batch(const std::vector<MambaStreamSnapshot>& snapshots);
   int streaming_batch_size() const;
   void collect_bitlinear_layers(std::vector<BitLinear*>& out);
@@ -104,6 +109,78 @@ public:
   size_t gpu_fast_path_hits() const { return gpu_fast_path_hits_; }
   size_t gpu_fast_path_fallbacks() const { return gpu_fast_path_fallbacks_; }
   const std::string& last_fallback_reason() const { return last_fallback_reason_; }
+  size_t faithful_forward_gpu_calls() const {
+    return faithful_forward_gpu_calls_;
+  }
+  size_t faithful_forward_host_fallbacks() const {
+    return faithful_forward_host_fallbacks_;
+  }
+  size_t faithful_backward_gpu_calls() const {
+    return faithful_backward_gpu_calls_;
+  }
+  size_t faithful_backward_host_fallbacks() const {
+    return faithful_backward_host_fallbacks_;
+  }
+  size_t faithful_streaming_gpu_calls() const {
+    return faithful_streaming_gpu_calls_;
+  }
+  size_t faithful_streaming_host_fallbacks() const {
+    return faithful_streaming_host_fallbacks_;
+  }
+  size_t stream_priming_gpu_calls() const {
+    return stream_priming_gpu_calls_;
+  }
+  size_t stream_priming_host_fallbacks() const {
+    return stream_priming_host_fallbacks_;
+  }
+  size_t faithful_recompute_forwards() const {
+    return faithful_recompute_forwards_;
+  }
+  size_t faithful_selective_history_recomputes() const {
+    return faithful_selective_history_recomputes_;
+  }
+  size_t faithful_full_block_recompute_forwards() const {
+    return faithful_full_block_recompute_forwards_;
+  }
+  size_t faithful_warp_aggregated_backward_calls() const {
+    return faithful_warp_aggregated_backward_calls_;
+  }
+  size_t faithful_deterministic_backward_calls() const {
+    return faithful_deterministic_backward_calls_;
+  }
+  size_t faithful_scalar_atomic_backward_calls() const {
+    return faithful_scalar_atomic_backward_calls_;
+  }
+  size_t faithful_reduced_conv_backward_calls() const {
+    return faithful_reduced_conv_backward_calls_;
+  }
+  size_t faithful_generic_atomic_conv_backward_calls() const {
+    return faithful_generic_atomic_conv_backward_calls_;
+  }
+  size_t faithful_peak_state_history_bytes() const {
+    return faithful_peak_state_history_bytes_;
+  }
+  size_t faithful_grouped_projection_forward_calls() const {
+    return faithful_grouped_projection_forward_calls_;
+  }
+  size_t faithful_grouped_projection_backward_calls() const {
+    return faithful_grouped_projection_backward_calls_;
+  }
+  size_t faithful_grouped_projection_cache_rebuilds() const {
+    return faithful_grouped_projection_cache_rebuilds_;
+  }
+  size_t faithful_grouped_projection_full_forward_calls() const {
+    return faithful_grouped_projection_full_forward_calls_;
+  }
+  size_t faithful_grouped_projection_sensitive_forward_calls() const {
+    return faithful_grouped_projection_sensitive_forward_calls_;
+  }
+  size_t faithful_grouped_projection_full_backward_calls() const {
+    return faithful_grouped_projection_full_backward_calls_;
+  }
+  size_t faithful_grouped_projection_sensitive_backward_calls() const {
+    return faithful_grouped_projection_sensitive_backward_calls_;
+  }
 
   // Accessors
   const std::string &get_layer_name() const { return layer_name; }
@@ -136,6 +213,17 @@ private:
   Tensor backward_proper_nstate(const Tensor &grad_output);
   Tensor forward_faithful(const Tensor &u);
   Tensor backward_faithful(const Tensor &grad_output);
+  bool faithful_grouped_projection_eligible(const Tensor& input) const;
+  bool faithful_sensitive_grouped_projection_eligible(
+      const Tensor& input) const;
+  void refresh_faithful_grouped_projection_cache();
+  std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
+  forward_faithful_grouped_projections(const Tensor& input);
+  std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor>
+  forward_faithful_sensitive_grouped_projections(const Tensor& input);
+  Tensor backward_faithful_grouped_projections(
+      const Tensor& gx, const Tensor& gz, const Tensor& gB,
+      const Tensor& gC, const Tensor& gdt);
   // Single-token incremental decode for the proper path.  Carries the SSD state
   // and a (K-1)-tap conv window (pp_stream_*) across calls so each generated
   // token is O(1) instead of re-scanning the whole prefix.  Numerically mirrors
@@ -170,11 +258,11 @@ private:
 
   int d_model;
   int d_state;
+  int d_inner;
   int n_heads;
   int d_head;
-  int d_inner;
-  int conv_dim;
   int n_groups;
+  int conv_dim;
 
   MambaConfig config_;
 
@@ -190,6 +278,7 @@ private:
   // unique_ptr so the DEFAULT path constructs and serializes exactly the same
   // parameter set as before (these stay null → not exposed via parameters()).
   std::unique_ptr<BitLinear> x_proj_;  // x stream
+  GpuProjectionGroup decode_projections_;
   std::unique_ptr<BitLinear> z_proj_;  // gate stream (silu)
   std::unique_ptr<BitLinear> B_proj_;  // selective B
   std::unique_ptr<BitLinear> C_proj_;  // selective C
@@ -223,11 +312,20 @@ private:
   Tensor pp_B_;              // B projection
   Tensor pp_C_;              // C projection
   Tensor pp_dt_;             // dt projection raw
+  // Optional stable decay scalars [rows,H,5].  The forward and backward use
+  // identical values while A/dt are immutable within a training step, so the
+  // GPU precompute is retained as part of the one-shot backward ticket.
+  Tensor pp_decay_terms_;
   Tensor pp_h_hist_;         // diagonal state history h_t [rows, dim]
   Tensor pp_y_ssd_;          // h_t * C_t (pre-gate)
   Tensor pp_gated_input_;    // (SSD + D*x) * SiLU(z)
   Tensor pp_gated_norm_;     // RMS-normalized gated input
   Tensor pp_state_hist_;     // N-state SSD history [rows, H, P, N] (BPTT)
+  // GPU faithful training may store the same logical history as
+  // [rows,N,H,P] for coalesced wave access. This flag is part of the internal
+  // layout contract; no tensor is interpreted with an incompatible shape.
+  bool pp_state_hist_state_major_ = false;
+  int pp_state_hist_chunk_size_ = 0; // 0 = dense history, 32 = entering states
   int pp_batch_ = 0;
   int pp_seq_ = 0;
 
@@ -242,9 +340,11 @@ private:
   bool pp_stream_active_ = false;
   // GPU incremental decode step (opt-in NSOS_MAMBA_GPU_STEP, diagonal path): the
   // SSD state h + conv ring live device-resident across tokens so the per-token
-  // decode has NO host round-trip (and is CUDA-graph capturable).  The host
-  // vectors above stay canonical for snapshot/restore; these device buffers are
-  // synced from them on (re)prime/restore and back to them on snapshot.  mutable:
+  // decode has NO host round-trip. GPU prefill primes these buffers directly
+  // from the final device history/ring tails; a restored CPU snapshot uploads
+  // them on the next step. The host vectors are therefore canonical only while
+  // pp_stream_dev_live_ is false; snapshots materialize the live device carry.
+  // mutable:
   // snapshot_streaming_state() is const but must read the live device state.
   mutable Tensor pp_stream_h_dev_;
   mutable Tensor pp_stream_ring_dev_;
@@ -261,10 +361,51 @@ private:
   bool training_mode_ = true;
   bool faithful_recompute_active_ = false;
   Tensor faithful_checkpoint_input_;
+  // Shared packed owner of the five canonical faithful projection weights in
+  // official [z,x,B,C,dt] order. Canonical Parameters remain independently
+  // named/checkpointed as non-overlapping aliasing views. Float mode groups all
+  // five GEMMs; QAT keeps ternary z/x separate and groups exact B/C/dt.
+  Tensor faithful_grouped_projection_weight_;
+  std::array<uint64_t, 5> faithful_grouped_projection_versions_{};
+  // Exact monotonic content epoch for the packed owner. It advances whenever
+  // any component Parameter::version changes and keys the lowp GEMM cache.
+  uint64_t faithful_grouped_projection_content_epoch_ = 0;
+  enum class FaithfulGroupedProjectionMode {
+    None,
+    Full,
+    Sensitive
+  };
+  FaithfulGroupedProjectionMode faithful_grouped_projection_backward_mode_ =
+      FaithfulGroupedProjectionMode::None;
   std::shared_ptr<Tensor> streaming_state_;
   size_t gpu_fast_path_hits_ = 0;
   size_t gpu_fast_path_fallbacks_ = 0;
   std::string last_fallback_reason_;
+  size_t faithful_forward_gpu_calls_ = 0;
+  size_t faithful_forward_host_fallbacks_ = 0;
+  size_t faithful_backward_gpu_calls_ = 0;
+  size_t faithful_backward_host_fallbacks_ = 0;
+  size_t faithful_streaming_gpu_calls_ = 0;
+  size_t faithful_streaming_host_fallbacks_ = 0;
+  size_t stream_priming_gpu_calls_ = 0;
+  size_t stream_priming_host_fallbacks_ = 0;
+  size_t faithful_recompute_forwards_ = 0;
+  size_t faithful_selective_history_recomputes_ = 0;
+  size_t faithful_full_block_recompute_forwards_ = 0;
+  size_t faithful_warp_aggregated_backward_calls_ = 0;
+  size_t faithful_deterministic_backward_calls_ = 0;
+  size_t faithful_scalar_atomic_backward_calls_ = 0;
+  size_t faithful_reduced_conv_backward_calls_ = 0;
+  size_t faithful_generic_atomic_conv_backward_calls_ = 0;
+  int faithful_runtime_warp_size_ = 0;
+  size_t faithful_peak_state_history_bytes_ = 0;
+  size_t faithful_grouped_projection_forward_calls_ = 0;
+  size_t faithful_grouped_projection_backward_calls_ = 0;
+  size_t faithful_grouped_projection_cache_rebuilds_ = 0;
+  size_t faithful_grouped_projection_full_forward_calls_ = 0;
+  size_t faithful_grouped_projection_sensitive_forward_calls_ = 0;
+  size_t faithful_grouped_projection_full_backward_calls_ = 0;
+  size_t faithful_grouped_projection_sensitive_backward_calls_ = 0;
 };
 
 } // namespace nsos

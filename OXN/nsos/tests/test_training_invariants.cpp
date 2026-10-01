@@ -1,15 +1,21 @@
 #include "../include/jamba.h"
 #include "../include/trainer.h"
 #include "../include/nsos/determinism.h"
+#include "../include/nsos/sha256.h"
+#include "sparse_gradient_contract.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace nsos;
@@ -36,6 +42,76 @@ void set_test_env(const char* name, const char* value) {
 #endif
 }
 
+struct ScopedTemporaryDirectory {
+  std::filesystem::path path;
+
+  explicit ScopedTemporaryDirectory(const std::string& prefix) {
+    const auto timestamp =
+        std::chrono::steady_clock::now()
+            .time_since_epoch()
+            .count();
+    path = std::filesystem::temp_directory_path() /
+           (prefix + "_" + std::to_string(timestamp));
+    std::filesystem::create_directories(path);
+  }
+
+  ~ScopedTemporaryDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+  }
+};
+
+std::vector<unsigned char> read_binary_file(
+    const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  require(input.is_open(), "could not open binary fixture");
+  return std::vector<unsigned char>(
+      std::istreambuf_iterator<char>(input),
+      std::istreambuf_iterator<char>());
+}
+
+void write_binary_file(
+    const std::filesystem::path& path,
+    const std::vector<unsigned char>& bytes) {
+  std::ofstream output(
+      path, std::ios::binary | std::ios::trunc);
+  require(output.is_open(), "could not write binary fixture");
+  if (!bytes.empty()) {
+    output.write(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+  }
+  output.close();
+  require(output.good(), "binary fixture write failed");
+}
+
+void require_tensor_bitwise_equal(
+    const Tensor& actual,
+    const Tensor& expected,
+    const std::string& context) {
+  require(actual.shape == expected.shape,
+          context + ": tensor-shape mismatch");
+  require(actual.get_device() == expected.get_device(),
+          context + ": tensor-device mismatch");
+  if (actual.size == 0) return;
+  const Tensor actual_cpu = actual.cpu();
+  const Tensor expected_cpu = expected.cpu();
+  require(
+      std::memcmp(
+          actual_cpu.data(), expected_cpu.data(),
+          static_cast<size_t>(actual_cpu.size) *
+              sizeof(float)) == 0,
+      context + ": tensor bytes changed");
+}
+
+#ifdef NSOS_ENABLE_TEST_HOOKS
+struct TrainingStateFaultReset {
+  ~TrainingStateFaultReset() {
+    testing::clear_training_state_stage_failure();
+  }
+};
+#endif
+
 float max_parameter_difference(JambaModel& lhs, JambaModel& rhs) {
   auto left = lhs.parameters();
   auto right = rhs.parameters();
@@ -51,6 +127,223 @@ float max_parameter_difference(JambaModel& lhs, JambaModel& rhs) {
     }
   }
   return maximum;
+}
+
+void require_model_parameters_bitwise_equal(
+    JambaModel& lhs, JambaModel& rhs,
+    const std::string& context) {
+  const auto left = lhs.parameters();
+  const auto right = rhs.parameters();
+  require(left.size() == right.size(),
+          context + ": parameter-count mismatch");
+  for (size_t index = 0; index < left.size(); ++index) {
+    require(left[index] != nullptr && right[index] != nullptr,
+            context + ": null parameter");
+    require(left[index]->name == right[index]->name,
+            context + ": parameter registry order differs");
+    require_tensor_bitwise_equal(
+        left[index]->data, right[index]->data,
+        context + ": " + left[index]->name);
+  }
+}
+
+void require_optimizer_states_by_registry_bitwise_equal(
+    Trainer& lhs_trainer, JambaModel& lhs_model,
+    Trainer& rhs_trainer, JambaModel& rhs_model,
+    const std::string& context) {
+  const auto left = lhs_model.parameters();
+  const auto right = rhs_model.parameters();
+  require(left.size() == right.size(),
+          context + ": optimizer registry size differs");
+  const auto compare =
+      [&](const auto& lhs_state, const auto& rhs_state,
+          const std::string& state_name) {
+        require(lhs_state.size() == rhs_state.size(),
+                context + ": " + state_name +
+                    " cardinality differs");
+        for (size_t index = 0; index < left.size(); ++index) {
+          const auto lhs_entry = lhs_state.find(left[index]);
+          const auto rhs_entry = rhs_state.find(right[index]);
+          if (lhs_entry == lhs_state.end() &&
+              rhs_entry == rhs_state.end()) {
+            continue;
+          }
+          require(
+              lhs_entry != lhs_state.end() &&
+                  rhs_entry != rhs_state.end(),
+              context + ": " + state_name +
+                  " registry membership differs");
+          require_tensor_bitwise_equal(
+              lhs_entry->second, rhs_entry->second,
+              context + ": " + state_name + ": " +
+                  left[index]->name);
+        }
+      };
+  compare(lhs_trainer.m_state, rhs_trainer.m_state, "first moment");
+  compare(lhs_trainer.v_state, rhs_trainer.v_state, "second moment");
+}
+
+std::vector<Tensor> clone_parameter_gradients(JambaModel& model) {
+  std::vector<Tensor> snapshots;
+  const auto parameters = model.parameters();
+  snapshots.reserve(parameters.size());
+  for (const Parameter* parameter : parameters) {
+    snapshots.push_back(
+        parameter && parameter->grad.size > 0
+            ? parameter->grad.clone()
+            : Tensor());
+  }
+  return snapshots;
+}
+
+std::vector<Tensor> clone_parameter_values(JambaModel& model) {
+  std::vector<Tensor> snapshots;
+  const auto parameters = model.parameters();
+  snapshots.reserve(parameters.size());
+  for (const Parameter* parameter : parameters) {
+    require(parameter != nullptr,
+            "cannot snapshot a null model parameter");
+    snapshots.push_back(parameter->data.clone());
+  }
+  return snapshots;
+}
+
+void require_parameter_values_bitwise_equal(
+    JambaModel& model,
+    const std::vector<Tensor>& expected,
+    const std::string& context) {
+  const auto parameters = model.parameters();
+  require(parameters.size() == expected.size(),
+          context + ": parameter-count mismatch");
+  for (size_t index = 0; index < parameters.size(); ++index) {
+    require(parameters[index] != nullptr,
+            context + ": null parameter");
+    require_tensor_bitwise_equal(
+        parameters[index]->data, expected[index],
+        context + ": " + parameters[index]->name);
+  }
+}
+
+std::unordered_map<Parameter*, Tensor> clone_tensor_state_map(
+    const std::unordered_map<Parameter*, Tensor>& source) {
+  std::unordered_map<Parameter*, Tensor> snapshot;
+  snapshot.reserve(source.size());
+  for (const auto& [parameter, tensor] : source) {
+    snapshot.emplace(parameter, tensor.clone());
+  }
+  return snapshot;
+}
+
+void require_tensor_state_map_bitwise_equal(
+    const std::unordered_map<Parameter*, Tensor>& actual,
+    const std::unordered_map<Parameter*, Tensor>& expected,
+    const std::string& context) {
+  require(actual.size() == expected.size(),
+          context + ": state-map cardinality changed");
+  for (const auto& [parameter, tensor] : expected) {
+    const auto found = actual.find(parameter);
+    require(found != actual.end(),
+            context + ": state-map parameter disappeared");
+    require_tensor_bitwise_equal(
+        found->second, tensor, context + ": state tensor");
+  }
+}
+
+void require_parameter_gradients_equal(
+    JambaModel& model,
+    const std::vector<Tensor>& expected,
+    const std::string& context) {
+  const auto parameters = model.parameters();
+  require(parameters.size() == expected.size(),
+          context + ": parameter-count mismatch");
+  for (size_t parameter_index = 0;
+       parameter_index < parameters.size();
+       ++parameter_index) {
+    const Parameter* parameter = parameters[parameter_index];
+    require(parameter != nullptr, context + ": null parameter");
+    require(parameter->grad.size == expected[parameter_index].size,
+            context + ": gradient-presence mismatch for " +
+                parameter->name);
+    if (parameter->grad.size == 0) continue;
+    const Tensor actual = parameter->grad.cpu();
+    const Tensor reference = expected[parameter_index].cpu();
+    require(actual.size == reference.size,
+            context + ": gradient-size mismatch for " +
+                parameter->name);
+    for (int element = 0; element < actual.size; ++element) {
+      require(actual.data()[element] == reference.data()[element],
+              context + ": gradient changed for " + parameter->name);
+    }
+  }
+}
+
+void test_model_backward_one_shot_contract() {
+  ModelConfig cfg;
+  cfg.num_layers = 1;
+  cfg.d_model = 8;
+  cfg.vocab_size = 32;
+  cfg.n_heads = 2;
+  cfg.n_kv_heads = 1;
+  cfg.attention_period = 64;
+  cfg.use_moe = false;
+  cfg.use_ttt = false;
+  cfg.use_chrass = false;
+  cfg.dropout = 0.0f;
+  cfg.mamba2_faithful = false;
+  cfg.tie_word_embeddings = false;
+
+  JambaModel model(cfg, Device::CPU);
+  model.set_training_mode(true);
+  const std::vector<int> ids = {1, 2, 3};
+  Context context;
+  Tensor logits = model.forward_ids(ids, &context);
+  const Tensor gradient = Tensor::ones(logits.shape.dims, Device::CPU)
+                              .mul(1e-3f);
+  model.backward(gradient, context);
+
+  const auto after_first_backward = clone_parameter_gradients(model);
+  bool duplicate_rejected = false;
+  try {
+    model.backward(gradient, context);
+  } catch (const std::runtime_error&) {
+    duplicate_rejected = true;
+  }
+  require(duplicate_rejected,
+          "model accepted a duplicate backward");
+  require_parameter_gradients_equal(
+      model, after_first_backward,
+      "duplicate backward rejection");
+
+  (void)model.forward_ids(ids, &context);
+  bool invalid_forward_rejected = false;
+  try {
+    (void)model.forward_ids({}, &context);
+  } catch (const std::invalid_argument&) {
+    invalid_forward_rejected = true;
+  }
+  require(invalid_forward_rejected,
+          "invalid forward fixture was not rejected");
+  bool stale_after_failure_rejected = false;
+  try {
+    model.backward(gradient, context);
+  } catch (const std::runtime_error&) {
+    stale_after_failure_rejected = true;
+  }
+  require(stale_after_failure_rejected,
+          "failed forward preserved a stale backward ticket");
+
+  (void)model.forward_ids(ids, &context);
+  (void)model.forward_trunk(ids, &context);
+  bool trunk_stale_rejected = false;
+  try {
+    model.backward(gradient, context);
+  } catch (const std::runtime_error&) {
+    trunk_stale_rejected = true;
+  }
+  require(trunk_stale_rejected,
+          "trunk-only forward preserved a full-model backward ticket");
+  std::cout << "[invariant] model backward one-shot contract enforced"
+            << std::endl;
 }
 
 void test_train_loop_chunk_invariance() {
@@ -297,7 +590,7 @@ void test_weighted_cross_entropy_contract() {
 void test_chrass_layerscale_vjp() {
   JambaBlock block(
       8, true, false, false, 0, 1, 2, 1, 1, 1, true, 0.0f, false,
-      16, true, 0.35f, 1234u, false, true, true, 2, true, 2, 4, 1);
+      16, true, 0.35f, 1234u, false, true, true, 64, 2, true, 2, 4, 1);
   Tensor x({1, 2, 8}, Device::CPU);
   Tensor dy({1, 2, 8}, Device::CPU);
   for (int i = 0; i < x.size; ++i) {
@@ -538,12 +831,56 @@ void test_training_checkpoint_continuation() {
   source_trainer.criticality_lr_scale[source_parameters.front()] = 0.8f;
   source_trainer.crit_g0_state[source_parameters.front()] = 1.125f;
 
-  const auto root = std::filesystem::temp_directory_path();
-  const auto model_path = root / "nsos_training_resume_model.bin";
-  const auto state_path = root / "nsos_training_resume_model.trainer.bin";
-  const auto wrong_path = root / "nsos_training_resume_wrong.bin";
+  ScopedTemporaryDirectory directory("nsos_training_resume");
+  const auto model_path = directory.path / "model.bin";
+  const auto state_path = directory.path / "model.trainer.bin";
+  const auto wrong_path = directory.path / "wrong.bin";
+  const auto corrupt_path = directory.path / "corrupt.trainer.bin";
+  const auto truncated_path =
+      directory.path / "truncated.trainer.bin";
+  const auto trailing_path =
+      directory.path / "trailing.trainer.bin";
+  const auto semantic_nan_path =
+      directory.path / "semantic_nan.trainer.bin";
   source.save(model_path.string());
   source_trainer.save_training_state(state_path.string(), model_path.string());
+  const std::vector<unsigned char> valid_state =
+      read_binary_file(state_path);
+  constexpr size_t kSha256TrailerBytes =
+      sizeof(uint32_t) + sizeof(uint64_t) + 64u;
+  require(valid_state.size() > kSha256TrailerBytes + 100u,
+          "training-state fixture is unexpectedly small");
+
+  std::vector<unsigned char> corrupt_state = valid_state;
+  corrupt_state[100] ^= 0x5au;
+  write_binary_file(corrupt_path, corrupt_state);
+
+  std::vector<unsigned char> truncated_state = valid_state;
+  truncated_state.resize(truncated_state.size() - 13u);
+  write_binary_file(truncated_path, truncated_state);
+
+  std::vector<unsigned char> trailing_state = valid_state;
+  trailing_state.push_back(0xa5u);
+  write_binary_file(trailing_path, trailing_state);
+
+  // Version 9 begins trainer floats after magic, version, architecture
+  // fingerprint, model byte count, model SHA-256 and RNG sequence.
+  constexpr size_t kLearningRateOffset =
+      sizeof(uint32_t) * 3u + sizeof(uint64_t) + 64u +
+      sizeof(uint64_t);
+  std::vector<unsigned char> semantic_nan_state = valid_state;
+  const uint32_t quiet_nan = 0x7fc00000u;
+  std::memcpy(semantic_nan_state.data() + kLearningRateOffset,
+              &quiet_nan, sizeof(quiet_nan));
+  const size_t semantic_payload_bytes =
+      semantic_nan_state.size() - kSha256TrailerBytes;
+  const std::string semantic_digest = integrity::sha256_hex(
+      semantic_nan_state.data(), semantic_payload_bytes);
+  require(semantic_digest.size() == 64u,
+          "SHA-256 fixture digest has invalid size");
+  std::copy(semantic_digest.begin(), semantic_digest.end(),
+            semantic_nan_state.end() - 64);
+  write_binary_file(semantic_nan_path, semantic_nan_state);
 
   JambaModel wrong_model(cfg, Device::CPU);
   wrong_model.save(wrong_path.string());
@@ -561,6 +898,138 @@ void test_training_checkpoint_continuation() {
   require(transaction_probe.global_step_count == 777,
           "failed training-state load partially mutated Trainer");
 
+  JambaModel failure_model(cfg, Device::CPU);
+  failure_model.load(model_path.string(), true);
+  Trainer failure_probe(&failure_model, 9.0f);
+  failure_probe.global_step_count = 777;
+  failure_probe.warmup_steps = 123;
+  failure_probe.total_training_steps = 987;
+  failure_probe.last_optimizer_step_skipped = true;
+  failure_probe.phase_scheduler.semantic_warmup_steps = 41;
+  failure_probe.phase_scheduler.qat_start_step = 654;
+  failure_model.set_training_rng_sequence(999);
+  auto failure_parameters = failure_model.parameters();
+  require(!failure_parameters.empty(),
+          "failure-transaction fixture has no parameters");
+  Parameter* failure_parameter = failure_parameters.front();
+  Tensor live_m = Tensor::ones(
+      failure_parameter->data.shape.dims, Device::CPU);
+  Tensor live_v = Tensor::ones(
+      failure_parameter->data.shape.dims, Device::CPU)
+                      .mul(2.0f);
+  failure_probe.m_state.emplace(failure_parameter, live_m.clone());
+  failure_probe.v_state.emplace(failure_parameter, live_v.clone());
+  failure_probe.crit_g0_state.emplace(failure_parameter, 4.25f);
+  failure_probe.external_lr_scale.emplace(failure_parameter, 1.75f);
+  failure_probe.criticality_lr_scale.emplace(failure_parameter, 0.625f);
+
+  const auto require_failure_probe_unchanged =
+      [&](const std::string& context) {
+        require(failure_probe.learning_rate == 9.0f,
+                context + ": learning rate changed");
+        require(failure_probe.global_step_count == 777 &&
+                    failure_probe.warmup_steps == 123 &&
+                    failure_probe.total_training_steps == 987,
+                context + ": scalar metadata changed");
+        require(failure_probe.last_optimizer_step_skipped,
+                context + ": optimizer status changed");
+        require(
+            failure_probe.phase_scheduler.semantic_warmup_steps == 41 &&
+                failure_probe.phase_scheduler.qat_start_step == 654,
+            context + ": scheduler changed");
+        require(failure_model.training_rng_sequence() == 999,
+                context + ": model RNG changed");
+        require(failure_probe.m_state.size() == 1u &&
+                    failure_probe.v_state.size() == 1u &&
+                    failure_probe.quant_state.empty(),
+                context + ": optimizer-state cardinality changed");
+        require_tensor_bitwise_equal(
+            failure_probe.m_state.at(failure_parameter), live_m,
+            context + ": first moment");
+        require_tensor_bitwise_equal(
+            failure_probe.v_state.at(failure_parameter), live_v,
+            context + ": second moment");
+        require(failure_probe.crit_g0_state.size() == 1u &&
+                    failure_probe.crit_g0_state.at(failure_parameter) ==
+                        4.25f &&
+                    failure_probe.external_lr_scale.size() == 1u &&
+                    failure_probe.external_lr_scale.at(failure_parameter) ==
+                        1.75f &&
+                    failure_probe.criticality_lr_scale.size() == 1u &&
+                    failure_probe.criticality_lr_scale.at(
+                        failure_parameter) == 0.625f,
+                context + ": per-parameter controller state changed");
+      };
+
+  const auto expect_transactional_rejection =
+      [&](const std::filesystem::path& path,
+          const std::string& context) {
+        bool rejected = false;
+        try {
+          failure_probe.load_training_state(
+              path.string(), model_path.string());
+        } catch (const std::exception&) {
+          rejected = true;
+        }
+        require(rejected, context + ": invalid state was accepted");
+        require_failure_probe_unchanged(context);
+      };
+  expect_transactional_rejection(
+      corrupt_path, "checksum corruption");
+  expect_transactional_rejection(
+      truncated_path, "truncated state");
+  expect_transactional_rejection(
+      trailing_path, "trailing state");
+  expect_transactional_rejection(
+      semantic_nan_path, "semantic NaN");
+
+#ifdef NSOS_ENABLE_TEST_HOOKS
+  {
+    TrainingStateFaultReset reset_faults;
+    testing::set_training_state_stage_failure_countdown(2);
+    bool oom_rejected = false;
+    try {
+      failure_probe.load_training_state(
+          state_path.string(), model_path.string());
+    } catch (const std::bad_alloc&) {
+      oom_rejected = true;
+    }
+    require(oom_rejected,
+            "injected mid-stage OOM did not abort training-state load");
+    require_failure_probe_unchanged("mid-stage OOM");
+  }
+  {
+    TrainingStateFaultReset reset_faults;
+    const int saved_total_steps =
+        source_trainer.total_training_steps;
+    source_trainer.total_training_steps =
+        saved_total_steps + 1;
+    testing::set_training_state_save_failure_before_replace(true);
+    bool interruption_rejected = false;
+    try {
+      source_trainer.save_training_state(
+          state_path.string(), model_path.string());
+    } catch (const std::runtime_error&) {
+      interruption_rejected = true;
+    }
+    source_trainer.total_training_steps =
+        saved_total_steps;
+    require(interruption_rejected,
+            "injected save interruption did not abort");
+    require(read_binary_file(state_path) == valid_state,
+            "interrupted save replaced the last valid sidecar");
+    const std::string temporary_prefix =
+        state_path.filename().string() + ".tmp.";
+    for (const auto& entry :
+         std::filesystem::directory_iterator(directory.path)) {
+      require(
+          entry.path().filename().string().rfind(
+              temporary_prefix, 0) != 0,
+          "interrupted save leaked a temporary sidecar");
+    }
+  }
+#endif
+
   JambaModel resumed(cfg, Device::CPU);
   resumed.load(model_path.string(), true);
   Trainer resumed_trainer(&resumed, 9.0f);
@@ -573,11 +1042,15 @@ void test_training_checkpoint_continuation() {
   require(resumed_trainer.m_state.size() == source_trainer.m_state.size() &&
               resumed_trainer.v_state.size() == source_trainer.v_state.size(),
           "Adam state cardinality was not restored");
+  require_model_parameters_bitwise_equal(
+      source, resumed, "CPU checkpoint round trip");
+  require_optimizer_states_by_registry_bitwise_equal(
+      source_trainer, source, resumed_trainer, resumed,
+      "CPU checkpoint round trip");
   auto resumed_parameters = resumed.parameters();
   require(!resumed_parameters.empty(), "resumed fixture has no parameters");
-  require(std::abs(resumed_trainer.lr_scale_for(resumed_parameters.front()) -
-                   source_trainer.lr_scale_for(source_parameters.front())) <
-              1e-7f,
+  require(resumed_trainer.lr_scale_for(resumed_parameters.front()) ==
+              source_trainer.lr_scale_for(source_parameters.front()),
           "composed per-parameter LR scales were not restored");
   require(resumed_trainer.crit_g0_state.size() ==
               source_trainer.crit_g0_state.size(),
@@ -596,17 +1069,332 @@ void test_training_checkpoint_continuation() {
   const float source_loss = source_trainer.train_step(tokens, targets);
   const float resumed_loss = resumed_trainer.train_step(tokens, targets);
   const float continuation_diff = max_parameter_difference(source, resumed);
-  require(std::abs(source_loss - resumed_loss) < 1e-6f,
-          "resumed objective diverged from uninterrupted training");
-  require(continuation_diff < 1e-7f,
-          "resumed optimizer update diverged from uninterrupted training");
+  require(std::memcmp(&source_loss, &resumed_loss, sizeof(float)) == 0,
+          "resumed objective is not bitwise identical");
+  require_model_parameters_bitwise_equal(
+      source, resumed, "CPU checkpoint continuation");
+  require_optimizer_states_by_registry_bitwise_equal(
+      source_trainer, source, resumed_trainer, resumed,
+      "CPU checkpoint continuation");
   std::cout << "[invariant] training resume loss="
             << std::abs(source_loss - resumed_loss)
             << " params=" << continuation_diff << std::endl;
+}
 
-  std::filesystem::remove(model_path);
-  std::filesystem::remove(state_path);
-  std::filesystem::remove(wrong_path);
+void test_nonfinite_optimizer_rejection_and_recovery() {
+#ifdef NSOS_ENABLE_TEST_HOOKS
+  ModelConfig cfg;
+  cfg.num_layers = 1;
+  cfg.d_model = 16;
+  cfg.vocab_size = 40;
+  cfg.n_heads = 4;
+  cfg.n_kv_heads = 2;
+  cfg.attention_period = 64;
+  cfg.use_moe = false;
+  cfg.use_ttt = false;
+  cfg.use_chrass = false;
+  cfg.dropout = 0.0f;
+  cfg.mamba2_faithful = false;
+  cfg.tie_word_embeddings = false;
+
+  determinism::DeterminismManager::instance().set_global_seed(20260728);
+  JambaModel model(cfg, Device::CPU);
+  Trainer trainer(&model, 1.0e-3f);
+  trainer.weight_decay = 0.0f;
+  trainer.max_grad_norm = 10.0f;
+  const std::vector<int> tokens = {1, 3, 5, 7, 9, 11};
+  const std::vector<int> targets = {3, 5, 7, 9, 11, 13};
+
+  const float warmup_loss = trainer.train_step(tokens, targets);
+  require(std::isfinite(warmup_loss),
+          "NaN recovery fixture warmup was non-finite");
+  const int step_before_fault = trainer.global_step_count;
+  const auto weights_before_fault =
+      clone_parameter_values(model);
+  const auto m_before_fault =
+      clone_tensor_state_map(trainer.m_state);
+  const auto v_before_fault =
+      clone_tensor_state_map(trainer.v_state);
+
+  TrainingStateFaultReset reset_faults;
+  testing::inject_training_nan_before_optimizer();
+  bool rejected = false;
+  try {
+    (void)trainer.train_step(tokens, targets);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  require(rejected,
+          "injected optimizer NaN did not reject the training step");
+  require(trainer.last_optimizer_step_skipped,
+          "NaN rejection did not report a skipped optimizer step");
+  require(trainer.global_step_count == step_before_fault,
+          "NaN rejection advanced the optimizer step");
+  require_parameter_values_bitwise_equal(
+      model, weights_before_fault, "NaN rejection");
+  require_tensor_state_map_bitwise_equal(
+      trainer.m_state, m_before_fault, "NaN rejection m");
+  require_tensor_state_map_bitwise_equal(
+      trainer.v_state, v_before_fault, "NaN rejection v");
+  for (const Parameter* parameter : model.parameters()) {
+    if (!parameter || !parameter->trainable ||
+        parameter->grad.size == 0) {
+      continue;
+    }
+    const Tensor gradient = parameter->grad.cpu();
+    for (int index = 0; index < gradient.size; ++index) {
+      require(gradient.data()[index] == 0.0f,
+              "NaN rejection retained a poisoned gradient");
+    }
+  }
+
+  const float recovered_loss = trainer.train_step(tokens, targets);
+  require(std::isfinite(recovered_loss),
+          "training did not recover after a rejected NaN step");
+  require(!trainer.last_optimizer_step_skipped,
+          "successful recovery step remained marked skipped");
+  require(trainer.global_step_count == step_before_fault + 1,
+          "recovery did not apply exactly one optimizer step");
+
+  // Adam's second moment is a non-negative quantity. A finite but corrupt
+  // negative value must be rejected by the same pre-commit gate; discovering
+  // it only after updating a prefix would unnecessarily poison the trainer.
+  Parameter* negative_v_parameter = nullptr;
+  for (auto& entry : trainer.v_state) {
+    if (entry.first && entry.second.size > 0 &&
+        entry.second.get_device() == Device::CPU) {
+      negative_v_parameter = entry.first;
+      break;
+    }
+  }
+  require(negative_v_parameter != nullptr,
+          "negative-second-moment fixture has no CPU Adam state");
+  Tensor& negative_v = trainer.v_state.at(negative_v_parameter);
+  const float valid_v0 = negative_v.data()[0];
+  negative_v.data()[0] = -1.0f;
+  const auto weights_before_negative_v =
+      clone_parameter_values(model);
+  const auto m_before_negative_v =
+      clone_tensor_state_map(trainer.m_state);
+  const auto v_before_negative_v =
+      clone_tensor_state_map(trainer.v_state);
+  const int step_before_negative_v = trainer.global_step_count;
+  bool negative_v_rejected = false;
+  try {
+    (void)trainer.train_step(tokens, targets);
+  } catch (const std::runtime_error&) {
+    negative_v_rejected = true;
+  }
+  require(negative_v_rejected,
+          "negative Adam second moment passed the pre-commit gate");
+  require(!trainer.optimizer_state_poisoned(),
+          "pre-commit second-moment rejection poisoned the trainer");
+  require(trainer.global_step_count == step_before_negative_v,
+          "negative second moment advanced the optimizer step");
+  require_parameter_values_bitwise_equal(
+      model, weights_before_negative_v,
+      "negative second-moment rejection");
+  require_tensor_state_map_bitwise_equal(
+      trainer.m_state, m_before_negative_v,
+      "negative second-moment rejection m");
+  require_tensor_state_map_bitwise_equal(
+      trainer.v_state, v_before_negative_v,
+      "negative second-moment rejection v");
+  negative_v.data()[0] = valid_v0;
+
+  std::cout << "[invariant] NaN rejected and recovered at step="
+            << trainer.global_step_count << std::endl;
+#endif
+}
+
+void test_optimizer_fail_stop_and_checkpoint_recovery() {
+#ifdef NSOS_ENABLE_TEST_HOOKS
+  ModelConfig cfg;
+  cfg.num_layers = 1;
+  cfg.d_model = 16;
+  cfg.vocab_size = 40;
+  cfg.n_heads = 4;
+  cfg.n_kv_heads = 2;
+  cfg.attention_period = 64;
+  cfg.use_moe = false;
+  cfg.use_ttt = false;
+  cfg.use_chrass = false;
+  cfg.dropout = 0.0f;
+  cfg.mamba2_faithful = false;
+  cfg.tie_word_embeddings = false;
+
+  determinism::DeterminismManager::instance().set_global_seed(
+      20260729);
+  JambaModel model(cfg, Device::CPU);
+  Trainer trainer(&model, 1.0e-3f);
+  trainer.weight_decay = 0.0f;
+  trainer.max_grad_norm = 10.0f;
+  const std::vector<int> tokens = {1, 3, 5, 7, 9, 11};
+  const std::vector<int> targets = {3, 5, 7, 9, 11, 13};
+  (void)trainer.train_step(tokens, targets);
+
+  ScopedTemporaryDirectory directory(
+      "nsos_optimizer_fail_stop");
+  const auto model_path = directory.path / "model.bin";
+  const auto state_path =
+      directory.path / "model.trainer.bin";
+  model.save(model_path.string());
+  trainer.save_training_state(
+      state_path.string(), model_path.string());
+  const auto durable_sidecar =
+      read_binary_file(state_path);
+  const int durable_step = trainer.global_step_count;
+
+  TrainingStateFaultReset reset_faults;
+  testing::set_optimizer_commit_failure_countdown(0);
+  bool interruption_rejected = false;
+  try {
+    (void)trainer.train_step(tokens, targets);
+  } catch (const std::runtime_error&) {
+    interruption_rejected = true;
+  }
+  require(interruption_rejected,
+          "injected mid-commit optimizer failure was accepted");
+  require(trainer.optimizer_state_poisoned(),
+          "ambiguous optimizer failure did not poison Trainer");
+  require(trainer.global_step_count == durable_step,
+          "partial optimizer cohort published a completed step");
+
+  const auto ambiguous_weights =
+      clone_parameter_values(model);
+  bool continuation_rejected = false;
+  try {
+    (void)trainer.train_step(tokens, targets);
+  } catch (const std::runtime_error&) {
+    continuation_rejected = true;
+  }
+  require(continuation_rejected,
+          "poisoned Trainer allowed another training attempt");
+  require_parameter_values_bitwise_equal(
+      model, ambiguous_weights,
+      "poisoned continuation rejection");
+
+  bool sidecar_export_rejected = false;
+  try {
+    trainer.save_training_state(
+        state_path.string(), model_path.string());
+  } catch (const std::runtime_error&) {
+    sidecar_export_rejected = true;
+  }
+  require(sidecar_export_rejected,
+          "poisoned Trainer exported an ambiguous sidecar");
+  require(read_binary_file(state_path) == durable_sidecar,
+          "failed poisoned export replaced the durable sidecar");
+
+  bool sidecar_only_recovery_rejected = false;
+  try {
+    trainer.load_training_state(
+        state_path.string(), model_path.string());
+  } catch (const std::runtime_error&) {
+    sidecar_only_recovery_rejected = true;
+  }
+  require(sidecar_only_recovery_rejected,
+          "sidecar load cleared poison without restoring model weights");
+  require(trainer.optimizer_state_poisoned(),
+          "failed recovery cleared optimizer poison");
+
+  model.load(model_path.string(), true);
+  trainer.load_training_state(
+      state_path.string(), model_path.string());
+  require(!trainer.optimizer_state_poisoned(),
+          "validated model+sidecar recovery retained poison");
+  require(trainer.global_step_count == durable_step,
+          "validated recovery restored the wrong step");
+  const float recovered =
+      trainer.train_step(tokens, targets);
+  require(std::isfinite(recovered),
+          "training did not resume after validated fail-stop recovery");
+  require(trainer.global_step_count == durable_step + 1,
+          "recovery did not commit exactly one optimizer step");
+  std::cout << "[invariant] optimizer fail-stop recovered at step="
+            << trainer.global_step_count << std::endl;
+#endif
+}
+
+void test_training_cancellation_contract() {
+  ModelConfig cfg;
+  cfg.num_layers = 1;
+  cfg.d_model = 16;
+  cfg.vocab_size = 40;
+  cfg.n_heads = 4;
+  cfg.n_kv_heads = 2;
+  cfg.attention_period = 64;
+  cfg.use_moe = false;
+  cfg.use_ttt = false;
+  cfg.use_chrass = false;
+  cfg.dropout = 0.0f;
+  cfg.mamba2_faithful = false;
+  cfg.tie_word_embeddings = false;
+
+  determinism::DeterminismManager::instance().set_global_seed(
+      20260729);
+  JambaModel model(cfg, Device::CPU);
+  Trainer trainer(&model, 1.0e-3f);
+  trainer.weight_decay = 0.0f;
+  trainer.max_grad_norm = 10.0f;
+  const std::vector<int> step_tokens =
+      {1, 3, 5, 7, 9, 11};
+  const std::vector<int> step_targets =
+      {3, 5, 7, 9, 11, 13};
+
+  const auto before_cancel =
+      clone_parameter_values(model);
+  trainer.request_cancellation();
+  bool entry_cancelled = false;
+  try {
+    (void)trainer.train_step(step_tokens, step_targets);
+  } catch (const AbortException&) {
+    entry_cancelled = true;
+  }
+  require(entry_cancelled,
+          "pre-requested training cancellation was ignored");
+  require(trainer.cancellation_requested(),
+          "cancellation request was cleared implicitly");
+  require(trainer.global_step_count == 0,
+          "cancelled entry advanced the optimizer");
+  require(trainer.m_state.empty() && trainer.v_state.empty(),
+          "cancelled entry allocated optimizer state");
+  require_parameter_values_bitwise_equal(
+      model, before_cancel, "pre-requested cancellation");
+
+  trainer.clear_cancellation();
+  int completed_callbacks = 0;
+  const std::vector<int> loop_tokens =
+      {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  bool boundary_cancelled = false;
+  try {
+    trainer.train_loop(
+        loop_tokens, 2, 1, 3,
+        [&](int, float) {
+          ++completed_callbacks;
+          trainer.request_cancellation();
+        },
+        3, 0);
+  } catch (const AbortException&) {
+    boundary_cancelled = true;
+  }
+  require(boundary_cancelled,
+          "train_loop did not stop after a callback cancellation");
+  require(completed_callbacks == 1,
+          "train_loop crossed more than one committed safe point");
+  require(trainer.global_step_count == 1,
+          "safe-point cancellation committed an unexpected step count");
+
+  trainer.clear_cancellation();
+  const float recovered =
+      trainer.train_step(step_tokens, step_targets);
+  require(std::isfinite(recovered),
+          "training did not recover after cancellation");
+  require(trainer.global_step_count == 2,
+          "post-cancellation recovery did not commit exactly one step");
+  std::cout << "[invariant] cancellation stopped at safe point and "
+               "recovered"
+            << std::endl;
 }
 
 void test_criticality_regularizer_contract() {
@@ -674,10 +1462,66 @@ void test_criticality_regularizer_contract() {
   set_test_env("NSOS_CRIT_REG", "0");
 }
 
+void test_post_commit_callback_failure_poisoning() {
+  ModelConfig cfg;
+  cfg.num_layers = 1;
+  cfg.d_model = 16;
+  cfg.vocab_size = 40;
+  cfg.n_heads = 4;
+  cfg.n_kv_heads = 2;
+  cfg.attention_period = 64;
+  cfg.use_moe = false;
+  cfg.use_ttt = false;
+  cfg.use_chrass = false;
+  cfg.dropout = 0.0f;
+  cfg.mamba2_faithful = false;
+  cfg.tie_word_embeddings = false;
+
+  JambaModel model(cfg, Device::CPU);
+  Trainer trainer(&model, 1.0e-3f);
+  trainer.weight_decay = 0.0f;
+  trainer.max_grad_norm = 10.0f;
+  const std::vector<int> tokens =
+      {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+
+  bool callback_failure_observed = false;
+  try {
+    trainer.train_loop(
+        tokens, 1, 1, 3,
+        [](int, float) {
+          throw std::runtime_error("injected post-commit callback failure");
+        },
+        1, 0);
+  } catch (const std::runtime_error&) {
+    callback_failure_observed = true;
+  }
+  require(callback_failure_observed,
+          "post-commit callback failure did not escape train_loop");
+  require(trainer.global_step_count == 1,
+          "post-commit callback fixture did not publish exactly one step");
+  require(trainer.optimizer_state_poisoned(),
+          "post-commit callback failure did not poison retry semantics");
+
+  bool retry_rejected = false;
+  try {
+    (void)trainer.train_step({1, 2, 3, 4}, {2, 3, 4, 5});
+  } catch (const OptimizerStatePoisonedException&) {
+    retry_rejected = true;
+  }
+  require(retry_rejected,
+          "post-commit callback failure allowed an ambiguous retry");
+  std::cout << "[invariant] post-commit callback failure poisoned retry"
+            << std::endl;
+}
+
 }  // namespace
 
 int main() {
   try {
+    sparse_gradient_test::parameter_contract(Device::CPU);
+    sparse_gradient_test::routed_optimizer_contract(Device::CPU);
+    sparse_gradient_test::routed_optimizer_contract(Device::CPU, 4);
+    test_model_backward_one_shot_contract();
     test_train_loop_chunk_invariance();
     test_router_input_vjp();
     test_switch_aux_chunk_invariance();
@@ -689,6 +1533,10 @@ int main() {
     test_model_config_is_authoritative();
     test_sliding_window_contract();
     test_training_checkpoint_continuation();
+    test_nonfinite_optimizer_rejection_and_recovery();
+    test_optimizer_fail_stop_and_checkpoint_recovery();
+    test_training_cancellation_contract();
+    test_post_commit_callback_failure_poisoning();
     test_criticality_regularizer_contract();
     std::cout << "All training invariants passed!" << std::endl;
     return 0;

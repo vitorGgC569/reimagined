@@ -2,7 +2,7 @@
 #define SPARSE_ATTENTION_KERNELS_CUH
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "../gpu_backend.h"
 #endif
 
 namespace nsos {

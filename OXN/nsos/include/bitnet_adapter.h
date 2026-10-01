@@ -81,4 +81,14 @@ public:
       std::vector<int8_t> &dst);
 };
 
+// True only when the executing CPU really implements AVX2 (CPUID leaf 1 +
+// XCR0 state check + leaf 7 AVX2 bit), cached after the first query.
+//
+// NSOS_ENABLE_AVX2_KERNELS only records that AVX2 kernels were *compiled*; it
+// defaults to ON for every x86_64 build. A binary produced on a modern host
+// and shipped to an older x86_64 CPU would execute an illegal instruction if
+// any call site dispatched on the build switch alone, so every AVX2 entry
+// point must gate on this predicate.
+bool avx2_runtime_supported();
+
 } // namespace nsos

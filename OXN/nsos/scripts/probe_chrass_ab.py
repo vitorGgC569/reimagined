@@ -35,11 +35,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # ─── Robust nsos_ext import (handles dev tree, build dir, installed) ────────
 def _import_nsos_ext():
+    initial_error = None
     try:
         import nsos_ext  # noqa: F401
         return nsos_ext
-    except ImportError:
-        pass
+    except ImportError as exc:
+        initial_error = exc
     # Search common build dirs
     here = Path(__file__).resolve().parent
     candidates = [
@@ -60,7 +61,7 @@ def _import_nsos_ext():
     raise ImportError(
         "Could not find nsos_ext module. Build it first or set PYTHONPATH "
         "to the build output directory."
-    )
+    ) from initial_error
 
 
 def build_model(eng_mod, args) -> Tuple[Any, Any]:
@@ -263,8 +264,10 @@ def main() -> int:
                     if el == el:  # not NaN
                         eval_loss_sum += el
                         eval_count += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"evaluation failed at training step {step}"
+                    ) from exc
             eval_mean = eval_loss_sum / max(eval_count, 1)
             eval_records.append({
                 "step": step,

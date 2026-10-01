@@ -36,7 +36,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONPATH=/opt/nsos/python
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-minimal \
+    python3 \
     libgomp1 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -50,11 +50,12 @@ COPY --from=builder /src/OXN/nsos/build-mvp/nsos_api_server /opt/nsos/bin/
 COPY --from=builder /src/OXN/nsos/build-mvp/nsos_cli /opt/nsos/bin/
 COPY --from=builder /src/OXN/nsos/build-mvp/nsos_ext*.so /opt/nsos/python/
 COPY OXN/nsos/README.md /opt/nsos/README.md
+COPY OXN/nsos/scripts/container_runtime.py /opt/nsos/bin/container_runtime.py
 
 USER nsos
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python3 -c "import nsos_ext; print('ok')" || exit 1
+    CMD python3 /opt/nsos/bin/container_runtime.py health
 
-CMD ["sh", "-c", "test -n \"$NSOS_API_TOKEN\" || { echo 'NSOS_API_TOKEN is required for container runtime'; exit 2; }; exec /opt/nsos/bin/nsos_api_server --host 0.0.0.0 --port ${NSOS_PORT:-8080} --auth-token \"$NSOS_API_TOKEN\" --pack-root /opt/nsos/artifacts/model_packs"]
+CMD ["python3", "/opt/nsos/bin/container_runtime.py", "serve"]

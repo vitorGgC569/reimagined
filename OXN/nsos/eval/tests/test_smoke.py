@@ -56,6 +56,7 @@ def main() -> int:
         failures = []
         for b in result.benchmarks:
             if b.status != "ok":
+                failures.append(f"{b.name}: incomplete smoke ({b.status}): {b.error}")
                 continue
             if b.name in ("hellaswag", "arc_easy", "mmlu_stem"):
                 acc = b.metrics.get("accuracy", -1)

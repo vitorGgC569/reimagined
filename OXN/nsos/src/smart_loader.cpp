@@ -20,18 +20,18 @@
 #include "smart_loader.h"
 
 #include <algorithm>
-#include <fcntl.h>
 #include <cerrno>
-#include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <limits>
+#include <system_error>
 #include <utility>
 
 #ifdef _WIN32
 #include <io.h>
 #define NSOS_OPEN  _open
 #define NSOS_CLOSE _close
-#define NSOS_O_RDONLY _O_RDONLY
+#define NSOS_O_RDONLY (_O_RDONLY | _O_BINARY)
 namespace {
 nsos::io_ssize_t pread_compat(int fd, void* buf, size_t count,
                                long long offset) {
@@ -66,16 +66,14 @@ SmartLoader::SmartLoader(size_t /*buffer_size*/) {
 }
 
 SmartLoader::~SmartLoader() {
-  // Drain first so promises in the queue are fulfilled instead of
-  // abandoned (which would surface as broken_promise on future::get()
-  // in any caller still holding a future).
-  drain();
-
   {
     std::lock_guard<std::mutex> lk(queue_mutex_);
     running_.store(false, std::memory_order_release);
   }
   queue_cv_.notify_all();
+  // No new request can enter after running_ becomes false. The worker drains
+  // the already-owned queue before observing shutdown.
+  drain();
 
   if (worker_thread_.joinable()) {
     worker_thread_.join();
@@ -86,10 +84,7 @@ std::future<LoadResult> SmartLoader::submit_request(const std::string& path,
                                                     size_t offset,
                                                     size_t size,
                                                     Tensor* dest) {
-  // We allocate IORequest on the heap so the promise survives across
-  // the worker's lifetime; ownership transfers to the worker which
-  // will delete it after fulfilling the promise.
-  IORequest* req = new IORequest{};
+  auto req = std::make_unique<IORequest>();
   req->filepath = path;
   req->offset = offset;
   req->size = size;
@@ -97,13 +92,28 @@ std::future<LoadResult> SmartLoader::submit_request(const std::string& path,
 
   std::future<LoadResult> fut = req->promise.get_future();
 
-  // Increment in_flight_ BEFORE pushing so that drain() cannot observe
-  // an empty queue + in_flight_ == 0 race window.
-  in_flight_.fetch_add(1, std::memory_order_acq_rel);
-
   {
     std::lock_guard<std::mutex> lk(queue_mutex_);
-    request_queue_.push(req);
+    if (!running_.load(std::memory_order_acquire)) {
+      throw std::runtime_error(
+          "SmartLoader cannot accept a request after shutdown");
+    }
+    const std::size_t prior =
+        in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    if (prior == (std::numeric_limits<std::size_t>::max)()) {
+      in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+      throw std::overflow_error("SmartLoader in-flight counter overflow");
+    }
+    try {
+      request_queue_.push(std::move(req));
+    } catch (...) {
+      in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+      if (prior == 0) {
+        std::lock_guard<std::mutex> drain_lock(drain_mutex_);
+        drain_cv_.notify_all();
+      }
+      throw;
+    }
   }
   queue_cv_.notify_one();
 
@@ -119,7 +129,7 @@ void SmartLoader::drain() {
 
 void SmartLoader::worker_loop() {
   while (true) {
-    IORequest* req = nullptr;
+    std::unique_ptr<IORequest> req;
 
     {
       std::unique_lock<std::mutex> lk(queue_mutex_);
@@ -133,109 +143,163 @@ void SmartLoader::worker_loop() {
         return;
       }
 
-      req = request_queue_.front();
+      req = std::move(request_queue_.front());
       request_queue_.pop();
     }
 
     // Perform the read outside the queue lock so other producers can
-    // continue submitting concurrently.
-    LoadResult result;
+    // continue submitting concurrently. The outer catch guarantees that an
+    // unexpected allocation/runtime exception still fulfills the future and
+    // releases the in-flight accounting slot.
+    try {
+      LoadResult result;
 
-    if (req->destination == nullptr) {
-      result.error_msg = "[SmartLoader] null destination tensor: " + req->filepath;
-      std::cerr << result.error_msg << std::endl;
-    } else if (req->destination->get_device() == Device::GPU) {
-      // The worker performs a host pread directly into Tensor::data().  A
-      // GPU-resident destination would have the kernel write into device
-      // memory through a host pointer -> memory corruption.  Reject instead.
-      result.error_msg =
-          "[SmartLoader] GPU destination tensor unsupported: " + req->filepath;
-      std::cerr << result.error_msg << std::endl;
-    } else if (req->destination->size < 0 ||
-               (req->destination->size > 0 && req->destination->raw_data() == nullptr) ||
-               static_cast<uint64_t>(req->destination->size) >
-                   (std::numeric_limits<size_t>::max)() / sizeof(float)) {
-      result.error_msg = "[SmartLoader] invalid destination tensor: " + req->filepath;
-      std::cerr << result.error_msg << std::endl;
-    } else if (req->size >
-               static_cast<size_t>(req->destination->size) * sizeof(float)) {
-      // Refuse to read more bytes than the destination tensor can hold; a
-      // positioned read into a too-small buffer is a heap overflow.
-      result.error_msg =
-          "[SmartLoader] read size " + std::to_string(req->size) +
-          " exceeds destination capacity " +
-          std::to_string(static_cast<size_t>(req->destination->size) *
-                         sizeof(float)) +
-          " bytes: " + req->filepath;
-      std::cerr << result.error_msg << std::endl;
-    } else if (req->filepath.empty()) {
-      result.error_msg = "[SmartLoader] file path must not be empty";
-    } else if (req->offset > static_cast<size_t>((std::numeric_limits<long long>::max)())) {
-      result.error_msg = "[SmartLoader] file offset exceeds supported range: " + req->filepath;
-    } else {
-      const int fd = NSOS_OPEN(req->filepath.c_str(), NSOS_O_RDONLY);
-      if (fd < 0) {
-        result.error_msg = "[SmartLoader] open failed: " + req->filepath;
+      if (req->destination == nullptr) {
+        result.error_msg =
+            "[SmartLoader] null destination tensor: " + req->filepath;
         std::cerr << result.error_msg << std::endl;
+      } else if (req->destination->get_device() == Device::GPU) {
+        // The worker performs a host pread directly into Tensor::data(). A
+        // GPU destination would make host I/O target device memory. Reject it.
+        result.error_msg =
+            "[SmartLoader] GPU destination tensor unsupported: " +
+            req->filepath;
+        std::cerr << result.error_msg << std::endl;
+      } else if (
+          req->destination->size < 0 ||
+          (req->destination->size > 0 &&
+           req->destination->raw_data() == nullptr) ||
+          static_cast<uint64_t>(req->destination->size) >
+              (std::numeric_limits<size_t>::max)() / sizeof(float)) {
+        result.error_msg =
+            "[SmartLoader] invalid destination tensor: " + req->filepath;
+        std::cerr << result.error_msg << std::endl;
+      } else if (req->size >
+                 static_cast<size_t>(req->destination->size) * sizeof(float)) {
+        // Refuse to read more bytes than the destination tensor can hold.
+        result.error_msg =
+            "[SmartLoader] read size " + std::to_string(req->size) +
+            " exceeds destination capacity " +
+            std::to_string(static_cast<size_t>(req->destination->size) *
+                           sizeof(float)) +
+            " bytes: " + req->filepath;
+        std::cerr << result.error_msg << std::endl;
+      } else if (req->filepath.empty()) {
+        result.error_msg = "[SmartLoader] file path must not be empty";
+      } else if (
+          req->offset > static_cast<size_t>(
+                            (std::numeric_limits<long long>::max)())) {
+        result.error_msg =
+            "[SmartLoader] file offset exceeds supported range: " +
+            req->filepath;
       } else {
-        size_t total_read = 0;
-        bool read_failed = false;
-        while (total_read < req->size) {
-          const size_t remaining = req->size - total_read;
-          const size_t chunk = (std::min)(
-              remaining,
-              static_cast<size_t>((std::numeric_limits<int>::max)()));
-          if (total_read > static_cast<size_t>((std::numeric_limits<long long>::max)()) -
-                               req->offset) {
-            result.error_msg =
-                "[SmartLoader] positioned read offset overflow: " + req->filepath;
-            read_failed = true;
-            break;
-          }
-          const io_ssize_t bytes = NSOS_PREAD(
-              fd,
-              reinterpret_cast<unsigned char*>(req->destination->raw_data()) + total_read,
-              chunk,
-              static_cast<long long>(req->offset + total_read));
-          if (bytes < 0) {
-            if (errno == EINTR) {
-              continue;
-            }
-            result.error_msg = "[SmartLoader] pread failed: " + req->filepath;
-            read_failed = true;
-            break;
-          }
-          if (bytes == 0) {
-            break;
-          }
-          total_read += static_cast<size_t>(bytes);
-        }
-        NSOS_CLOSE(fd);
-
-        if (read_failed) {
+        const int fd = NSOS_OPEN(req->filepath.c_str(), NSOS_O_RDONLY);
+        if (fd < 0) {
+          const int open_errno = errno;
+          result.error_msg =
+              "[SmartLoader] open failed (errno " +
+              std::to_string(open_errno) + ": " +
+              std::error_code(open_errno, std::generic_category()).message() +
+              "): " + req->filepath;
           std::cerr << result.error_msg << std::endl;
         } else {
-          result.bytes_read = static_cast<io_ssize_t>(total_read);
+          size_t total_read = 0;
+          bool read_failed = false;
+          while (total_read < req->size) {
+            const size_t remaining = req->size - total_read;
+            const size_t chunk = (std::min)(
+                remaining,
+                static_cast<size_t>((std::numeric_limits<int>::max)()));
+            if (total_read >
+                static_cast<size_t>(
+                    (std::numeric_limits<long long>::max)()) - req->offset) {
+              result.error_msg =
+                  "[SmartLoader] positioned read offset overflow: " +
+                  req->filepath;
+              read_failed = true;
+              break;
+            }
+            const io_ssize_t bytes = NSOS_PREAD(
+                fd,
+                reinterpret_cast<unsigned char*>(
+                    req->destination->raw_data()) + total_read,
+                chunk,
+                static_cast<long long>(req->offset + total_read));
+            if (bytes < 0) {
+              if (errno == EINTR) {
+                continue;
+              }
+              const int read_errno = errno;
+              result.error_msg =
+                  "[SmartLoader] pread failed (errno " +
+                  std::to_string(read_errno) + ": " +
+                  std::error_code(read_errno, std::generic_category()).message() +
+                  "): " + req->filepath;
+              read_failed = true;
+              break;
+            }
+            if (bytes == 0) {
+              break;
+            }
+            total_read += static_cast<size_t>(bytes);
+          }
+          const int close_status = NSOS_CLOSE(fd);
+          if (close_status != 0) {
+            const int close_errno = errno;
+            const std::string close_error =
+                "[SmartLoader] close failed (errno " +
+                std::to_string(close_errno) + ": " +
+                std::error_code(close_errno, std::generic_category()).message() +
+                "): " + req->filepath;
+            result.error_msg = result.error_msg.empty()
+                                   ? close_error
+                                   : result.error_msg + "; " + close_error;
+            read_failed = true;
+          }
+          if (!read_failed && total_read != req->size) {
+            result.error_msg =
+                "[SmartLoader] short read: requested " +
+                std::to_string(req->size) + " bytes, received " +
+                std::to_string(total_read) + " bytes: " + req->filepath;
+            read_failed = true;
+          }
+
+          if (read_failed) {
+            std::cerr << result.error_msg << std::endl;
+          } else {
+            result.bytes_read = static_cast<io_ssize_t>(total_read);
+          }
         }
+      }
+
+      // Fulfill the promise BEFORE decrementing in_flight_ so a thread
+      // racing in drain() cannot observe in_flight_ == 0 and proceed
+      // before the result is visible to the original future holder.
+      try {
+        req->promise.set_value(std::move(result));
+      } catch (const std::future_error& e) {
+        // A no-state or already-satisfied promise violates the queue ownership
+        // contract. Log it, but keep draining unrelated requests.
+        std::cerr << "[SmartLoader] promise.set_value failed: " << e.what()
+                  << std::endl;
+      }
+    } catch (...) {
+      try {
+        req->promise.set_exception(std::current_exception());
+      } catch (const std::future_error& error) {
+        std::cerr << "[SmartLoader] promise.set_exception failed: "
+                  << error.what() << std::endl;
       }
     }
 
-    // Fulfill the promise BEFORE decrementing in_flight_ so a thread
-    // racing in drain() cannot observe in_flight_ == 0 and proceed
-    // before the result is visible to the original future holder.
-    try {
-      req->promise.set_value(std::move(result));
-    } catch (const std::future_error& e) {
-      // Promise was already satisfied or future was destroyed; log but
-      // do not propagate so the worker stays alive.
-      std::cerr << "[SmartLoader] promise.set_value failed: " << e.what()
-                << std::endl;
+    const std::size_t prior =
+        in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    if (prior == 0) {
+      in_flight_.store(0, std::memory_order_release);
+      std::cerr << "[SmartLoader] in-flight accounting underflow" << std::endl;
+      std::terminate();
     }
-
-    delete req;
-
-    const std::size_t remaining =
-        in_flight_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    const std::size_t remaining = prior - 1;
     if (remaining == 0) {
       // Notify *all* drainers — there may be several barriers waiting.
       std::lock_guard<std::mutex> lk(drain_mutex_);

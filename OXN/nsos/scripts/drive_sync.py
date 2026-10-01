@@ -188,8 +188,11 @@ def sync_via_rclone(remote: str, run_filter: Optional[str]) -> int:
             try:
                 new_count = int(line.split()[1].split("/")[0])
                 break
-            except (IndexError, ValueError):
-                pass
+            except (IndexError, ValueError) as exc:
+                print(
+                    f"[sync] could not parse rclone transfer count: {exc}",
+                    file=sys.stderr,
+                )
     return new_count
 
 

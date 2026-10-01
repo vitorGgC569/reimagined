@@ -40,6 +40,10 @@ class ModelAdapter(ABC):
         capabilities before calling.
     """
 
+    def evaluation_identity(self) -> dict:
+        """Unknown adapters are never silently classified as trained models."""
+        return {"kind": "unverified", "model_name": self.capability.model_name}
+
     @property
     @abstractmethod
     def capability(self) -> AdapterCapability:

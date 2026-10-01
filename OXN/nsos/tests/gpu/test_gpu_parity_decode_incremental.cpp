@@ -1,6 +1,6 @@
 // Real incremental-decode parity for a hybrid Mamba + attention model.
 //
-// The former test at this slot was a placeholder that returned success.
+// The former test at this slot returned success without exercising behavior.
 // This gate performs a prompt prefill followed by one-token streaming steps on
 // CUDA.  Every step is checked against both CPU streaming and a fresh
 // full-prefix CPU forward, so stale SSM state, KV-cache corruption and
@@ -110,6 +110,37 @@ int main() {
                 << " token=" << token << " compared=cpu_stream+cpu_full"
                 << std::endl;
     }
+
+    // Merge GPU-resident prefill snapshots once, then advance independent rows
+    // for several steps without round-tripping the Mamba carry through the CPU.
+    std::vector<std::vector<int>> prefixes{{1, 5, 7, 3}, {2, 4, 6, 8}};
+    std::vector<nsos::JambaSessionSnapshot> snapshots;
+    for (const auto& row : prefixes) {
+      gpu_stream.reset_session();
+      gpu_stream.set_streaming_inference(true);
+      Tensor last = gpu_stream.forward_ids_last(row);
+      if (last.shape.dims != std::vector<int>({1, config.vocab_size}))
+        throw std::runtime_error("GPU last-token projection retained prompt rows");
+      snapshots.push_back(gpu_stream.fork_session(true));
+    }
+    gpu_stream.restore_session_batch(snapshots);
+    gpu_stream.reserve_kv_cache(12, Device::GPU, 2);
+    for (int step = 0; step < 3; ++step) {
+      std::vector<std::vector<int>> next{{9 + step}, {13 + step}};
+      Tensor actual = gpu_stream.forward_ids_batch(next).reshape({2, config.vocab_size}).cpu();
+      for (int row = 0; row < 2; ++row) {
+        prefixes[row].push_back(next[row][0]);
+        cpu_reference.reset_session();
+        Tensor expected = cpu_reference.forward_ids_last(prefixes[row]);
+        assert_close(actual.slice(0, row, row + 1), expected, 5e-3f,
+                     "device-resident batched decode vs full CPU prefix");
+      }
+    }
+    const auto saved_batch = gpu_stream.fork_session_batch(true);
+    Tensor before_restore = gpu_stream.forward_ids_batch({{3}, {4}});
+    gpu_stream.restore_session_batch(saved_batch);
+    Tensor after_restore = gpu_stream.forward_ids_batch({{3}, {4}});
+    assert_close(before_restore, after_restore, 1e-5f, "GPU batch snapshot repeat");
 
     std::error_code ec;
     std::filesystem::remove(model_path, ec);

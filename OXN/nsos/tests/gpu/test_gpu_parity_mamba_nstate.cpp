@@ -38,8 +38,17 @@ int main() {
     Tensor dy = y_cpu.clone();
     Context ctx;
     Tensor gin_cpu = layer.backward(dy, ctx);
+    auto parameters = layer.parameters();
+    std::vector<Tensor> cpu_parameter_grads;
+    cpu_parameter_grads.reserve(parameters.size());
+    for (Parameter* parameter : parameters) {
+      cpu_parameter_grads.push_back(
+          parameter->grad.size > 0 ? parameter->grad.clone() : Tensor());
+      parameter->zero_grad();
+    }
 
     // ── GPU under test (same weights moved to device) ──
+    determinism::set_deterministic_reductions(true);
     layer.to(Device::GPU);
     Tensor x_gpu = x.to(Device::GPU);
     Tensor y_gpu = layer.forward(x_gpu);
@@ -49,12 +58,46 @@ int main() {
     assert_close(y_cpu, y_gpu, 1e-3f, "mamba_nstate forward y");
     assert_close(gin_cpu, gin_gpu, 1e-3f, "mamba_nstate backward d/input");
 
-    determinism::set_deterministic_reductions(true);
-    Tensor y_det = layer.forward(x_gpu);
-    Tensor gin_det = layer.backward(y_det.clone(), ctx);
-    assert_close(y_cpu, y_det, 1e-3f, "mamba_nstate deterministic forward");
-    assert_close(gin_cpu, gin_det, 1e-3f,
-                 "mamba_nstate deterministic backward d/input");
+    parameters = layer.parameters();
+    if (parameters.size() != cpu_parameter_grads.size()) {
+      throw std::runtime_error(
+          "mamba_nstate parameter registry changed across device");
+    }
+    std::vector<Tensor> deterministic_parameter_grads;
+    deterministic_parameter_grads.reserve(parameters.size());
+    for (size_t index = 0; index < parameters.size(); ++index) {
+      Parameter* parameter = parameters[index];
+      const Tensor& cpu_grad = cpu_parameter_grads[index];
+      if (cpu_grad.size == 0 && parameter->grad.size == 0) {
+        deterministic_parameter_grads.emplace_back();
+        continue;
+      }
+      if (cpu_grad.size == 0 || parameter->grad.size == 0) {
+        throw std::runtime_error(
+            "mamba_nstate gradient presence mismatch for " +
+            parameter->name);
+      }
+      assert_close(cpu_grad, parameter->grad, 2e-3f,
+                   ("mamba_nstate parameter " + parameter->name).c_str(),
+                   2e-4f);
+      deterministic_parameter_grads.push_back(parameter->grad.clone());
+      parameter->zero_grad();
+    }
+
+    Tensor y_repeat = layer.forward(x_gpu);
+    Tensor gin_repeat = layer.backward(dy_gpu, ctx);
+    assert_close(y_gpu, y_repeat, 0.0f,
+                 "mamba_nstate deterministic forward exact repeat");
+    assert_close(gin_gpu, gin_repeat, 0.0f,
+                 "mamba_nstate deterministic backward exact repeat");
+    parameters = layer.parameters();
+    for (size_t index = 0; index < parameters.size(); ++index) {
+      if (deterministic_parameter_grads[index].size == 0) continue;
+      assert_close(
+          deterministic_parameter_grads[index], parameters[index]->grad, 0.0f,
+          ("mamba_nstate deterministic parameter exact repeat " +
+           parameters[index]->name).c_str());
+    }
     determinism::set_deterministic_reductions(false);
   });
 }

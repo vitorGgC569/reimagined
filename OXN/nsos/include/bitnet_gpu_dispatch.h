@@ -26,8 +26,9 @@ namespace nsos {
 //
 // Inputs:
 //   x_gpu          : float [M, K]  (device, contiguous)
-//   packed_weights_gpu : uint32 [(N*K + 15)/16] (device, contiguous;
-//                         layout matches BitNetAdapter::pack_weights_microsoft_style)
+//   packed_weights_gpu : uint32 [N*(K/16)] (device, contiguous and row-aligned;
+//                         K must be divisible by 16 and the layout matches
+//                         BitNetAdapter::pack_weights_microsoft_style)
 //   weight_scale   : float scalar
 //   M, K, N        : matrix dimensions
 //   precision_bits : selects q_max for activation quantization
@@ -45,7 +46,9 @@ namespace nsos {
 Tensor bitnet_gemm_158bit_gpu(const Tensor& x_gpu,
                               const Tensor& packed_weights_gpu,
                               float weight_scale, int M, int K, int N,
-                              int precision_bits);
+                              int precision_bits,
+                              const Tensor* magnitude = nullptr,
+                              const Tensor* bias = nullptr);
 
 // =====================================================================
 // K3: device-aware QAT fake-quant (straight-through estimator) helpers.

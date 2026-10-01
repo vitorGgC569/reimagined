@@ -13,7 +13,7 @@
 #include <limits>
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "../include/gpu_backend.h"
 #endif
 
 namespace nsos {
@@ -24,6 +24,14 @@ int32_t bitlinear_row_sum_i8_avx2(const int8_t* row_ptr, int cols);
 #endif
 
 namespace {
+
+int require_positive_feature_count(int value, const char* label) {
+  if (value <= 0) {
+    throw std::invalid_argument(
+        std::string("BitLinear ") + label + " must be positive");
+  }
+  return value;
+}
 
 void compute_weight_row_sums(const std::vector<int8_t>& weights,
                              int rows,
@@ -36,31 +44,48 @@ void compute_weight_row_sums(const std::vector<int8_t>& weights,
   // implementation is identical math (no quantization error) and
   // the kernel pattern is reused by the inference path for activation
   // statistics.  Scalar fallback below for non-x86 builds.
+  //
+  // The AVX2 kernel is selected by avx2_runtime_supported(), not by the build
+  // switch alone: NSOS_ENABLE_AVX2_KERNELS defaults to ON for every x86_64
+  // build, so dispatching on it would execute an illegal instruction on a
+  // pre-AVX2 CPU. This matches how gemm_158bit_i8 already dispatches.
+#if defined(NSOS_ENABLE_AVX2_KERNELS)
+  const bool use_avx2 = avx2_runtime_supported();
+#else
+  constexpr bool use_avx2 = false;
+#endif
   for (int row = 0; row < rows; ++row) {
     const int8_t* row_ptr = weights.data() + static_cast<size_t>(row) * cols;
 #if defined(NSOS_ENABLE_AVX2_KERNELS)
-    row_sums[static_cast<size_t>(row)] = bitlinear_row_sum_i8_avx2(row_ptr, cols);
-#else
+    if (use_avx2) {
+      row_sums[static_cast<size_t>(row)] =
+          bitlinear_row_sum_i8_avx2(row_ptr, cols);
+      continue;
+    }
+#endif
+    (void)use_avx2;
     int32_t sum = 0;
     for (int col = 0; col < cols; ++col) {
       sum += static_cast<int32_t>(row_ptr[col]);
     }
     row_sums[static_cast<size_t>(row)] = sum;
-#endif
   }
 }
 
 } // namespace
 
 BitLinear::BitLinear(int in, int out, bool b)
-    : in_features(in), out_features(out), use_bias(b),
-      weight(Tensor::kaiming_uniform({out, in}), "weight"),
-      magnitude(Tensor::ones({out}, Device::CPU), "magnitude"),
-      bias(Tensor::zeros({out}), "bias"),
-      flat_alpha(Tensor::ones({in}), "flat_alpha"),
-      flat_beta(Tensor::zeros({in}), "flat_beta") {
+    : in_features(require_positive_feature_count(in, "input features")),
+      out_features(require_positive_feature_count(out, "output features")),
+      use_bias(b),
+      weight(Tensor::kaiming_uniform({out_features, in_features}), "weight"),
+      magnitude(Tensor::ones({out_features}, Device::CPU), "magnitude"),
+      bias(Tensor::zeros({out_features}), "bias"),
+      flat_alpha(Tensor::ones({in_features}), "flat_alpha", false),
+      flat_beta(Tensor::zeros({in_features}), "flat_beta", false) {
 
-  packed_stride = (in_features + 15) / 16;
+  packed_stride =
+      static_cast<size_t>(in_features / 16 + (in_features % 16 != 0));
   repack_weights();
 
   loqa.A = Parameter(Tensor::zeros({in, 32}), "loqa_A");
@@ -74,17 +99,21 @@ BitLinear::BitLinear(int in, int out, bool b)
 // kaiming_uniform call.  When seed=0, falls through to the existing
 // un-seeded path for byte-exact backwards compatibility.
 BitLinear::BitLinear(int in, int out, bool b, uint64_t seed)
-    : in_features(in), out_features(out), use_bias(b),
+    : in_features(require_positive_feature_count(in, "input features")),
+      out_features(require_positive_feature_count(out, "output features")),
+      use_bias(b),
       weight((seed == 0)
-                ? Tensor::kaiming_uniform({out, in})
-                : Tensor::kaiming_uniform({out, in}, Device::CPU, seed),
+                ? Tensor::kaiming_uniform({out_features, in_features})
+                : Tensor::kaiming_uniform(
+                      {out_features, in_features}, Device::CPU, seed),
              "weight"),
-      magnitude(Tensor::ones({out}, Device::CPU), "magnitude"),
-      bias(Tensor::zeros({out}), "bias"),
-      flat_alpha(Tensor::ones({in}), "flat_alpha"),
-      flat_beta(Tensor::zeros({in}), "flat_beta") {
+      magnitude(Tensor::ones({out_features}, Device::CPU), "magnitude"),
+      bias(Tensor::zeros({out_features}), "bias"),
+      flat_alpha(Tensor::ones({in_features}), "flat_alpha", false),
+      flat_beta(Tensor::zeros({in_features}), "flat_beta", false) {
 
-  packed_stride = (in_features + 15) / 16;
+  packed_stride =
+      static_cast<size_t>(in_features / 16 + (in_features % 16 != 0));
   repack_weights();
 
   loqa.A = Parameter(Tensor::zeros({in, 32}), "loqa_A");
@@ -105,6 +134,7 @@ void BitLinear::invalidate_cached_materialized_weights() {
   // repack, release) invalidates it too.
   qat_inference_cache_valid_ = false;
   qat_inference_w_eff_ = Tensor();
+  qat_inference_weight_version_ = 0;
   saved_qat_w_eff_ = Tensor();
   saved_qat_scale_ = Tensor();
   saved_qat_weight_version_ = 0;
@@ -236,12 +266,17 @@ Tensor BitLinear::quantize_activations_bitnet(const Tensor &x,
     // (round-half-to-even).  Scalar tails handle K not divisible
     // by 8.  Scalar fallback below stays for non-x86 builds and
     // for builds that explicitly disabled AVX2 kernels.
+    // Gated on avx2_runtime_supported(), not on the build switch: see the
+    // note in compute_weight_row_sums above.
 #if defined(NSOS_ENABLE_AVX2_KERNELS)
-    const float max_val = bitlinear_row_max_abs_avx2(row_ptr, K);
-    const float scale = q_max / (max_val + 1e-8f);
-    out_scales[i] = (max_val + 1e-8f) / q_max;
-    bitlinear_row_scale_round_avx2(row_q_ptr, row_ptr, K, scale);
-#else
+    if (avx2_runtime_supported()) {
+      const float max_val = bitlinear_row_max_abs_avx2(row_ptr, K);
+      const float scale = q_max / (max_val + 1e-8f);
+      out_scales[i] = (max_val + 1e-8f) / q_max;
+      bitlinear_row_scale_round_avx2(row_q_ptr, row_ptr, K, scale);
+      continue;
+    }
+#endif
     float max_val = 0.0f;
     for (int j = 0; j < K; ++j)
       max_val = std::max(max_val, std::abs(row_ptr[j]));
@@ -249,13 +284,8 @@ Tensor BitLinear::quantize_activations_bitnet(const Tensor &x,
     out_scales[i] = (max_val + 1e-8f) / q_max;
     for (int j = 0; j < K; ++j) {
       float val = row_ptr[j] * scale;
-      if (precision_bits == 2) {
-        row_q_ptr[j] = std::round(val);
-      } else {
-        row_q_ptr[j] = std::round(val);
-      }
+      row_q_ptr[j] = std::round(val);
     }
-#endif
   }
   return x_q;
 }
@@ -265,6 +295,10 @@ Tensor BitLinear::gemm_158bit_ultra(const Tensor &x_q,
                                     bool fuse_output_affine) {
   const int M = x_q.shape.numel() / in_features;
   const int N = out_features;
+  // The packed adapters consume [rows, features]. A batched input preserves
+  // its [batch, time, features] shape through quantization, so flatten it here
+  // just as the reference and GPU projections do.
+  const Tensor x_flat = x_q.reshape({M, in_features});
   Tensor y({M, N}, Device::CPU);
   const float* magnitude_ptr = fuse_output_affine ? magnitude.data.data() : nullptr;
   const float* bias_ptr = fuse_output_affine && use_bias ? bias.data.data() : nullptr;
@@ -280,22 +314,126 @@ Tensor BitLinear::gemm_158bit_ultra(const Tensor &x_q,
       cached_heat_map_ = lut_tmac::compute_heat_map(packed_weights, N, in_features);
     }
     lut_tmac::gemm_158bit_lut_tmac(
-        x_q, packed_weights, cached_heat_map_, act_scales, weight_scale, y,
+        x_flat, packed_weights, cached_heat_map_, act_scales, weight_scale, y,
         magnitude_ptr, bias_ptr, fuse_output_affine && use_bias);
     return y;
   }
 
   if (!unpacked_weights_i8.empty()) {
-    BitNetAdapter::gemm_158bit_i8(x_q, unpacked_weights_i8, unpacked_weight_row_sums,
+    BitNetAdapter::gemm_158bit_i8(x_flat, unpacked_weights_i8, unpacked_weight_row_sums,
                                   act_scales, weight_scale, y, magnitude_ptr, bias_ptr,
                                   fuse_output_affine && use_bias);
   } else {
-    BitNetAdapter::gemm_158bit_lut(x_q, packed_weights, act_scales, weight_scale, y,
+    BitNetAdapter::gemm_158bit_lut(x_flat, packed_weights, act_scales, weight_scale, y,
                                    magnitude_ptr, bias_ptr,
                                    fuse_output_affine && use_bias);
   }
 
   return y;
+}
+
+bool BitLinear::prepare_gpu_decode_view(GpuLinearView& view) {
+  view = {};
+#ifdef USE_CUDA
+  if (training_mode_ || loqa.active || matmul_precision_mode() != 0 ||
+      in_features <= 0 || out_features <= 0 || precision_bits < 2 || precision_bits > 8 ||
+      magnitude.data.get_device() != Device::GPU ||
+      (norm_strategy != NormStrategy::NONE &&
+       norm_strategy != NormStrategy::RMS_PRE &&
+       norm_strategy != NormStrategy::RMS_PERI)) return false;
+  view.inputs = in_features;
+  view.outputs = out_features;
+  view.rms_input = norm_strategy != NormStrategy::NONE;
+  view.magnitude = exact_linear_mode_ ? nullptr : magnitude.data.raw_data();
+  view.bias = use_bias ? bias.data.raw_data() : nullptr;
+  if (use_reference_path) {
+    if (weight.data.size == 0 || weight.data.get_device() != Device::GPU) return false;
+    view.weight = weight.data.raw_data();
+    return true;
+  }
+  if (gpu_packed_inference_enabled_ && packed_weight_valid && in_features % 16 == 0) {
+    const int words = static_cast<int>(packed_weights.size());
+    if (cached_gpu_packed_weights_.size != words ||
+        cached_gpu_packed_version_ != packed_weight_version) {
+      Tensor host({words}, Device::CPU);
+      std::memcpy(host.data(), packed_weights.data(), packed_weights.size() * sizeof(uint32_t));
+      cached_gpu_packed_weights_ = host.to(Device::GPU);
+      cached_gpu_packed_version_ = packed_weight_version;
+    }
+    view.packed = reinterpret_cast<const uint32_t*>(cached_gpu_packed_weights_.raw_data());
+    view.activation_bits = precision_bits;
+    view.weight_scale = weight_scale;
+    return true;
+  }
+  // Keep the fake-quant path identical to forward(), including its opt-in
+  // packed policy and version-based invalidation.
+  if (!gpu_packed_inference_enabled_ && !quantization_sensitive_ && weight.data.size > 0) {
+    if (!qat_inference_cache_valid_ ||
+        qat_inference_w_eff_.size != weight.data.size ||
+        qat_inference_weight_version_ != weight.version ||
+        qat_inference_w_eff_.get_device() != Device::GPU) {
+      qat_inference_scale_ = tensor_abs_mean(weight.data) + 1e-8f;
+      qat_inference_w_eff_ = qat_fake_quant_ternary(weight.data, qat_inference_scale_);
+      qat_inference_weight_version_ = weight.version;
+      qat_inference_cache_valid_ = true;
+    }
+    view.weight = qat_inference_w_eff_.raw_data();
+    view.activation_bits = precision_bits;
+    return true;
+  }
+  view.weight = materialize_weight_for_device(Device::GPU).raw_data();
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool BitLinear::supports_gpu_grouped_training() const {
+#ifdef USE_CUDA
+  return training_mode_ && !loqa.active &&
+      (use_reference_path || !quantization_sensitive_) &&
+      (norm_strategy == NormStrategy::NONE || norm_strategy == NormStrategy::RMS_PRE ||
+       norm_strategy == NormStrategy::RMS_PERI) &&
+      weight.data.get_device() == Device::GPU &&
+      weight.data.shape.dims == std::vector<int>{out_features, in_features} &&
+      (exact_linear_mode_ || (magnitude.data.get_device() == Device::GPU && magnitude.data.size == out_features)) &&
+      (!use_bias || (bias.data.get_device() == Device::GPU && bias.data.size == out_features)) &&
+      precision_bits >= 1 && precision_bits <= 16;
+#else
+  return false;
+#endif
+}
+
+void BitLinear::prepare_gpu_grouped_training_view(GpuMoeTrainingLinearView& view,
+    Tensor& effective_weight, Tensor& qat_scale, bool defer_qat) {
+  if (!supports_gpu_grouped_training())
+    throw std::invalid_argument("Grouped MoE training requires GPU float/QAT BitLinear without LoQA");
+  discard_backward_state();
+  view = {};
+  view.inputs = in_features; view.outputs = out_features;
+  view.rms_input = norm_strategy != NormStrategy::NONE;
+  view.magnitude = exact_linear_mode_ ? nullptr : magnitude.data.raw_data();
+  view.bias = use_bias ? bias.data.raw_data() : nullptr;
+  view.latent_weight = weight.data.raw_data();
+  if (use_reference_path) {
+    effective_weight = weight.data;
+    qat_scale = Tensor();
+  } else {
+    if (defer_qat) {
+      // The grouped owner schedules preparation after device routing. No
+      // inactive expert's latent weights need to be read/quantized.
+      if (effective_weight.shape != weight.data.shape || effective_weight.get_device() != Device::GPU ||
+          effective_weight.raw_data() == weight.data.raw_data())
+        effective_weight = Tensor::uninitialized(weight.data.shape.dims, Device::GPU);
+      if (qat_scale.size != 1 || qat_scale.get_device() != Device::GPU)
+        qat_scale = Tensor::uninitialized({1}, Device::GPU);
+    } else {
+      effective_weight = qat_fake_quant_ternary_absmean(weight.data, &qat_scale);
+    }
+    view.activation_bits = precision_bits;
+    view.qat_scale = qat_scale.raw_data();
+  }
+  view.weight = effective_weight.raw_data();
 }
 
 Tensor BitLinear::forward(const Tensor &input) {
@@ -346,7 +484,8 @@ Tensor BitLinear::forward(const Tensor &input) {
     }
     if (training_mode_) saved_linear_input = linear_input.clone();
 
-    Tensor output = matmul_nt(linear_input, weight.data);  // A·Wᵀ sem materializar Wᵀ
+    Tensor output = matmul_nt_cached_weight(
+        linear_input, weight.data, weight.version);
     if (loqa.active) {
       Tensor loqa_out = loqa.apply(linear_input);
       if (loqa_out.size > 0) {
@@ -354,8 +493,12 @@ Tensor BitLinear::forward(const Tensor &input) {
       }
     }
 
-    if (training_mode_) saved_pre_output = output.clone();
-    output = output.mul(magnitude.data);
+    if (training_mode_ && !exact_linear_mode_) {
+      saved_pre_output = output.clone();
+    }
+    if (!exact_linear_mode_) {
+      output = output.mul(magnitude.data);
+    }
 
     if (use_bias) {
       output = output.add(bias.data);
@@ -420,17 +563,22 @@ Tensor BitLinear::forward(const Tensor &input) {
         // decode win, the sync D2H would also abort CUDA-graph capture.
         if (!qat_inference_cache_valid_ ||
             qat_inference_w_eff_.size != weight.data.size ||
-            qat_inference_w_eff_.get_device() != weight.data.get_device()) {
+            qat_inference_w_eff_.get_device() != weight.data.get_device() ||
+            qat_inference_weight_version_ != weight.version) {
           qat_inference_scale_ = tensor_abs_mean(weight.data) + 1e-8f;
           qat_inference_w_eff_ =
               qat_fake_quant_ternary(weight.data, qat_inference_scale_);
+          qat_inference_weight_version_ = weight.version;
           qat_inference_cache_valid_ = true;
         }
         weight_scale = qat_inference_scale_;
         w_eff = qat_inference_w_eff_;
       }
       Tensor x_dq = qat_fake_quant_activations(linear_input, precision_bits);  // [M,in]
-      Tensor pre = matmul_nt(x_dq, w_eff);                                    // [M,out]
+      Tensor pre = training_mode_
+                       ? matmul_nt(x_dq, w_eff)
+                       : matmul_nt_cached_weight(
+                             x_dq, w_eff, weight.version);                     // [M,out]
       if (training_mode_) {
         // Backward state — only needed for the STE backward during training.
         qat_gpu_active_ = true;
@@ -440,7 +588,8 @@ Tensor BitLinear::forward(const Tensor &input) {
         saved_qat_scale_ = qat_scale;
         saved_qat_weight_version_ = weight.version;
       }
-      Tensor out_q = pre.mul(magnitude.data);
+      Tensor out_q =
+          exact_linear_mode_ ? pre : pre.mul(magnitude.data);
       if (use_bias) {
         out_q = out_q.add(bias.data);
       }
@@ -495,13 +644,9 @@ Tensor BitLinear::forward(const Tensor &input) {
 
       Tensor y = bitnet_gemm_158bit_gpu(
           linear_input, cached_gpu_packed_weights_, weight_scale, M,
-          in_features, out_features, precision_bits);
-
-      if (training_mode_) saved_pre_output = y.clone();
-      y = y.mul(magnitude.data);
-      if (use_bias) {
-        y = y.add(bias.data);
-      }
+          in_features, out_features, precision_bits,
+          exact_linear_mode_ ? nullptr : &magnitude.data,
+          use_bias ? &bias.data : nullptr);
       if (input.shape.dims.size() == 3) {
         return y.reshape(
             {input.shape.dims[0], input.shape.dims[1], out_features});
@@ -514,7 +659,8 @@ Tensor BitLinear::forward(const Tensor &input) {
 #endif
 
     const Tensor& effective_weight = materialize_weight_for_device(Device::GPU);
-    Tensor output = matmul_nt(linear_input, effective_weight);  // OP_T nativo, sem cópia
+    Tensor output = matmul_nt_cached_weight(
+        linear_input, effective_weight, weight.version);
     if (loqa.active) {
       Tensor loqa_out = loqa.apply(linear_input);
       if (loqa_out.size > 0) {
@@ -522,8 +668,12 @@ Tensor BitLinear::forward(const Tensor &input) {
       }
     }
 
-    if (training_mode_) saved_pre_output = output.clone();
-    output = output.mul(magnitude.data);
+    if (training_mode_ && !exact_linear_mode_) {
+      saved_pre_output = output.clone();
+    }
+    if (!exact_linear_mode_) {
+      output = output.mul(magnitude.data);
+    }
     if (use_bias) {
       output = output.add(bias.data);
     }
@@ -567,7 +717,8 @@ Tensor BitLinear::forward(const Tensor &input) {
     hadamard_transform(x.data(), M, in_features);
   }
   saved_x_quant = quantize_activations_bitnet(x, saved_act_scales);
-  const bool fuse_output_affine = !loqa.active;
+  const bool fuse_output_affine =
+      !loqa.active && !exact_linear_mode_;
   Tensor output = gemm_158bit_ultra(saved_x_quant, saved_act_scales, fuse_output_affine);
   if (loqa.active) {
     Tensor loqa_out = loqa.apply(loqa_input);
@@ -575,7 +726,9 @@ Tensor BitLinear::forward(const Tensor &input) {
       output = output.add(loqa_out);
   }
   if (!fuse_output_affine) {
-    output = output.mul(magnitude.data);
+    if (!exact_linear_mode_) {
+      output = output.mul(magnitude.data);
+    }
     if (use_bias)
       output = output.add(bias.data);
   }
@@ -604,6 +757,7 @@ void BitLinear::discard_backward_state() {
 
 void BitLinear::release_full_precision_weight() {
   weight.data = Tensor();
+  weight.grad = Tensor();
   invalidate_cached_materialized_weights();
 }
 
@@ -677,60 +831,208 @@ size_t BitLinear::auxiliary_memory_usage_bytes() const {
   return bytes;
 }
 
-void BitLinear::import_packed_state(const BitLinearPackedState& state,
-                                    Device dev,
-                                    bool release_full_precision) {
+BitLinear::PreparedPackedState BitLinear::prepare_packed_state(
+    const BitLinearPackedState& state,
+    Device dev,
+    bool release_full_precision,
+    const Tensor* exact_full_precision_weight) const {
   if (state.in_features != in_features || state.out_features != out_features ||
       state.use_bias != use_bias) {
     throw std::runtime_error("BitLinear packed state shape mismatch");
   }
 
-  packed_weights = state.packed_weights;
+  const size_t total_weights =
+      static_cast<size_t>(out_features) *
+      static_cast<size_t>(in_features);
+  const size_t expected_words = (total_weights + 15U) / 16U;
+  if (state.packed_weights.size() != expected_words ||
+      state.magnitude.size() != static_cast<size_t>(out_features) ||
+      state.bias.size() != (use_bias
+                                ? static_cast<size_t>(out_features)
+                                : 0U) ||
+      state.flat_alpha.size() != static_cast<size_t>(in_features) ||
+      state.flat_beta.size() != static_cast<size_t>(in_features)) {
+    throw std::runtime_error(
+        "BitLinear packed state buffer length mismatch");
+  }
+  if (!std::isfinite(state.weight_scale) ||
+      state.weight_scale <= 0.0f) {
+    throw std::runtime_error(
+        "BitLinear packed state has an invalid weight scale");
+  }
+  const auto require_finite = [](const std::vector<float>& values,
+                                 const char* label) {
+    if (!std::all_of(values.begin(), values.end(),
+                     [](float value) { return std::isfinite(value); })) {
+      throw std::runtime_error(
+          std::string("BitLinear packed state contains a non-finite ") +
+          label);
+    }
+  };
+  require_finite(state.magnitude, "magnitude");
+  require_finite(state.bias, "bias");
+  require_finite(state.flat_alpha, "flat-alpha buffer");
+  require_finite(state.flat_beta, "flat-beta buffer");
+  for (size_t index = 0; index < total_weights; ++index) {
+    const uint32_t code =
+        (state.packed_weights[index / 16U] >>
+         (2U * static_cast<unsigned int>(index % 16U))) &
+        0x3U;
+    if (code == 0x3U) {
+      throw std::runtime_error(
+          "BitLinear packed state contains a reserved ternary code");
+    }
+  }
+
+  if (release_full_precision && exact_full_precision_weight != nullptr) {
+    throw std::invalid_argument(
+        "Cannot release and replace a BitLinear full-precision weight in the "
+        "same packed-state transaction");
+  }
+
+  // Prepare every allocation and derived buffer first. If any allocation or
+  // transfer fails, the live layer remains byte-for-byte unchanged.
+  PreparedPackedState prepared;
+  prepared.packed_weights = state.packed_weights;
   BitNetAdapter::unpack_weights_microsoft_style_to_i8(
-      packed_weights, out_features, in_features, unpacked_weights_i8);
-  compute_weight_row_sums(unpacked_weights_i8, out_features, in_features,
-                          unpacked_weight_row_sums);
-  weight_scale = state.weight_scale;
-  packed_stride = (in_features + 15) / 16;
-  packed_weight_valid = true;
-  packed_weight_version = weight.version;
-
-  magnitude.data = Tensor({out_features}, dev);
-  magnitude.data.copy_from(
-      Tensor::from_blob(const_cast<float*>(state.magnitude.data()),
-                        {out_features},
-                        Device::CPU)
-          .to(dev));
-
-  if (use_bias) {
-    bias.data = Tensor({out_features}, dev);
-    bias.data.copy_from(
-        Tensor::from_blob(const_cast<float*>(state.bias.data()),
-                          {out_features},
+      prepared.packed_weights, out_features, in_features,
+      prepared.unpacked_weights);
+  compute_weight_row_sums(prepared.unpacked_weights, out_features, in_features,
+                          prepared.row_sums);
+  const auto stage_tensor = [dev](const std::vector<float>& values,
+                                  int count) {
+    Tensor host =
+        Tensor::from_blob(const_cast<float*>(values.data()), {count},
                           Device::CPU)
-            .to(dev));
+            .clone();
+    return dev == Device::CPU ? host : host.to(dev);
+  };
+  prepared.magnitude = stage_tensor(state.magnitude, out_features);
+  prepared.bias =
+      use_bias ? stage_tensor(state.bias, out_features) : Tensor();
+  prepared.flat_alpha = stage_tensor(state.flat_alpha, in_features);
+  prepared.flat_beta = stage_tensor(state.flat_beta, in_features);
+  prepared.weight_scale = state.weight_scale;
+
+  if (!release_full_precision) {
+    const Tensor* candidate =
+        exact_full_precision_weight != nullptr
+            ? exact_full_precision_weight
+            : &weight.data;
+    if (candidate->size == 0 ||
+        candidate->shape.dims !=
+            std::vector<int>({out_features, in_features}) ||
+        candidate->get_device() != dev) {
+      throw std::invalid_argument(
+          "Retaining BitLinear FP32 weights requires a matching base weight "
+          "with the layer shape and target device");
+    }
+    const Tensor candidate_cpu =
+        candidate->get_device() == Device::GPU
+            ? candidate->cpu()
+            : *candidate;
+    const float* candidate_values = candidate_cpu.data();
+    if (!std::all_of(
+            candidate_values,
+            candidate_values + candidate_cpu.size,
+            [](float value) { return std::isfinite(value); })) {
+      throw std::runtime_error(
+          "Retained BitLinear FP32 weight contains a non-finite value");
+    }
+    const float candidate_scale =
+        tensor_abs_mean(candidate_cpu) + 1e-8f;
+    const float scale_tolerance =
+        std::max(1e-7f,
+                 std::abs(state.weight_scale) * 1e-6f);
+    if (std::abs(candidate_scale - state.weight_scale) >
+        scale_tolerance) {
+      throw std::runtime_error(
+          "Retained BitLinear FP32 weight does not match the edge-pack "
+          "quantization scale (fp32=" +
+          std::to_string(candidate_scale) +
+          ", packed=" + std::to_string(state.weight_scale) +
+          ", in=" + std::to_string(in_features) +
+          ", out=" + std::to_string(out_features) + ")");
+    }
+    for (size_t index = 0; index < total_weights; ++index) {
+      const float normalized =
+          candidate_values[index] /
+          (candidate_scale + 1e-8f);
+      const uint32_t expected_code =
+          normalized > 0.5f
+              ? 0x2u
+              : (normalized < -0.5f ? 0x0u : 0x1u);
+      const uint32_t packed_code =
+          (state.packed_weights[index / 16U] >>
+           (2U * static_cast<unsigned int>(index % 16U))) &
+          0x3U;
+      if (packed_code != expected_code) {
+        throw std::runtime_error(
+            "Retained BitLinear FP32 weight does not match the edge-pack "
+            "ternary codes");
+      }
+    }
+    // A live layer may intentionally share its weight storage with another
+    // parameter (the tied token embedding/value head is the canonical case).
+    // Replacing that Tensor during the noexcept commit would silently break
+    // the alias even though the candidate was already the exact validated
+    // destination storage. Preserve it in place; external staged weights are
+    // still cloned here so commit remains allocation-free and transactional.
+    prepared.preserve_existing_full_precision_storage =
+        candidate->raw_data() == weight.data.raw_data();
+    if (!prepared.preserve_existing_full_precision_storage) {
+      prepared.full_precision_weight = candidate->clone();
+    }
+    prepared.keep_full_precision_weight = true;
   }
+  return prepared;
+}
 
-  flat_alpha.data = Tensor({in_features}, dev);
-  flat_alpha.data.copy_from(
-      Tensor::from_blob(const_cast<float*>(state.flat_alpha.data()),
-                        {in_features},
-                        Device::CPU)
-          .to(dev));
+void BitLinear::commit_prepared_packed_state(
+    PreparedPackedState&& prepared) noexcept {
+  packed_weights = std::move(prepared.packed_weights);
+  unpacked_weights_i8 = std::move(prepared.unpacked_weights);
+  unpacked_weight_row_sums = std::move(prepared.row_sums);
+  weight_scale = prepared.weight_scale;
+  packed_stride =
+      static_cast<size_t>(in_features / 16 + (in_features % 16 != 0));
+  packed_weight_valid = true;
+  magnitude.data = std::move(prepared.magnitude);
+  magnitude.grad = Tensor();
+  magnitude.mark_updated();
+  if (use_bias) {
+    bias.data = std::move(prepared.bias);
+    bias.grad = Tensor();
+    bias.mark_updated();
+  }
+  flat_alpha.data = std::move(prepared.flat_alpha);
+  flat_alpha.grad = Tensor();
+  flat_alpha.mark_updated();
+  flat_beta.data = std::move(prepared.flat_beta);
+  flat_beta.grad = Tensor();
+  flat_beta.mark_updated();
 
-  flat_beta.data = Tensor({in_features}, dev);
-  flat_beta.data.copy_from(
-      Tensor::from_blob(const_cast<float*>(state.flat_beta.data()),
-                        {in_features},
-                        Device::CPU)
-          .to(dev));
-
-  if (release_full_precision) {
-    release_full_precision_weight();
-    use_reference_path = false;
+  if (prepared.keep_full_precision_weight) {
+    if (!prepared.preserve_existing_full_precision_storage) {
+      weight.data = std::move(prepared.full_precision_weight);
+    }
+    weight.grad = Tensor();
+    weight.mark_updated();
   } else {
-    invalidate_cached_materialized_weights();
+    weight.data = Tensor();
+    weight.grad = Tensor();
+    use_reference_path = false;
   }
+  packed_weight_version = weight.version;
+  invalidate_cached_materialized_weights();
+}
+
+void BitLinear::import_packed_state(const BitLinearPackedState& state,
+                                    Device dev,
+                                    bool release_full_precision) {
+  PreparedPackedState prepared =
+      prepare_packed_state(state, dev, release_full_precision);
+  commit_prepared_packed_state(std::move(prepared));
 }
 
 void BitLinear::to(Device dev) {
@@ -774,6 +1076,10 @@ std::vector<Parameter *> BitLinear::parameters() {
 }
 
 void BitLinear::set_precision_mode(int bits) {
+  if (bits < 2 || bits > 8) {
+    throw std::invalid_argument(
+        "BitLinear precision mode must be in the closed interval [2, 8]");
+  }
   precision_bits = bits;
   // Repack or adjust quantization tables if needed
 }
@@ -797,15 +1103,19 @@ Tensor BitLinear::backward(const Tensor &grad) {
         weight.data.size == 0) {
       throw std::runtime_error("BitLinear QAT backward: missing saved QAT state");
     }
-    // out = pre * magnitude + bias  ->  exact magnitude/bias grads.
-    magnitude.add_grad(grad_2d.mul(saved_qat_pre_).sum(0));
+    // out = pre * magnitude + bias. Exact-linear mode bypasses the
+    // compatibility-only magnitude buffer entirely.
+    if (!exact_linear_mode_) {
+      magnitude.add_grad(grad_2d.mul(saved_qat_pre_).sum(0));
+    }
     if (use_bias) {
       bias.add_grad(grad_2d.sum(0));
     }
-    Tensor grad_pre = grad_2d.mul(magnitude.data);
+    Tensor grad_pre =
+        exact_linear_mode_ ? grad_2d : grad_2d.mul(magnitude.data);
     // Weight grad (STE through ternary): dW = grad_pre^T @ x_dq (the dequantized
     // activations actually multiplied).
-    Tensor dW = grad_pre.transpose().matmul(saved_qat_x_dq_);
+    Tensor dW = matmul_tn(grad_pre, saved_qat_x_dq_);
     // STE clip: zero grad for latent weights already saturated past |W/scale|>1.
     if (saved_qat_scale_.size == 1 &&
         saved_qat_scale_.get_device() == weight.data.get_device() &&
@@ -825,53 +1135,60 @@ Tensor BitLinear::backward(const Tensor &grad) {
             ? saved_qat_w_eff_
             : qat_fake_quant_ternary(weight.data, weight_scale);
     Tensor dx = grad_pre.matmul(w_eff);
+    dx = dx.reshape(saved_input.shape.dims);
     if (norm_strategy == NormStrategy::RMS_PERI ||
         norm_strategy == NormStrategy::RMS_PRE) {
       dx = saved_input.rmsnorm_backward(dx, saved_x_norm);
     }
-    return dx.reshape(saved_input.shape.dims);
+    return dx;
   }
 
   if (use_reference_path) {
     Tensor linear_input = saved_linear_input.size > 0 ? saved_linear_input
                                                       : input_2d;
-    Tensor grad_pre = grad_2d.clone();
+    // All consumers below are read-only; magnitude.mul() allocates its result.
+    // Share the upstream buffer instead of copying the whole [rows, out] tensor.
+    Tensor grad_pre = grad_2d;
 
     if (use_bias) {
       bias.add_grad(grad_2d.sum(0));
     }
 
-    Tensor d_mag = saved_pre_output.size > 0
-                       ? grad_2d.mul(saved_pre_output).sum(0)
-                       : Tensor::zeros({out_features}, grad_2d.get_device());
-    magnitude.add_grad(d_mag);
+    if (!exact_linear_mode_) {
+      if (saved_pre_output.size == 0) {
+        throw std::logic_error(
+            "BitLinear backward is missing the pre-magnitude output");
+      }
+      magnitude.add_grad(
+          grad_2d.mul(saved_pre_output).sum(0));
+      grad_pre = grad_pre.mul(magnitude.data);
+    }
 
-    grad_pre = grad_pre.mul(magnitude.data);
-
-    Tensor dW = grad_pre.transpose().matmul(linear_input);
+    Tensor dW = matmul_tn(grad_pre, linear_input);
     weight.add_grad(dW);
 
     Tensor dx = grad_pre.matmul(weight.data);
 
     if (loqa.active) {
       Tensor inputA = linear_input.matmul(loqa.A.data);
-      Tensor dB = inputA.transpose().matmul(grad_pre);
+      Tensor dB = matmul_tn(inputA, grad_pre);
       loqa.B.add_grad(dB);
 
-      Tensor gradBt = grad_pre.matmul(loqa.B.data.transpose());
-      Tensor dA = linear_input.transpose().matmul(gradBt);
+      Tensor gradBt = matmul_nt(grad_pre, loqa.B.data);
+      Tensor dA = matmul_tn(linear_input, gradBt);
       loqa.A.add_grad(dA);
 
-      Tensor dx_loqa = gradBt.matmul(loqa.A.data.transpose());
+      Tensor dx_loqa = matmul_nt(gradBt, loqa.A.data);
       dx = dx.add(dx_loqa);
     }
 
+    dx = dx.reshape(saved_input.shape.dims);
     if (norm_strategy == NormStrategy::RMS_PERI ||
         norm_strategy == NormStrategy::RMS_PRE) {
       dx = saved_input.rmsnorm_backward(dx, saved_x_norm);
     }
 
-    return dx.reshape(saved_input.shape.dims);
+    return dx;
   }
 
   // ── NON-REFERENCE PATH: straight-through estimator (STE) backward for the
@@ -946,17 +1263,17 @@ Tensor BitLinear::backward(const Tensor &grad) {
     loqa_out = loqa_input.matmul(loqa.A.data).matmul(loqa.B.data); // [M, out]
   }
 
-  // Recover `pre` (gemm output before the magnitude/bias affine) for the exact
-  // magnitude gradient.  The fused forward folds the affine into the gemm, so
-  // recompute the un-fused gemm from the saved quantized activation.
-  Tensor pre_2d =
-      gemm_158bit_ultra(saved_x_quant, saved_act_scales, false)
-          .reshape({M, out_features});
-  Tensor pre_full =
-      (loqa.active && loqa_out.size > 0) ? pre_2d.add(loqa_out) : pre_2d;
-
-  // d_magnitude[j] = Sum_i grad[i,j] * pre_full[i,j]   (exact)
-  magnitude.add_grad(grad_2d.mul(pre_full).sum(0));
+  if (!exact_linear_mode_) {
+    // Recover `pre` (gemm output before the magnitude/bias affine) for the
+    // exact magnitude gradient. The fused forward folds the affine into the
+    // gemm, so recompute the un-fused result from the saved activation.
+    Tensor pre_2d =
+        gemm_158bit_ultra(saved_x_quant, saved_act_scales, false)
+            .reshape({M, out_features});
+    Tensor pre_full =
+        (loqa.active && loqa_out.size > 0) ? pre_2d.add(loqa_out) : pre_2d;
+    magnitude.add_grad(grad_2d.mul(pre_full).sum(0));
+  }
 
   // d_bias = Sum_i grad[i,j]
   if (use_bias) {
@@ -964,10 +1281,11 @@ Tensor BitLinear::backward(const Tensor &grad) {
   }
 
   // Gradient into the pre-magnitude output.
-  Tensor grad_pre = grad_2d.mul(magnitude.data);
+  Tensor grad_pre =
+      exact_linear_mode_ ? grad_2d : grad_2d.mul(magnitude.data);
 
   // Weight gradient (STE through ternary): dW = grad_pre^T @ act_dequant.
-  Tensor dW = grad_pre.transpose().matmul(act_dequant);
+  Tensor dW = matmul_tn(grad_pre, act_dequant);
 
   // Tequila dead-zone gradient boost (opt-in): help near-zero latent weights
   // escape the ternary dead band.
@@ -1000,12 +1318,12 @@ Tensor BitLinear::backward(const Tensor &grad) {
   Tensor dx_loqa;
   if (loqa.active) {
     Tensor inputA = loqa_input.matmul(loqa.A.data);           // [M, r]
-    Tensor dB = inputA.transpose().matmul(grad_pre);          // [r, out]
+    Tensor dB = matmul_tn(inputA, grad_pre);                  // [r, out]
     loqa.B.add_grad(dB);
-    Tensor gradBt = grad_pre.matmul(loqa.B.data.transpose()); // [M, r]
-    Tensor dA = loqa_input.transpose().matmul(gradBt);        // [in, r]
+    Tensor gradBt = matmul_nt(grad_pre, loqa.B.data);         // [M, r]
+    Tensor dA = matmul_tn(loqa_input, gradBt);                // [in, r]
     loqa.A.add_grad(dA);
-    dx_loqa = gradBt.matmul(loqa.A.data.transpose());         // [M, in] (wrt x_norm)
+    dx_loqa = matmul_nt(gradBt, loqa.A.data);                 // [M, in] (wrt x_norm)
   }
 
   // Gradient into the Hadamard-transformed activation, STE through
@@ -1029,12 +1347,13 @@ Tensor BitLinear::backward(const Tensor &grad) {
   }
 
   // Reverse RMSNorm back to the layer input.
+  dx = dx.reshape(saved_input.shape.dims);
   if (norm_strategy == NormStrategy::RMS_PERI ||
       norm_strategy == NormStrategy::RMS_PRE) {
     dx = saved_input.rmsnorm_backward(dx, saved_x_norm);
   }
 
-  return dx.reshape(saved_input.shape.dims);
+  return dx;
 }
 
 Tensor BitLinear::quantize_weights(const Tensor &w_float) {
@@ -1075,8 +1394,11 @@ Tensor BitLinear::add_qat_regularization_grad(float regularization) {
     // managed-memory migration.
     ternary_target = saved_qat_w_eff_;
   } else {
-    const float scale = tensor_abs_mean(weight.data) + 1e-8f;
-    ternary_target = qat_fake_quant_ternary(weight.data, scale);
+    // Warmup and topology-dormant linears have no saved QAT forward tensor.
+    // Compute both absmean and fake quantization on device instead of reading
+    // one scale scalar per layer back to the host.
+    ternary_target =
+        qat_fake_quant_ternary_absmean(weight.data, nullptr);
   }
 
   Tensor penalty_grad = weight.data.sub(ternary_target).mul(regularization);
