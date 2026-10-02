@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cerrno>
+#include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -45,8 +48,40 @@ inline bool deterministic_adamw_chunked_enabled() {
         "NSOS_DETERMINISTIC_ADAMW_CHUNKED", true);
 }
 
+inline bool muon_enabled() {
+    const char* value=std::getenv("NSOS_OPTIMIZER");
+    if(!value || !*value || std::string(value)=="adamw")return false;
+    if(std::string(value)=="muon_ns5_fp32_v1")return true;
+    throw std::invalid_argument("NSOS_OPTIMIZER must be adamw or muon_ns5_fp32_v1");
+}
+inline float muon_learning_rate() {
+    const char* value=std::getenv("NSOS_MUON_LR");
+    if(!value || !*value)throw std::invalid_argument("Muon requires explicit NSOS_MUON_LR; Adam learning rates do not transfer");
+    if(*value==' ' || *value=='\t' || *value=='\n' || *value=='\r')throw std::invalid_argument("NSOS_MUON_LR has leading whitespace");
+    char* end=nullptr;errno=0;const float result=std::strtof(value,&end);
+    if(errno==ERANGE || end==value || *end || !std::isfinite(result) || result<=0)
+        throw std::invalid_argument("NSOS_MUON_LR must be a finite positive FP32 value");
+    return result;
+}
+inline std::string muon_learning_rate_identity() {
+    const float lr=muon_learning_rate();std::uint32_t bits=0;
+    std::memcpy(&bits,&lr,sizeof(bits));return std::to_string(bits);
+}
+inline bool fused_optimizer_epilogue_enabled() {
+    return parse_optimizer_boolean("NSOS_OPTIMIZER_FUSED_EPILOGUE",false);
+}
+inline bool legacy_device_sparse_adam_enabled() {
+    return parse_optimizer_boolean("NSOS_MOE_DEVICE_ADAM",false);
+}
+inline bool dense_device_optimizer_enabled() {
+    const bool muon=muon_enabled();
+    const bool fused=fused_optimizer_epilogue_enabled();
+    return muon || fused;
+}
 inline bool device_sparse_adam_enabled() {
-    return parse_optimizer_boolean("NSOS_MOE_DEVICE_ADAM", false);
+    const bool legacy=legacy_device_sparse_adam_enabled();
+    const bool dense=dense_device_optimizer_enabled();
+    return dense || legacy;
 }
 inline constexpr const char* kDeviceSparseGradientIdentity =
     "explicit_group_contribution_device_v1";

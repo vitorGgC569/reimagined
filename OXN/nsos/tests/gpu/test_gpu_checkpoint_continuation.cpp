@@ -397,7 +397,7 @@ int main() {
       require(static_cast<bool>(state), "checkpoint sidecar header is truncated");
       require(magic == 0x4E535452u,
               "training-state sidecar magic is not NSTR");
-      require(version == 10u, "training-state sidecar is not checkpoint v10");
+      require(version == 11u, "training-state sidecar is not checkpoint v11");
     }
 
     JambaModel resumed(config, Device::GPU);
@@ -440,7 +440,7 @@ int main() {
             "GPU resumed update is not bitwise identical");
     require_optimizer_states_equal(
         first, uninterrupted, resumed_trainer, resumed);
-    std::cout << "[GPUParity:checkpoint_continuation] version=10"
+    std::cout << "[GPUParity:checkpoint_continuation] version=11"
               << " round_trip_param_diff=" << round_trip_difference
               << " continuation_loss_diff="
               << std::abs(uninterrupted_loss - resumed_loss)

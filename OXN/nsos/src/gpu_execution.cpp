@@ -8,6 +8,8 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_map>
+#include <cstdio>
 
 namespace nsos::gpu {
 namespace {
@@ -42,6 +44,7 @@ std::size_t width(StorageType type) {
 struct ExecutionContext::Impl {
   std::recursive_mutex mutex;
   bool frozen = false;
+  bool default_lane = false;
 #ifdef USE_CUDA
   struct Entry {
     cuda_detail::DeviceBuffer<unsigned char> buffer;
@@ -52,42 +55,86 @@ struct ExecutionContext::Impl {
   cudaStream_t stream = nullptr;
   cudaEvent_t enter_event = nullptr, leave_event = nullptr;
   int device = -1;
+  bool initialized = false;
+  int blas_availability = -1;
+  cublasHandle_t blas = nullptr;
   void initialize() {
-    if (stream) return;
+    if (initialized) return;
     std::string error;
-    if (!select_preferred_device(&device, &error))
+    if (default_lane) checked(cudaGetDevice(&device),"default execution device");
+    else if (!select_preferred_device(&device, &error))
       throw std::runtime_error("Execution context: " + error);
     try {
-      checked(cudaStreamCreate(&stream), "create execution stream");
+      if (default_lane) stream = default_stream();
+      else checked(cudaStreamCreate(&stream), "create execution stream");
       checked(cudaEventCreate(&enter_event), "create entry fence");
       checked(cudaEventCreate(&leave_event), "create exit fence");
+      initialized = true;
     } catch (...) {
       if (enter_event) (void)cudaEventDestroy(enter_event);
       if (leave_event) (void)cudaEventDestroy(leave_event);
-      if (stream) (void)cudaStreamDestroy(stream);
+      if (stream && !default_lane) (void)cudaStreamDestroy(stream);
       enter_event = leave_event = nullptr;
       stream = nullptr;
       throw;
     }
+  }
+  cublasHandle_t classic_blas_handle() {
+    if (blas_availability == 0) return nullptr;
+    if (blas_availability == 1) {
+      int active = -1;
+      checked(cudaGetDevice(&active),"classic BLAS selected device");
+      if (active != device || current_stream() != stream)
+        throw std::logic_error("Classic BLAS lease requires the owning device/stream");
+      return blas;
+    }
+    if (frozen) throw std::logic_error("Classic BLAS handle initialization during capture/replay");
+    if (cudaFree(nullptr) != cudaSuccess) {blas_availability=0;return nullptr;}
+    initialize();
+    int active=-1;checked(cudaGetDevice(&active),"classic BLAS selected device");
+    if(active!=device || current_stream()!=stream)
+      throw std::logic_error("Classic BLAS initialization requires the owning device/stream");
+    cublasHandle_t staged=nullptr;
+    if(cublasCreate(&staged)!=CUBLAS_STATUS_SUCCESS) {
+      if(staged) (void)cublasDestroy(staged);
+      blas_availability=0;return nullptr;
+    }
+    // This is the sole SetStream call for the handle's entire lifetime.
+    // Its old stream is the SDK default; no private stream is ever migrated.
+    if(cublasSetStream(staged,stream)!=CUBLAS_STATUS_SUCCESS) {
+      (void)cublasDestroy(staged);blas_availability=0;return nullptr;
+    }
+    blas=staged;blas_availability=1;return blas;
   }
   ~Impl() {
     if (device >= 0) {
       int previous = -1;
       (void)cudaGetDevice(&previous);
       if (cudaSetDevice(device) != cudaSuccess) return;
-      if (stream) report_cleanup_status(cudaStreamSynchronize(stream), "execution drain");
+      if (initialized) report_cleanup_status(cudaStreamSynchronize(stream), "execution drain");
+      // The BLAS allocator/workspace still refers to this live stream. Destroy
+      // its handle after the drain, before destroying the stream or fences.
+      if (blas) {
+        const auto status=cublasDestroy(blas);
+        if(status!=CUBLAS_STATUS_SUCCESS)
+          std::fprintf(stderr,"[GPU cleanup] classic BLAS handle destroy failed: status=%d\n",int(status));
+        blas=nullptr;
+      }
       // Release on the owning device, before destroying its stream.
       for (auto& entry : entries) entry.buffer.release();
       if (enter_event) report_cleanup_status(cudaEventDestroy(enter_event), "entry fence");
       if (leave_event) report_cleanup_status(cudaEventDestroy(leave_event), "exit fence");
-      if (stream) report_cleanup_status(cudaStreamDestroy(stream), "execution stream");
+      if (stream && !default_lane) report_cleanup_status(cudaStreamDestroy(stream), "execution stream");
       if (previous >= 0 && previous != device) (void)cudaSetDevice(previous);
     }
   }
 #endif
 };
 
-ExecutionContext::ExecutionContext() : impl_(std::make_unique<Impl>()) {}
+ExecutionContext::ExecutionContext() : ExecutionContext(false) {}
+ExecutionContext::ExecutionContext(bool default_lane) : impl_(std::make_unique<Impl>()) {
+  impl_->default_lane=default_lane;
+}
 void record_dispatch(DispatchPath path) noexcept {
   const auto index = static_cast<unsigned>(path);
   if (index < counters.size()) counters[index].fetch_add(1, std::memory_order_relaxed);
@@ -98,6 +145,24 @@ std::array<std::uint64_t, static_cast<unsigned>(DispatchPath::Count)> dispatch_c
   return result;
 }
 ExecutionContext::~ExecutionContext() = default;
+
+ExecutionContext::ClassicBlasLease::ClassicBlasLease(ExecutionContext& context) {
+#ifdef USE_CUDA
+  if (&context != &current_execution_context())
+    throw std::logic_error("Classic BLAS lease requires the current execution lane");
+  context.impl_->mutex.lock();
+  try {
+    handle_=reinterpret_cast<void*>(context.impl_->classic_blas_handle());
+    context_=&context;
+  } catch (...) {context.impl_->mutex.unlock();throw;}
+#else
+  (void)context;
+#endif
+}
+ExecutionContext::ClassicBlasLease::~ClassicBlasLease() {
+  if(context_) context_->impl_->mutex.unlock();
+}
+
 
 void* ExecutionContext::reserve(WorkspaceSlot slot, StorageType type, std::size_t elements) {
   std::lock_guard lock(impl_->mutex);
@@ -185,7 +250,18 @@ ExecutionContext::Scope::Scope(ExecutionContext& context, bool enabled) {
 ExecutionContext::Scope::~Scope() = default;
 ExecutionContext& current_execution_context() {
   if (bound_context) return *bound_context;
-  thread_local ExecutionContext fallback;
+#ifdef USE_CUDA
+  // Default streams are device-affine too. A standalone handle never follows
+  // a model's private stream or migrates when the caller selects another GPU.
+  int device=-1;
+  if(cudaGetDevice(&device)==cudaSuccess) {
+    thread_local std::unordered_map<int,std::unique_ptr<ExecutionContext>> default_lanes;
+    auto& lane=default_lanes[device];
+    if(!lane) lane=std::unique_ptr<ExecutionContext>(new ExecutionContext(true));
+    return *lane;
+  }
+#endif
+  thread_local ExecutionContext fallback(true);
   return fallback;
 }
 #ifdef USE_CUDA

@@ -1,14 +1,31 @@
 #include "gpu_sparse_adam.h"
 #include "gpu_attention_training.h"
+#include "muon_math.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <set>
 #ifdef USE_CUDA
 #include "cuda/sparse_optimizer_activity.cuh"
+#include "cuda/muon_optimizer.cuh"
 #endif
 
+#include <cstdint>
+
 namespace nsos {
+namespace {
+struct AtomicOptimizerDispatchCounters {
+    std::atomic<std::uint64_t> adamw_device{0},adamw_fused{0},muon_adam{0},muon_directions{0},fused_clear{0};
+};
+AtomicOptimizerDispatchCounters optimizer_dispatch_counters;
+}
+GpuSparseAdamDispatchCounters gpu_sparse_adam_dispatch_counters() noexcept {
+    const auto& c=optimizer_dispatch_counters;
+    return {c.adamw_device.load(std::memory_order_relaxed),c.adamw_fused.load(std::memory_order_relaxed),
+        c.muon_adam.load(std::memory_order_relaxed),c.muon_directions.load(std::memory_order_relaxed),
+        c.fused_clear.load(std::memory_order_relaxed)};
+}
 #ifdef USE_CUDA
 namespace {
 void check(cudaError_t status) {
@@ -36,11 +53,18 @@ struct GpuSparseAdam::Impl {
     std::vector<GpuSparseAdamSlot> slots;
     std::vector<std::string> names;
     std::vector<Tensor> m, v;
+    std::vector<Tensor> directions;
     std::vector<uint64_t> versions;
     std::vector<float*> weight_storage, gradient_storage;
     std::vector<std::shared_ptr<GpuGradientActivity>> domains;
     std::function<void(int*)> merge_upstream_status;
     cuda_detail::DeviceBuffer<float*> w_, g_, m_, v_;
+    cuda_detail::DeviceBuffer<float*> directions_;
+    cuda_detail::DeviceBuffer<unsigned char> muon_mask_;
+    cuda_detail::DeviceBuffer<float> muon_x_,muon_y_,muon_gram_,muon_poly_;
+    cuda_detail::DeviceBuffer<double> muon_norm_;
+    bool has_muon = false;
+    bool fused_reset_ready = false;
     cuda_detail::DeviceBuffer<const unsigned char*> predicates_;
     cuda_detail::DeviceBuffer<const int*> issues_;
     cuda_detail::DeviceBuffer<unsigned long long> offsets_;
@@ -81,6 +105,7 @@ void GpuSparseAdam::configure(const std::vector<GpuSparseAdamSlot>& slots,
     std::function<void(int*)> merge_upstream_status) try {
 #ifdef USE_CUDA
     auto& s = *impl_;
+    s.fused_reset_ready=false;
     if (s.prepared || slots.empty() || slots.size() > size_t(std::numeric_limits<int>::max()))
         throw std::logic_error("Invalid/nested sparse Adam transaction");
     if (s.device < 0) { check(cudaGetDevice(&s.device)); s.stream = gpu::current_stream(); }
@@ -96,7 +121,11 @@ void GpuSparseAdam::configure(const std::vector<GpuSparseAdamSlot>& slots,
         if (!p || !p->trainable || !p->data.size || p->data.get_device() != Device::GPU ||
             !std::isfinite(slots[i].learning_rate) || slots[i].learning_rate < 0 ||
             !unique.insert(p).second || p->name.empty() || !names.insert(p->name).second ||
-            (!first && (s.slots[i].parameter != p || s.names[i] != p->name || s.m[i].shape != p->data.shape)))
+            (slots[i].algorithm != GpuSparseAlgorithm::AdamW && slots[i].algorithm != GpuSparseAlgorithm::MuonNs5Fp32) ||
+            (slots[i].algorithm == GpuSparseAlgorithm::MuonNs5Fp32 &&
+                !muon::hidden_matrix(p->name,p->data.shape.dims)) ||
+            (!first && (s.slots[i].parameter != p || s.names[i] != p->name || s.m[i].shape != p->data.shape ||
+                s.slots[i].algorithm != slots[i].algorithm)))
             throw std::invalid_argument("Sparse Adam registry/shape/LR/name mismatch");
         if (p->grad.size && (p->grad.shape != p->data.shape || p->grad.get_device() != Device::GPU))
             throw std::invalid_argument("Sparse Adam gradient shape/device mismatch");
@@ -124,9 +153,32 @@ void GpuSparseAdam::configure(const std::vector<GpuSparseAdamSlot>& slots,
             s.m.push_back(Tensor::uninitialized(slot.parameter->data.shape.dims, Device::GPU));
             s.v.push_back(Tensor::uninitialized(slot.parameter->data.shape.dims, Device::GPU));
             s.versions.push_back(slot.parameter->version);
+            s.directions.push_back(slot.algorithm==GpuSparseAlgorithm::MuonNs5Fp32 ?
+                Tensor::uninitialized(slot.parameter->data.shape.dims,Device::GPU) : Tensor());
+            s.has_muon = s.has_muon || slot.algorithm==GpuSparseAlgorithm::MuonNs5Fp32;
         }
         upload(s.initialized_, std::vector<unsigned char>(slots.size(),0));
         upload(s.versions_, s.versions);
+    }
+    // All allocation precedes the bank's numerical snapshot/commit boundary.
+    if(first) {
+    size_t matrix_elements=0,gram_elements=0;
+    std::vector<float*> directions;
+    std::vector<unsigned char> muon_mask;
+    for(size_t i=0;i<slots.size();++i) {
+        const bool use_muon=slots[i].algorithm==GpuSparseAlgorithm::MuonNs5Fp32;
+        muon_mask.push_back(use_muon?1:0);directions.push_back(use_muon?s.directions[i].raw_data():nullptr);
+        if(use_muon) {
+            const auto& dims=slots[i].parameter->data.shape.dims;
+            const size_t r=size_t((std::min)(dims[0],dims[1]));
+            if(r>std::numeric_limits<size_t>::max()/r)throw std::length_error("Muon gram scratch overflow");
+            matrix_elements=(std::max)(matrix_elements,size_t(slots[i].parameter->data.size));
+            gram_elements=(std::max)(gram_elements,r*r);
+        }
+    }
+    if(s.has_muon && (!s.muon_x_.ensure(matrix_elements)||!s.muon_y_.ensure(matrix_elements)||
+        !s.muon_gram_.ensure(gram_elements)||!s.muon_poly_.ensure(gram_elements)||!s.muon_norm_.ensure(1)))throw std::bad_alloc();
+    upload(s.directions_,directions);upload(s.muon_mask_,muon_mask);
     }
     s.slots = slots; s.domains.clear(); s.merge_upstream_status=std::move(merge_upstream_status);
     std::vector<float*> w, g, m, v;
@@ -186,6 +238,10 @@ GpuSparseAdamResult GpuSparseAdam::step(const GpuSparseAdamOptions& o) {
 #ifdef USE_CUDA
     auto& s=*impl_; s.lane();
     if (!s.prepared) throw std::logic_error("Sparse Adam requires configured group");
+    if((s.has_muon || o.fused_epilogue || o.clear_gradients) && s.slots.size()>65535)
+        throw std::length_error("Hybrid optimizer tensor count exceeds grid indexing");
+    if(o.clear_gradients && !o.fused_epilogue)
+        throw std::invalid_argument("Gradient clearing requires the fused optimizer epilogue");
     if (o.accumulation_steps < 1 || !std::isfinite(o.max_norm) || o.max_norm <= 0 ||
         !std::isfinite(o.beta1) || o.beta1 < 0 || o.beta1 >= 1 ||
         !std::isfinite(o.beta2) || o.beta2 < 0 || o.beta2 >= 1 ||
@@ -194,6 +250,7 @@ GpuSparseAdamResult GpuSparseAdam::step(const GpuSparseAdamOptions& o) {
         throw std::invalid_argument("Invalid sparse Adam hyperparameters");
     s.validate_storage();
     bool snapshot_ready=false;
+    std::uint64_t muon_directions_this_commit=0;
     try {
         check(cudaMemsetAsync(s.status_.get(),0,2*sizeof(int),s.stream));
         std::vector<Parameter*> status_parameters;
@@ -225,7 +282,19 @@ GpuSparseAdamResult GpuSparseAdam::step(const GpuSparseAdamOptions& o) {
             require(launch_activity_multi_tensor_sqsum(s.sqsum_.get(),s.desc));
         }
         require(launch_activity_multi_tensor_initialize_moments(s.desc,s.initialized_.get()));
-        if (o.deterministic)
+        if(s.has_muon || o.fused_epilogue) {
+            for(size_t i=0;i<s.slots.size();++i)if(s.slots[i].algorithm==GpuSparseAlgorithm::MuonNs5Fp32) {
+                const auto& dims=s.slots[i].parameter->data.shape.dims;
+                require(launch_activity_muon_direction(s.desc,static_cast<int>(i),dims[0],dims[1],
+                    s.muon_x_.get(),s.muon_y_.get(),s.muon_gram_.get(),s.muon_poly_.get(),
+                    s.directions[i].raw_data(),s.muon_norm_.get(),o.deterministic?nullptr:s.sqsum_.get(),
+                    accumulation_scale,o.max_norm,s.status_.get()+1));
+                ++muon_directions_this_commit;
+            }
+            require(launch_activity_hybrid_muon_adam_epilogue(s.desc,s.muon_mask_.get(),s.directions_.get(),
+                o.deterministic?nullptr:s.sqsum_.get(),accumulation_scale,o.max_norm,o.beta1,o.beta2,
+                o.bc1,o.bc2,o.eps,o.weight_decay,o.clear_gradients,s.status_.get()+1));
+        } else if (o.deterministic)
             require(launch_activity_multi_tensor_adamw_update_deterministic(s.desc,s.chunks_.get(),s.chunk_count,
                 o.beta1,o.beta2,o.bc1,o.bc2,o.eps,o.weight_decay,s.status_.get()+1));
         else
@@ -249,6 +318,15 @@ GpuSparseAdamResult GpuSparseAdam::step(const GpuSparseAdamOptions& o) {
         // never used to construct a host optimizer cohort or lazy moment state.
         for (size_t i=0;i<versions.size();++i) s.slots[i].parameter->version=versions[i];
         s.versions=versions; s.prepared=false;
+        s.fused_reset_ready=o.clear_gradients;
+        // Publish benchmark counters only after finite gates and device versions commit.
+        auto& counters=optimizer_dispatch_counters;
+        if(s.has_muon) {
+            counters.muon_adam.fetch_add(1,std::memory_order_relaxed);
+            counters.muon_directions.fetch_add(muon_directions_this_commit,std::memory_order_relaxed);
+        } else if(o.fused_epilogue) counters.adamw_fused.fetch_add(1,std::memory_order_relaxed);
+        else counters.adamw_device.fetch_add(1,std::memory_order_relaxed);
+        if(o.clear_gradients)counters.fused_clear.fetch_add(1,std::memory_order_relaxed);
         return {true,norm};
     } catch (...) {
         try {
@@ -268,8 +346,31 @@ GpuSparseAdamResult GpuSparseAdam::step(const GpuSparseAdamOptions& o) {
 void GpuSparseAdam::abort() {
 #ifdef USE_CUDA
     auto& s=*impl_; s.lane();
+    s.fused_reset_ready=false;
     for (const auto& domain:s.domains) domain->abort();
     s.prepared=false;
+#endif
+}
+bool GpuSparseAdam::consume_fused_gradient_reset(const std::vector<Parameter*>& parameters) {
+#ifdef USE_CUDA
+    auto& s=*impl_;s.lane();
+    const bool ready=s.fused_reset_ready;s.fused_reset_ready=false;
+    if(!ready || s.prepared)return false;
+    std::vector<Parameter*> registry;
+    for(auto* p:parameters)if(p && p->trainable && p->data.size)registry.push_back(p);
+    if(registry.size()!=s.slots.size())return false;
+    for(size_t i=0;i<registry.size();++i) {
+        auto* p=registry[i];
+        if(p!=s.slots[i].parameter || p->name!=s.names[i] || p->has_device_gradient_activity() ||
+            p->version!=s.versions[i] || p->data.raw_data()!=s.weight_storage[i] ||
+            p->grad.raw_data()!=s.gradient_storage[i] ||
+            p->data.shape!=s.m[i].shape || (p->grad.size && p->grad.shape!=p->data.shape) ||
+            (!p->tracks_gradient_contributions() && p->grad.size && !s.slots[i].dense_contributed))return false;
+    }
+    for(auto* p:registry)p->reset_gradient_activity();
+    return true;
+#else
+    (void)parameters;return false;
 #endif
 }
 std::vector<GpuSparseAdamState> GpuSparseAdam::snapshot() const {
@@ -281,7 +382,7 @@ std::vector<GpuSparseAdamState> GpuSparseAdam::snapshot() const {
     for (size_t i=0;i<s.slots.size();++i) {
         const bool present=initialized[i]!=0;
         states.push_back({s.slots[i].parameter->name,s.versions[i],present,
-            present?s.m[i]:Tensor(),present?s.v[i]:Tensor()});
+            present?s.m[i]:Tensor(),present?s.v[i]:Tensor(),s.slots[i].algorithm});
     }
     return states;
 #else
@@ -291,20 +392,22 @@ std::vector<GpuSparseAdamState> GpuSparseAdam::snapshot() const {
 void GpuSparseAdam::restore(const std::vector<GpuSparseAdamState>& states) {
 #ifdef USE_CUDA
     auto& s=*impl_; s.lane();
+    s.fused_reset_ready=false;
     if (states.size()!=s.slots.size()) throw std::logic_error("Restore requires matching registry");
     // Validate/stage the complete checkpoint before publishing any state.
     std::vector<Tensor> m,v; std::vector<unsigned char> initialized;
     std::vector<uint64_t> versions;
     for (size_t i=0;i<states.size();++i) {
         const auto& state=states[i]; auto* p=s.slots[i].parameter;
-        if (state.name!=p->name || !state.version ||
+        if (state.name!=p->name || !state.version || state.algorithm!=s.slots[i].algorithm ||
             (!state.initialized && (state.m.size || state.v.size)) ||
             (state.initialized && (state.m.shape!=p->data.shape || state.v.shape!=p->data.shape)))
             throw std::invalid_argument("Sparse Adam checkpoint metadata mismatch");
         if (state.initialized) {
             const auto mh=state.m.to(Device::CPU), vh=state.v.to(Device::CPU);
             for (size_t j=0;j<size_t(mh.size);++j)
-                if (!std::isfinite(mh.data()[j]) || !std::isfinite(vh.data()[j]) || vh.data()[j]<0)
+                if (!std::isfinite(mh.data()[j]) || !std::isfinite(vh.data()[j]) || vh.data()[j]<0 ||
+                    (state.algorithm==GpuSparseAlgorithm::MuonNs5Fp32 && vh.data()[j]!=0))
                     throw std::invalid_argument("Nonfinite/negative sparse Adam checkpoint moments");
             m.push_back(mh.to(Device::GPU)); v.push_back(vh.to(Device::GPU));
         } else {

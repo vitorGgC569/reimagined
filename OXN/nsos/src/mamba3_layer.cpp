@@ -1,11 +1,13 @@
 #include "mamba3_layer.h"
 #include "mamba3_layer_math.h"
+#include "cuda/mamba3_projection_wmma.cuh"
 #include "gpu_backend.h"
 #include "gpu_execution.h"
 #include "cuda/device_buffer.h"
 #include "checkpoint_io.h"
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <cmath>
 #include <climits>
 #include <fstream>
@@ -18,6 +20,7 @@
 namespace nsos {
 namespace {
 namespace mb=mamba3_block;
+namespace mp=mamba3_projection;
 void require(bool ok,const char* message) {if(!ok) throw std::runtime_error(message);}
 void tensor_shape(const Tensor& x,const std::vector<int>& dims,Device dev) {
     require(x.shape.dims==dims&&x.get_device()==dev&&x.raw_data(),"Mamba3 tensor shape/device/storage mismatch");
@@ -70,10 +73,14 @@ std::vector<CoreField> fields(const mb::Shape& s) {
 }
 }
 struct Mamba3Tape::Impl {
-    mb::Shape shape;Device device=Device::CPU;std::uint64_t model_id=0;bool consumed=false,published=false,cancelled=false;
+    mb::Shape shape;Device device=Device::CPU;
+    mp::Policy projection_policy=mp::Policy::ExactFP32;std::uint64_t projection_dispatches=0;std::uint64_t model_id=0;bool consumed=false,published=false,cancelled=false;
     std::vector<std::uint64_t> versions;std::vector<CoreField> core_fields;std::vector<int> valid;std::vector<int> input_shape;
     Tensor input,in_weight,out_weight,core,projection,mixed,output,status,history,q,k,phase,readout;
     Tensor adjoint,dmixed,dprojection,partial,dcore,scratch,din_weight,dout_weight,dinput;
+    mb::GpuProvider gpu_provider=mb::GpuProvider::DenseReference;
+    Tensor gy,token_parameters,bc_gradient,phase_gradient,reverse,dz,dx_value,ddt,da,dtrap,coefficients;
+    mb::BackwardWorkspace backward_workspace() {return {gy.raw_data(),token_parameters.raw_data(),bc_gradient.raw_data(),phase_gradient.raw_data(),reverse.raw_data(),dz.raw_data(),dx_value.raw_data(),ddt.raw_data(),da.raw_data(),dtrap.raw_data()};}
     Mamba3State initial,final,dinitial,seed;
     std::thread::id thread=std::this_thread::get_id();
 #ifdef USE_CUDA
@@ -104,9 +111,31 @@ struct Mamba3Tape::Impl {
 #endif
     }
     void gate_state(Mamba3State& state) {gate(state.phase);gate(state.ssm);gate(state.k);gate(state.v);}
-    mb::Trace<float> trace() {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data()};}
-    mb::Trace<const float> trace_const() const {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data()};}
-    std::size_t workspace() const {return std::size_t(history.size+q.size+k.size+phase.size+readout.size+partial.size+scratch.size)*sizeof(float);}
+    Tensor dense(const Tensor& a,const Tensor& b,bool ta,bool tb,mp::ExactAxis axis=mp::ExactAxis::None,int begin=0) {
+        const auto& ad=a.shape.dims;const auto& bd=b.shape.dims;
+        require(ad.size()==2&&bd.size()==2,"Mamba3 dense projection requires matrices");
+        const int rows=ad[ta?1:0],k=ad[ta?0:1],cols=bd[tb?0:1];
+        require(k==bd[tb?1:0],"Mamba3 dense projection reduction mismatch");
+        if(projection_policy==mp::Policy::ExactFP32) {
+            if(ta) {require(!tb,"Mamba3 exact transpose-both unsupported");return matmul_tn(a,b);}
+            return tb?matmul_nt(a,b):a.matmul(b);
+        }
+        require(device==Device::GPU,"Mamba3 lowp projection requires GPU; no host fallback");
+        // The WMMA pass writes every output cell, including zero-padded M/N/K
+        // tiles; the exact reduction suffix reads only this freshly written pass.
+        Tensor out=Tensor::uninitialized({rows,cols},device);
+#ifdef USE_CUDA
+        require(mp::gemm(projection_policy,ta,tb,rows,cols,k,a.raw_data(),b.raw_data(),out.raw_data(),axis,begin),
+            "Mamba3 lowp projection unavailable/enqueue failed; no exact fallback; discard/drain lane");
+        ++projection_dispatches;
+#else
+        throw std::runtime_error("Mamba3 lowp projection requires GPU build");
+#endif
+        return out;
+    }
+    mb::Trace<float> trace() {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data(),gpu_provider!=mb::GpuProvider::DenseReference,mb::is_flash_provider(gpu_provider),coefficients.raw_data(),gpu_provider==mb::GpuProvider::FlashFp32ReplayLdsV2};}
+    mb::Trace<const float> trace_const() const {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data(),gpu_provider!=mb::GpuProvider::DenseReference,mb::is_flash_provider(gpu_provider),coefficients.raw_data(),gpu_provider==mb::GpuProvider::FlashFp32ReplayLdsV2};}
+    std::size_t workspace() const {return (std::size_t(history.size)+coefficients.size+q.size+k.size+phase.size+readout.size+partial.size+scratch.size+gy.size+token_parameters.size+bc_gradient.size+phase_gradient.size+reverse.size+dz.size+dx_value.size+ddt.size+da.size+dtrap.size)*sizeof(float);}
 };
 struct Mamba3Layer::Impl {
     int model;Mamba3Config config;Device device=Device::CPU;Tensor core;std::vector<Parameter> params;std::string name="mamba3";
@@ -122,6 +151,7 @@ const Tensor& Mamba3Tape::status_tensor() const {impl_->lane();return impl_->sta
 bool Mamba3Tape::consumed() const {return impl_->consumed;}
 void Mamba3Tape::cancel() {impl_->lane();impl_->consumed=true;impl_->cancelled=true;}
 std::size_t Mamba3Tape::workspace_bytes() const {return impl_->workspace();}
+std::string Mamba3Tape::projection_runtime_identity() const {return mp::identity(impl_->projection_policy);}
 std::vector<int> Mamba3Tape::audit_status() const {
     impl_->lane();Tensor status=impl_->status.cpu();std::vector<int> codes(impl_->shape.batch);
     for(int b=0;b<impl_->shape.batch;++b) codes[b]=int(status.data()[b]);return codes;
@@ -131,20 +161,28 @@ Mamba3Backward Mamba3Tape::backward(const Tensor& dy,const Mamba3State& seed) {
     tensor_shape(dy,p.input_shape,p.device);state_shape(seed,p.shape,p.device);require(matmul_precision_mode()==0,"Mamba3 v1 requires FP32 GEMM policy");
     p.consumed=true;const auto& s=p.shape;const mb::Layout l(s);const int rows=s.batch*s.sequence;
     p.seed=empty(seed)?zero(s,p.device):clone(seed);p.adjoint=Tensor::zeros({rows,s.model},p.device);p.mask(dy,p.adjoint,s.model);p.check(p.adjoint,s.model);
-    p.dmixed=p.adjoint.matmul(p.out_weight); // [T,D] * [D,I]
+    p.dmixed=p.dense(p.adjoint,p.out_weight,false,false); // [T,D] * [D,I]
     p.dprojection=Tensor::zeros({rows,s.width()},p.device);p.partial=flat(std::size_t(s.batch)*l.total,p.device);p.dcore=flat(l.total,p.device);
     p.scratch=flat(std::size_t(s.batch)*mb::scratch_per_head(s),p.device);p.dinitial=zero(s,p.device);
+    if(p.gpu_provider!=mb::GpuProvider::DenseReference) {
+        const auto tokens=std::size_t(s.batch)*s.heads*s.sequence;
+        p.gy=flat(mb::readout_size(s),p.device);p.token_parameters=flat(tokens*mb::token_layout(s).total,p.device);
+        p.bc_gradient=flat(tokens*2*s.rank*s.state_dim,p.device);p.phase_gradient=flat(mb::phase_size(s),p.device);
+        p.reverse=flat(mb::is_flash_provider(p.gpu_provider)?mb::checkpoint_history_size(s):mb::history_size(s),p.device);
+        p.dz=flat(tokens*s.head_dim,p.device);p.dx_value=flat(tokens*s.head_dim,p.device);
+        p.ddt=flat(tokens,p.device);p.da=flat(tokens,p.device);p.dtrap=flat(tokens,p.device);
+    }
     if(p.device==Device::CPU) {
         for(int b=0;b<s.batch;++b) mb::detail::backward_batch(s,l,b,p.projection.data(),p.core.data(),p.valid.data(),source(p.initial),p.trace_const(),p.dmixed.data(),source(p.seed),p.dprojection.data(),p.partial.data()+std::size_t(b)*l.total,dest(p.dinitial),p.scratch.data()+std::size_t(b)*mb::scratch_per_head(s),p.status.data());
         bool bad=false;for(int b=0;b<s.batch;++b) bad|=p.status.data()[b]!=0;
         if(!bad) for(int b=0;b<s.batch;++b) for(std::size_t i=0;i<l.total;++i) p.dcore.data()[i]+=p.partial.data()[std::size_t(b)*l.total+i];
     }
 #ifdef USE_CUDA
-    else {require(mb::gpu_backward(s,p.projection.raw_data(),p.core.raw_data(),p.prefixes.get(),source(p.initial),p.trace_const(),p.dmixed.raw_data(),source(p.seed),p.dprojection.raw_data(),p.partial.raw_data(),dest(p.dinitial),p.scratch.raw_data(),p.status.raw_data()),"Mamba3 VJP enqueue failed; discard/drain lane");require(mb::gpu_reduce(s,p.partial.raw_data(),p.dcore.raw_data(),p.status.raw_data()),"Mamba3 reduction enqueue failed");}
+    else {require(mb::gpu_backward(s,p.projection.raw_data(),p.core.raw_data(),p.prefixes.get(),source(p.initial),p.trace_const(),p.dmixed.raw_data(),source(p.seed),p.dprojection.raw_data(),p.partial.raw_data(),dest(p.dinitial),p.scratch.raw_data(),p.status.raw_data(),p.backward_workspace()),"Mamba3 VJP enqueue failed; discard/drain lane");require(mb::gpu_reduce(s,p.partial.raw_data(),p.dcore.raw_data(),p.status.raw_data()),"Mamba3 reduction enqueue failed");}
 #endif
     p.gate(p.dprojection);p.gate_state(p.dinitial);
-    p.dinput=p.dprojection.matmul(p.in_weight);p.check(p.dinput,s.model);p.gate(p.dinput);p.gate_state(p.dinitial);
-    p.din_weight=matmul_tn(p.dprojection,p.input);p.dout_weight=matmul_tn(p.adjoint,p.mixed);
+    p.dinput=p.dense(p.dprojection,p.in_weight,false,false,mp::ExactAxis::Reduction,2*s.inner()+2*s.bc());p.check(p.dinput,s.model);p.gate(p.dinput);p.gate_state(p.dinitial);
+    p.din_weight=p.dense(p.dprojection,p.input,true,false,mp::ExactAxis::OutputRows,2*s.inner()+2*s.bc());p.dout_weight=p.dense(p.adjoint,p.mixed,true,false);
     // Projection GEMM/parameter reductions can overflow after the recurrence.
     // Check every parameter gradient and propagate failure to ALL batches.
     auto finite_parameters=[&](Tensor& t) {
@@ -183,7 +221,24 @@ std::shared_ptr<Mamba3Tape> Mamba3Layer::forward_owned(const Tensor& input,const
     const auto dims=input.shape.dims;require(dims.size()==2||dims.size()==3,"Mamba3 input must be [S,D] or [B,S,D]");
     const int B=dims.size()==3?dims[0]:1,S=dims.size()==3?dims[1]:dims[0];const auto s=geometry(layer.model,layer.config,B,S);
     tensor_shape(input,dims,layer.device);require(dims.back()==layer.model,"Mamba3 model dimension mismatch");state_shape(initial,s,layer.device);
-    auto p=std::make_unique<Mamba3Tape::Impl>();p->shape=s;p->device=layer.device;p->model_id=layer.id;p->input_shape=dims;p->core_fields=fields(s);
+    auto p=std::make_unique<Mamba3Tape::Impl>();p->shape=s;p->device=layer.device;
+    p->gpu_provider=mb::gpu_provider_from_environment();
+    require(p->gpu_provider==mb::GpuProvider::DenseReference||layer.device==Device::GPU,"Mamba3 optimized provider requires GPU; no CPU fallback");
+    require(p->gpu_provider==mb::GpuProvider::DenseReference||mb::parallel_eligible(s),"Mamba3 optimized provider workspace/grid capacity exceeded");p->model_id=layer.id;p->input_shape=dims;p->core_fields=fields(s);
+    p->projection_policy=mp::policy();
+    if(p->projection_policy!=mp::Policy::ExactFP32) {
+        require(layer.device==Device::GPU,"Mamba3 lowp projection requires GPU; no host fallback");
+        for(const auto& projection_dims:{std::array<int,3>{B*S,s.width(),s.model},
+            std::array<int,3>{B*S,s.model,s.inner()},std::array<int,3>{B*S,s.inner(),s.model},
+            std::array<int,3>{B*S,s.model,s.width()},std::array<int,3>{s.width(),s.model,B*S},
+            std::array<int,3>{s.model,s.inner(),B*S}})
+            require(mp::geometry(projection_dims[0],projection_dims[1],projection_dims[2]),"Mamba3 WMMA projection geometry exceeds supported bounds");
+#ifdef USE_CUDA
+        require(mp::supported(p->projection_policy),"Mamba3 WMMA requires compiled RDNA3 gfx11 wave32 provider");
+#else
+        throw std::runtime_error("Mamba3 lowp projection requires GPU build");
+#endif
+    }
     p->valid=lengths.empty()?std::vector<int>(B,S):lengths;require(p->valid.size()==std::size_t(B),"Mamba3 prefix shape");for(int n:p->valid) require(n>=0&&n<=S,"Mamba3 invalid prefix");
     for(auto* param:parameters()) p->versions.push_back(param->version);
 #ifndef USE_CUDA
@@ -205,18 +260,37 @@ std::shared_ptr<Mamba3Tape> Mamba3Layer::forward_owned(const Tensor& input,const
         else require(mb::gpu_parameter_check(B,std::size_t(weight->size),weight->raw_data(),p->status.raw_data()),"Mamba3 weight preflight enqueue failed");
 #endif
     }
-    p->projection=matmul_nt(p->input,p->in_weight);p->mixed=Tensor::zeros({B*S,s.inner()},layer.device);
-    p->history=flat(mb::history_size(s),layer.device);p->q=flat(mb::rotation_size(s),layer.device);p->k=flat(mb::rotation_size(s),layer.device);p->phase=flat(mb::phase_size(s),layer.device);p->readout=flat(mb::readout_size(s),layer.device);
+    p->projection=p->dense(p->input,p->in_weight,false,true,mp::ExactAxis::OutputCols,2*s.inner()+2*s.bc());p->mixed=Tensor::zeros({B*S,s.inner()},layer.device);
+    if(p->gpu_provider!=mb::GpuProvider::DenseReference) p->coefficients=flat(mb::coefficient_size(s),layer.device);
+    p->history=flat(mb::is_flash_provider(p->gpu_provider)?mb::checkpoint_history_size(s):mb::history_size(s),layer.device);p->q=flat(mb::rotation_size(s),layer.device);p->k=flat(mb::rotation_size(s),layer.device);p->phase=flat(mb::phase_size(s),layer.device);p->readout=flat(mb::readout_size(s),layer.device);
     if(layer.device==Device::CPU) {for(int b=0;b<B;++b) if(!p->status.data()[b]) mb::detail::forward_batch(s,mb::Layout(s),b,p->projection.data(),p->core.data(),p->valid.data(),source(p->initial),dest(p->final),p->trace(),p->mixed.data(),p->status.data());++layer.telemetry.cpu_forward;}
 #ifdef USE_CUDA
-    else {require(mb::gpu_forward(s,p->projection.raw_data(),p->core.raw_data(),p->prefixes.get(),source(p->initial),dest(p->final),p->trace(),p->mixed.raw_data(),p->status.raw_data()),"Mamba3 integral forward enqueue failed; discard/drain lane");++layer.telemetry.gpu_forward;}
+    else {require(mb::gpu_forward(s,p->projection.raw_data(),p->core.raw_data(),p->prefixes.get(),source(p->initial),dest(p->final),p->trace(),p->mixed.raw_data(),p->status.raw_data()),"Mamba3 integral forward enqueue failed; discard/drain lane");++layer.telemetry.gpu_forward;
+        switch(p->gpu_provider) {
+        case mb::GpuProvider::DenseReference: ++layer.telemetry.gpu_reference_forward;break;
+        case mb::GpuProvider::ParallelFp32: ++layer.telemetry.gpu_parallel_forward;break;
+        case mb::GpuProvider::FlashFp32ReplayLdsV2:
+        case mb::GpuProvider::FlashFp32: ++layer.telemetry.gpu_flash_forward;break;
+        }
+    }
 #endif
-    p->gate(p->mixed);p->output=matmul_nt(p->mixed,p->out_weight);p->check(p->output,layer.model);p->gate(p->output);p->gate_state(p->final);
+    p->gate(p->mixed);p->output=p->dense(p->mixed,p->out_weight,false,true);p->check(p->output,layer.model);p->gate(p->output);p->gate_state(p->final);
+    layer.telemetry.projection_wmma_gemms+=p->projection_dispatches;
     layer.telemetry.peak_workspace_bytes=std::max(layer.telemetry.peak_workspace_bytes,p->workspace());return std::shared_ptr<Mamba3Tape>(new Mamba3Tape(std::move(p)));
 }
 Mamba3Backward Mamba3Layer::backward_owned(const std::shared_ptr<Mamba3Tape>& tape,const Tensor& dy,const Mamba3State& seed) {
-    require(bool(tape)&&tape->impl_->model_id==impl_->id,"Mamba3 foreign/null tape");auto result=tape->backward(dy,seed);
-    if(impl_->device==Device::CPU) ++impl_->telemetry.cpu_backward;else ++impl_->telemetry.gpu_backward;
+    require(bool(tape)&&tape->impl_->model_id==impl_->id,"Mamba3 foreign/null tape");const auto before=tape->impl_->projection_dispatches;auto result=tape->backward(dy,seed);
+    impl_->telemetry.projection_wmma_gemms+=tape->impl_->projection_dispatches-before;
+    if(impl_->device==Device::CPU) ++impl_->telemetry.cpu_backward;else {
+        ++impl_->telemetry.gpu_backward;
+        // Do not resample the environment between forward and its owned VJP.
+        switch(tape->impl_->gpu_provider) {
+        case mb::GpuProvider::DenseReference: ++impl_->telemetry.gpu_reference_backward;break;
+        case mb::GpuProvider::ParallelFp32: ++impl_->telemetry.gpu_parallel_backward;break;
+        case mb::GpuProvider::FlashFp32ReplayLdsV2:
+        case mb::GpuProvider::FlashFp32: ++impl_->telemetry.gpu_flash_backward;break;
+        }
+    }
     impl_->telemetry.peak_workspace_bytes=std::max(impl_->telemetry.peak_workspace_bytes,tape->workspace_bytes());return result;
 }
 void Mamba3Layer::publish(Mamba3Backward& result) {

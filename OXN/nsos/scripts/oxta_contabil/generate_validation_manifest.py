@@ -488,7 +488,7 @@ def main() -> int:
     hip_contract = require_log(
         validation_root / "hip_checkpoint_continuation.log",
         (
-            "version=10 round_trip_param_diff=0 continuation_loss_diff=0 "
+            "version=11 round_trip_param_diff=0 continuation_loss_diff=0 "
             "continuation_param_diff=0",
             "deterministic_mamba=loss_weights_moments_resume_exact",
             "deterministic_attention=loss_weights_moments_resume_exact",

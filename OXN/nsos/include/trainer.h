@@ -194,8 +194,8 @@ public:
     // modo que todo A recebe a mesma quantidade de dados antes de alcançar o
     // LR principal.
     //
-    // Checkpoints escritos antes deste campo não o contêm; a ausência
-    // significa `Steps` e preserva o comportamento anterior byte a byte.
+    // Sidecar v11 persists the declared unit and exact token schedule.
+    // Older sidecars require explicit step-only progress migration.
     enum class SchedulerUnit { Steps, Tokens };
     SchedulerUnit scheduler_unit = SchedulerUnit::Steps;
     long long warmup_tokens = 0;
@@ -212,6 +212,10 @@ public:
     // checkpoint.
     long long tokens_processed = 0;
     long long tokens_committed = 0;
+    // False after explicit legacy step-only migration: these counts cover
+    // work since migration, not the unavailable historical token totals.
+    // An incomplete run cannot resume or switch to the token scheduler.
+    bool token_counters_complete = true;
 
     // Regime efetivo do último commit.  Se o clipping estiver ativo na maior
     // parte dos updates, quem governa o passo é o clipper e não o AdamW —
@@ -319,9 +323,12 @@ public:
     // and optimizer checkpoint is rejected before any Trainer state mutates.
     void save_training_state(const std::string& state_path,
                              const std::string& model_path) const;
+    // The two legacy permissions are independent. Progress migration is
+    // step-only and marks token history incomplete; Tokens is always refused.
     void load_training_state(const std::string& state_path,
                              const std::string& model_path,
-                             bool allow_legacy_runtime_identity = false);
+                             bool allow_legacy_runtime_identity = false,
+                             bool allow_legacy_progress_state = false);
 
     // Seals the structural execution policy on first
     // observation/training/checkpoint operation. Backend, device, precision,

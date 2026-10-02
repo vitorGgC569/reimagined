@@ -26,6 +26,15 @@ using namespace nsos;
 namespace {
 
 py::array_t<float> tensor_to_numpy(Tensor& tensor) {
+    // Inspect the authoritative extent before cloning/copying. The default
+    // rank-zero sentinel has size 0; a real Tensor({}) scalar has size 1.
+    if (tensor.size == 0) {
+        std::vector<py::ssize_t> empty_shape;
+        for (int dim : tensor.shape.dims)
+            empty_shape.push_back(static_cast<py::ssize_t>(dim));
+        if (empty_shape.empty()) empty_shape.push_back(0);
+        return py::array_t<float>(empty_shape);
+    }
     auto* holder = new Tensor(tensor.get_device() == Device::GPU ? tensor.cpu() : tensor.clone());
     py::capsule base(holder, [](void* ptr) {
         delete static_cast<Tensor*>(ptr);
@@ -119,7 +128,7 @@ PYBIND11_MODULE(nsos_ext, m) {
             "tiled_attention", "compact_attention", "mamba_epilogue", "graph_replay", "grouped_moe_training",
             "grouped_moe_wmma_gemm", "grouped_moe_gradient_commit", "kan_recompute", "kan_wmma_gemm",
             "mamba3_siso_forward", "mamba3_siso_backward",
-            "mamba3_preprocess_forward", "mamba3_preprocess_backward"};
+            "mamba3_preprocess_forward", "mamba3_preprocess_backward", "mamba3_projection_wmma"};
         static_assert(sizeof(names) / sizeof(names[0]) == static_cast<unsigned>(gpu::DispatchPath::Count));
         py::dict result;
         for (size_t i = 0; i < counts.size(); ++i) result[names[i]] = counts[i];
@@ -192,6 +201,15 @@ PYBIND11_MODULE(nsos_ext, m) {
             st.capture_contract_violations;
         d["pool_enabled"] = st.pool_enabled;
         d["capture_active"] = st.capture_active;
+        return d;
+    });
+    m.def("gpu_sparse_adam_dispatch_counters", []() {
+        const auto c=gpu_sparse_adam_dispatch_counters();py::dict d;
+        d["adamw_device_commits"]=c.adamw_device_commits;
+        d["adamw_fused_epilogue_commits"]=c.adamw_fused_epilogue_commits;
+        d["muon_adam_commits"]=c.muon_adam_commits;
+        d["muon_matrix_directions"]=c.muon_matrix_directions;
+        d["fused_gradient_clear_commits"]=c.fused_gradient_clear_commits;
         return d;
     });
     m.def("gpu_transfer_stats", []() {
@@ -1081,6 +1099,13 @@ PYBIND11_MODULE(nsos_ext, m) {
                 item["implementation"] = mamba3_block::identity;
                 item["cpu_forward"] = layer.cpu_forward;
                 item["gpu_forward"] = layer.gpu_forward;
+                item["projection_wmma_gemms"] = layer.projection_wmma_gemms;
+                item["gpu_reference_forward"] = layer.gpu_reference_forward;
+                item["gpu_reference_backward"] = layer.gpu_reference_backward;
+                item["gpu_parallel_forward"] = layer.gpu_parallel_forward;
+                item["gpu_parallel_backward"] = layer.gpu_parallel_backward;
+                item["gpu_flash_forward"] = layer.gpu_flash_forward;
+                item["gpu_flash_backward"] = layer.gpu_flash_backward;
                 item["cpu_backward"] = layer.cpu_backward;
                 item["gpu_backward"] = layer.gpu_backward;
                 item["cancelled"] = layer.cancelled;
@@ -1284,6 +1309,8 @@ PYBIND11_MODULE(nsos_ext, m) {
             },
             [](Trainer& t, const std::string& unit) {
                 if (unit == "tokens") {
+                    if (!t.token_counters_complete)
+                        throw std::invalid_argument("Token scheduler requires complete historical token counters");
                     t.scheduler_unit = Trainer::SchedulerUnit::Tokens;
                 } else if (unit == "steps") {
                     t.scheduler_unit = Trainer::SchedulerUnit::Steps;
@@ -1315,6 +1342,9 @@ PYBIND11_MODULE(nsos_ext, m) {
         .def_property_readonly(
             "tokens_committed",
             [](const Trainer& t) { return t.tokens_committed; })
+        .def_property_readonly(
+            "token_counters_complete",
+            [](const Trainer& t) { return t.token_counters_complete; })
         .def_property_readonly(
             "pending_accumulation_microbatches",
             [](const Trainer& t) {
@@ -1363,7 +1393,8 @@ PYBIND11_MODULE(nsos_ext, m) {
              py::arg("state_path"), py::arg("model_path"))
         .def("load_training_state", &Trainer::load_training_state,
              py::arg("state_path"), py::arg("model_path"),
-             py::arg("allow_legacy_runtime_identity") = false)
+             py::arg("allow_legacy_runtime_identity") = false,
+             py::arg("allow_legacy_progress_state") = false)
         .def("execution_identity", [](const Trainer& trainer) {
             py::dict result;
             for (const auto& [key, value] :

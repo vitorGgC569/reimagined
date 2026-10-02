@@ -4,6 +4,7 @@
 #include "../include/nsos/determinism.h"
 #include "../include/runtime_execution_identity.h"
 #include "../include/gpu_gemm_provider.h"
+#include "../include/gpu_execution.h"
 #include "../include/tensor_iterator.h"
 #include "../include/cuda/gpu_utils.h"
 #include "../include/cuda/kernels.cuh"
@@ -184,83 +185,24 @@ void cublas_check(cublasStatus_t status, const char* op) {
     }
 }
 
-// thread_local (K6 replica-safety class): a cublasHandle_t must not be used
-// concurrently from multiple threads (cuBLAS docs) — the HTTP server drives
-// concurrent inference replicas that all call Tensor::matmul.  Per-thread
-// handles are the vendored-recommended pattern; all still launch on the legacy
-// stream 0, so ordering semantics are unchanged for the single-threaded
-// training path (one handle, same behavior as before).
-struct ThreadBlasState {
-    int availability = -1;
-    cublasHandle_t handle = nullptr;
-    cudaStream_t stream = nullptr;
-    bool stream_bound = false;
-
-    ~ThreadBlasState() noexcept {
-        if (handle != nullptr) {
-            (void)cublasDestroy(handle);
-            handle = nullptr;
-        }
+// A lane owns one classic BLAS handle for one device/stream. Retaining a TLS
+// handle after a model stream is destroyed violates rocBLAS workspace lifetime.
+// The lease holds the context mutex until the entire host BLAS call is queued;
+// explicit model scopes are reentrant and standalone lanes are per thread.
+struct ScopedBlasHandle {
+    gpu::ExecutionContext::ClassicBlasLease lease;
+    explicit ScopedBlasHandle() : lease(gpu::current_execution_context()) {}
+    operator cublasHandle_t() const noexcept {
+        return reinterpret_cast<cublasHandle_t>(lease.handle());
     }
 };
-
-ThreadBlasState& gpu_blas_state() {
-    thread_local ThreadBlasState state;
-    return state;
-}
-
 bool gpu_blas_supported() {
-    ThreadBlasState& state = gpu_blas_state();
-    if (state.availability != -1) {
-        return state.availability == 1;
-    }
-
-    const cudaError_t context_status = cudaFree(nullptr);
-    if (context_status != cudaSuccess) {
-        state.availability = 0;
-        return false;
-    }
-
-    if (cublasCreate(&state.handle) != CUBLAS_STATUS_SUCCESS) {
-        state.handle = nullptr;
-        state.availability = 0;
-        return false;
-    }
-
-#ifdef NSOS_CUDA_PTDS
-    // Per-thread-default-stream build: our __global__ launches go to
-    // cudaStreamPerThread (nvcc --default-stream=per-thread), but cuBLAS
-    // interprets a null stream as the LEGACY stream regardless of that flag.
-    // Pin the handle to the per-thread stream explicitly so GEMMs stay
-    // ordered with the surrounding kernels — and get RECORDED when a decode
-    // CUDA graph captures that stream.
-    if (cublasSetStream(state.handle, cudaStreamPerThread) !=
-        CUBLAS_STATUS_SUCCESS) {
-        cublasDestroy(state.handle);
-        state.handle = nullptr;
-        state.availability = 0;
-        return false;
-    }
-#endif
-
-    state.availability = 1;
-    return true;
+    ScopedBlasHandle handle;
+    return static_cast<cublasHandle_t>(handle)!=nullptr;
 }
-
-cublasHandle_t cublas_handle() {
+ScopedBlasHandle cublas_handle() {
     gpu::require_classic_gemm_provider();
-    if (!gpu_blas_supported()) {
-        return nullptr;
-    }
-    auto& state = gpu_blas_state();
-    const auto stream = gpu::current_stream();
-    if (!state.stream_bound || state.stream != stream) {
-        if (cublasSetStream(state.handle, stream) != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("Cannot bind BLAS to the execution stream");
-        state.stream = stream;
-        state.stream_bound = true;
-    }
-    return state.handle;
+    return ScopedBlasHandle();
 }
 
 // AUDIT (post BATCH 4): the mixed-precision GEMM path used to do
@@ -2083,7 +2025,7 @@ Tensor matmul_nt_impl(const Tensor& a, const Tensor& b_rowmajor,
         // Row-major C[m,n] = A[m,k] · B[n,k]ᵀ.  Em termos column-major do
         // cuBLAS (mesma memória): C_cm[n,m] = OP_T(B_mem, ld=k)[n,k] ·
         // OP_N(A_mem, ld=k)[k,m].  B é compartilhado entre batches (stride 0).
-        cublasHandle_t handle = cublas_handle();
+        auto handle = cublas_handle();
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublas_check(
@@ -2954,7 +2896,7 @@ Tensor Tensor::matmul(const Tensor& other) const {
         const float* a_ptr = raw_data();
         const float* b_ptr = other.raw_data();
         float* out_ptr = result.raw_data();
-        cublasHandle_t handle = cublas_handle();
+        auto handle = cublas_handle();
         const float alpha = 1.0f;
         const float beta = 0.0f;
 
@@ -3691,6 +3633,16 @@ float Tensor::norm() const {
 }
 
 Tensor Tensor::clone() const {
+    // Default Tensor is a size-zero rank-zero sentinel, not a scalar. Shape
+    // alone cannot reconstruct it: Tensor({}) has one element. Empty views
+    // also carry zero-extent metadata but require no storage or copy.
+    if (size == 0) {
+        Tensor result;
+        result.shape = shape;
+        result.device = device;
+        result.host_accessible_storage_ = host_accessible_storage_;
+        return result;
+    }
     // Cópia integral sobrescreve tudo — sem zero-fill.
     Tensor result = Tensor::uninitialized(shape.dims, device);
     if (size > 0) {
@@ -3713,6 +3665,14 @@ Tensor Tensor::clone() const {
 Tensor Tensor::to(Device dev) const {
     if (device == dev) {
         return *this;
+    }
+
+    if (size == 0) {
+        Tensor result;
+        result.shape = shape;
+        result.device = dev;
+        result.host_accessible_storage_ = dev == Device::CPU;
+        return result;
     }
 
     // Cópia integral sobrescreve tudo — sem zero-fill.

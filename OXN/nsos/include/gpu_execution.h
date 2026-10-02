@@ -16,7 +16,7 @@ enum class DispatchPath : unsigned {
   BitnetGemv, BitnetGemm, SparseMoe, GroupedProjection, TiledAttention,
   CompactAttention, MambaEpilogue, GraphReplay, GroupedMoeTraining, GroupedMoeWmmaGemm,
   GroupedMoeGradientCommit, KanRecompute, KanWmmaGemm, Mamba3SisoForward, Mamba3SisoBackward,
-  Mamba3PreprocessForward, Mamba3PreprocessBackward, Count
+  Mamba3PreprocessForward, Mamba3PreprocessBackward, Mamba3ProjectionWmma, Count
 };
 void record_dispatch(DispatchPath path) noexcept;
 std::array<std::uint64_t, static_cast<unsigned>(DispatchPath::Count)> dispatch_counters() noexcept;
@@ -35,6 +35,21 @@ class ExecutionContext {
   // pointers. Warm every shape first, then freeze; failure is explicit.
   void freeze(bool enabled) noexcept;
 
+  // Serializes classic BLAS host calls with the lane. The handle is created
+  // lazily, bound once to this lane's device/stream, and never migrated.
+  // Opaque vendor handle keeps the public/CPU layout independent of SDK types.
+  class ClassicBlasLease {
+   public:
+    explicit ClassicBlasLease(ExecutionContext& context);
+    ~ClassicBlasLease();
+    ClassicBlasLease(const ClassicBlasLease&) = delete;
+    ClassicBlasLease& operator=(const ClassicBlasLease&) = delete;
+    void* handle() const noexcept { return handle_; }
+   private:
+    ExecutionContext* context_ = nullptr;
+    void* handle_ = nullptr;
+  };
+
   class Scope {
    public:
     explicit Scope(ExecutionContext& context, bool enabled = true);
@@ -46,9 +61,11 @@ class ExecutionContext {
     std::unique_ptr<State> state_;
   };
  private:
+  explicit ExecutionContext(bool default_lane);
   struct Impl;
   std::unique_ptr<Impl> impl_;
   friend class Scope;
+  friend ExecutionContext& current_execution_context();
 };
 
 // Standalone operators use a thread-local lane; model calls bind their own.

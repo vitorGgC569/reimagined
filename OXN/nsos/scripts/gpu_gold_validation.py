@@ -410,8 +410,8 @@ def run_gpu_suite(
             "and clone_dispatches=1"
         )
     checkpoint_output = contract_outputs["test_gpu_checkpoint_continuation"]
-    if "version=10" not in checkpoint_output or "PASS" not in checkpoint_output:
-        raise ValidationFailure("checkpoint v10 GPU evidence is incomplete")
+    if "version=11" not in checkpoint_output or "PASS" not in checkpoint_output:
+        raise ValidationFailure("checkpoint v11 GPU evidence is incomplete")
     mixed_output = contract_outputs["test_gpu_mixed_precision_contract"]
     if "fp16=executed" not in mixed_output:
         raise ValidationFailure(

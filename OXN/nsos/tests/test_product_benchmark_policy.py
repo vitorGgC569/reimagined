@@ -770,7 +770,7 @@ class GpuGoldInventoryTests(unittest.TestCase):
             outputs = [
                 (0, "CTest green"),
                 (0, "load_dispatches=1 clone_dispatches=1"),
-                (0, "version=10 PASS"),
+                (0, "version=11 PASS"),
                 (0, "fp16=executed PASS"),
             ]
             with mock.patch.object(gpu_gold, "run_capture", side_effect=outputs) as capture:

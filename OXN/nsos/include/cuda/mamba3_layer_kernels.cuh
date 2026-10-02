@@ -2,7 +2,15 @@
 #include <cstddef>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
+#include <string>
+#include <stdexcept>
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define NSOS_M3_SHAPE_HD __host__ __device__
+#else
+#define NSOS_M3_SHAPE_HD
+#endif
 namespace nsos::mamba3_block {
 inline constexpr const char* identity="mamba3_dense_fp32_siso_mimo_n128_v1";
 inline constexpr const char* upstream="e9594ce1c732d97440f0332fdc43170a2294dbfa";
@@ -12,15 +20,15 @@ struct Shape {
     int batch=0,sequence=0,model=0,heads=0,groups=0,head_dim=0,state_dim=128,rank=1,rotary_pairs=32;
     bool mimo=false,out_norm=false;
     double norm_eps=1e-5,a_floor=1e-4;
-    int inner() const {return heads*head_dim;}
-    int bc() const {return rank*groups*state_dim;}
-    int width() const {return 2*inner()+2*bc()+3*heads+rotary_pairs;}
+    NSOS_M3_SHAPE_HD int inner() const {return heads*head_dim;}
+    NSOS_M3_SHAPE_HD int bc() const {return rank*groups*state_dim;}
+    NSOS_M3_SHAPE_HD int width() const {return 2*inner()+2*bc()+3*heads+rotary_pairs;}
 };
 // Core weights are packed in this order. Every canonical Parameter is a
 // non-overlapping owning storage_view, never a duplicate optimizer parameter.
 struct Layout {
     std::size_t bnorm=0,cnorm=0,dt=0,bbias=0,cbias=0,d=0,x=0,z=0,o=0,norm=0,total=0;
-    explicit Layout(const Shape& s) {
+    NSOS_M3_SHAPE_HD explicit Layout(const Shape& s) {
         cnorm=s.state_dim;dt=cnorm+s.state_dim;bbias=dt+s.heads;
         cbias=bbias+std::size_t(s.heads)*s.rank*s.state_dim;d=cbias+std::size_t(s.heads)*s.rank*s.state_dim;
         x=d+s.heads;z=x+(s.mimo?std::size_t(s.heads)*s.rank*s.head_dim:0);
@@ -50,7 +58,33 @@ inline std::size_t phase_size(const Shape& s) {return std::size_t(s.batch)*s.hea
 inline std::size_t readout_size(const Shape& s) {return std::size_t(s.batch)*s.heads*s.sequence*s.rank*s.head_dim;}
 inline std::size_t scratch_per_head(const Shape& s) {return std::size_t(s.head_dim)*s.state_dim+3*s.rank*s.state_dim+2*s.rank*s.head_dim+s.rotary_pairs;}
 template<class T> struct State {T *phase=nullptr,*ssm=nullptr,*k=nullptr,*v=nullptr;};
-template<class T> struct Trace {T *history=nullptr,*q=nullptr,*k=nullptr,*phase=nullptr,*readout=nullptr;};
+enum class GpuProvider { DenseReference, ParallelFp32, FlashFp32, FlashFp32ReplayLdsV2 };
+inline bool is_flash_provider(GpuProvider p) {return p==GpuProvider::FlashFp32||p==GpuProvider::FlashFp32ReplayLdsV2;}
+inline GpuProvider gpu_provider_from_environment() {
+    const char* value=std::getenv("NSOS_MAMBA3_GPU_PROVIDER");
+    const std::string mode=value?value:"dense_reference";
+    if(mode=="dense_reference") return GpuProvider::DenseReference;
+    if(mode=="parallel_fp32_v1") return GpuProvider::ParallelFp32;
+    if(mode=="flash_fp32_v1") return GpuProvider::FlashFp32;
+    if(mode=="flash_fp32_replay_lds_v2") return GpuProvider::FlashFp32ReplayLdsV2;
+    throw std::invalid_argument("Unknown NSOS_MAMBA3_GPU_PROVIDER: "+mode);
+}
+inline constexpr int parallel_tile=32;
+inline std::size_t checkpoint_history_size(const Shape& s) {
+    return std::size_t(s.batch)*s.heads*((s.sequence+parallel_tile-1)/parallel_tile+1)*s.head_dim*s.state_dim;
+}
+inline constexpr int coefficient_fields=7;
+inline std::size_t coefficient_size(const Shape& s) {return std::size_t(coefficient_fields)*s.batch*s.heads*s.sequence;}
+inline Layout token_layout(Shape s) {s.heads=1;s.groups=1;return Layout(s);}
+inline bool parallel_eligible(const Shape& s) {
+    const auto count=std::size_t(s.batch)*s.heads*s.sequence,lim=std::size_t(std::numeric_limits<int>::max());
+    return eligible(s)&&count<=lim/coefficient_fields&&count<=lim/token_layout(s).total&&count<=lim/(2*s.rank*s.state_dim)&&count<=lim/(s.rank*s.head_dim)&&count<=lim/s.rotary_pairs;
+}
+template<class T> struct Trace {T *history=nullptr,*q=nullptr,*k=nullptr,*phase=nullptr,*readout=nullptr;bool parallel=false,checkpoints=false;T* coefficients=nullptr;bool replay_lds=false;};
+struct BackwardWorkspace {
+    float *gy=nullptr,*token_parameters=nullptr,*bc=nullptr,*phase=nullptr,*reverse=nullptr;
+    float *dz=nullptr,*dx=nullptr,*ddt=nullptr,*da=nullptr,*dtrap=nullptr;
+};
 // Numeric routines are shared by the FP64 oracle, explicit CPU baseline, and
 // GPU correctness baseline. Independent numerical/quadratic tests are required;
 // agreement of these three implementations alone is not independent evidence.
@@ -58,7 +92,7 @@ bool gpu_forward(Shape s,const float* projection,const float* core,const int* va
     State<const float> initial,State<float> final,Trace<float> trace,float* y,float* status);
 bool gpu_backward(Shape s,const float* projection,const float* core,const int* valid,
     State<const float> initial,Trace<const float> trace,const float* dy,State<const float> final_seed,
-    float* dprojection,float* partial,State<float> dinitial,float* scratch,float* status);
+    float* dprojection,float* partial,State<float> dinitial,float* scratch,float* status,BackwardWorkspace workspace={});
 bool gpu_reduce(Shape s,const float* partial,float* gradient,const float* status);
 // Mask copies never read padded input/adjoint storage. Gate protects state
 // publication after the full projected output has been checked for finiteness.
@@ -68,3 +102,5 @@ bool gpu_gate(int batch,std::size_t elements_per_batch,const float* status,float
 bool gpu_parameter_check(int batch,std::size_t elements,const float* values,float* status);
 bool gpu_parameter_gate(int batch,std::size_t elements,const float* status,float* values);
 }
+
+#undef NSOS_M3_SHAPE_HD

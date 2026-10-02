@@ -1,4 +1,5 @@
 import json
+import numpy as np
 import os
 from pathlib import Path
 
@@ -29,7 +30,39 @@ if os.name == "nt" and hasattr(os, "add_dll_directory"):
 import nsos_ext
 
 
+def check_empty(t, expected):
+    n = nsos_ext
+    assert t.size==0
+    assert t.clone().size==0, "empty clone invented scalar storage"
+    for copy in (t,t.clone(),t.cpu().clone(),t.to(n.Device.GPU).cpu().clone()):
+        assert copy.size==0 and copy.shape==t.shape
+        a=copy.numpy()
+        assert a.shape==expected and a.size==0 and a.dtype==np.float32
+        assert np.isfinite(a).all()
+
+
+def empty_binding_contract():
+    n = nsos_ext
+    linear=n.BitLinear(4,3,True)
+    parameters=linear.parameters()
+    assert parameters and all(p.grad.size==0 for p in parameters)
+    for p in parameters: check_empty(p.grad,(0,))
+    for dims in ([0],[2,0,3],[0,4],[3,2,0],[0,0]):
+        for device in (n.Device.CPU,n.Device.GPU):check_empty(n.Tensor(dims,device),tuple(dims))
+    scalar=n.Tensor([],n.Device.CPU,1.25)
+    assert scalar.size==1 and scalar.shape==[]
+    for t in (scalar,scalar.clone()):
+        a=t.numpy();assert a.shape==() and a.size==1 and float(a)==1.25
+    source=n.Tensor.ones([2,3],n.Device.CPU)
+    array=source.numpy()
+    assert array.shape==(2,3) and np.array_equal(array,np.ones((2,3),np.float32))
+    array[0,0]=9
+    assert source.numpy()[0,0]==1
+    del source
+    assert array[0,0]==9
+
 def main() -> int:
+    empty_binding_contract()
     backend = nsos_ext.gpu_backend_name()
     vendor = nsos_ext.gpu_vendor_name()
     assert backend in {"none", "cuda", "hip"}

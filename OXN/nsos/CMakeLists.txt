@@ -258,6 +258,7 @@ set(NSOS_GPU_SOURCES
     src/cuda/mamba3_siso_kernels.cu
     src/cuda/mamba3_preprocess_kernels.cu
     src/cuda/mamba3_layer_kernels.cu
+    src/cuda/mamba3_projection_wmma.cu
     src/cuda/moe_kernels.cu
     src/cuda/moe_training_kernels.cu
     src/cuda/moe_training_wmma.cu
@@ -269,6 +270,7 @@ set(NSOS_GPU_SOURCES
     src/cuda/tiled_cross_entropy.cu
     src/cuda/fused_optimizer_kernels.cu
     src/cuda/sparse_optimizer_activity.cu
+    src/cuda/muon_optimizer.cu
 )
 
 # Prefer an explicitly discoverable HIP SDK in AUTO mode. This makes an AMD
@@ -433,9 +435,13 @@ if (NSOS_GPU_BACKEND_REQUESTED STREQUAL "HIP" OR
         COMPILE_OPTIONS -fno-fast-math)
     set_property(SOURCE src/cuda/mamba3_layer_kernels.cu APPEND PROPERTY
         COMPILE_OPTIONS -fno-fast-math)
+    set_property(SOURCE src/cuda/mamba3_projection_wmma.cu APPEND PROPERTY
+        COMPILE_OPTIONS -fno-fast-math)
     set_property(SOURCE src/cuda/tiled_cross_entropy.cu APPEND PROPERTY
         COMPILE_OPTIONS -fno-fast-math)
     set_property(SOURCE src/cuda/sparse_optimizer_activity.cu APPEND PROPERTY
+        COMPILE_OPTIONS -fno-fast-math)
+    set_property(SOURCE src/cuda/muon_optimizer.cu APPEND PROPERTY
         COMPILE_OPTIONS -fno-fast-math)
     target_include_directories(nsos_hip_kernels PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -867,9 +873,16 @@ if (NSOS_BUILD_TESTS)
     add_executable(test_mamba3_layer tests/test_mamba3_layer.cpp)
     target_link_libraries(test_mamba3_layer PRIVATE nsos_core)
     add_test(NAME test_mamba3_layer COMMAND test_mamba3_layer)
+    add_executable(test_mamba3_scan_identity tests/test_mamba3_scan_identity.cpp)
+    target_link_libraries(test_mamba3_scan_identity PRIVATE nsos_core)
+    add_test(NAME test_mamba3_scan_identity COMMAND test_mamba3_scan_identity)
     if (NSOS_GPU_ENABLED)
         add_test(NAME test_gpu_mamba3_layer COMMAND test_mamba3_layer --gpu)
         set_tests_properties(test_gpu_mamba3_layer PROPERTIES RUN_SERIAL TRUE)
+        add_test(NAME test_gpu_mamba3_scan_identity COMMAND test_mamba3_scan_identity --gpu)
+        set_tests_properties(test_gpu_mamba3_scan_identity PROPERTIES RUN_SERIAL TRUE)
+        set_tests_properties(test_gpu_mamba3_scan_identity PROPERTIES ENVIRONMENT
+            "NSOS_CUDA_SYNC=1;NSOS_REQUIRE_GPU_TESTS=1;NSOS_GPU_MEMORY=device;NSOS_NO_MEMADVISE=1")
     endif()
 
     add_executable(test_tiled_head_loss tests/test_tiled_head_loss.cpp)
@@ -898,6 +911,16 @@ if (NSOS_BUILD_TESTS)
     add_executable(test_training_snapshot_frozen tests/test_training_snapshot_frozen.cpp)
     target_link_libraries(test_training_snapshot_frozen PRIVATE nsos_core)
     add_test(NAME test_training_snapshot_frozen COMMAND test_training_snapshot_frozen)
+    add_executable(test_muon_math tests/test_muon_math.cpp)
+    target_link_libraries(test_muon_math PRIVATE nsos_core)
+    add_test(NAME test_muon_math COMMAND test_muon_math)
+    add_executable(test_training_entrypoint_token_counters tests/test_training_entrypoint_token_counters.cpp)
+    target_link_libraries(test_training_entrypoint_token_counters PRIVATE nsos_core)
+    add_test(NAME test_training_entrypoint_token_counters COMMAND test_training_entrypoint_token_counters)
+
+    add_executable(test_training_progress_checkpoint tests/test_training_progress_checkpoint.cpp)
+    target_link_libraries(test_training_progress_checkpoint PRIVATE nsos_core)
+    add_test(NAME test_training_progress_checkpoint COMMAND test_training_progress_checkpoint)
 
     add_executable(test_runtime_execution_identity tests/test_runtime_execution_identity.cpp)
     target_link_libraries(test_runtime_execution_identity PRIVATE nsos_core)
@@ -987,6 +1010,29 @@ if (NSOS_BUILD_TESTS)
     endif()
 
     if (NSOS_BUILD_PYTHON)
+        add_executable(mamba3_math_oracle_probe tests/mamba3_validation/probe_current_math.cpp)
+        target_include_directories(mamba3_math_oracle_probe PRIVATE include)
+        add_test(NAME test_mamba3_current_source_oracle
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/mamba3_validation/test_current_source.py
+                --probe $<TARGET_FILE:mamba3_math_oracle_probe>
+                --work-dir ${CMAKE_CURRENT_BINARY_DIR}/current-source-oracle)
+        add_test(NAME test_mamba3_scan_recompute_oracle
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/mamba3_validation/test_scan_recompute.py
+                --native-module-dir $<TARGET_FILE_DIR:nsos_ext>
+                --result ${CMAKE_CURRENT_BINARY_DIR}/scan-recompute-cpu.json)
+        set_tests_properties(test_mamba3_scan_recompute_oracle PROPERTIES ENVIRONMENT
+            "NSOS_MAMBA3_GPU_PROVIDER=dense_reference;NSOS_MAMBA3_PROJECTION_PROVIDER=exact_fp32")
+        if (NSOS_GPU_ENABLED)
+            foreach(_mamba3_oracle_provider parallel_fp32_v1 flash_fp32_v1)
+                add_test(NAME test_gpu_mamba3_scan_recompute_oracle_${_mamba3_oracle_provider}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/mamba3_validation/test_scan_recompute.py
+                        --native-module-dir $<TARGET_FILE_DIR:nsos_ext> --gpu
+                        --result ${CMAKE_CURRENT_BINARY_DIR}/scan-recompute-${_mamba3_oracle_provider}.json)
+                set_tests_properties(test_gpu_mamba3_scan_recompute_oracle_${_mamba3_oracle_provider}
+                    PROPERTIES RUN_SERIAL TRUE ENVIRONMENT
+                    "NSOS_MAMBA3_GPU_PROVIDER=${_mamba3_oracle_provider};NSOS_MAMBA3_PROJECTION_PROVIDER=exact_fp32;NSOS_CUDA_SYNC=1;NSOS_REQUIRE_GPU_TESTS=1;NSOS_GPU_MEMORY=device;NSOS_NO_MEMADVISE=1")
+            endforeach()
+        endif()
         add_test(
             NAME test_python_binding_smoke
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_binding_smoke.py
@@ -1008,6 +1054,16 @@ if (NSOS_BUILD_TESTS)
                         --module-dir $<TARGET_FILE_DIR:nsos_ext>
                         --artifact-dir ${NSOS_MAMBA3_UPSTREAM_ARTIFACT_DIR} --gpu)
                 set_tests_properties(test_gpu_mamba3_pinned_upstream PROPERTIES RUN_SERIAL TRUE)
+                foreach(_mamba3_scan_provider parallel_fp32_v1 flash_fp32_v1)
+                    add_test(NAME test_gpu_mamba3_pinned_upstream_${_mamba3_scan_provider}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mamba3_pinned_upstream.py
+                            --module-dir $<TARGET_FILE_DIR:nsos_ext>
+                            --artifact-dir ${NSOS_MAMBA3_UPSTREAM_ARTIFACT_DIR} --gpu
+                            --fixtures-dir ${CMAKE_CURRENT_BINARY_DIR}/upstream-fixtures-${_mamba3_scan_provider})
+                    set_tests_properties(test_gpu_mamba3_pinned_upstream_${_mamba3_scan_provider}
+                        PROPERTIES RUN_SERIAL TRUE ENVIRONMENT
+                        "NSOS_MAMBA3_GPU_PROVIDER=${_mamba3_scan_provider};NSOS_MAMBA3_PROJECTION_PROVIDER=exact_fp32;NSOS_CUDA_SYNC=1;NSOS_REQUIRE_GPU_TESTS=1;NSOS_GPU_MEMORY=device;NSOS_NO_MEMADVISE=1")
+                endforeach()
             endif()
         endif()
     endif()
@@ -1174,6 +1230,26 @@ if (NSOS_BUILD_TESTS)
     target_link_libraries(test_gpu_sparse_adam_transaction PRIVATE nsos_core)
     target_include_directories(test_gpu_sparse_adam_transaction PRIVATE tests/gpu)
     add_test(NAME test_gpu_sparse_adam_transaction COMMAND test_gpu_sparse_adam_transaction)
+    add_executable(test_gpu_muon_transaction tests/gpu/test_gpu_muon_transaction.cpp)
+    target_link_libraries(test_gpu_muon_transaction PRIVATE nsos_core)
+    target_include_directories(test_gpu_muon_transaction PRIVATE tests/gpu)
+    add_test(NAME test_gpu_muon_transaction COMMAND test_gpu_muon_transaction)
+    add_executable(test_gpu_muon_trainer tests/gpu/test_gpu_muon_trainer.cpp)
+    target_link_libraries(test_gpu_muon_trainer PRIVATE nsos_core)
+    target_include_directories(test_gpu_muon_trainer PRIVATE tests/gpu)
+    add_test(NAME test_gpu_muon_trainer COMMAND test_gpu_muon_trainer)
+    add_executable(test_gpu_fused_dense_adam tests/gpu/test_gpu_fused_dense_adam.cpp)
+    target_link_libraries(test_gpu_fused_dense_adam PRIVATE nsos_core)
+    target_include_directories(test_gpu_fused_dense_adam PRIVATE tests/gpu)
+    add_test(NAME test_gpu_fused_dense_adam COMMAND test_gpu_fused_dense_adam)
+    foreach(_independent_gpu_fixture test_gpu_muon_adam_transaction test_gpu_loss_scale_accumulation
+            test_gpu_loss_scale_accumulation_unobserved test_gpu_loss_scale_owner_negatives)
+        add_executable(${_independent_gpu_fixture} tests/gpu/${_independent_gpu_fixture}.cpp)
+        target_link_libraries(${_independent_gpu_fixture} PRIVATE nsos_core)
+        target_include_directories(${_independent_gpu_fixture} PRIVATE tests/gpu)
+        add_test(NAME ${_independent_gpu_fixture} COMMAND ${_independent_gpu_fixture})
+        set_tests_properties(${_independent_gpu_fixture} PROPERTIES RUN_SERIAL TRUE)
+    endforeach()
     add_executable(test_gpu_sparse_adam_trainer tests/gpu/test_gpu_sparse_adam_trainer.cpp)
     target_link_libraries(test_gpu_sparse_adam_trainer PRIVATE nsos_core)
     target_include_directories(test_gpu_sparse_adam_trainer PRIVATE tests/gpu)
@@ -1184,10 +1260,30 @@ if (NSOS_BUILD_TESTS)
         target_link_libraries(test_gpu_mamba3_siso PRIVATE nsos_core)
         target_include_directories(test_gpu_mamba3_siso PRIVATE tests/gpu)
         add_test(NAME test_gpu_mamba3_siso COMMAND test_gpu_mamba3_siso)
+        add_executable(test_gpu_mamba3_projection_wmma tests/gpu/test_gpu_mamba3_projection_wmma.cpp)
+        target_link_libraries(test_gpu_mamba3_projection_wmma PRIVATE nsos_core)
+        target_include_directories(test_gpu_mamba3_projection_wmma PRIVATE tests/gpu)
+        if (NSOS_ROCWMMA_ENABLED)
+            add_test(NAME test_gpu_mamba3_projection_wmma COMMAND test_gpu_mamba3_projection_wmma)
+            set_tests_properties(test_gpu_mamba3_projection_wmma PROPERTIES RUN_SERIAL TRUE)
+        endif()
+        add_executable(test_gpu_blas_context_lifetime tests/gpu/test_gpu_blas_context_lifetime.cpp)
+        target_link_libraries(test_gpu_blas_context_lifetime PRIVATE nsos_core)
+        target_include_directories(test_gpu_blas_context_lifetime PRIVATE tests/gpu)
+        add_test(NAME test_gpu_blas_context_lifetime COMMAND test_gpu_blas_context_lifetime)
+        set_tests_properties(test_gpu_blas_context_lifetime PROPERTIES RUN_SERIAL TRUE)
         add_executable(test_gpu_mamba3_projected tests/gpu/test_gpu_mamba3_projected.cpp)
         target_link_libraries(test_gpu_mamba3_projected PRIVATE nsos_core)
         target_include_directories(test_gpu_mamba3_projected PRIVATE tests/gpu)
         add_test(NAME test_gpu_mamba3_projected COMMAND test_gpu_mamba3_projected)
+        # Parity gate for the parallel (SSD) and flash-recompute providers of
+        # Mamba-3: forward output + input/parameter VJPs must match the dense
+        # reference within 5e-4 across sequence lengths 1..129 and MIMO ranks.
+        add_executable(test_gpu_mamba3_parallel tests/gpu/test_gpu_mamba3_parallel.cpp)
+        target_link_libraries(test_gpu_mamba3_parallel PRIVATE nsos_core)
+        target_include_directories(test_gpu_mamba3_parallel PRIVATE tests/gpu)
+        add_test(NAME test_gpu_mamba3_parallel COMMAND test_gpu_mamba3_parallel)
+        set_tests_properties(test_gpu_mamba3_parallel PROPERTIES RUN_SERIAL TRUE)
     endif()
     add_executable(test_gpu_moe_grouped_training tests/gpu/test_gpu_moe_grouped_training.cpp)
     target_link_libraries(test_gpu_moe_grouped_training PRIVATE nsos_core)
@@ -1441,6 +1537,12 @@ if (NSOS_BUILD_TESTS)
             test_gpu_training_redesign
             test_gpu_device_sparse_optimizer
             test_gpu_sparse_adam_transaction
+            test_gpu_muon_transaction
+            test_gpu_muon_trainer
+            test_gpu_fused_dense_adam
+            test_gpu_muon_adam_transaction
+            test_gpu_loss_scale_accumulation
+            test_gpu_loss_scale_owner_negatives
             test_gpu_sparse_adam_trainer
             test_gpu_moe_grouped_training
             test_gpu_parity_moe_router
@@ -1484,13 +1586,29 @@ if (NSOS_BUILD_TESTS)
             list(APPEND _NSOS_GPU_SYNC_TESTS test_gpu_mamba3_siso)
             list(APPEND _NSOS_GPU_SYNC_TESTS test_gpu_mamba3_projected)
         endif()
+        if (TARGET test_gpu_mamba3_parallel)
+            list(APPEND _NSOS_GPU_SYNC_TESTS test_gpu_mamba3_parallel)
+        endif()
         if (NSOS_ROCWMMA_ENABLED)
             list(APPEND _NSOS_GPU_SYNC_TESTS test_gpu_moe_wmma_training test_gpu_checkpoint_continuation_moe_wmma test_gpu_checkpoint_continuation_kan_wmma test_gpu_attention_rdna_training)
+            if (TARGET test_gpu_mamba3_projection_wmma)
+                list(APPEND _NSOS_GPU_SYNC_TESTS test_gpu_mamba3_projection_wmma)
+            endif()
         endif()
         set_tests_properties(
             ${_NSOS_GPU_SYNC_TESTS}
             PROPERTIES ENVIRONMENT
                 "NSOS_CUDA_SYNC=1;NSOS_REQUIRE_GPU_TESTS=1;NSOS_GPU_MEMORY=device;NSOS_NO_MEMADVISE=1")
+        # Exercise actual asynchronous BLAS ownership; global per-op sync could
+        # hide stream allocator reuse. This gate remains fail-closed and serial.
+        if (TARGET test_gpu_blas_context_lifetime)
+            set_tests_properties(test_gpu_blas_context_lifetime PROPERTIES ENVIRONMENT
+                "NSOS_CUDA_SYNC=0;NSOS_REQUIRE_GPU_TESTS=1;NSOS_GPU_MEMORY=device;NSOS_NO_MEMADVISE=1")
+        endif()
+        if (TARGET test_gpu_loss_scale_accumulation_unobserved)
+            set_tests_properties(test_gpu_loss_scale_accumulation_unobserved PROPERTIES ENVIRONMENT
+                "NSOS_CUDA_SYNC=0;NSOS_REQUIRE_GPU_TESTS=1;NSOS_GPU_MEMORY=device;NSOS_NO_MEMADVISE=1")
+        endif()
         set_property(TEST test_gpu_parity_jamba_redesign APPEND PROPERTY ENVIRONMENT
             "NSOS_ATTN_TILED_TRAINING=1;NSOS_MOE_ORDERED_DEVICE=1")
         set_property(TEST test_gpu_parity_ttt_device APPEND PROPERTY ENVIRONMENT

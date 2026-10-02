@@ -1,3 +1,5 @@
+#include "cuda/mamba3_projection_wmma.cuh"
+#include "cuda/mamba3_layer_kernels.cuh"
 #include "../include/runtime_execution_identity.h"
 #include "../include/gpu_gemm_provider.h"
 
@@ -6,6 +8,7 @@
 #include "../include/nsos/determinism.h"
 #include "../include/nsos/sha256.h"
 #include "../include/optimizer_runtime_policy.h"
+#include "../include/muon_math.h"
 #include "../include/training_runtime_policy.h"
 #include "../include/tensor.h"
 
@@ -384,23 +387,46 @@ RuntimeExecutionIdentity capture_runtime_execution_identity(
                          : "ordered_per_tensor_v1"));
     add_field(identity, "optimizer.state_bits",
               std::to_string(optimizer_state_bits));
+    if(optimizer_policy::muon_enabled()) {
+        if(optimizer_state_bits!=32 || !has_gpu_parameter || has_cpu_parameter || matmul_precision_mode()==2)
+            throw std::invalid_argument("Muon FP32 policy requires a fully GPU FP32/BF16 model with FP32 optimizer state");
+        add_field(identity,"optimizer.algorithm",muon::kIdentity);
+        add_field(identity,"optimizer.muon_reference",muon::kReferenceCommit);
+        add_field(identity,"optimizer.muon_reference_sha256",muon::kReferenceSha256);
+        add_field(identity,"optimizer.muon_coefficients","3.4445,-4.7750,2.0315;steps5;eps1e-7;momentum0.95;nesterov1");
+        add_field(identity,"optimizer.muon_partition","hidden_layers_matrix_weight_except_router_embedding_head_v1");
+        add_field(identity,"optimizer.muon_lr_fp32_bits",optimizer_policy::muon_learning_rate_identity());
+        add_field(identity,"optimizer.muon_lr_schedule","aux_adam_schedule_ratio_times_composed_parameter_scale_v1");
+        add_field(identity,"optimizer.muon_state","m_fp32_momentum_v_exact_zero_lazy_v1");
+    }
+    if(optimizer_policy::fused_optimizer_epilogue_enabled()) {
+        if(optimizer_state_bits!=32 || !has_gpu_parameter || has_cpu_parameter)
+            throw std::invalid_argument("Fused optimizer epilogue requires a fully GPU model and FP32 optimizer state");
+        if(matmul_precision_mode()==2 && gradient_accumulation_steps>1)
+            throw std::invalid_argument("Fused dense Adam FP16 accumulation requires a validated per-microbatch unscale policy");
+        add_field(identity,"optimizer.fused_epilogue","post_vjp_global_gate_update_clear_next_group_zero_elision_v1");
+    }
+    if(optimizer_policy::muon_enabled() || optimizer_policy::fused_optimizer_epilogue_enabled())
+        add_field(identity,"optimizer.device_adam_update_arithmetic",
+                  "serial_fp32_lr_times_mhat_before_denominator_divide_v2");
     if (model.model_config().mamba3_enabled)
         add_field(identity, "optimizer.explicit_no_decay", "mamba3_dt_bias_D_v1");
-    if (has_sparse_gradient_parameter) {
-        // Previously retained zero buffers could make an inactive expert decay
-        // its moments/weight. Do not resume that trajectory under this fix.
-        add_field(identity, "optimizer.sparse_gradient_policy",
-                  optimizer_policy::device_sparse_adam_enabled()
-                      ? optimizer_policy::kDeviceSparseGradientIdentity
-                      : "explicit_group_contribution_host_v1");
-        if(optimizer_policy::device_sparse_adam_enabled()) {
-            if (optimizer_state_bits != 32)
-                throw std::invalid_argument("Device sparse Adam identity requires FP32 moments");
-            if(!has_gpu_parameter || has_cpu_parameter || !training_policy::grouped_moe_training() || !training_policy::ordered_moe())
-                throw std::invalid_argument("Device sparse Adam identity requires fully GPU grouped ordered MoE");
-            add_field(identity,"optimizer.device_sparse_transaction","predicate_finite_lazy_snapshot_versions_v1");
-            add_field(identity,"moe.qat_regularization_membership","task_union_active_only_v1");
-        }
+    if(optimizer_policy::device_sparse_adam_enabled()) {
+        // Generic contribution tracking (e.g. Mamba3) does not imply MoE.
+        // Owner identity is topology-stable and independent of buffer presence.
+        const bool has_moe=std::any_of(model.layers.begin(),model.layers.end(),[](const auto& block){return block && block->uses_moe();});
+        if(optimizer_state_bits!=32 || !has_gpu_parameter || has_cpu_parameter)
+            throw std::invalid_argument("Device optimizer transaction requires fully GPU FP32 moments");
+        if(optimizer_policy::legacy_device_sparse_adam_enabled() && !has_moe)
+            throw std::invalid_argument("NSOS_MOE_DEVICE_ADAM=1 requires at least one MoE block");
+        if(has_moe && (!training_policy::grouped_moe_training() || !training_policy::ordered_moe()))
+            throw std::invalid_argument("MoE device optimizer requires grouped ordered MoE");
+        add_field(identity,"optimizer.sparse_gradient_policy",optimizer_policy::kDeviceSparseGradientIdentity);
+        add_field(identity,"optimizer.device_sparse_transaction","predicate_finite_lazy_snapshot_versions_v1");
+        if(has_moe)add_field(identity,"moe.qat_regularization_membership","task_union_active_only_v1");
+        else add_field(identity,"optimizer.dense_gradient_bank","explicit_dense_contribution_finite_lazy_snapshot_versions_v1");
+    } else if(has_sparse_gradient_parameter) {
+        add_field(identity,"optimizer.sparse_gradient_policy","explicit_group_contribution_host_v1");
     }
     add_field(identity, "optimizer.norm_accumulator",
               deterministic ? "fp64_fixed_order" : "fp32_backend_order");
@@ -411,6 +437,20 @@ RuntimeExecutionIdentity capture_runtime_execution_identity(
     }
     if (optimizer_policy::device_sparse_adam_enabled()) {
         add_field(identity,"optimizer.activity_norm_policy",deterministic?"device_activity_fp64_tree256_v1":"device_activity_fp32_folded_v1");
+    }
+    const auto mamba3_projection_policy=mamba3_projection::policy();
+    if(mamba3_projection_policy!=mamba3_projection::Policy::ExactFP32) {
+        if(!model.model_config().mamba3_enabled)
+            throw std::invalid_argument("Mamba3 WMMA projection policy requires Mamba3 architecture");
+        if(!has_gpu_parameter || has_cpu_parameter)
+            throw std::invalid_argument("Mamba3 WMMA projection policy requires fully GPU model");
+#ifdef USE_CUDA
+        if(!mamba3_projection::supported(mamba3_projection_policy))
+            throw std::invalid_argument("Mamba3 WMMA projection policy requires compiled RDNA3 wave32");
+#else
+        throw std::invalid_argument("Mamba3 WMMA projection policy requires GPU build");
+#endif
+        add_field(identity,"mamba3.projection_arithmetic",mamba3_projection::identity(mamba3_projection_policy));
     }
     const auto attention_provider = training_policy::attention_provider();
     if (attention_provider != attention_training::Policy::FP32) {
@@ -481,16 +521,35 @@ RuntimeExecutionIdentity capture_runtime_execution_identity(
                   : "multi_tensor_flat_binary_search_v1");
 
     const ModelConfig& config = model.model_config();
+    const auto mamba3_scan_provider=mamba3_block::gpu_provider_from_environment();
+    if(mamba3_scan_provider!=mamba3_block::GpuProvider::DenseReference) {
+        if(!config.mamba3_enabled || !has_gpu_parameter || has_cpu_parameter)
+            throw std::invalid_argument("Mamba3 parallel/Flash requires fully GPU Mamba3 model");
+        add_field(identity,"mamba3.scan_provider",
+            mamba3_block::is_flash_provider(mamba3_scan_provider)
+                ? (mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "flash_fp32_replay_lds_v2" : "flash_fp32_v1") : "parallel_fp32_v1");
+        add_field(identity,"mamba3.scan_tile_tokens",std::to_string(mamba3_block::parallel_tile));
+        if(mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2) {
+            add_field(identity,"mamba3.state_prefix","tile32_hillis_steele_sequential_chunk_carry_v1");
+            add_field(identity,"mamba3.state_suffix","tile32_hillis_steele_sequential_reverse_carry_v1");
+            add_field(identity,"mamba3.backward_replay","t4_p1_n128_stride129_explicit_scalar_seam_halos_v2");
+            add_field(identity,"mamba3.phase_order","serial_token_fp32_wrap_v1");
+        }
+    }
     if (config.mamba3_enabled) {
         add_field(identity, "mamba3.implementation", "mamba3_dense_fp32_siso_mimo_n128_v1");
         add_field(identity, "mamba3.upstream", "e9594ce1c732d97440f0332fdc43170a2294dbfa");
         add_field(identity, "mamba3.precision", "fp32_dense_projections_fp64_norm_vjp_radial");
-        add_field(identity, "mamba3.history", "dense_bh_time_pn_v1");
+        add_field(identity, "mamba3.history",
+            mamba3_block::is_flash_provider(mamba3_scan_provider)
+                ? (mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "tile32_boundaries_t4_lds_explicit_halos_v2" : "tile32_boundaries_replay_v1") : "dense_bh_time_pn_v1");
         add_field(identity, "mamba3.publication", "explicit_all_batch_status_audit_v1");
     }
     add_field(identity, "checkpoint.gradient_policy",
               config.mamba3_enabled
-                  ? "retain_mamba3_full_history_v1"
+                  ? (mamba3_block::is_flash_provider(mamba3_scan_provider)
+                        ? (mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "retain_mamba3_tile32_boundary_replay_lds_v2" : "retain_mamba3_tile32_boundary_replay_v1")
+                        : "retain_mamba3_full_history_v1")
                   : config.use_gradient_checkpointing
                   ? "selective_faithful_recompute_v1"
                   : "retain_full_history_v1");
@@ -502,8 +561,14 @@ RuntimeExecutionIdentity capture_runtime_execution_identity(
                   ? "dense_vocab_gather_v1"
                   : "present_id_csr_ordered_v1");
     if (config.mamba3_enabled) {
-        add_field(identity, "mamba.history_layout", "mamba3_dense_bh_time_pn_v1");
-        add_field(identity, "mamba.scan_geometry", "mamba3_serial_batch_owner_v1");
+        add_field(identity, "mamba.history_layout",
+                  mamba3_block::is_flash_provider(mamba3_scan_provider)
+                      ? "mamba3_tile32_boundaries_bh_pn_v1"
+                      : "mamba3_dense_bh_time_pn_v1");
+        add_field(identity, "mamba.scan_geometry",
+                  mamba3_scan_provider==mamba3_block::GpuProvider::DenseReference
+                      ? "mamba3_serial_batch_owner_v1"
+                      : "mamba3_tile32_affine_prefix_128threads_4cells_v1");
     } else {
 #ifdef USE_CUDA
     add_field(identity, "mamba.history_layout",

@@ -39,6 +39,7 @@ public:
     std::vector<int> audit_status() const; // explicit readback + fence
     const Tensor& status_tensor() const; // [B] FP32 integer codes 0/1/2/3
     std::size_t workspace_bytes() const;
+    std::string projection_runtime_identity() const; // arithmetic captured by this tape
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -52,8 +53,13 @@ struct Mamba3Backward {
     std::shared_ptr<Mamba3Tape> owner; // publication binds lifetime/identity/status
 };
 struct Mamba3Telemetry {
+    // Successful GPU enqueue counters, by the provider captured in the tape.
+    std::uint64_t gpu_reference_forward=0,gpu_reference_backward=0;
+    std::uint64_t gpu_parallel_forward=0,gpu_parallel_backward=0;
+    std::uint64_t gpu_flash_forward=0,gpu_flash_backward=0;
     std::uint64_t cpu_forward=0,gpu_forward=0,cpu_backward=0,gpu_backward=0,cancelled=0;
     std::size_t peak_workspace_bytes=0;
+    std::uint64_t projection_wmma_gemms=0;
 };
 class Mamba3Layer {
 public:

@@ -8,6 +8,7 @@
 #include "../include/nsos_serializer.h"
 #include "../include/nsos/determinism.h"  // K4: ordered reductions under NSOS_DETERMINISTIC
 #include "../include/optimizer_runtime_policy.h"
+#include "../include/muon_math.h"
 #include "../include/training_runtime_policy.h"
 #include "../include/gpu_attention_training.h"
 #include "../include/checkpoint_io.h"
@@ -49,7 +50,7 @@ namespace nsos {
 namespace {
 
 constexpr uint32_t kTrainingStateMagic = 0x4E535452u;  // NSTR
-constexpr uint32_t kTrainingStateVersion = 10u;
+constexpr uint32_t kTrainingStateVersion = 11u;
 constexpr uint32_t kTrainingStateLegacyVersion = 1u;
 constexpr uint32_t kTrainingStateTrailerMagic = 0x3553544Eu;  // NTS5
 constexpr uint32_t kTrainingStateSha256TrailerMagic =
@@ -476,6 +477,244 @@ struct TrainingStateMetadata {
     int32_t loss_scale_growth_tracker = 0;
     TrainPhaseScheduler phase_scheduler;
 };
+
+// v11 appends an explicit progress record to the existing payload. Never
+// serialize C++ struct padding or infer historical token counts from steps.
+constexpr uint32_t kTrainingProgressMagic = 0x31525054u; // TPR1
+struct TrainingProgressState {
+    Trainer::SchedulerUnit scheduler_unit = Trainer::SchedulerUnit::Steps;
+    int64_t warmup_tokens = 0;
+    int64_t training_tokens = 0;
+    int64_t decay_tokens = 0;
+    int64_t tokens_processed = 0;
+    int64_t tokens_committed = 0;
+    bool token_counters_complete = true;
+    int32_t gradient_accumulation_steps = 1;
+    float last_grad_norm_pre_clip = 0;
+    float last_grad_norm_post_clip = 0;
+    bool last_update_was_clipped = false;
+    int32_t last_accumulation_steps = 1;
+    bool last_optimizer_step_skipped = false;
+    AuxiliaryStackStats last_auxiliary_stats;
+    TrainingObjectiveStats last_objective_stats;
+    TrainingStepTelemetry last_step_telemetry;
+};
+
+void require_checkpoint_boundary(const Trainer& trainer) {
+    if (trainer.pending_accumulation_microbatches != 0 ||
+        trainer.pending_accumulated_tokens != 0 ||
+        trainer.pending_supervised_loss_sum.size != 0 ||
+        trainer.device_sparse_group_open || !trainer.device_moe_groups.empty())
+        throw std::logic_error("Training checkpoint/clone requires a closed accumulation boundary");
+}
+
+TrainingProgressState capture_training_progress(const Trainer& trainer) {
+    TrainingProgressState state;
+    state.scheduler_unit = trainer.scheduler_unit;
+    state.warmup_tokens = trainer.warmup_tokens;
+    state.training_tokens = trainer.training_tokens;
+    state.decay_tokens = trainer.decay_tokens;
+    state.tokens_processed = trainer.tokens_processed;
+    state.tokens_committed = trainer.tokens_committed;
+    state.token_counters_complete = trainer.token_counters_complete;
+    state.gradient_accumulation_steps = trainer.gradient_accumulation_steps;
+    state.last_grad_norm_pre_clip = trainer.last_grad_norm_pre_clip;
+    state.last_grad_norm_post_clip = trainer.last_grad_norm_post_clip;
+    state.last_update_was_clipped = trainer.last_update_was_clipped;
+    state.last_accumulation_steps = trainer.last_accumulation_steps;
+    state.last_optimizer_step_skipped = trainer.last_optimizer_step_skipped;
+    state.last_auxiliary_stats = trainer.last_auxiliary_stats;
+    state.last_objective_stats = trainer.last_objective_stats;
+    state.last_step_telemetry = trainer.last_step_telemetry;
+    return state;
+}
+
+void publish_training_progress(Trainer& trainer, const TrainingProgressState& state) noexcept {
+    trainer.scheduler_unit = state.scheduler_unit;
+    trainer.warmup_tokens = state.warmup_tokens;
+    trainer.training_tokens = state.training_tokens;
+    trainer.decay_tokens = state.decay_tokens;
+    trainer.tokens_processed = state.tokens_processed;
+    trainer.tokens_committed = state.tokens_committed;
+    trainer.token_counters_complete = state.token_counters_complete;
+    trainer.gradient_accumulation_steps = state.gradient_accumulation_steps;
+    trainer.last_grad_norm_pre_clip = state.last_grad_norm_pre_clip;
+    trainer.last_grad_norm_post_clip = state.last_grad_norm_post_clip;
+    trainer.last_update_was_clipped = state.last_update_was_clipped;
+    trainer.last_accumulation_steps = state.last_accumulation_steps;
+    trainer.last_optimizer_step_skipped = state.last_optimizer_step_skipped;
+    trainer.last_auxiliary_stats = state.last_auxiliary_stats;
+    trainer.last_objective_stats = state.last_objective_stats;
+    trainer.last_step_telemetry = state.last_step_telemetry;
+}
+
+void validate_training_progress(const TrainingProgressState& state, int global_step) {
+    const auto unit = static_cast<uint32_t>(state.scheduler_unit);
+    const auto limit = std::numeric_limits<int64_t>::max();
+    if (unit > 1 || state.gradient_accumulation_steps <= 0 || state.last_accumulation_steps <= 0 ||
+        state.warmup_tokens < 0 || state.warmup_tokens == limit ||
+        state.training_tokens < 0 || state.training_tokens == limit || state.decay_tokens < 0 ||
+        state.decay_tokens > state.training_tokens || state.tokens_processed < 0 ||
+        state.tokens_processed == limit || state.tokens_committed < 0 ||
+        state.tokens_committed > state.tokens_processed ||
+        (state.scheduler_unit == Trainer::SchedulerUnit::Tokens &&
+         (!state.token_counters_complete || state.training_tokens <= state.warmup_tokens ||
+          state.decay_tokens > state.training_tokens - state.warmup_tokens)))
+        throw std::runtime_error("Invalid training progress scheduler/accumulation/token metadata");
+    for (float value : {state.last_grad_norm_pre_clip, state.last_grad_norm_post_clip})
+        if (std::isnan(value) || value < 0 || (!state.last_optimizer_step_skipped && !std::isfinite(value)))
+            throw std::runtime_error("Invalid training progress clipping telemetry");
+    if (state.last_auxiliary_stats.bucket_count < 0) throw std::runtime_error("Invalid auxiliary counter: bucket_count");
+    if (state.last_auxiliary_stats.due_count < 0) throw std::runtime_error("Invalid auxiliary counter: due_count");
+    if (state.last_auxiliary_stats.applied_count < 0) throw std::runtime_error("Invalid auxiliary counter: applied_count");
+    if (state.last_auxiliary_stats.reasoning_count < 0) throw std::runtime_error("Invalid auxiliary counter: reasoning_count");
+    if (state.last_auxiliary_stats.memory_count < 0) throw std::runtime_error("Invalid auxiliary counter: memory_count");
+    if (state.last_auxiliary_stats.session_adapt_count < 0) throw std::runtime_error("Invalid auxiliary counter: session_adapt_count");
+    if (state.last_auxiliary_stats.sample_count < 0) throw std::runtime_error("Invalid auxiliary counter: sample_count");
+    if (state.last_auxiliary_stats.prompt_tokens < 0) throw std::runtime_error("Invalid auxiliary counter: prompt_tokens");
+    if (state.last_auxiliary_stats.answer_tokens < 0) throw std::runtime_error("Invalid auxiliary counter: answer_tokens");
+    if (!std::isfinite(state.last_auxiliary_stats.prompt_state_norm)) throw std::runtime_error("Invalid auxiliary telemetry: prompt_state_norm");
+    if (!std::isfinite(state.last_auxiliary_stats.target_state_norm)) throw std::runtime_error("Invalid auxiliary telemetry: target_state_norm");
+    if (!std::isfinite(state.last_auxiliary_stats.reason_delta_norm)) throw std::runtime_error("Invalid auxiliary telemetry: reason_delta_norm");
+    if (!std::isfinite(state.last_auxiliary_stats.reason_cosine)) throw std::runtime_error("Invalid auxiliary telemetry: reason_cosine");
+    if (!std::isfinite(state.last_auxiliary_stats.memory_delta_norm)) throw std::runtime_error("Invalid auxiliary telemetry: memory_delta_norm");
+    if (!std::isfinite(state.last_auxiliary_stats.memory_cosine)) throw std::runtime_error("Invalid auxiliary telemetry: memory_cosine");
+    if (!std::isfinite(state.last_auxiliary_stats.final_target_delta_norm)) throw std::runtime_error("Invalid auxiliary telemetry: final_target_delta_norm");
+    if (!std::isfinite(state.last_objective_stats.supervised_cross_entropy)) throw std::runtime_error("Invalid objective telemetry: supervised_cross_entropy");
+    if (!std::isfinite(state.last_objective_stats.repetition_unlikelihood)) throw std::runtime_error("Invalid objective telemetry: repetition_unlikelihood");
+    if (!std::isfinite(state.last_objective_stats.logit_l2)) throw std::runtime_error("Invalid objective telemetry: logit_l2");
+    if (!std::isfinite(state.last_objective_stats.sparse_selector)) throw std::runtime_error("Invalid objective telemetry: sparse_selector");
+    if (!std::isfinite(state.last_objective_stats.qat_regularization)) throw std::runtime_error("Invalid objective telemetry: qat_regularization");
+    if (!std::isfinite(state.last_objective_stats.moe_auxiliary)) throw std::runtime_error("Invalid objective telemetry: moe_auxiliary");
+    if (!std::isfinite(state.last_objective_stats.criticality_regularization)) throw std::runtime_error("Invalid objective telemetry: criticality_regularization");
+    if (!std::isfinite(state.last_objective_stats.total)) throw std::runtime_error("Invalid objective telemetry: total");
+    if (state.last_step_telemetry.global_step < 0 || state.last_step_telemetry.global_step > global_step ||
+        state.last_step_telemetry.bucket_count < 0)
+        throw std::runtime_error("Invalid step telemetry counters");
+    if (!std::isfinite(state.last_step_telemetry.wall_ms) || state.last_step_telemetry.wall_ms < 0) throw std::runtime_error("Invalid timing telemetry: wall_ms");
+    if (!std::isfinite(state.last_step_telemetry.preparation_ms) || state.last_step_telemetry.preparation_ms < 0) throw std::runtime_error("Invalid timing telemetry: preparation_ms");
+    if (!std::isfinite(state.last_step_telemetry.inter_bucket_ms) || state.last_step_telemetry.inter_bucket_ms < 0) throw std::runtime_error("Invalid timing telemetry: inter_bucket_ms");
+    if (!std::isfinite(state.last_step_telemetry.forward_ms) || state.last_step_telemetry.forward_ms < 0) throw std::runtime_error("Invalid timing telemetry: forward_ms");
+    if (!std::isfinite(state.last_step_telemetry.loss_ms) || state.last_step_telemetry.loss_ms < 0) throw std::runtime_error("Invalid timing telemetry: loss_ms");
+    if (!std::isfinite(state.last_step_telemetry.backward_ms) || state.last_step_telemetry.backward_ms < 0) throw std::runtime_error("Invalid timing telemetry: backward_ms");
+    if (!std::isfinite(state.last_step_telemetry.optimizer_ms) || state.last_step_telemetry.optimizer_ms < 0) throw std::runtime_error("Invalid timing telemetry: optimizer_ms");
+    if (!std::isfinite(state.last_step_telemetry.unaccounted_ms)) throw std::runtime_error("Invalid timing telemetry: unaccounted_ms");
+}
+
+void write_training_progress(std::ostream& output, const TrainingProgressState& state) {
+    write_training_pod(output, kTrainingProgressMagic, "progress magic");
+    write_training_pod(output, static_cast<uint32_t>(state.scheduler_unit), "progress scheduler_unit");
+    write_training_pod(output, static_cast<int32_t>(state.gradient_accumulation_steps), "progress gradient_accumulation_steps");
+    write_training_pod(output, static_cast<int64_t>(state.warmup_tokens), "progress warmup_tokens");
+    write_training_pod(output, static_cast<int64_t>(state.training_tokens), "progress training_tokens");
+    write_training_pod(output, static_cast<int64_t>(state.decay_tokens), "progress decay_tokens");
+    write_training_pod(output, static_cast<int64_t>(state.tokens_processed), "progress tokens_processed");
+    write_training_pod(output, static_cast<int64_t>(state.tokens_committed), "progress tokens_committed");
+    write_training_pod(output, static_cast<uint8_t>(state.token_counters_complete), "progress token_counters_complete");
+    write_training_pod(output, static_cast<float>(state.last_grad_norm_pre_clip), "progress last_grad_norm_pre_clip");
+    write_training_pod(output, static_cast<float>(state.last_grad_norm_post_clip), "progress last_grad_norm_post_clip");
+    write_training_pod(output, static_cast<uint8_t>(state.last_update_was_clipped), "progress last_update_was_clipped");
+    write_training_pod(output, static_cast<int32_t>(state.last_accumulation_steps), "progress last_accumulation_steps");
+    write_training_pod(output, static_cast<uint8_t>(state.last_optimizer_step_skipped), "progress last_optimizer_step_skipped");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.bucket_count), "progress last_auxiliary_stats.bucket_count");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.due_count), "progress last_auxiliary_stats.due_count");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.applied_count), "progress last_auxiliary_stats.applied_count");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.reasoning_count), "progress last_auxiliary_stats.reasoning_count");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.memory_count), "progress last_auxiliary_stats.memory_count");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.session_adapt_count), "progress last_auxiliary_stats.session_adapt_count");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.sample_count), "progress last_auxiliary_stats.sample_count");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.prompt_tokens), "progress last_auxiliary_stats.prompt_tokens");
+    write_training_pod(output, static_cast<int32_t>(state.last_auxiliary_stats.answer_tokens), "progress last_auxiliary_stats.answer_tokens");
+    write_training_pod(output, static_cast<float>(state.last_auxiliary_stats.prompt_state_norm), "progress last_auxiliary_stats.prompt_state_norm");
+    write_training_pod(output, static_cast<float>(state.last_auxiliary_stats.target_state_norm), "progress last_auxiliary_stats.target_state_norm");
+    write_training_pod(output, static_cast<float>(state.last_auxiliary_stats.reason_delta_norm), "progress last_auxiliary_stats.reason_delta_norm");
+    write_training_pod(output, static_cast<float>(state.last_auxiliary_stats.reason_cosine), "progress last_auxiliary_stats.reason_cosine");
+    write_training_pod(output, static_cast<float>(state.last_auxiliary_stats.memory_delta_norm), "progress last_auxiliary_stats.memory_delta_norm");
+    write_training_pod(output, static_cast<float>(state.last_auxiliary_stats.memory_cosine), "progress last_auxiliary_stats.memory_cosine");
+    write_training_pod(output, static_cast<float>(state.last_auxiliary_stats.final_target_delta_norm), "progress last_auxiliary_stats.final_target_delta_norm");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.supervised_cross_entropy), "progress last_objective_stats.supervised_cross_entropy");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.repetition_unlikelihood), "progress last_objective_stats.repetition_unlikelihood");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.logit_l2), "progress last_objective_stats.logit_l2");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.sparse_selector), "progress last_objective_stats.sparse_selector");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.qat_regularization), "progress last_objective_stats.qat_regularization");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.moe_auxiliary), "progress last_objective_stats.moe_auxiliary");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.criticality_regularization), "progress last_objective_stats.criticality_regularization");
+    write_training_pod(output, static_cast<float>(state.last_objective_stats.total), "progress last_objective_stats.total");
+    write_training_pod(output, static_cast<uint8_t>(state.last_step_telemetry.enabled), "progress last_step_telemetry.enabled");
+    write_training_pod(output, static_cast<int32_t>(state.last_step_telemetry.global_step), "progress last_step_telemetry.global_step");
+    write_training_pod(output, static_cast<int32_t>(state.last_step_telemetry.bucket_count), "progress last_step_telemetry.bucket_count");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.wall_ms), "progress last_step_telemetry.wall_ms");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.preparation_ms), "progress last_step_telemetry.preparation_ms");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.inter_bucket_ms), "progress last_step_telemetry.inter_bucket_ms");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.forward_ms), "progress last_step_telemetry.forward_ms");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.loss_ms), "progress last_step_telemetry.loss_ms");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.backward_ms), "progress last_step_telemetry.backward_ms");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.optimizer_ms), "progress last_step_telemetry.optimizer_ms");
+    write_training_pod(output, static_cast<double>(state.last_step_telemetry.unaccounted_ms), "progress last_step_telemetry.unaccounted_ms");
+}
+
+TrainingProgressState read_training_progress(std::istream& input) {
+    if (read_training_pod<uint32_t>(input, "progress magic") != kTrainingProgressMagic)
+        throw std::runtime_error("Invalid training progress record magic");
+    TrainingProgressState state;
+    state.scheduler_unit = static_cast<Trainer::SchedulerUnit>(read_training_pod<uint32_t>(input, "progress scheduler unit"));
+    state.gradient_accumulation_steps = read_training_pod<int32_t>(input, "progress gradient_accumulation_steps");
+    state.warmup_tokens = read_training_pod<int64_t>(input, "progress warmup_tokens");
+    state.training_tokens = read_training_pod<int64_t>(input, "progress training_tokens");
+    state.decay_tokens = read_training_pod<int64_t>(input, "progress decay_tokens");
+    state.tokens_processed = read_training_pod<int64_t>(input, "progress tokens_processed");
+    state.tokens_committed = read_training_pod<int64_t>(input, "progress tokens_committed");
+    { const auto value = read_training_pod<uint8_t>(input, "progress token_counters_complete");
+      if (value > 1) throw std::runtime_error("Invalid training progress boolean: token_counters_complete");
+      state.token_counters_complete = value != 0; }
+    state.last_grad_norm_pre_clip = read_training_pod<float>(input, "progress last_grad_norm_pre_clip");
+    state.last_grad_norm_post_clip = read_training_pod<float>(input, "progress last_grad_norm_post_clip");
+    { const auto value = read_training_pod<uint8_t>(input, "progress last_update_was_clipped");
+      if (value > 1) throw std::runtime_error("Invalid training progress boolean: last_update_was_clipped");
+      state.last_update_was_clipped = value != 0; }
+    state.last_accumulation_steps = read_training_pod<int32_t>(input, "progress last_accumulation_steps");
+    { const auto value = read_training_pod<uint8_t>(input, "progress last_optimizer_step_skipped");
+      if (value > 1) throw std::runtime_error("Invalid training progress boolean: last_optimizer_step_skipped");
+      state.last_optimizer_step_skipped = value != 0; }
+    state.last_auxiliary_stats.bucket_count = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.bucket_count");
+    state.last_auxiliary_stats.due_count = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.due_count");
+    state.last_auxiliary_stats.applied_count = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.applied_count");
+    state.last_auxiliary_stats.reasoning_count = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.reasoning_count");
+    state.last_auxiliary_stats.memory_count = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.memory_count");
+    state.last_auxiliary_stats.session_adapt_count = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.session_adapt_count");
+    state.last_auxiliary_stats.sample_count = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.sample_count");
+    state.last_auxiliary_stats.prompt_tokens = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.prompt_tokens");
+    state.last_auxiliary_stats.answer_tokens = read_training_pod<int32_t>(input, "progress last_auxiliary_stats.answer_tokens");
+    state.last_auxiliary_stats.prompt_state_norm = read_training_pod<float>(input, "progress last_auxiliary_stats.prompt_state_norm");
+    state.last_auxiliary_stats.target_state_norm = read_training_pod<float>(input, "progress last_auxiliary_stats.target_state_norm");
+    state.last_auxiliary_stats.reason_delta_norm = read_training_pod<float>(input, "progress last_auxiliary_stats.reason_delta_norm");
+    state.last_auxiliary_stats.reason_cosine = read_training_pod<float>(input, "progress last_auxiliary_stats.reason_cosine");
+    state.last_auxiliary_stats.memory_delta_norm = read_training_pod<float>(input, "progress last_auxiliary_stats.memory_delta_norm");
+    state.last_auxiliary_stats.memory_cosine = read_training_pod<float>(input, "progress last_auxiliary_stats.memory_cosine");
+    state.last_auxiliary_stats.final_target_delta_norm = read_training_pod<float>(input, "progress last_auxiliary_stats.final_target_delta_norm");
+    state.last_objective_stats.supervised_cross_entropy = read_training_pod<float>(input, "progress last_objective_stats.supervised_cross_entropy");
+    state.last_objective_stats.repetition_unlikelihood = read_training_pod<float>(input, "progress last_objective_stats.repetition_unlikelihood");
+    state.last_objective_stats.logit_l2 = read_training_pod<float>(input, "progress last_objective_stats.logit_l2");
+    state.last_objective_stats.sparse_selector = read_training_pod<float>(input, "progress last_objective_stats.sparse_selector");
+    state.last_objective_stats.qat_regularization = read_training_pod<float>(input, "progress last_objective_stats.qat_regularization");
+    state.last_objective_stats.moe_auxiliary = read_training_pod<float>(input, "progress last_objective_stats.moe_auxiliary");
+    state.last_objective_stats.criticality_regularization = read_training_pod<float>(input, "progress last_objective_stats.criticality_regularization");
+    state.last_objective_stats.total = read_training_pod<float>(input, "progress last_objective_stats.total");
+    { const auto value = read_training_pod<uint8_t>(input, "progress last_step_telemetry.enabled");
+      if (value > 1) throw std::runtime_error("Invalid training progress boolean: last_step_telemetry.enabled");
+      state.last_step_telemetry.enabled = value != 0; }
+    state.last_step_telemetry.global_step = read_training_pod<int32_t>(input, "progress last_step_telemetry.global_step");
+    state.last_step_telemetry.bucket_count = read_training_pod<int32_t>(input, "progress last_step_telemetry.bucket_count");
+    state.last_step_telemetry.wall_ms = read_training_pod<double>(input, "progress last_step_telemetry.wall_ms");
+    state.last_step_telemetry.preparation_ms = read_training_pod<double>(input, "progress last_step_telemetry.preparation_ms");
+    state.last_step_telemetry.inter_bucket_ms = read_training_pod<double>(input, "progress last_step_telemetry.inter_bucket_ms");
+    state.last_step_telemetry.forward_ms = read_training_pod<double>(input, "progress last_step_telemetry.forward_ms");
+    state.last_step_telemetry.loss_ms = read_training_pod<double>(input, "progress last_step_telemetry.loss_ms");
+    state.last_step_telemetry.backward_ms = read_training_pod<double>(input, "progress last_step_telemetry.backward_ms");
+    state.last_step_telemetry.optimizer_ms = read_training_pod<double>(input, "progress last_step_telemetry.optimizer_ms");
+    state.last_step_telemetry.unaccounted_ms = read_training_pod<double>(input, "progress last_step_telemetry.unaccounted_ms");
+    return state;
+}
 
 struct TrainingParameterRecord {
     Parameter* parameter = nullptr;
@@ -1687,6 +1926,8 @@ void validate_trainer_configuration(const Trainer& trainer) {
         throw std::invalid_argument(
             "Trainer dynamic loss-scale configuration is invalid");
     }
+    if (trainer.scheduler_unit == Trainer::SchedulerUnit::Tokens && !trainer.token_counters_complete)
+        throw std::invalid_argument("Token scheduler requires complete historical token counters");
     validate_phase_scheduler_configuration(trainer.phase_scheduler);
 }
 
@@ -2303,9 +2544,15 @@ float apply_moe_aux_regularization(Trainer& trainer, int accumulation_steps) {
 // Posição do scheduler em tokens: os já commitados mais o grupo que está
 // prestes a commitar.  Espelha `next_step = global_step_count + 1` do modo
 // legado, isto é, a posição depois deste update.
+void require_token_capacity(long long value, size_t increment) {
+    if (value < 0 || increment > static_cast<unsigned long long>(std::numeric_limits<long long>::max() - value))
+        throw std::overflow_error("Training token counter overflow");
+}
+
 long long scheduler_token_position(const Trainer& trainer) {
     long long position = trainer.tokens_committed;
     if (trainer.pending_accumulated_tokens > 0) {
+        require_token_capacity(position, static_cast<size_t>(trainer.pending_accumulated_tokens));
         position += trainer.pending_accumulated_tokens;
     }
     return position;
@@ -3927,9 +4174,16 @@ float apply_optimizer_step(Trainer& trainer,
         const int next_step=trainer.global_step_count+1;
         const float lr=compute_lr_for_step(trainer,next_step);
         std::vector<GpuSparseAdamSlot> slots;
-        for(auto* p:params)if(p && p->trainable && p->data.size)
+        const bool use_muon=optimizer_policy::muon_enabled();
+        if(use_muon && trainer.learning_rate<=0)
+            throw std::invalid_argument("Muon schedule requires a positive auxiliary Adam base learning rate");
+        const float muon_lr=use_muon ? optimizer_policy::muon_learning_rate()*(lr/trainer.learning_rate) : 0;
+        for(auto* p:params)if(p && p->trainable && p->data.size) {
+            const bool matrix=use_muon && muon::hidden_matrix(p->name,p->data.shape.dims);
             slots.push_back({p,lr*trainer.lr_scale_for(p),should_apply_weight_decay(*p, trainer),
                 p->has_device_gradient_activity()?false:p->has_gradient()});
+            if(matrix){slots.back().algorithm=GpuSparseAlgorithm::MuonNs5Fp32;slots.back().learning_rate=muon_lr*trainer.lr_scale_for(p);}
+        }
         ParameterAuditStepScope parameter_audit(trainer,params);
         const bool restore_moments=!trainer.device_sparse_adam;
         if(restore_moments)trainer.device_sparse_adam=std::make_shared<GpuSparseAdam>();
@@ -3940,7 +4194,7 @@ float apply_optimizer_step(Trainer& trainer,
                 auto* p=slot.parameter; const auto m=trainer.m_state.find(p),v=trainer.v_state.find(p);
                 if((m==trainer.m_state.end())!=(v==trainer.v_state.end()))throw std::logic_error("Sparse Adam incomplete restored moments");
                 const bool present=m!=trainer.m_state.end();
-                states.push_back({p->name,p->version,present,present?m->second:Tensor(),present?v->second:Tensor()});
+                states.push_back({p->name,p->version,present,present?m->second:Tensor(),present?v->second:Tensor(),slot.algorithm});
             }
             trainer.device_sparse_adam->restore(states);
         }
@@ -3949,6 +4203,8 @@ float apply_optimizer_step(Trainer& trainer,
         options.bc1=1.0f-std::pow(trainer.beta1,next_step);options.bc2=1.0f-std::pow(trainer.beta2,next_step);
         options.eps=trainer.eps;options.weight_decay=trainer.weight_decay;options.max_norm=trainer.max_grad_norm;
         options.accumulation_steps=accumulation_steps;options.deterministic=determinism::deterministic_reductions_enabled();
+        options.fused_epilogue=optimizer_policy::fused_optimizer_epilogue_enabled();
+        options.clear_gradients=options.fused_epilogue;
         // This lane commits one bank transaction; injected interruption is a
         // group boundary before any update, rather than a partial tensor write.
         optimizer_commit_fault_point();
@@ -4953,6 +5209,18 @@ float train_supervised_batch_impl(Trainer& trainer,
     if (prompt_batch.empty() || prompt_batch.size() != answer_batch.size()) {
         throw std::runtime_error("train_supervised_batch requires aligned prompt/answer batches");
     }
+    require_checkpoint_boundary(trainer);
+    long long batch_tokens = 0;
+    for (size_t index = 0; index < prompt_batch.size(); ++index) {
+        if (prompt_batch[index].empty() || answer_batch[index].empty())
+            throw std::runtime_error("train_supervised_batch received empty prompt/answer");
+        require_token_capacity(batch_tokens, prompt_batch[index].size());
+        batch_tokens += static_cast<long long>(prompt_batch[index].size());
+        require_token_capacity(batch_tokens, answer_batch[index].size() - 1);
+        batch_tokens += static_cast<long long>(answer_batch[index].size() - 1);
+    }
+    require_token_capacity(trainer.tokens_processed, static_cast<size_t>(batch_tokens));
+    require_token_capacity(trainer.tokens_committed, static_cast<size_t>(batch_tokens));
     // Âncora do wall C++ (NSOS_TRAIN_TIMING): a diferença entre o wall do
     // chamador Python e este wall expõe o custo de binding/conversão de listas.
     const auto tm_call0 = std::chrono::steady_clock::now();
@@ -5185,6 +5453,8 @@ float train_supervised_batch_impl(Trainer& trainer,
         throw_if_training_cancelled(trainer);
         const auto _tm_bwd1 = tm_now();
         tm_bwd += tm_ms(_tm_bwd1 - _tm_loss1).count();
+        for (const auto& input : grouped_inputs)
+            trainer.tokens_processed += static_cast<long long>(input.size());
         tm_last = _tm_bwd1;
     }
 
@@ -5199,10 +5469,15 @@ float train_supervised_batch_impl(Trainer& trainer,
         trainer.model ? trainer.model->audit_collector() : nullptr;
     const auto _tm_opt0 = tm_now();
     throw_if_training_cancelled(trainer);
+    trainer.pending_accumulated_tokens = batch_tokens;
     const float criticality_loss = apply_optimizer_step(
         trainer, params, std::max(sample_count, 1),
         step_audit && step_audit->enabled() ? &grad_norm : nullptr);
-    if (!trainer.last_optimizer_step_skipped) attempt.mark_optimizer_committed();
+    if (!trainer.last_optimizer_step_skipped) {
+        attempt.mark_optimizer_committed();
+        trainer.tokens_committed += batch_tokens;
+    }
+    trainer.pending_accumulated_tokens = 0;
     const auto _tm_opt1 = tm_now();
     if (supervised_loss_device.size != 1) {
         throw std::logic_error(
@@ -5403,6 +5678,7 @@ Trainer::capture_checkpoint_snapshot() const {
         std::lock_guard<std::recursive_mutex> model_lock(
             model->execution_mutex_);
         ensure_optimizer_state_usable();
+        require_checkpoint_boundary(*this);
         snapshot_config = model->model_config();
         source_parameters = model->parameters();
     }
@@ -5538,8 +5814,11 @@ void Trainer::clone_runtime_state_to(
         target.model->execution_mutex_);
     ensure_optimizer_state_usable();
     validate_trainer_configuration(*this);
+    require_checkpoint_boundary(*this);
+    require_checkpoint_boundary(target);
     synchronize_device_sparse_checkpoint();
-    target.device_sparse_adam.reset();
+    const auto staged_progress = capture_training_progress(*this);
+    validate_training_progress(staged_progress, global_step_count);
     const RuntimeExecutionIdentity& source_execution_identity =
         ensure_execution_identity_locked();
     RuntimeExecutionIdentity target_execution_identity =
@@ -5857,6 +6136,8 @@ void Trainer::clone_runtime_state_to(
             last_objective_stats;
         target.last_step_telemetry =
             last_step_telemetry;
+        publish_training_progress(target, staged_progress);
+        target.device_sparse_adam.reset();
         target.m_state.swap(staged_m);
         target.v_state.swap(staged_v);
         target.quant_state.swap(staged_quant);
@@ -5889,6 +6170,9 @@ void Trainer::save_training_state(const std::string& state_path,
         model->execution_mutex_);
     ensure_optimizer_state_usable();
     validate_trainer_configuration(*this);
+    require_checkpoint_boundary(*this);
+    const auto progress = capture_training_progress(*this);
+    validate_training_progress(progress, global_step_count);
     const RuntimeExecutionIdentity& execution_identity =
         ensure_execution_identity_locked();
     synchronize_device_sparse_checkpoint();
@@ -6077,6 +6361,9 @@ void Trainer::save_training_state(const std::string& state_path,
                     "Optimizer state contains a non-finite or negative "
                     "moment for " + stable_name);
             }
+            if(has_moments && optimizer_policy::muon_enabled() && muon::hidden_matrix(parameter->name,parameter->data.shape.dims) &&
+                std::any_of(v_values.begin(),v_values.end(),[](float value){return value!=0;}))
+                throw std::runtime_error("Muon checkpoint contains an Adam second moment for "+stable_name);
 
             const auto criticality_it = crit_g0_state.find(parameter);
             const auto external_lr_it = external_lr_scale.find(parameter);
@@ -6253,6 +6540,7 @@ void Trainer::save_training_state(const std::string& state_path,
                 }
             }
         }
+        write_training_progress(output, progress);
         output.flush();
         if (!output) throw std::runtime_error("Training-state flush failed");
         output.close();
@@ -6307,12 +6595,21 @@ void Trainer::save_training_state(const std::string& state_path,
 
 void Trainer::load_training_state(const std::string& state_path,
                                   const std::string& model_path,
-                                  bool allow_legacy_runtime_identity) {
+                                  bool allow_legacy_runtime_identity,
+                                  bool allow_legacy_progress_state) {
     RuntimeExecutionPolicyLease policy_lease;
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!model) throw std::runtime_error("Trainer has no model");
     const bool recovering_poison =
         optimizer_state_poisoned();
+    if (recovering_poison &&
+        (device_sparse_group_open || !device_moe_groups.empty())) {
+        throw OptimizerStatePoisonedException(
+            "Poisoned optimizer has an unclosed device owner; recover with "
+            "a fresh model and Trainer loaded from the exact model checkpoint "
+            "and its matching training-state sidecar");
+    }
+    require_checkpoint_boundary(*this);
     std::lock_guard<std::recursive_mutex> model_lock(
         model->execution_mutex_);
     std::ifstream input(state_path, std::ios::binary);
@@ -6326,6 +6623,12 @@ void Trainer::load_training_state(const std::string& state_path,
     }
     verify_training_state_integrity(
         std::filesystem::path(state_path), version);
+    if (version < 11u) {
+        if (!allow_legacy_progress_state)
+            throw std::runtime_error("Legacy training state has no token/progress record; explicit progress migration required");
+        if (scheduler_unit != SchedulerUnit::Steps || (version < 10u && gradient_accumulation_steps != 1))
+            throw std::runtime_error("Legacy training state cannot prove token scheduler/accumulation history; resume refused");
+    }
     const uint32_t fingerprint =
         read_training_pod<uint32_t>(input, "architecture fingerprint");
     if (fingerprint != ModelSerializer::architecture_fingerprint(model)) {
@@ -6552,6 +6855,8 @@ void Trainer::load_training_state(const std::string& state_path,
                 "explicit legacy-identity migration only after verifying the "
                 "original runtime policy.");
         }
+        if(optimizer_policy::muon_enabled())
+            throw std::runtime_error("Muon rejects legacy identity migration: Adam moments cannot be reinterpreted as Muon momentum");
         staged_execution_identity =
             std::move(current_execution_identity);
     }
@@ -6646,6 +6951,8 @@ void Trainer::load_training_state(const std::string& state_path,
                     throw std::runtime_error(
                         "Invalid optimizer moment in training state");
                 }
+                if(optimizer_policy::muon_enabled() && muon::hidden_matrix(parameter->name,parameter->data.shape.dims) && record.v[i]!=0)
+                    throw std::runtime_error("Muon sidecar contains an Adam second moment");
             }
         }
         records.push_back(std::move(record));
@@ -6777,6 +7084,22 @@ void Trainer::load_training_state(const std::string& state_path,
             memory_records.push_back(std::move(record));
         }
     }
+    TrainingProgressState staged_progress;
+    if (version >= 11u) {
+        staged_progress = read_training_progress(input);
+        validate_training_progress(staged_progress, metadata.global_step_count);
+        if (staged_progress.scheduler_unit != scheduler_unit ||
+            staged_progress.gradient_accumulation_steps != gradient_accumulation_steps)
+            throw std::runtime_error("Training progress declared scheduler/A mismatch; resume refused");
+    } else {
+        // Explicit step-only migration. Counts below measure only work since
+        // migration and are marked incomplete; never fabricate lost history.
+        staged_progress.scheduler_unit = SchedulerUnit::Steps;
+        staged_progress.gradient_accumulation_steps = gradient_accumulation_steps;
+        staged_progress.token_counters_complete = false;
+        staged_progress.last_accumulation_steps = gradient_accumulation_steps;
+    }
+
     if (version >= 5u) {
         const bool sha256_trailer = version >= 9u;
         const uint64_t trailer_bytes =
@@ -6977,7 +7300,7 @@ void Trainer::load_training_state(const std::string& state_path,
         metadata.loss_scale_growth_interval;
     loss_scale_growth_tracker =
         metadata.loss_scale_growth_tracker;
-    last_optimizer_step_skipped = false;
+    publish_training_progress(*this, staged_progress);
     phase_scheduler = std::move(metadata.phase_scheduler);
     execution_identity_ =
         std::move(staged_execution_identity);
@@ -7007,7 +7330,12 @@ gpu::ExecutionContext& Trainer::device_sparse_execution_context() const {
 void Trainer::begin_device_sparse_group() {
     if(!optimizer_policy::device_sparse_adam_enabled())return;
     if(device_sparse_group_open)throw std::logic_error("Nested device sparse accumulation group");
-    if(!model || !training_policy::grouped_moe_training() || !training_policy::ordered_moe() || !gpu_custom_kernels_supported())
+    const bool allow_dense=optimizer_policy::dense_device_optimizer_enabled();
+    const bool has_moe=model && std::any_of(model->layers.begin(),model->layers.end(),[](const auto& block){return block && block->uses_moe();});
+    if(optimizer_policy::legacy_device_sparse_adam_enabled() && !has_moe)
+        throw std::invalid_argument("NSOS_MOE_DEVICE_ADAM=1 requires at least one MoE block; use the fused epilogue policy for dense Adam");
+    if(!model || !gpu_custom_kernels_supported() ||
+        ((!allow_dense || has_moe) && (!training_policy::grouped_moe_training() || !training_policy::ordered_moe())))
         throw std::invalid_argument("NSOS_MOE_DEVICE_ADAM requires grouped, ordered GPU MoE");
     if (optimizer_state_bits != 32)
         throw std::invalid_argument("NSOS_MOE_DEVICE_ADAM requires FP32 moments; quantized states use the legacy policy");
@@ -7032,13 +7360,26 @@ void Trainer::begin_device_sparse_group() {
             group->device_activity()->gradient_scale=1.0f/active_loss_scale(*this);
             device_moe_groups.push_back(std::move(group));
         }
-        if(device_moe_groups.empty())throw std::invalid_argument("Device sparse Adam policy requires at least one MoE block");
+        if(device_moe_groups.empty() && !allow_dense)throw std::invalid_argument("Device sparse Adam policy requires at least one MoE block");
         device_sparse_group_open=true;device_sparse_objectives_finalized=false;
     } catch(...) {finish_device_sparse_group(true);throw;}
 }
 
 void Trainer::finish_device_sparse_group(bool abort, bool materialize_for_audit) {
-    if(device_moe_groups.empty()){device_sparse_group_open=false;return;}
+    if (device_moe_groups.empty()) {
+        if(abort && device_sparse_group_open) {
+            gpu::ExecutionContext::Scope lane(device_sparse_execution_context());
+            if(device_sparse_adam)device_sparse_adam->abort();
+            attention_training::reset_status(model->parameters());
+        }
+        device_sparse_group_open = false;
+        if (abort) {
+            pending_accumulation_microbatches = 0;
+            pending_accumulated_tokens = 0;
+            pending_supervised_loss_sum = Tensor{};
+        }
+        return;
+    }
     gpu::ExecutionContext::Scope lane(device_sparse_execution_context());
     if(abort && device_sparse_adam)device_sparse_adam->abort();
     if(abort)attention_training::reset_status(model->parameters());
@@ -7090,6 +7431,12 @@ bool Trainer::optimizer_state_poisoned() const noexcept {
 
 void Trainer::ensure_optimizer_state_usable() const {
     if (optimizer_state_poisoned()) {
+        if (device_sparse_group_open || !device_moe_groups.empty()) {
+            throw OptimizerStatePoisonedException(
+                "Poisoned optimizer has an unclosed device owner; recover with "
+                "a fresh model and Trainer loaded from the exact model checkpoint "
+                "and its matching training-state sidecar");
+        }
         throw OptimizerStatePoisonedException(
             "Trainer optimizer state is fail-stop poisoned after an "
             "ambiguous commit failure; reload the exact model checkpoint "
@@ -7185,11 +7532,24 @@ float Trainer::accumulate_gradients_impl(
     // legado (train_step e accumulate_gradients) sempre chega aqui com o
     // contador em zero e portanto mantém o comportamento anterior.
     if (pending_accumulation_microbatches == 0) {
-        zero_model_gradients(params);
+        bool fused_reset=false;
+        if(device_sparse_adam && optimizer_policy::fused_optimizer_epilogue_enabled()) {
+            gpu::ExecutionContext::Scope lane(device_sparse_execution_context());
+            fused_reset=device_sparse_adam->consume_fused_gradient_reset(params);
+        }
+        if(!fused_reset)zero_model_gradients(params);
         begin_device_sparse_group();
         begin_moe_aux_accumulation(*this);
     } else if (!device_sparse_group_open) {
         begin_moe_aux_accumulation(*this);
+    }
+    // Dense stored sums were unscaled at the previous microbatch boundary.
+    // Restore their scale before any next forward/selector/backward adds a
+    // scaled contribution, so the common unscale preserves both terms.
+    // scale_gradients skips device-activity tensors: their producer already
+    // unscales each contribution when committing its sparse gradient bank.
+    if (pending_accumulation_microbatches > 0) {
+        scale_gradients(params, loss_scale);
     }
     last_step_telemetry = TrainingStepTelemetry{};
 
@@ -7289,6 +7649,11 @@ float Trainer::accumulate_gradients_impl(
 float Trainer::accumulate_gradients(
     const std::vector<int>& tokens,
     const std::vector<int>& targets) {
+    RuntimeExecutionPolicyLease policy_lease;
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!model) throw std::runtime_error("Trainer requires model");
+    std::lock_guard<std::recursive_mutex> model_lock(model->execution_mutex_);
+    ensure_optimizer_state_usable();
     // Sondagem independente: sempre parte de gradientes limpos.  Reiniciar o
     // contador garante que uma sonda disparada no meio de um grupo não seja
     // confundida com um microbatch dele.
@@ -7303,6 +7668,10 @@ float Trainer::accumulate_gradients(
 float Trainer::accumulate_microbatch(
     const std::vector<int>& tokens,
     const std::vector<int>& targets) {
+    RuntimeExecutionPolicyLease policy_lease;
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!model) throw std::runtime_error("Trainer requires model");
+    std::lock_guard<std::recursive_mutex> model_lock(model->execution_mutex_);
     if (tokens.empty()) {
         throw std::invalid_argument(
             "accumulate_microbatch requires a non-empty token window");
@@ -7312,6 +7681,9 @@ float Trainer::accumulate_microbatch(
         throw std::runtime_error(
             "gradient accumulation group overflowed its microbatch counter");
     }
+    require_token_capacity(tokens_processed, tokens.size());
+    require_token_capacity(pending_accumulated_tokens, tokens.size());
+    require_token_capacity(tokens_committed, tokens.size());
     // Caminho diferido, idêntico ao de train_step: a loss permanece no device
     // e só é lida no commit.  Ler aqui deslocaria o ponto de sincronização e
     // quebraria a equivalência bit a bit em A=1.
@@ -7337,6 +7709,8 @@ float Trainer::accumulate_microbatch(
 }
 
 void Trainer::abort_gradient_accumulation() {
+    RuntimeExecutionPolicyLease policy_lease;
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     // Descarta um grupo parcial. Os gradientes dos microbatches já computados
     // contaminariam a próxima tentativa, e nem global_step_count nem
     // tokens_committed podem avançar por trabalho que nunca foi commitado.
@@ -7344,6 +7718,7 @@ void Trainer::abort_gradient_accumulation() {
     pending_accumulated_tokens = 0;
     pending_supervised_loss_sum = Tensor{};
     if (!model) return;
+    std::lock_guard<std::recursive_mutex> model_lock(model->execution_mutex_);
     auto params = trainable_model_parameters(model);
     bool cleanup_succeeded = cancel_moe_aux_accumulation(*this);
     try { finish_device_sparse_group(true); } catch (...) { cleanup_succeeded = false; }
@@ -7366,6 +7741,10 @@ void Trainer::abort_gradient_accumulation() {
 }
 
 float Trainer::commit_optimizer_step(int accumulation_steps) {
+    RuntimeExecutionPolicyLease policy_lease;
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!model) throw std::runtime_error("Trainer requires model");
+    std::lock_guard<std::recursive_mutex> model_lock(model->execution_mutex_);
     if (accumulation_steps <= 0) {
         throw std::invalid_argument(
             "commit_optimizer_step requires accumulation_steps >= 1");
@@ -7380,6 +7759,9 @@ float Trainer::commit_optimizer_step(int accumulation_steps) {
             " but the declared gradient_accumulation_steps is " +
             std::to_string(gradient_accumulation_steps));
     }
+    if (pending_accumulated_tokens < 0)
+        throw std::invalid_argument("Negative pending token count");
+    require_token_capacity(tokens_committed, static_cast<size_t>(pending_accumulated_tokens));
     if (pending_accumulation_microbatches != accumulation_steps) {
         // Fail-closed: commitar com contagem diferente da acumulada aplicaria
         // o divisor errado e falsificaria silenciosamente o batch efetivo.
@@ -7463,6 +7845,8 @@ float Trainer::train_step(const std::vector<int>& tokens,
     using tm_ms = std::chrono::duration<double, std::milli>;
     RuntimeExecutionPolicyLease policy_lease;
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    require_token_capacity(tokens_processed, tokens.size());
+    require_token_capacity(tokens_committed, tokens.size());
     if (!model) throw std::runtime_error("Trainer requires model");
     std::lock_guard<std::recursive_mutex> model_lock(
         model->execution_mutex_);
@@ -7471,6 +7855,13 @@ float Trainer::train_step(const std::vector<int>& tokens,
     // Factored so the criticality instrument can read gradients without
     // mutating weights (Trainer::accumulate_gradients).  Behavior identical
     // to the previous monolithic train_step.
+    validate_trainer_configuration(*this);
+    if (gradient_accumulation_steps != 1) {
+        throw std::invalid_argument(
+            "train_step requires declared accumulation A=1; use "
+            "accumulate_microbatch/commit_optimizer_step for A>1");
+    }
+    require_checkpoint_boundary(*this);
     Tensor deferred_supervised_loss;
     (void)accumulate_gradients_impl(
         tokens, targets, &deferred_supervised_loss);
@@ -7479,18 +7870,24 @@ float Trainer::train_step(const std::vector<int>& tokens,
     TrainingAttemptGuard attempt(*this, params);
     throw_if_training_cancelled(*this);
     float grad_norm = 0.0f;
-    LayerAuditCollector* step_audit =
-        model ? model->audit_collector() : nullptr;
+    // The token scheduler uses the position after this candidate update.
+    // This remains pending until the global optimizer gate commits it.
+    pending_accumulated_tokens = static_cast<long long>(tokens.size());
     const float criticality_loss =
         apply_optimizer_step(
             *this, params, 1,
-            step_audit && step_audit->enabled() ? &grad_norm : nullptr);
+            &grad_norm);
     if (!(*this).last_optimizer_step_skipped) attempt.mark_optimizer_committed();
     // O caminho legado é um grupo de acumulação de tamanho 1: os contadores de
     // token avançam aqui para que scheduler, checkpoint e telemetria enxerguem
     // a mesma grandeza nos dois caminhos.
     tokens_processed += static_cast<long long>(tokens.size());
     if (!last_optimizer_step_skipped) tokens_committed += static_cast<long long>(tokens.size());
+    pending_accumulated_tokens = 0;
+    last_grad_norm_pre_clip = grad_norm;
+    last_update_was_clipped = grad_norm > max_grad_norm;
+    last_grad_norm_post_clip =
+        last_update_was_clipped ? max_grad_norm : grad_norm;
     last_accumulation_steps = 1;
     const auto tm_opt1 = tm_now();
     if (deferred_supervised_loss.size != 1) {
@@ -7561,6 +7958,7 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
     validate_trainer_configuration(*this);
     (void)ensure_execution_identity_locked();
     throw_if_training_cancelled(*this);
+    require_checkpoint_boundary(*this);
     if (epochs <= 0 || batch_size <= 0 || seq_len <= 0) {
         throw std::invalid_argument(
             "train_loop requires positive epochs, batch_size, and seq_len");
@@ -7585,8 +7983,6 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
     int internal_global_step = start_step;
     int encountered_step = 0;
     auto params = trainable_model_parameters(model);
-    const float loss_scale = active_loss_scale(*this);
-
     for (int epoch = 0; epoch < epochs; ++epoch) {
         for (size_t start = 0; start + seq_len < tokens.size();
              start += static_cast<size_t>(seq_len * effective_batch)) {
@@ -7596,8 +7992,14 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
             }
             throw_if_training_cancelled(*this);
             TrainingAttemptGuard attempt(*this, params);
+            const float loss_scale = active_loss_scale(*this);
             apply_progressive_qat_phase(*this);
-            zero_model_gradients(params);
+            bool fused_reset=false;
+            if(device_sparse_adam && optimizer_policy::fused_optimizer_epilogue_enabled()) {
+                gpu::ExecutionContext::Scope lane(device_sparse_execution_context());
+                fused_reset=device_sparse_adam->consume_fused_gradient_reset(params);
+            }
+            if(!fused_reset)zero_model_gradients(params);
             begin_device_sparse_group();
             begin_moe_aux_accumulation(*this);
             model->set_training_mode(true);
@@ -7624,6 +8026,9 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
 
             const int samples = static_cast<int>(batch_inputs.size());
             if (samples == 0) continue;
+            const size_t batch_tokens = flat_targets.size();
+            require_token_capacity(tokens_processed, batch_tokens);
+            require_token_capacity(tokens_committed, batch_tokens);
 
             // Chunked forward + cross_entropy + backward.
             //
@@ -7740,6 +8145,7 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
                 else model->backward_external(grad, ctx);
                 throw_if_training_cancelled(*this);
 
+                tokens_processed += static_cast<long long>(chunk_targets.size());
                 aggregate_supervised_loss +=
                     static_cast<double>(supervised_loss) * chunk_samples;
                 aggregate_repetition_loss +=
@@ -7777,13 +8183,18 @@ void Trainer::train_loop(const std::vector<int>& tokens, int epochs, int batch_s
             LayerAuditCollector* step_audit =
                 model ? model->audit_collector() : nullptr;
             throw_if_training_cancelled(*this);
+            pending_accumulated_tokens = static_cast<long long>(batch_tokens);
             const float criticality_loss =
                 apply_optimizer_step(
                     *this, params, 1,
                     step_audit && step_audit->enabled()
                         ? &grad_norm
                         : nullptr);
-            if (!(*this).last_optimizer_step_skipped) attempt.mark_optimizer_committed();
+            if (!last_optimizer_step_skipped) {
+                attempt.mark_optimizer_committed();
+                tokens_committed += static_cast<long long>(batch_tokens);
+            }
+            pending_accumulated_tokens = 0;
             last_objective_stats.criticality_regularization = criticality_loss;
             last_objective_stats.total += criticality_loss;
             const float mean_loss = last_objective_stats.total;
