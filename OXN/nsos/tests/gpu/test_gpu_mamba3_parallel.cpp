@@ -76,6 +76,27 @@ void finitecheck_direct_regression() {
     throw std::runtime_error("Direct finitechecks require GPU build");
 #endif
 }
+void hierarchical_direct_rejection() {
+#ifdef USE_CUDA
+    namespace mb=nsos::mamba3_block;
+    const mb::Shape s{1,1,1,1,1,1,128,1,32,false,false};
+    Tensor dummy=Tensor::zeros({1},Device::GPU);float* p=dummy.raw_data();
+    mb::State<const float> in{p,p,p,p};mb::State<float> out{p,p,p,p};
+    mb::BackwardWorkspace ws{p,p,p,p,p,p,p,p,p,p};
+    // Non-null fields isolate the new flag/scratch guards. Every case must
+    // return before any device-property query, source read or launch.
+    for(int bad=0;bad<5;++bad) {
+        mb::Trace<float> tr{p,p,p,p,p,true,true,p,true,true,p,p};
+        if(bad==0)tr.parallel=false;if(bad==1)tr.checkpoints=false;
+        if(bad==2)tr.replay_lds=false;if(bad==3)tr.hierarchy_a=nullptr;if(bad==4)tr.hierarchy_b=nullptr;
+        require(!mb::gpu_forward(s,p,p,reinterpret_cast<const int*>(p),in,out,tr,p,p),"hierarchy invalid Trace accepted by forward");
+        mb::Trace<const float> ctr{p,p,p,p,p,tr.parallel,tr.checkpoints,p,tr.replay_lds,true,tr.hierarchy_a,tr.hierarchy_b};
+        require(!mb::gpu_backward(s,p,p,reinterpret_cast<const int*>(p),in,ctr,p,in,p,p,out,p,p,ws),"hierarchy invalid Trace accepted by backward");
+    }
+    require(mb::hierarchy_nodes_per_cell(mb::Shape{1,32769,1,1,1,1,128,1,32,false,false})==1025+33+2,"hierarchy scratch node formula");
+    gp::cuda_sync_or_throw("hierarchy rejected Trace flags");
+#endif
+}
 void phase_seam_regression() {
     const int B=1,S=4,D=4,H=4,P=2,N=128,A=32;
     Mamba3Config c;c.head_dim=P;c.state_dim=N;c.expand=2;c.n_groups=2;c.seed=90210;
@@ -92,7 +113,7 @@ void phase_seam_regression() {
     auto ct=cpu.forward_owned(input,initial);const auto expected=ct->snapshot_final_state();
     for(int i=0;i<expected.phase.size;++i) require(expected.phase.data()[i]==initial_phase,"seam fixture failed to retain sub-ULP reference increments");
     auto cg=cpu.backward_owned(ct,dy,seed);
-    for(const char* provider:{"parallel_fp32_v1","flash_fp32_v1","flash_fp32_replay_lds_v2"}) {
+    for(const char* provider:{"parallel_fp32_v1","flash_fp32_v1","flash_fp32_replay_lds_v2","flash_fp32_hierarchical_v1"}) {
         mode(provider);Mamba3Layer gpu(D,c);auto gpu_params=gpu.parameters();
         for(std::size_t i=0;i<gpu_params.size();++i) gpu_params[i]->copy_data_from(params[i]->data);
         gpu.to(Device::GPU);auto gt=gpu.forward_owned(input.to(Device::GPU),move(initial,Device::GPU));
@@ -119,7 +140,7 @@ void case_parity(int S,int R,bool norm,int model=4,int head_dim=2,int groups=2,i
     auto ct=cpu.forward_owned(x,initial,lengths);auto cout=ct->output();auto cstate=ct->snapshot_final_state();auto cg=cpu.backward_owned(ct,dy,seed);
     std::size_t parallel_forward_bytes=0,parallel_backward_bytes=0;
     Mamba3Backward flash_v1;
-    for(const char* provider:{"parallel_fp32_v1","flash_fp32_v1","flash_fp32_replay_lds_v2"}) {
+    for(const char* provider:{"parallel_fp32_v1","flash_fp32_v1","flash_fp32_replay_lds_v2","flash_fp32_hierarchical_v1"}) {
         mode(provider);Mamba3Layer gpu(model,c);gpu.to(Device::GPU);auto in=move(initial,Device::GPU),gs=move(seed,Device::GPU);
         auto gt=gpu.forward_owned(x.to(Device::GPU),in,lengths);
         gp::assert_close(gt->output(),cout,5e-4f,"optimized output",5e-4f);close(gt->snapshot_final_state(),cstate);
@@ -151,8 +172,8 @@ void case_parity(int S,int R,bool norm,int model=4,int head_dim=2,int groups=2,i
     }
     mode("dense_reference");
 }
-void v2_failure_ownership() {
-    mode("flash_fp32_replay_lds_v2");Mamba3Config c;c.head_dim=2;c.n_groups=2;c.mimo=true;c.mimo_rank=4;
+void v2_failure_ownership(const char* provider="flash_fp32_replay_lds_v2") {
+    mode(provider);Mamba3Config c;c.head_dim=2;c.n_groups=2;c.mimo=true;c.mimo_rank=4;
     Mamba3Layer layer(4,c),foreign_layer(4,c);layer.to(Device::GPU);foreign_layer.to(Device::GPU);
     Tensor x=Tensor::ones({1,33,4}),dy=Tensor::ones({1,33,4});
     auto tape=layer.forward_owned(x.to(Device::GPU));Tensor bad_dy=dy.clone();bad_dy.data()[0]=std::numeric_limits<float>::quiet_NaN();
@@ -179,6 +200,13 @@ int main() {return gp::run_parity("mamba3_parallel",[] {
     set_matmul_precision_mode(0);
     for(int S:{1,31,32,33,65,129}) for(int R:{1,4}) for(bool norm:{false,true}) case_parity(S,R,norm);
     case_parity(33,8,true);case_parity(33,8,true,4,2,2,128,false,.5f,true);finitecheck_direct_regression();phase_seam_regression();
+    // Rank-sized LDS selects ceilings 1/2/4/8. Odd ranks must not index beyond
+    // their selected scratch; retain independent CPU VJP and Flash v1 bitwise
+    // oracles with active ragged/empty prefixes and both checkpoint seams.
+    for(int R:{2,3,5,6,7}) {
+        case_parity(33,R,true,4,2,2,128,true,.5f,false);
+        case_parity(33,R,true,4,2,2,128,true,.5f,true);
+    }
     // Exercise long inter-chunk carries and phase suffixes beyond the small
     // tail matrix, while keeping the independent CPU VJP oracle practical.
     case_parity(257,1,true);case_parity(1025,4,true);
@@ -194,5 +222,10 @@ int main() {return gp::run_parity("mamba3_parallel",[] {
     case_parity(33,4,true,10,5,2,128,true,1.f);
     case_parity(5,8,true,64,128,1,128,true,1.f);
     case_parity(65,4,false,4,2,2,128,true,.5f);
-    v2_failure_ownership();mode("dense_reference");
+    v2_failure_ownership();v2_failure_ownership("flash_fp32_hierarchical_v1");hierarchical_direct_rejection();
+    // Q32/Q33 and Q1024/Q1025 boundaries cross successive hierarchy levels.
+    case_parity(1024,1,true,4,2,2,8,true);
+    case_parity(1025,4,true,4,2,2,128,true);
+    case_parity(32769,1,true,4,2,2,8,true);
+    mode("dense_reference");
 });}

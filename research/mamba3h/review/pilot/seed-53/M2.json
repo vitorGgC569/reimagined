@@ -1,0 +1,68 @@
+{
+  "status": "completed",
+  "seed": 53,
+  "arm": "M2",
+  "label": "actual_native_frozen_backbone_adapter_P0",
+  "updates": 20,
+  "elapsed_seconds": 1.271101100021042,
+  "loss_first": 1.7933053970336914,
+  "loss_last": 1.7521471977233887,
+  "grad_norm_max": 0.5321861505508423,
+  "grad_norm_p99": 0.5310392910242081,
+  "trainable_parameters": 337,
+  "trainable_bytes": 1348,
+  "persistent_buffer_bytes": 0,
+  "evaluations": {
+    "validation": {
+      "accuracy": 0.2265625,
+      "correct": 29,
+      "total": 128,
+      "latency_seconds": 0.10269540001172572,
+      "retrieval": {
+        "reads": 128,
+        "similarity_evaluations": 108,
+        "similarity_madds": 864,
+        "topk_calls": 108,
+        "value_reads": 108,
+        "writes": 256,
+        "evictions": 0,
+        "overwrites": 143,
+        "revocations": 32
+      },
+      "aux_state_bytes_per_eval_batch": 3744,
+      "cache_bytes_estimate": 1116,
+      "state_norm_max": 2.431441068649292
+    },
+    "test": {
+      "accuracy": 0.14453125,
+      "correct": 37,
+      "total": 256,
+      "latency_seconds": 0.20826189999934286,
+      "retrieval": {
+        "reads": 256,
+        "similarity_evaluations": 235,
+        "similarity_madds": 1880,
+        "topk_calls": 235,
+        "value_reads": 235,
+        "writes": 512,
+        "evictions": 0,
+        "overwrites": 286,
+        "revocations": 64
+      },
+      "aux_state_bytes_per_eval_batch": 3744,
+      "cache_bytes_estimate": 1116,
+      "state_norm_max": 2.5254292488098145
+    }
+  },
+  "parameters_ever_nonzero_gradient": 182,
+  "native_frozen_parameters": 3340,
+  "native_persistent_state_bytes_per_example": 5408,
+  "feature_cache_bytes": {
+    "train": 65536,
+    "validation": 32768,
+    "test": 65536
+  },
+  "routing": "visible causal metadata, no learned gates",
+  "native_backbone_frozen": true,
+  "full_compute_matched": false
+}

@@ -1,0 +1,137 @@
+{
+  "protocol_sha256": "3d0a1ac21c36b88d3bd9acb6fc693bf89d887c59cf9ed1cdb1f1b56a6f1e3dd5",
+  "provider_sha256": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+  "unique_inputs": 800,
+  "seeds": [
+    {
+      "seed": 11,
+      "splits": [
+        {
+          "split": "train",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-11\\train.jsonl",
+          "source_sha256": "25dc73ac3e3a55fabb73ee34e63f4928bc6450124d4b0c67005b3fe555935c6e",
+          "examples": 64
+        },
+        {
+          "split": "validation",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-11\\validation.jsonl",
+          "source_sha256": "e706b4e08e7413bbcbc479ff03ef8d7bf9c5d196a6905832bb8c83accf382015",
+          "examples": 32
+        },
+        {
+          "split": "test",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-11\\test.jsonl",
+          "source_sha256": "02df3cd9867402915f2878ace69b34b3ec602483ce9c82effeeb3f0a347f595a",
+          "examples": 64
+        }
+      ],
+      "input_sha256": "15f670c6c26aca1a2c9219edf1e1caffe4b5d857bc69d60dc00b38480de56ab9",
+      "native_sha256": "8a371ac92b659723fc08ca3592489b032d094a66dc0eaa65f03d85cb9795205e",
+      "conditioning_sha256": "69800b93e9023fda0b94569584d278b07b216ccfeab285b3354ec81560d9cebc"
+    },
+    {
+      "seed": 23,
+      "splits": [
+        {
+          "split": "train",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-23\\train.jsonl",
+          "source_sha256": "e30f3ae5ec7948e9066e668271897d5972dec61bf7823714eadba487031b9c8f",
+          "examples": 64
+        },
+        {
+          "split": "validation",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-23\\validation.jsonl",
+          "source_sha256": "b885fe2809be1a8327b5b5e178cce00a72d2a7ecb47b8253770eb694823287f2",
+          "examples": 32
+        },
+        {
+          "split": "test",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-23\\test.jsonl",
+          "source_sha256": "c5bc738ec994487ffbf2c2f9548374179d7cf9bdc8481480338ca413af735839",
+          "examples": 64
+        }
+      ],
+      "input_sha256": "f57e9be6fa8adce59af97e275e7a801c74709a6b99786edc65aed252be94fe01",
+      "native_sha256": "af7d3e020a8cdf3493c58cd0bb2da855ed24e383057d48d5c653c5b57e561417",
+      "conditioning_sha256": "7c33dc0cee0715cb5bb210e8c3bb7f917e80c9a3c5c8506823131f7ee55ac64b"
+    },
+    {
+      "seed": 37,
+      "splits": [
+        {
+          "split": "train",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-37\\train.jsonl",
+          "source_sha256": "1f403732bed686ab9d7ba1d113c52adfc35d966e457307f0332941e8a14700d0",
+          "examples": 64
+        },
+        {
+          "split": "validation",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-37\\validation.jsonl",
+          "source_sha256": "b0ad14811bbeb1f0b155656d654c978178c8f7e9f2610e10f5e68060e9b23cef",
+          "examples": 32
+        },
+        {
+          "split": "test",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-37\\test.jsonl",
+          "source_sha256": "361e6454d7e12b3dd58a1f7af48483d568a730a04a258e79127854dfab73363f",
+          "examples": 64
+        }
+      ],
+      "input_sha256": "a6e256f2c96b176532d7efe96b6e1edddc538844b40361100f35187a91514e19",
+      "native_sha256": "d1640a937fefeffd0e4f42ab7ec7e9c36946178dabbb14caadec13053f120791",
+      "conditioning_sha256": "0f5a86b67642c4e58edacaab02f6b9f712e5a9733e98a42126523ac11e3b1557"
+    },
+    {
+      "seed": 53,
+      "splits": [
+        {
+          "split": "train",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-53\\train.jsonl",
+          "source_sha256": "3c6ff0c403b7dd4e92a4bf443270661995212e6bd66185b7845874b30b757641",
+          "examples": 64
+        },
+        {
+          "split": "validation",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-53\\validation.jsonl",
+          "source_sha256": "f9a50f86baf131ab1b56c0fff5dc874b45ac7c4eaf7117cbf564c9c6348deda4",
+          "examples": 32
+        },
+        {
+          "split": "test",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-53\\test.jsonl",
+          "source_sha256": "239f830eed405f11632b6ca4a8eb549181d989a0d218eca70cec6842d96276fc",
+          "examples": 64
+        }
+      ],
+      "input_sha256": "a5ca424f3eaba7a19ed253eb4b68e286254203189637d7ff971cf9f9d3050cf1",
+      "native_sha256": "08d4366b623ca3af43504cd073496188fbce328528a334c0a07ac3a8f51b0cc8",
+      "conditioning_sha256": "63c68c29772688a85dfc2d682684c05cec141366fb21b413b03a7441a499bfb7"
+    },
+    {
+      "seed": 71,
+      "splits": [
+        {
+          "split": "train",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-71\\train.jsonl",
+          "source_sha256": "4de686102480451e94d95c271f6269cb757fd5c47e74cfadc96555fac630b23a",
+          "examples": 64
+        },
+        {
+          "split": "validation",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-71\\validation.jsonl",
+          "source_sha256": "e23cf5f3c25675fc3b1175af3c53bc807f391dbe20eda749839f4d049d27c881",
+          "examples": 32
+        },
+        {
+          "split": "test",
+          "source": "research\\mamba3h\\review\\p1\\handoffs\\benchmarks\\p1_positive\\datasets\\seed-71\\test.jsonl",
+          "source_sha256": "10a727ab36d349b6899ce489c2f305c13bc31a53d1917eb61601ffd7fbe6d415",
+          "examples": 64
+        }
+      ],
+      "input_sha256": "c85b4eca7f6881904badacdb85b0b9793a20467f3dadc0115d229eebf042cf94",
+      "native_sha256": "709e54e5f8936dcb1347e28fffd776b6b4e48a2ad9515ddaa06568093b72e974",
+      "conditioning_sha256": "23e8724f8f05bc8a47a1b91b8baecd09b1378c3c309799bf7016f4492105de14"
+    }
+  ]
+}

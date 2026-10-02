@@ -130,3 +130,7 @@ artifacts/
 QwenImages/
 benchmark_results/
 *.state
+
+# Optional research worker console captures (keep locally with frozen receipts)
+research/mamba3h/**/*.stdout
+research/mamba3h/**/*.stderr

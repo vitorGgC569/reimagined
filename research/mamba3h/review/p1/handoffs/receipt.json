@@ -1,0 +1,56 @@
+{
+  "peer_receipts": [
+    {
+      "folder": "algebra/p1_checks",
+      "manifest_path": "manifest.json",
+      "manifest_sha256": "539e8ddb6988bd55a85acdc2b5200e43491fd3fca2719f691e1a7f852ac99076",
+      "files_verified": 8,
+      "aggregate_sha256": null
+    },
+    {
+      "folder": "memory/p1_checks",
+      "manifest_path": "manifest.json",
+      "manifest_sha256": "e5f89a64ec35145bb95462ada9c9408f6c4d2099108cdfac496f77489f7ee5ae",
+      "files_verified": 10,
+      "aggregate_sha256": null
+    },
+    {
+      "folder": "benchmarks/p1_positive",
+      "manifest_path": "manifests/SHA256.json",
+      "manifest_sha256": "776d83b43508ae816a617cc1231da7a6de70cbfb0059860b9b8562592b74851b",
+      "files_verified": 33,
+      "aggregate_sha256": "0534f00e6da00c373e3aeef622194eebe4865a9dceb113c0d38374928532b934"
+    }
+  ],
+  "old_root2_files_verified": 322,
+  "old_manifest_sha256": "fd72ca8887958f56f435d53876f2050ee84f59d1f784a7def9bcba6fa3943d8e",
+  "shared_baseline_drift": [
+    {
+      "path": "OXN/nsos/src/mamba3_layer.cpp",
+      "frozen_sha256": "102ef8f789e93d600bf3df8d3de233988665347f8a086f7dd58aa97e4232bb14",
+      "current_sha256": "7f4f07b709eb0c6bcdf4b59be9b5afb95345940ca6955deaa73a5188480b9a60"
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/nsos_ext.cp312-win_amd64.pyd",
+      "frozen_sha256": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+      "current_sha256": "8987a6e56eaf433a1d4e1a0609a700b515e591d7bfe94080cb63695d3bf4a434"
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/test_mamba3_layer.exe",
+      "frozen_sha256": "295274404b9227940e0e21b7a6bcb03f0ad88092927cb9422f2381ff6de62e48",
+      "current_sha256": "20141a52b50b9834edf45bd64d84fba9eedbab19d1eac7d197114b4744ec3f1e"
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/test_mamba3_integral_reference.exe",
+      "frozen_sha256": "71dd9f88a839a4fe4a6db317d33e6cdefe5b92ae3b9d13052e97f2fa9f7ccfc5",
+      "current_sha256": "b097acf3a4695157374118c2ea562f808da077494501a0d68262fc05ca5d8d4a"
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/mamba3_math_oracle_probe.exe",
+      "frozen_sha256": "ffe32a493348683d80606f7389f574b1e53238357edc3b2cb58aafe2bbd34e21",
+      "current_sha256": "dfb437aa5f2b44813311b0501ea72abd4c5784bb767ce79e187fcb5a2a64f717"
+    }
+  ],
+  "private_exact_provider_verified": true,
+  "no_original_files_edited": true
+}

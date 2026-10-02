@@ -1,0 +1,8 @@
+{
+  "receipt": "learned_results_initial.json",
+  "status": "preserved_preliminary_run_superseded_for_thread_import_order_and_counter_instrumentation",
+  "reason": "Initial package __init__ imported Torch before runner set process-local thread environment. Torch runtime threads were 2; pre-import thread environment was not guaranteed. Lazy package import fixes the ordering. All initial jobs are preserved, no outcome-based selection.",
+  "original_slots_sha256": "8fb8730d0c77824bd616b0f8e8063b402554ef461aeacf819e74b10504a32df2",
+  "original_learned_trial_sha256": "d3ac9bef12e8a6b12442db40b865b7648c86e853db76047ae22498464bfcc583",
+  "protocol_sha256": "f72b46d15d02ef3ae86d2b0a15c5971ba933a711310569283f1e05824b9816ff"
+}

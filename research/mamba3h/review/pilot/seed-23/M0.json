@@ -1,0 +1,48 @@
+{
+  "status": "completed",
+  "seed": 23,
+  "arm": "M0",
+  "label": "actual_native_frozen_backbone_adapter_P0",
+  "updates": 20,
+  "elapsed_seconds": 0.09618749999208376,
+  "loss_first": 8.865538597106934,
+  "loss_last": 2.2415390014648438,
+  "grad_norm_max": 38.417327880859375,
+  "grad_norm_p99": 37.64044021606445,
+  "trainable_parameters": 54,
+  "trainable_bytes": 216,
+  "persistent_buffer_bytes": 0,
+  "evaluations": {
+    "validation": {
+      "accuracy": 0.140625,
+      "correct": 18,
+      "total": 128,
+      "latency_seconds": 0.0015657999902032316,
+      "retrieval": {},
+      "aux_state_bytes_per_eval_batch": 0,
+      "cache_bytes_estimate": 0,
+      "state_norm_max": 0
+    },
+    "test": {
+      "accuracy": 0.15234375,
+      "correct": 39,
+      "total": 256,
+      "latency_seconds": 0.003416399995330721,
+      "retrieval": {},
+      "aux_state_bytes_per_eval_batch": 0,
+      "cache_bytes_estimate": 0,
+      "state_norm_max": 0
+    }
+  },
+  "parameters_ever_nonzero_gradient": 54,
+  "native_frozen_parameters": 3340,
+  "native_persistent_state_bytes_per_example": 5408,
+  "feature_cache_bytes": {
+    "train": 65536,
+    "validation": 32768,
+    "test": 65536
+  },
+  "routing": "visible causal metadata, no learned gates",
+  "native_backbone_frozen": true,
+  "full_compute_matched": false
+}

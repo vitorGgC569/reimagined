@@ -1,0 +1,27 @@
+{
+  "schema": "algebra-p1-exact-known-control-v1",
+  "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E",
+  "created_utc": "2026-10-02T03:12:04.102958+00:00",
+  "device": "CPU",
+  "max_threads": 2,
+  "learned": false,
+  "optimizer_updates": 0,
+  "files": {
+    "exact_entity.py": "43008ba9c9f7d4d246eb790b628dcee90e2dadbd5b6206e67c39298f05280087",
+    "test_exact_entity.py": "336a020f2c0874be9b674fbc4966d0313b819e1f9d6473984de603d7ca979d20",
+    "run_checks.py": "1baabfadaac60960fbbfe0a73bf8e16b2e7c2bc4d41c67b9a4c7ad034d0a8681",
+    "protocol.json": "cc966ebb38eba41d5014131672097f1926406366d9f1456d20807ef85839b920",
+    "HANDOFF.md": "754ba20bd0307d2923c1fdd6a15f852f4336d306b0806d9913ec71330c3c9763",
+    "freeze.py": "24220b6645324c46c878d718ec31a237efeb2a76885da0768350ac1a644daa5f",
+    "results.json": "105a5146df91cff727d3b881fefcfaead394f2b138516c51c08f6713646bea52",
+    "tests.log": "30ce2b134521fc4184a97ebc44cac94ca291bfc21789dc0c9d74039c15327808"
+  },
+  "read_only_dependencies": {
+    "research/mamba3h/benchmarks/oracle.py": "c1af6f8962897a3687670849765591d69cfb57247ca06467484cae48ea09705e",
+    "research/mamba3h/benchmarks/schema.py": "73091e5c688cf3ab35e9fdc9033ddeebc693e050b1806405a11704b4a798d501",
+    "research/mamba3h/benchmarks/generation.py": "ec8a74cf0b7ea15c81fc6c63a631274a5cd01f252eef6bfd564e7159acccbc7d",
+    "research/mamba3h/benchmarks/__init__.py": "a2a393216271a6d9ae6150b64358b9bf3891642aa474fb96df3a532c0a555a2d",
+    "research/mamba3h/algebra/HANDOFF.md": "61e8a6a70ca9fffdd857a5f352b00fc29e6fa38f060122e425de5b204bf543d4",
+    "research/mamba3h/algebra/manifest.json": "7a389aac8f7d54fef77344b6b8c9ef1704235586b40799d56e2f58a1c80ed43d"
+  }
+}

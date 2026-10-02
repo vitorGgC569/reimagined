@@ -1,0 +1,20 @@
+{
+  "scope": "independent archive review, no learned run or old evidence change",
+  "files": [
+    {
+      "path": "integration/archive_review/verify_baseline.py",
+      "bytes": 4952,
+      "sha256": "eea4000a2e4021c62cd881a87e5e4e6b0c208d39b0e3464ee1fcddd68c295c55"
+    },
+    {
+      "path": "review/archive_review/receipt.json",
+      "bytes": 7679,
+      "sha256": "2409b62f1adbd31239ca742b9a995cc48654d7438caf0c0cb7078441516c01fc"
+    },
+    {
+      "path": "review/archive_review/HANDOFF.md",
+      "bytes": 937,
+      "sha256": "4ad0f8117fad872e8723aafc37481f9dbfd9028aa57fcd9286a18298b03216d2"
+    }
+  ]
+}

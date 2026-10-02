@@ -1,0 +1,493 @@
+{
+  "rows": [
+    {
+      "arm": "M0",
+      "accuracy_mean": 0.1546875,
+      "accuracy_by_seed": [
+        0.1328125,
+        0.15234375,
+        0.17578125,
+        0.13671875,
+        0.17578125
+      ],
+      "trainable_parameters": 54,
+      "effective_gradient_parameter_count_by_seed": [
+        54,
+        54,
+        54,
+        54,
+        54
+      ],
+      "native_frozen_parameters": 3340,
+      "native_state_bytes_per_example": 5408,
+      "aux_state_bytes_per_example": 0,
+      "test_latency_seconds_mean": 0.003530199988745153,
+      "state_norm_max": 0,
+      "preclip_gradient_norm_max": 50.76169204711914,
+      "retrieval_by_seed": [
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "peak_cache_bytes_estimate": 0
+    },
+    {
+      "arm": "M1",
+      "accuracy_mean": 0.17265625,
+      "accuracy_by_seed": [
+        0.1640625,
+        0.19921875,
+        0.109375,
+        0.21484375,
+        0.17578125
+      ],
+      "trainable_parameters": 224,
+      "effective_gradient_parameter_count_by_seed": [
+        224,
+        224,
+        224,
+        224,
+        224
+      ],
+      "native_frozen_parameters": 3340,
+      "native_state_bytes_per_example": 5408,
+      "aux_state_bytes_per_example": 32,
+      "test_latency_seconds_mean": 0.07573579999152572,
+      "state_norm_max": 671.3408813476562,
+      "preclip_gradient_norm_max": 222.96585083007812,
+      "retrieval_by_seed": [
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "peak_cache_bytes_estimate": 0
+    },
+    {
+      "arm": "M2",
+      "accuracy_mean": 0.17109375,
+      "accuracy_by_seed": [
+        0.15625,
+        0.12109375,
+        0.2265625,
+        0.14453125,
+        0.20703125
+      ],
+      "trainable_parameters": 337,
+      "effective_gradient_parameter_count_by_seed": [
+        182,
+        182,
+        182,
+        182,
+        182
+      ],
+      "native_frozen_parameters": 3340,
+      "native_state_bytes_per_example": 5408,
+      "aux_state_bytes_per_example": 468,
+      "test_latency_seconds_mean": 0.240219019993674,
+      "state_norm_max": 110.67727661132812,
+      "preclip_gradient_norm_max": 50.29291915893555,
+      "retrieval_by_seed": [
+        {
+          "reads": 256,
+          "similarity_evaluations": 239,
+          "similarity_madds": 1912,
+          "topk_calls": 239,
+          "value_reads": 239,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 276,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 226,
+          "similarity_madds": 1808,
+          "topk_calls": 226,
+          "value_reads": 226,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 287,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 223,
+          "similarity_madds": 1784,
+          "topk_calls": 223,
+          "value_reads": 223,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 282,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 235,
+          "similarity_madds": 1880,
+          "topk_calls": 235,
+          "value_reads": 235,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 286,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 235,
+          "similarity_madds": 1880,
+          "topk_calls": 235,
+          "value_reads": 235,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 284,
+          "revocations": 64
+        }
+      ],
+      "peak_cache_bytes_estimate": 1116
+    },
+    {
+      "arm": "M3",
+      "accuracy_mean": 0.165625,
+      "accuracy_by_seed": [
+        0.140625,
+        0.21484375,
+        0.11328125,
+        0.1796875,
+        0.1796875
+      ],
+      "trainable_parameters": 507,
+      "effective_gradient_parameter_count_by_seed": [
+        352,
+        352,
+        352,
+        352,
+        352
+      ],
+      "native_frozen_parameters": 3340,
+      "native_state_bytes_per_example": 5408,
+      "aux_state_bytes_per_example": 500,
+      "test_latency_seconds_mean": 0.3256754800095223,
+      "state_norm_max": 671.9789428710938,
+      "preclip_gradient_norm_max": 222.59228515625,
+      "retrieval_by_seed": [
+        {
+          "reads": 256,
+          "similarity_evaluations": 239,
+          "similarity_madds": 1912,
+          "topk_calls": 239,
+          "value_reads": 239,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 276,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 226,
+          "similarity_madds": 1808,
+          "topk_calls": 226,
+          "value_reads": 226,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 287,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 223,
+          "similarity_madds": 1784,
+          "topk_calls": 223,
+          "value_reads": 223,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 282,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 235,
+          "similarity_madds": 1880,
+          "topk_calls": 235,
+          "value_reads": 235,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 286,
+          "revocations": 64
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 235,
+          "similarity_madds": 1880,
+          "topk_calls": 235,
+          "value_reads": 235,
+          "writes": 512,
+          "evictions": 0,
+          "overwrites": 284,
+          "revocations": 64
+        }
+      ],
+      "peak_cache_bytes_estimate": 1116
+    },
+    {
+      "arm": "MA",
+      "accuracy_mean": 0.17734375,
+      "accuracy_by_seed": [
+        0.1484375,
+        0.17578125,
+        0.203125,
+        0.19140625,
+        0.16796875
+      ],
+      "trainable_parameters": 337,
+      "effective_gradient_parameter_count_by_seed": [
+        182,
+        182,
+        182,
+        182,
+        182
+      ],
+      "native_frozen_parameters": 3340,
+      "native_state_bytes_per_example": 5408,
+      "aux_state_bytes_per_example": 468,
+      "test_latency_seconds_mean": 0.30401054000249134,
+      "state_norm_max": 144.19570922851562,
+      "preclip_gradient_norm_max": 48.757362365722656,
+      "retrieval_by_seed": [
+        {
+          "reads": 256,
+          "similarity_evaluations": 1017,
+          "similarity_madds": 8136,
+          "topk_calls": 256,
+          "value_reads": 256,
+          "writes": 1024,
+          "evictions": 768,
+          "overwrites": 0,
+          "revocations": 0
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 1015,
+          "similarity_madds": 8120,
+          "topk_calls": 256,
+          "value_reads": 256,
+          "writes": 1024,
+          "evictions": 768,
+          "overwrites": 0,
+          "revocations": 0
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 1012,
+          "similarity_madds": 8096,
+          "topk_calls": 256,
+          "value_reads": 256,
+          "writes": 1024,
+          "evictions": 768,
+          "overwrites": 0,
+          "revocations": 0
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 1014,
+          "similarity_madds": 8112,
+          "topk_calls": 256,
+          "value_reads": 256,
+          "writes": 1024,
+          "evictions": 768,
+          "overwrites": 0,
+          "revocations": 0
+        },
+        {
+          "reads": 256,
+          "similarity_evaluations": 1015,
+          "similarity_madds": 8120,
+          "topk_calls": 256,
+          "value_reads": 256,
+          "writes": 1024,
+          "evictions": 768,
+          "overwrites": 0,
+          "revocations": 0
+        }
+      ],
+      "peak_cache_bytes_estimate": 1248
+    },
+    {
+      "arm": "MC",
+      "accuracy_mean": 0.1671875,
+      "accuracy_by_seed": [
+        0.171875,
+        0.1640625,
+        0.140625,
+        0.18359375,
+        0.17578125
+      ],
+      "trainable_parameters": 224,
+      "effective_gradient_parameter_count_by_seed": [
+        224,
+        224,
+        224,
+        224,
+        224
+      ],
+      "native_frozen_parameters": 3340,
+      "native_state_bytes_per_example": 5408,
+      "aux_state_bytes_per_example": 32,
+      "test_latency_seconds_mean": 0.06681945999152958,
+      "state_norm_max": 696.4592895507812,
+      "preclip_gradient_norm_max": 247.81570434570312,
+      "retrieval_by_seed": [
+        {},
+        {},
+        {},
+        {},
+        {}
+      ],
+      "peak_cache_bytes_estimate": 0
+    }
+  ],
+  "conditioning_and_constant_controls": [
+    {
+      "seed": 11,
+      "train_majority_class": 1,
+      "train_selected_constant_test_accuracy": 0.19140625,
+      "uniform_6_class_reference": 0.16666666666666666,
+      "test_label_counts": {
+        "0": 50,
+        "1": 49,
+        "2": 38,
+        "3": 44,
+        "4": 39,
+        "125": 36
+      },
+      "native_feature_max_abs": {
+        "train": 85.48124694824219,
+        "validation": 94.1893310546875,
+        "test": 88.9121322631836
+      },
+      "native_feature_norm_p99": {
+        "train": 122.65119934082031,
+        "validation": 120.55010223388672,
+        "test": 123.63628387451172
+      }
+    },
+    {
+      "seed": 23,
+      "train_majority_class": 1,
+      "train_selected_constant_test_accuracy": 0.1328125,
+      "uniform_6_class_reference": 0.16666666666666666,
+      "test_label_counts": {
+        "0": 40,
+        "1": 34,
+        "2": 46,
+        "3": 58,
+        "4": 37,
+        "125": 41
+      },
+      "native_feature_max_abs": {
+        "train": 52.87557601928711,
+        "validation": 55.184974670410156,
+        "test": 54.582401275634766
+      },
+      "native_feature_norm_p99": {
+        "train": 93.36209106445312,
+        "validation": 95.86445617675781,
+        "test": 88.75750732421875
+      }
+    },
+    {
+      "seed": 37,
+      "train_majority_class": 0,
+      "train_selected_constant_test_accuracy": 0.1484375,
+      "uniform_6_class_reference": 0.16666666666666666,
+      "test_label_counts": {
+        "0": 38,
+        "1": 52,
+        "2": 39,
+        "3": 34,
+        "4": 46,
+        "125": 47
+      },
+      "native_feature_max_abs": {
+        "train": 11.129327774047852,
+        "validation": 10.462430000305176,
+        "test": 10.889144897460938
+      },
+      "native_feature_norm_p99": {
+        "train": 16.129648208618164,
+        "validation": 16.335107803344727,
+        "test": 15.8020658493042
+      }
+    },
+    {
+      "seed": 53,
+      "train_majority_class": 0,
+      "train_selected_constant_test_accuracy": 0.12890625,
+      "uniform_6_class_reference": 0.16666666666666666,
+      "test_label_counts": {
+        "0": 33,
+        "1": 55,
+        "2": 46,
+        "3": 39,
+        "4": 47,
+        "125": 36
+      },
+      "native_feature_max_abs": {
+        "train": 5.319873809814453,
+        "validation": 5.47184944152832,
+        "test": 5.349885940551758
+      },
+      "native_feature_norm_p99": {
+        "train": 9.73112964630127,
+        "validation": 9.714349746704102,
+        "test": 9.79494571685791
+      }
+    },
+    {
+      "seed": 71,
+      "train_majority_class": 0,
+      "train_selected_constant_test_accuracy": 0.1796875,
+      "uniform_6_class_reference": 0.16666666666666666,
+      "test_label_counts": {
+        "0": 46,
+        "1": 42,
+        "2": 41,
+        "3": 49,
+        "4": 50,
+        "125": 28
+      },
+      "native_feature_max_abs": {
+        "train": 40.53193283081055,
+        "validation": 40.809051513671875,
+        "test": 39.685516357421875
+      },
+      "native_feature_norm_p99": {
+        "train": 74.45691680908203,
+        "validation": 73.66446685791016,
+        "test": 73.36910247802734
+      }
+    }
+  ],
+  "interaction": {
+    "mean": -0.0234375,
+    "by_seed": [
+      -0.046875,
+      0.046875,
+      -0.046875,
+      -0.04296875,
+      -0.02734375
+    ],
+    "interval_95_t_df4": [
+      -0.07325596632082707,
+      0.026380966320827058
+    ]
+  },
+  "learned_wall_seconds": 139.64336619980168,
+  "memory_caveat": "Entity-scoped top-k1 often has a single candidate; Q/K scoring gradients may be zero. Gates unused. This pilot does not establish learned addressing.",
+  "algebra_caveat": "Auxiliary global state per example, not entity-scoped group state or native transition. NOOP has identity homogeneous operator and visible input injection.",
+  "matching": "M1/MC equal raw parameter count; M2/MA same initialized modules and capacity. M3/M0 counts/active state/compute differ. No matched whole-grid compute claim.",
+  "conditioning_caveat": "Native outputs are unnormalized, and large additive states/preclip gradients were observed. No post-test conditioning or update retuning was performed."
+}

@@ -58,14 +58,17 @@ inline std::size_t phase_size(const Shape& s) {return std::size_t(s.batch)*s.hea
 inline std::size_t readout_size(const Shape& s) {return std::size_t(s.batch)*s.heads*s.sequence*s.rank*s.head_dim;}
 inline std::size_t scratch_per_head(const Shape& s) {return std::size_t(s.head_dim)*s.state_dim+3*s.rank*s.state_dim+2*s.rank*s.head_dim+s.rotary_pairs;}
 template<class T> struct State {T *phase=nullptr,*ssm=nullptr,*k=nullptr,*v=nullptr;};
-enum class GpuProvider { DenseReference, ParallelFp32, FlashFp32, FlashFp32ReplayLdsV2 };
-inline bool is_flash_provider(GpuProvider p) {return p==GpuProvider::FlashFp32||p==GpuProvider::FlashFp32ReplayLdsV2;}
+enum class GpuProvider { DenseReference, ParallelFp32, FlashFp32, FlashFp32ReplayLdsV2, FlashFp32HierarchicalV1 };
+inline bool is_flash_provider(GpuProvider p) {return p==GpuProvider::FlashFp32||p==GpuProvider::FlashFp32ReplayLdsV2||p==GpuProvider::FlashFp32HierarchicalV1;}
+inline bool is_hierarchical_provider(GpuProvider p) {return p==GpuProvider::FlashFp32HierarchicalV1;}
+inline bool is_replay_lds_provider(GpuProvider p) {return p==GpuProvider::FlashFp32ReplayLdsV2||is_hierarchical_provider(p);}
 inline GpuProvider gpu_provider_from_environment() {
     const char* value=std::getenv("NSOS_MAMBA3_GPU_PROVIDER");
     const std::string mode=value?value:"dense_reference";
     if(mode=="dense_reference") return GpuProvider::DenseReference;
     if(mode=="parallel_fp32_v1") return GpuProvider::ParallelFp32;
     if(mode=="flash_fp32_v1") return GpuProvider::FlashFp32;
+    if(mode=="flash_fp32_hierarchical_v1") return GpuProvider::FlashFp32HierarchicalV1;
     if(mode=="flash_fp32_replay_lds_v2") return GpuProvider::FlashFp32ReplayLdsV2;
     throw std::invalid_argument("Unknown NSOS_MAMBA3_GPU_PROVIDER: "+mode);
 }
@@ -80,7 +83,14 @@ inline bool parallel_eligible(const Shape& s) {
     const auto count=std::size_t(s.batch)*s.heads*s.sequence,lim=std::size_t(std::numeric_limits<int>::max());
     return eligible(s)&&count<=lim/coefficient_fields&&count<=lim/token_layout(s).total&&count<=lim/(2*s.rank*s.state_dim)&&count<=lim/(s.rank*s.head_dim)&&count<=lim/s.rotary_pairs;
 }
-template<class T> struct Trace {T *history=nullptr,*q=nullptr,*k=nullptr,*phase=nullptr,*readout=nullptr;bool parallel=false,checkpoints=false;T* coefficients=nullptr;bool replay_lds=false;};
+// Arity32 inclusive summary tree: Q + ceil(Q/32) + ... (last length <=32) nodes per PN cell.
+inline std::size_t hierarchy_nodes_per_cell(const Shape& s) {
+    std::size_t q=(s.sequence+parallel_tile-1)/parallel_tile,total=q;
+    while(q>parallel_tile) {q=(q+parallel_tile-1)/parallel_tile;total+=q;}return total;
+}
+inline std::size_t hierarchy_elements(const Shape& s) {return std::size_t(s.batch)*s.heads*s.head_dim*s.state_dim*hierarchy_nodes_per_cell(s);}
+inline bool hierarchical_eligible(const Shape& s) {return parallel_eligible(s)&&hierarchy_elements(s)<=std::size_t(std::numeric_limits<int>::max());}
+template<class T> struct Trace {T *history=nullptr,*q=nullptr,*k=nullptr,*phase=nullptr,*readout=nullptr;bool parallel=false,checkpoints=false;T* coefficients=nullptr;bool replay_lds=false;bool hierarchical=false;float* hierarchy_a=nullptr;float* hierarchy_b=nullptr;};
 struct BackwardWorkspace {
     float *gy=nullptr,*token_parameters=nullptr,*bc=nullptr,*phase=nullptr,*reverse=nullptr;
     float *dz=nullptr,*dx=nullptr,*ddt=nullptr,*da=nullptr,*dtrap=nullptr;

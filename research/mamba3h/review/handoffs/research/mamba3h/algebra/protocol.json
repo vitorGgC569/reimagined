@@ -1,0 +1,19 @@
+{
+  "scope": "isolated_algebra_operator_fit_NOT_Mamba3H",
+  "baseline_commit": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "device": "CPU", "threads": 2,
+  "paired_seeds": [11, 23, 37, 53, 71],
+  "ranks": [1, 2, 4], "arms": ["noncommuting", "commuting"],
+  "dim": 5, "operations": 10,
+  "optimizer": "Adam", "learning_rate": 0.08,
+  "updates": 60, "hyperparameter_settings": 1,
+  "fit_probes_per_operator": 32, "evaluation_probes_per_operator": 64,
+  "probe_seed_offsets": {"fit": 1000, "eval": 2000, "sequence": 3000},
+  "evaluation_sequences": 64, "sequence_length": 8,
+  "job_wall_seconds": 15, "aggregate_learned_wall_seconds": 180,
+  "stop": "nonfinite immediately; timeout censors cell; preserve every cell; no test selection",
+  "tolerances": {"fp64_exact_atol": 2e-12, "fp64_vjp_atol": 1e-11},
+  "closure": {"small_dim": 5, "large_dim": 64, "length": 24, "probes": 32, "recompression_rank": 4},
+  "native": "read-only CPU provider; no recurrence port or adapter integration claimed",
+  "prepared_unattempted": ["integrated factorial trials", "cross-group transfer", "GPU", "language/SOTA"]
+}

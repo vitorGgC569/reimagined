@@ -1,0 +1,29 @@
+{
+  "passed": true,
+  "unit_tests": 79,
+  "failures": 0,
+  "errors": 0,
+  "runs": [
+    {
+      "module": "research.mamba3h.algebra.test_algebra",
+      "expected_tests": 9,
+      "returncode": 0
+    },
+    {
+      "module": "research.mamba3h.memory.test_slots",
+      "expected_tests": 20,
+      "returncode": 0
+    },
+    {
+      "module": "research.mamba3h.benchmarks.tests",
+      "expected_tests": 50,
+      "returncode": 0
+    }
+  ],
+  "elapsed_seconds": 5.9987493000226095,
+  "pilot_episodes_verified": 800,
+  "physical_native_empty_supported": false,
+  "copied_completed_sources": true,
+  "threads": 2,
+  "gpu_executed": false
+}

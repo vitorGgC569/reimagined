@@ -1,0 +1,237 @@
+[
+  {
+    "seed": 11,
+    "arm": "M0",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "efeee7617b6485055e86b1514e424545ccc6792e6a6ef4583e8a16f147162f17",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 11,
+    "arm": "M1",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "2fcca8714888503c78eacfde53f619f55c41f7227c21fde30a2e9a91b317e9ce",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 11,
+    "arm": "M2",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "52f764253bde7b043ee0f2d8acb66e49c6f5504ae60f1e33323923fb8d864d83",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 11,
+    "arm": "M3",
+    "status": "completed",
+    "returncode": 0,
+    "wall_seconds": 4.670059100026265
+  },
+  {
+    "seed": 11,
+    "arm": "MA",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "b35f852bc666754f2f53a79e3dbfc23086148714b20a8199be2ed27b4f564829",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 11,
+    "arm": "MC",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "69f010b5c5a92b7754f4cbf3323d43b70c761ee4da383669d667e5a9037c3176",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 23,
+    "arm": "M0",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "f9ffb1868c183151253d948913ccda715c076e74036569e6dc20aa53e0ff215f",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 23,
+    "arm": "M1",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "27d1ae1cdf68b54373c1ea2b038e114f1f297013000adfe2856e5b536ac6dd07",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 23,
+    "arm": "M2",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "17356d000e7c111bd237660edf8cd6f1984c84ae0960f85516b29545db042e8d",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 23,
+    "arm": "M3",
+    "status": "completed",
+    "returncode": 0,
+    "wall_seconds": 4.035011100000702
+  },
+  {
+    "seed": 23,
+    "arm": "MA",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "6131f69b15e6581dd54d97c39d186a7a2506a590af183ab5e352c71a7c5f8370",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 23,
+    "arm": "MC",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "7a08793863143876f1e499e3c2428fc0308f6e0f6deaee2ab6926332525bd9f6",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 37,
+    "arm": "M0",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "14101152d857f397a64c93bd7e4affac6cb89edfcc5aef3291a7e5ef0f88b00e",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 37,
+    "arm": "M1",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "bf811b95d886588d704375c7712e67f967a34053bc2043872a8f4ffaf6001f7d",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 37,
+    "arm": "M2",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "1ce02fb5425bef628eed62f443965d58105a42e60297e0ca7aa893693499bc1f",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 37,
+    "arm": "M3",
+    "status": "completed",
+    "returncode": 0,
+    "wall_seconds": 4.236519299971405
+  },
+  {
+    "seed": 37,
+    "arm": "MA",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "f125f07986f16460714114626f0f605a88abeeb8c0c915f492bfbebc89df945b",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 37,
+    "arm": "MC",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "e0e0b7cbe128345ab06ec2c42f8d8d617fb424420f4c506f14d353dbacd304a6",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 53,
+    "arm": "M0",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "0bff8ad24abaf5eea7fce141f160268c1b8119fd8c1e2dc93ccc61a4dbeee1a3",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 53,
+    "arm": "M1",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "929d3c4ee705a851c7461b3ef91cf2f207a4009228a13c532a1db15cd9ee5e18",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 53,
+    "arm": "M2",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "63aff6ccb1f2d63c1658314eb632af82bada96a46a404a29f189a2cab4e54c25",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 53,
+    "arm": "M3",
+    "status": "completed",
+    "returncode": 0,
+    "wall_seconds": 4.031393399985973
+  },
+  {
+    "seed": 53,
+    "arm": "MA",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "5630ae30818c6a0c0b3e5cc92ddb5ccc92a408ed646fd26e1f74f4cdeee4f8fc",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 53,
+    "arm": "MC",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "c0a45a2919e8684e40cead0e25310c9699f1b805e0241f9419f0e13b2a74ce8e",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 71,
+    "arm": "M0",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "df338c28cb1931a0e0899a9690cac77fdeb83350163df00b8db368f7ef401826",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 71,
+    "arm": "M1",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "f42c331aae29622849ba49d2d9c595bdf67c866e01937e9acabc335f431cb998",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 71,
+    "arm": "M2",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "5d74c4d194c0f039cdd6bab27e85061aad11f212bc280f7a6b7a24c934349b0d",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 71,
+    "arm": "M3",
+    "status": "completed",
+    "returncode": 0,
+    "wall_seconds": 4.206468899967149
+  },
+  {
+    "seed": 71,
+    "arm": "MA",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "9fc77061e89551c7ae65aa1c65e3e546d38dada8c7b50468ef61a926a29bf3c1",
+    "wall_seconds": 0.0
+  },
+  {
+    "seed": 71,
+    "arm": "MC",
+    "status": "completed",
+    "origin": "reused unchanged pilot-v1 cell",
+    "source_sha256": "549afe100f5ccdbe2bbdc4ee6d5b3ea8623a6c4dc0a102ed1a5e606847428a58",
+    "wall_seconds": 0.0
+  }
+]

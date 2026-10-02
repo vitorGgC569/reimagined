@@ -1,0 +1,37 @@
+[
+  {
+    "seed": 11,
+    "arm": "M0",
+    "status": "failed",
+    "returncode": 1,
+    "wall_seconds": 2.2642996000358835
+  },
+  {
+    "seed": 11,
+    "arm": "MC_capacity",
+    "status": "failed",
+    "returncode": 1,
+    "wall_seconds": 2.227558600017801
+  },
+  {
+    "seed": 11,
+    "arm": "M2_symbolic_address",
+    "status": "failed",
+    "returncode": 1,
+    "wall_seconds": 2.4850603999802843
+  },
+  {
+    "seed": 11,
+    "arm": "M2_anonymous_k2",
+    "status": "failed",
+    "returncode": 1,
+    "wall_seconds": 2.223570899979677
+  },
+  {
+    "seed": 11,
+    "arm": "MA_anonymous_k2",
+    "status": "failed",
+    "returncode": 1,
+    "wall_seconds": 2.3845693000475876
+  }
+]

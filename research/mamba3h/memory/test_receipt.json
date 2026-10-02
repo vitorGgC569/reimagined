@@ -1,0 +1,23 @@
+{
+  "command": [
+    "C:\\Users\\vitor\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
+    "-m",
+    "unittest",
+    "research.mamba3h.memory.test_slots",
+    "-v"
+  ],
+  "returncode": 0,
+  "elapsed_seconds": 3.072379900026135,
+  "source_sha256": {
+    "slots.py": "d71014c38df919661b629873673a16024dc6224d03a9ac11a294c20ecca6e28f",
+    "test_slots.py": "3a791def2e5c2ec9f2cb408f911602575dfe1e435955044e10ac02c2e7e767b2",
+    "__init__.py": "aee56e883d7437772c63391ed6274c9100845ee5caed3953336ffbed13d14658"
+  },
+  "thread_env": {
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "OPENBLAS_NUM_THREADS": "2",
+    "NUMEXPR_NUM_THREADS": "2"
+  },
+  "scope": "isolated_component_CPU_correctness_not_native_integration"
+}

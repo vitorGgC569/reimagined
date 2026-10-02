@@ -1,0 +1,7 @@
+{
+  "status":"failed_copied_test_import",
+  "root_tests_passed":5,
+  "reason":"Copied algebra test launched by filename omitted repository root from Python module path",
+  "resolution":"Explicit process-local PYTHONPATH to absolute repository root; rerun tests to new output directory with unchanged sources/assertions",
+  "optimizer_updates":0
+}

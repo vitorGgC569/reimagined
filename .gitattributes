@@ -13,3 +13,6 @@
 *.npy binary
 *.pth binary
 *.safetensors binary
+
+# Frozen research receipts carry SHA-256 of raw bytes; preserve their line endings.
+research/mamba3h/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

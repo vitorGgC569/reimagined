@@ -1,0 +1,16 @@
+{
+  "protocol":"P1a-frozen-checkpoint-mechanism-audit-v1",
+  "status":"declared after completed P1a test scores, before these diagnostic evaluations",
+  "analysis":"posthoc exploratory, not independent confirmatory evidence",
+  "seeds":[11,23,37,53,71],
+  "arms":["M2_symbolic_address","M2_anonymous_k2","MA_anonymous_k2"],
+  "variants":["full_checkpoint_replay","restore_initial_QK_keep_final_values_output_head","zero_retrieval_output_keep_final_head"],
+  "dataset":"unchanged P1a test only; no training or further tuning",
+  "optimizer_updates":0,
+  "purpose":"Nonzero QK gradients alone do not establish useful addressing. Test dependence on learned QK and retrieval residual with every other checkpoint tensor fixed.",
+  "metrics":["absolute accuracy","paired deltas full-minus-ablation with five-seed unadjusted t intervals","inclusion of current query entity original WRITE slot in selected topk"],
+  "route_metric_limit":"Exact WRITE slot inclusion is a proxy; native features in other tokens may carry related information. It is not a complete causal attribution of value information.",
+  "threads":2,
+  "wall_budget_seconds":60,
+  "no_selection":"Run all declared arms/seeds/variants; preserve failures; no choose-best configuration; do not revise learned outcomes."
+}

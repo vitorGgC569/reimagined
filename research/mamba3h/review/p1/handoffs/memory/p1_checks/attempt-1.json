@@ -1,0 +1,2465 @@
+{
+  "scope": "isolated_no_update_P1_memory_checks",
+  "attempt": 1,
+  "protocol_sha256": "5aef0e039d58ec584a4e720cf513a16c9ccda2460c7dcccb4bfaec6c82ee71df",
+  "source_sha256": {
+    "checks.py": "31b5eed25ed1c12d0574192ff2034a3e7b527e9626b41fcfad4550bd9e4934d2",
+    "routing.py": "394233b096a1c53ebd6c562ce9dbef1f7e5dd6f06d614667ddbc0a5dd4130590",
+    "run_checks.py": "7f46c2b1ea99ea968eb71637dfab69f1f104b68e2dcbcb9392fca67bbc511c24"
+  },
+  "frozen_before": {
+    "manifest_sha256": "376ba6fb332a77235950c9a3ad0fb41daa2f488b60c7360d60e76848417b6149",
+    "files_sha256": {
+      "__init__.py": "aee56e883d7437772c63391ed6274c9100845ee5caed3953336ffbed13d14658",
+      "HANDOFF.md": "5609e36f0442c44df80e8d13b178422eeb31684f448c2e3df4b93c813f17c841",
+      "initial_run_note.json": "485286f3f750b4de149b2bf55e2b40025fee3a72c23f3cc805c5b8457d327397",
+      "learned_results.json": "0c548e7a6386fdcff1760e3d8b637f2c4ecb21a6121ec6216439f0d00e20c977",
+      "learned_results_initial.json": "de549be738c98276339d5d0b04d539363bbb0f7e8ce582462c6916f19ab0b9d2",
+      "learned_trial.py": "55d2c25cbe5810ed498ef983ffa7e1cf91f9abfa8c23d0db8eee0e08b193490d",
+      "slots.py": "d71014c38df919661b629873673a16024dc6224d03a9ac11a294c20ecca6e28f",
+      "test_receipt.json": "60c994e8a6515a91f1a306736dd2a9a05eb540d15f578493f70165a396d90de9",
+      "test_results.log": "b43d52383ab7b29c15a750f6243a40f15874c99bbf9fa3f5ae7abd34ab66513c",
+      "test_slots.py": "3a791def2e5c2ec9f2cb408f911602575dfe1e435955044e10ac02c2e7e767b2",
+      "trial_protocol.json": "f72b46d15d02ef3ae86d2b0a15c5971ba933a711310569283f1e05824b9816ff",
+      "verify.py": "42b7249d6eb56f62352547851aa5242193d5b05032c31a3fa2d6053dfb813f6a"
+    }
+  },
+  "optimizer_updates": 0,
+  "torch_version": "2.4.1+cpu",
+  "intra_threads": 2,
+  "interop_threads": 2,
+  "preimport_thread_env": {
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "OPENBLAS_NUM_THREADS": "2",
+    "NUMEXPR_NUM_THREADS": "2"
+  },
+  "tests": {
+    "run": 10,
+    "failures": 0,
+    "errors": 0,
+    "passed": true
+  },
+  "failure_details": [],
+  "comparisons": [
+    {
+      "seed": 11,
+      "arm": "anonymous",
+      "initial_model_sha256": "dc1d11a6d111954de3a7efd009693d522158d64071c73d1c4e524ca7714675a9",
+      "final_model_sha256": "dc1d11a6d111954de3a7efd009693d522158d64071c73d1c4e524ca7714675a9",
+      "updates": 0,
+      "loss_at_initialization": 1.4031348612508714,
+      "query_candidate_count_per_sample": 3,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            2,
+            1
+          ],
+          [
+            2,
+            0
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1184,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.004200736819713931,
+          "max_abs": 0.0034342011401634434,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.003820685278585302,
+          "max_abs": 0.001077419639711828,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.10857023506459143,
+          "max_abs": 0.047806852428445554,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.081429563972743,
+          "max_abs": 0.02391840361322276,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5087127563205894,
+          "max_abs": 0.2790447540722917,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.27016028659177765,
+          "max_abs": 0.23039031754235104,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 11,
+      "arm": "symbolic_ADDRESS",
+      "initial_model_sha256": "dc1d11a6d111954de3a7efd009693d522158d64071c73d1c4e524ca7714675a9",
+      "final_model_sha256": "dc1d11a6d111954de3a7efd009693d522158d64071c73d1c4e524ca7714675a9",
+      "updates": 0,
+      "loss_at_initialization": 1.3457512364855504,
+      "query_candidate_count_per_sample": 1,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 936,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.15948224540865982,
+          "max_abs": 0.05573541033348495,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.14158616619904513,
+          "max_abs": 0.048338181880400136,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5265978321303416,
+          "max_abs": 0.2602436571690614,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2692289562253531,
+          "max_abs": 0.22961435200640742,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 0,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 11,
+      "arm": "sparse_anonymous_store_all",
+      "initial_model_sha256": "dc1d11a6d111954de3a7efd009693d522158d64071c73d1c4e524ca7714675a9",
+      "final_model_sha256": "dc1d11a6d111954de3a7efd009693d522158d64071c73d1c4e524ca7714675a9",
+      "updates": 0,
+      "loss_at_initialization": 1.3991718719958743,
+      "query_candidate_count_per_sample": 5,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 3,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          6,
+          6,
+          6
+        ],
+        "selected_indices": [
+          [
+            2,
+            4
+          ],
+          [
+            2,
+            0
+          ],
+          [
+            0,
+            3
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1344,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "SparseRetrievalAttention"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 18,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.00412052952919647,
+          "max_abs": 0.0034342011401634434,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.0034823460557566483,
+          "max_abs": 0.0009628370036867137,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.08615628249977185,
+          "max_abs": 0.02733878225430213,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.08492719014753275,
+          "max_abs": 0.021088660234096404,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.4855791052246197,
+          "max_abs": 0.2472734601674008,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2701241553324911,
+          "max_abs": 0.23070781961326542,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          5,
+          5,
+          5
+        ],
+        [
+          6,
+          6,
+          6
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 23,
+      "arm": "anonymous",
+      "initial_model_sha256": "3ab8e8f4d4bcf5174d87e0601025759bf99fdc16e9eff57055a4e8c038a6d591",
+      "final_model_sha256": "3ab8e8f4d4bcf5174d87e0601025759bf99fdc16e9eff57055a4e8c038a6d591",
+      "updates": 0,
+      "loss_at_initialization": 1.3976141982983978,
+      "query_candidate_count_per_sample": 3,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            2,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            0,
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1184,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.0053990060751776935,
+          "max_abs": 0.0025845092965952844,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.005494413281542333,
+          "max_abs": 0.0016363684427909656,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.13341145410705293,
+          "max_abs": 0.038750893958517996,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.12844504566585546,
+          "max_abs": 0.041027801349741946,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5189050235108857,
+          "max_abs": 0.28707590602287447,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.26328834170768567,
+          "max_abs": 0.20670891896440036,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 23,
+      "arm": "symbolic_ADDRESS",
+      "initial_model_sha256": "3ab8e8f4d4bcf5174d87e0601025759bf99fdc16e9eff57055a4e8c038a6d591",
+      "final_model_sha256": "3ab8e8f4d4bcf5174d87e0601025759bf99fdc16e9eff57055a4e8c038a6d591",
+      "updates": 0,
+      "loss_at_initialization": 1.4570628085819013,
+      "query_candidate_count_per_sample": 1,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 936,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.20828786055381845,
+          "max_abs": 0.06289931740140933,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.19102625983984584,
+          "max_abs": 0.07074664441522814,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5302484353106742,
+          "max_abs": 0.30114902070309496,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2622909910319641,
+          "max_abs": 0.2037742830124904,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 0,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 23,
+      "arm": "sparse_anonymous_store_all",
+      "initial_model_sha256": "3ab8e8f4d4bcf5174d87e0601025759bf99fdc16e9eff57055a4e8c038a6d591",
+      "final_model_sha256": "3ab8e8f4d4bcf5174d87e0601025759bf99fdc16e9eff57055a4e8c038a6d591",
+      "updates": 0,
+      "loss_at_initialization": 1.3754060655844544,
+      "query_candidate_count_per_sample": 5,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 3,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          6,
+          6,
+          6
+        ],
+        "selected_indices": [
+          [
+            2,
+            4
+          ],
+          [
+            0,
+            4
+          ],
+          [
+            0,
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1344,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "SparseRetrievalAttention"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 18,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.0032851976315007164,
+          "max_abs": 0.0017426427958297155,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 40,
+          "norm": 0.002507500146672964,
+          "max_abs": 0.0008049532349522783,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 40,
+          "norm": 0.11514678729467581,
+          "max_abs": 0.03822056693167151,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.1105706950335642,
+          "max_abs": 0.028304407170980022,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.504011003119435,
+          "max_abs": 0.28628641603953436,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.26155643250947463,
+          "max_abs": 0.20647880101098093,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 64,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          5,
+          5,
+          5
+        ],
+        [
+          6,
+          6,
+          6
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 37,
+      "arm": "anonymous",
+      "initial_model_sha256": "adc1b439a14bcf06d0d11cf24918740b54e001e4c0a131a449bfe4ed365b55e0",
+      "final_model_sha256": "adc1b439a14bcf06d0d11cf24918740b54e001e4c0a131a449bfe4ed365b55e0",
+      "updates": 0,
+      "loss_at_initialization": 1.500005582908721,
+      "query_candidate_count_per_sample": 3,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            0,
+            1
+          ],
+          [
+            2,
+            0
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1184,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.007967186855106344,
+          "max_abs": 0.00401795751870607,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.006753169720793848,
+          "max_abs": 0.002033628543999494,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.12585478707659994,
+          "max_abs": 0.034292511759251514,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.16391273336120302,
+          "max_abs": 0.047673950184156266,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5186167515409527,
+          "max_abs": 0.30679721677768396,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2907178612201395,
+          "max_abs": 0.22419787946531433,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 37,
+      "arm": "symbolic_ADDRESS",
+      "initial_model_sha256": "adc1b439a14bcf06d0d11cf24918740b54e001e4c0a131a449bfe4ed365b55e0",
+      "final_model_sha256": "adc1b439a14bcf06d0d11cf24918740b54e001e4c0a131a449bfe4ed365b55e0",
+      "updates": 0,
+      "loss_at_initialization": 1.584686253917316,
+      "query_candidate_count_per_sample": 1,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 936,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.2184802845940734,
+          "max_abs": 0.0824545926871645,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.24539623142348033,
+          "max_abs": 0.06895247556789498,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.6500881529289213,
+          "max_abs": 0.3803086921731386,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2919340288856297,
+          "max_abs": 0.22584022383950303,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 0,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 37,
+      "arm": "sparse_anonymous_store_all",
+      "initial_model_sha256": "adc1b439a14bcf06d0d11cf24918740b54e001e4c0a131a449bfe4ed365b55e0",
+      "final_model_sha256": "adc1b439a14bcf06d0d11cf24918740b54e001e4c0a131a449bfe4ed365b55e0",
+      "updates": 0,
+      "loss_at_initialization": 1.5029947125107344,
+      "query_candidate_count_per_sample": 5,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 3,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          6,
+          6,
+          6
+        ],
+        "selected_indices": [
+          [
+            0,
+            1
+          ],
+          [
+            2,
+            0
+          ],
+          [
+            4,
+            3
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1344,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "SparseRetrievalAttention"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 18,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.00872330618388549,
+          "max_abs": 0.00401795751870607,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 56,
+          "norm": 0.007409705355588905,
+          "max_abs": 0.0024931036243663655,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 56,
+          "norm": 0.12088184282059158,
+          "max_abs": 0.03944692527474493,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.19204339339114393,
+          "max_abs": 0.05859104335748853,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5190949356513916,
+          "max_abs": 0.3138245429945551,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2871904609292959,
+          "max_abs": 0.22320909900956443,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 80,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          5,
+          5,
+          5
+        ],
+        [
+          6,
+          6,
+          6
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 53,
+      "arm": "anonymous",
+      "initial_model_sha256": "ab9824aa2d9c796a8b3cc57e51bdd84429da28179d1e08f768f94fd0da6722f8",
+      "final_model_sha256": "ab9824aa2d9c796a8b3cc57e51bdd84429da28179d1e08f768f94fd0da6722f8",
+      "updates": 0,
+      "loss_at_initialization": 1.4646954222264499,
+      "query_candidate_count_per_sample": 3,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            2,
+            0
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1184,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.0016978060211003273,
+          "max_abs": 0.0006807229899221202,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.0016396844332177923,
+          "max_abs": 0.00040844246062734027,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.1112946627584272,
+          "max_abs": 0.03344399700346261,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.14308852937218575,
+          "max_abs": 0.06984848672980516,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5385249854375677,
+          "max_abs": 0.27591945399222745,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.29542046611248013,
+          "max_abs": 0.25065127665694587,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 53,
+      "arm": "symbolic_ADDRESS",
+      "initial_model_sha256": "ab9824aa2d9c796a8b3cc57e51bdd84429da28179d1e08f768f94fd0da6722f8",
+      "final_model_sha256": "ab9824aa2d9c796a8b3cc57e51bdd84429da28179d1e08f768f94fd0da6722f8",
+      "updates": 0,
+      "loss_at_initialization": 1.4669212774914595,
+      "query_candidate_count_per_sample": 1,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 936,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.17885800808735566,
+          "max_abs": 0.05652283635209988,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.20581911622865193,
+          "max_abs": 0.10040050533269522,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5380145657831075,
+          "max_abs": 0.29430407044602075,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2952362038188325,
+          "max_abs": 0.25053741843707455,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 0,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 53,
+      "arm": "sparse_anonymous_store_all",
+      "initial_model_sha256": "ab9824aa2d9c796a8b3cc57e51bdd84429da28179d1e08f768f94fd0da6722f8",
+      "final_model_sha256": "ab9824aa2d9c796a8b3cc57e51bdd84429da28179d1e08f768f94fd0da6722f8",
+      "updates": 0,
+      "loss_at_initialization": 1.457793837582851,
+      "query_candidate_count_per_sample": 5,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 3,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          6,
+          6,
+          6
+        ],
+        "selected_indices": [
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            4
+          ],
+          [
+            2,
+            0
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1344,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "SparseRetrievalAttention"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 18,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.0013779639477193158,
+          "max_abs": 0.0006807229899221202,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.001150979700975192,
+          "max_abs": 0.0003603826714535083,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.10003848223907337,
+          "max_abs": 0.0472832340061301,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.14588334490895027,
+          "max_abs": 0.0698949896887644,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5312563225779688,
+          "max_abs": 0.2771513361511915,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.2906617061183959,
+          "max_abs": 0.24667591920920814,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          5,
+          5,
+          5
+        ],
+        [
+          6,
+          6,
+          6
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 71,
+      "arm": "anonymous",
+      "initial_model_sha256": "0f7c71d981d2234bd107ae7df569a538312bfe7b9c8ad409760571d312893852",
+      "final_model_sha256": "0f7c71d981d2234bd107ae7df569a538312bfe7b9c8ad409760571d312893852",
+      "updates": 0,
+      "loss_at_initialization": 1.5154458543403688,
+      "query_candidate_count_per_sample": 3,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            2,
+            1
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1184,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 9,
+        "similarity_madds": 72,
+        "topk_calls": 3,
+        "topk_candidates": 9,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.006605202090563335,
+          "max_abs": 0.0037006743974149015,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.005582793549365393,
+          "max_abs": 0.0015812575157162659,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.16190863395136193,
+          "max_abs": 0.046198214906756185,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.12042532466188527,
+          "max_abs": 0.038891928257606005,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5209036210070076,
+          "max_abs": 0.26892520001948805,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.33685444732495584,
+          "max_abs": 0.2908025258548237,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 71,
+      "arm": "symbolic_ADDRESS",
+      "initial_model_sha256": "0f7c71d981d2234bd107ae7df569a538312bfe7b9c8ad409760571d312893852",
+      "final_model_sha256": "0f7c71d981d2234bd107ae7df569a538312bfe7b9c8ad409760571d312893852",
+      "updates": 0,
+      "loss_at_initialization": 1.543490170121964,
+      "query_candidate_count_per_sample": 1,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 0,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          3,
+          3,
+          3
+        ],
+        "selected_indices": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 936,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "CausalSlotMemory"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 3,
+        "similarity_madds": 24,
+        "topk_calls": 3,
+        "topk_candidates": 3,
+        "address_candidates": 0,
+        "value_reads": 3,
+        "writes": 9,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 24,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.29041027852285906,
+          "max_abs": 0.0910370946092749,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.22737593542437395,
+          "max_abs": 0.08424568724738056,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5441088981160705,
+          "max_abs": 0.32693261599182316,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.33999775002425353,
+          "max_abs": 0.2930879090353171,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 0,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          3,
+          3,
+          3
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    },
+    {
+      "seed": 71,
+      "arm": "sparse_anonymous_store_all",
+      "initial_model_sha256": "0f7c71d981d2234bd107ae7df569a538312bfe7b9c8ad409760571d312893852",
+      "final_model_sha256": "0f7c71d981d2234bd107ae7df569a538312bfe7b9c8ad409760571d312893852",
+      "updates": 0,
+      "loss_at_initialization": 1.5397109690765935,
+      "query_candidate_count_per_sample": 5,
+      "query_stats": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 3,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 576,
+        "output_madds": 192,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18,
+        "occupancy": [
+          6,
+          6,
+          6
+        ],
+        "selected_indices": [
+          [
+            4,
+            3
+          ],
+          [
+            0,
+            4
+          ],
+          [
+            2,
+            3
+          ]
+        ],
+        "parameter_bytes": 2264,
+        "state_bytes": 3042,
+        "cache_bytes_estimate": 1344,
+        "cache_bytes_kind": "tensor_workspace_estimate_not_allocator_peak",
+        "component_label": "isolated_memory_component",
+        "backend": "SparseRetrievalAttention"
+      },
+      "total_operations": {
+        "read_requests": 3,
+        "reads": 3,
+        "similarity_evaluations": 15,
+        "similarity_madds": 120,
+        "topk_calls": 3,
+        "topk_candidates": 15,
+        "address_candidates": 0,
+        "value_reads": 6,
+        "writes": 18,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 3456,
+        "output_madds": 1152,
+        "attention_madds": 48,
+        "candidate_slot_checks": 18
+      },
+      "parameter_count": 319,
+      "parameter_bytes_including_readout": 2552,
+      "state_bytes_batch3": 3042,
+      "state_bytes_per_sample": 1014,
+      "gradients": {
+        "memory.query.weight": {
+          "nonzero_elements": 24,
+          "norm": 0.002348407950264239,
+          "max_abs": 0.0015680313476922247,
+          "finite": true
+        },
+        "memory.key.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.003140388748934663,
+          "max_abs": 0.0014288460806481521,
+          "finite": true
+        },
+        "memory.value.weight": {
+          "nonzero_elements": 48,
+          "norm": 0.1698929603593841,
+          "max_abs": 0.06066721261174464,
+          "finite": true
+        },
+        "memory.output.weight": {
+          "nonzero_elements": 64,
+          "norm": 0.098055730608089,
+          "max_abs": 0.0417597387402663,
+          "finite": true
+        },
+        "memory.gates.weight": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "memory.gates.bias": {
+          "nonzero_elements": 0,
+          "norm": 0.0,
+          "max_abs": 0.0,
+          "finite": true
+        },
+        "readout.weight": {
+          "nonzero_elements": 32,
+          "norm": 0.5244470183292006,
+          "max_abs": 0.29156592461143793,
+          "finite": true
+        },
+        "readout.bias": {
+          "nonzero_elements": 4,
+          "norm": 0.3409235513215017,
+          "max_abs": 0.2936757635030071,
+          "finite": true
+        }
+      },
+      "qk_nonzero_elements": 72,
+      "dtype": "torch.float64",
+      "occupancy_by_step": [
+        [
+          1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          3,
+          3,
+          3
+        ],
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          5,
+          5,
+          5
+        ],
+        [
+          6,
+          6,
+          6
+        ]
+      ],
+      "future_current_query_slot_in_selected": false
+    }
+  ],
+  "status": "passed",
+  "frozen_after": {
+    "manifest_sha256": "376ba6fb332a77235950c9a3ad0fb41daa2f488b60c7360d60e76848417b6149",
+    "files_sha256": {
+      "__init__.py": "aee56e883d7437772c63391ed6274c9100845ee5caed3953336ffbed13d14658",
+      "HANDOFF.md": "5609e36f0442c44df80e8d13b178422eeb31684f448c2e3df4b93c813f17c841",
+      "initial_run_note.json": "485286f3f750b4de149b2bf55e2b40025fee3a72c23f3cc805c5b8457d327397",
+      "learned_results.json": "0c548e7a6386fdcff1760e3d8b637f2c4ecb21a6121ec6216439f0d00e20c977",
+      "learned_results_initial.json": "de549be738c98276339d5d0b04d539363bbb0f7e8ce582462c6916f19ab0b9d2",
+      "learned_trial.py": "55d2c25cbe5810ed498ef983ffa7e1cf91f9abfa8c23d0db8eee0e08b193490d",
+      "slots.py": "d71014c38df919661b629873673a16024dc6224d03a9ac11a294c20ecca6e28f",
+      "test_receipt.json": "60c994e8a6515a91f1a306736dd2a9a05eb540d15f578493f70165a396d90de9",
+      "test_results.log": "b43d52383ab7b29c15a750f6243a40f15874c99bbf9fa3f5ae7abd34ab66513c",
+      "test_slots.py": "3a791def2e5c2ec9f2cb408f911602575dfe1e435955044e10ac02c2e7e767b2",
+      "trial_protocol.json": "f72b46d15d02ef3ae86d2b0a15c5971ba933a711310569283f1e05824b9816ff",
+      "verify.py": "42b7249d6eb56f62352547851aa5242193d5b05032c31a3fa2d6053dfb813f6a"
+    }
+  },
+  "elapsed_seconds": 0.6998753999941982
+}

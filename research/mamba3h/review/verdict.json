@@ -1,0 +1,131 @@
+{
+  "utc": "2026-10-02T02:58:13.193734+00:00",
+  "baseline_commit": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "label": "actual_native_frozen_backbone_adapter_P0",
+  "native_equivalence": "passed",
+  "peer_correctness_tests": 79,
+  "root_independent_tests": 7,
+  "corpus_exact_episodes": 800,
+  "original_learned_jobs": 30,
+  "causal_correction_jobs": 5,
+  "failed_jobs": 0,
+  "censored_jobs": 0,
+  "learned_wall_seconds": 160.82281799975317,
+  "integrated_advantage": "not_demonstrated",
+  "component_feasibility": "supported_on_isolated_controls",
+  "fixed_rank4_closure": "rejected",
+  "whole_grid_budget_matching": "not_established",
+  "native_end_to_end": "unattempted",
+  "production_enablement": "not_recommended",
+  "order_sensitive_test_queries": 40,
+  "total_test_queries": 1280,
+  "full_5_seed_pairs": true,
+  "peer_manifests": {
+    "algebra": "7a389aac8f7d54fef77344b6b8c9ef1704235586b40799d56e2f58a1c80ed43d",
+    "memory": "376ba6fb332a77235950c9a3ad0fb41daa2f488b60c7360d60e76848417b6149",
+    "benchmarks": "b96eaf8d81820dc5aa400632704f72d150a8e93ed3ef58b2d7e707e5579b6285"
+  },
+  "corrected_paired_comparisons": {
+    "M1": {
+      "paired_count": 5,
+      "deltas": [
+        0.03125,
+        0.046875,
+        -0.06640625,
+        0.078125,
+        0.0
+      ],
+      "mean_delta": 0.01796875,
+      "interval_95_t_df4": [
+        -0.05024583907914385,
+        0.08618333907914386
+      ],
+      "five_seed_claim_allowed": true,
+      "gap_recovery": null,
+      "gap_reason": "oracle ceiling not measured"
+    },
+    "M2": {
+      "paired_count": 5,
+      "deltas": [
+        0.0234375,
+        -0.03125,
+        0.05078125,
+        0.0078125,
+        0.03125
+      ],
+      "mean_delta": 0.01640625,
+      "interval_95_t_df4": [
+        -0.021846205273425717,
+        0.054658705273425714
+      ],
+      "five_seed_claim_allowed": true,
+      "gap_recovery": null,
+      "gap_reason": "oracle ceiling not measured"
+    },
+    "M3": {
+      "paired_count": 5,
+      "deltas": [
+        -0.00390625,
+        0.05078125,
+        -0.078125,
+        0.08984375,
+        0.01953125
+      ],
+      "mean_delta": 0.015625,
+      "interval_95_t_df4": [
+        -0.06273318669847439,
+        0.09398318669847439
+      ],
+      "five_seed_claim_allowed": true,
+      "gap_recovery": null,
+      "gap_reason": "oracle ceiling not measured"
+    },
+    "MA": {
+      "paired_count": 5,
+      "deltas": [
+        0.015625,
+        0.0234375,
+        0.02734375,
+        0.0546875,
+        -0.0078125
+      ],
+      "mean_delta": 0.02265625,
+      "interval_95_t_df4": [
+        -0.005290619407931803,
+        0.0506031194079318
+      ],
+      "five_seed_claim_allowed": true,
+      "gap_recovery": null,
+      "gap_reason": "oracle ceiling not measured"
+    },
+    "MC": {
+      "paired_count": 5,
+      "deltas": [
+        0.0390625,
+        0.01171875,
+        -0.03515625,
+        0.046875,
+        0.0
+      ],
+      "mean_delta": 0.0125,
+      "interval_95_t_df4": [
+        -0.028282498658979336,
+        0.05328249865897934
+      ],
+      "five_seed_claim_allowed": true,
+      "gap_recovery": null,
+      "gap_reason": "oracle ceiling not measured"
+    }
+  },
+  "unattempted": [
+    "MQAR",
+    "group tracking learned trials",
+    "unseen ordered pairs",
+    "cross-group",
+    "rank2/4 integrated trials",
+    "native end-to-end training",
+    "GPU",
+    "pretraining",
+    "multimodal"
+  ]
+}

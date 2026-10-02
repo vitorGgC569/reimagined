@@ -1,0 +1,53 @@
+{
+  "label": "released_peer_API_snapshot",
+  "files": [
+    {
+      "owner": "algebra",
+      "source": "research\\mamba3h\\algebra\\operators.py",
+      "sha256": "1a37d9a58b6e45e2fae25a5514cf4f33135dfdc56618315054d017d0845dc2a6",
+      "bytes": 8616
+    },
+    {
+      "owner": "memory",
+      "source": "research\\mamba3h\\memory\\slots.py",
+      "sha256": "d71014c38df919661b629873673a16024dc6224d03a9ac11a294c20ecca6e28f",
+      "bytes": 14722
+    },
+    {
+      "owner": "memory",
+      "source": "research\\mamba3h\\memory\\__init__.py",
+      "sha256": "aee56e883d7437772c63391ed6274c9100845ee5caed3953336ffbed13d14658",
+      "bytes": 339
+    },
+    {
+      "owner": "benchmarks",
+      "source": "research\\mamba3h\\benchmarks\\__init__.py",
+      "sha256": "8ff33cf11190167cba9265f2b36f77aff05a287acb0807fd87745ee6af5f8adc",
+      "bytes": 463
+    },
+    {
+      "owner": "benchmarks",
+      "source": "research\\mamba3h\\benchmarks\\schema.py",
+      "sha256": "3ddae4397af0c5050ff3e8d3d26043c781abec3662b1578298a481737abc2e06",
+      "bytes": 4654
+    },
+    {
+      "owner": "benchmarks",
+      "source": "research\\mamba3h\\benchmarks\\generation.py",
+      "sha256": "ec8a74cf0b7ea15c81fc6c63a631274a5cd01f252eef6bfd564e7159acccbc7d",
+      "bytes": 8213
+    },
+    {
+      "owner": "benchmarks",
+      "source": "research\\mamba3h\\benchmarks\\oracle.py",
+      "sha256": "c1af6f8962897a3687670849765591d69cfb57247ca06467484cae48ea09705e",
+      "bytes": 3097
+    },
+    {
+      "owner": "benchmarks",
+      "source": "research\\mamba3h\\benchmarks\\protocol.py",
+      "sha256": "9bcca5d43b6bab0e6e0292c318187f10840631b99573a6538976fc7a1c18543c",
+      "bytes": 8031
+    }
+  ]
+}

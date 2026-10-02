@@ -1,0 +1,30 @@
+{
+  "schema": "mamba3h-algebra-p0-v1",
+  "baseline_commit": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "created_utc": "2026-10-02T02:42:30.384603+00:00",
+  "device": "CPU",
+  "max_threads": 2,
+  "python": "3.12.10",
+  "scope": "isolated algebra; native reference read-only; integration unattempted",
+  "files": {
+    "operators.py": "1a37d9a58b6e45e2fae25a5514cf4f33135dfdc56618315054d017d0845dc2a6",
+    "test_algebra.py": "018b7e7039230c907b79dd2fba20038a0572e13e0678d294f470ac9b3fbca0fd",
+    "run_diagnostics.py": "eabd7431f9bbb2f65a4f0cae3f110d89b9929d072fc7ef863a7a17431dc6063a",
+    "native_probe.py": "16cae3bccaa4f6ba68550cc6249e875a4b3c286ba18d36c74e83831bcd2a3571",
+    "freeze_manifest.py": "c696c0546e1f7097dcf3d81e75c1ec8e3679a306c701744128331767ba2b6d5e",
+    "protocol.json": "b9030d41674d43d8cca5473abcd356bc2f96d64e34096eb968dfe018f74897eb",
+    "results.json": "4255b2449696384a6be40f988ac891db87b3b1b2291b06ec5d457e2e95f9efa6",
+    "tests.log": "9dd1ecf8002c697ab00c6426e354312b58bb29079b4afbe44db5add125f62f54",
+    "native_receipt.json": "71e9e84e05edcba3a64f8c051fc32f18a8262583d8317cd7082ba919fcc02279",
+    "native_results.json": "7ec93caed8317e5cb4af13d295bb481dafddb94936e04779f311ddfc31c46708",
+    "native_tests.log": "4622d7f5c76725d407dfc87cf77a4bae6bd5ad3821b65f091425fe48602d03d1",
+    "HANDOFF.md": "61e8a6a70ca9fffdd857a5f352b00fc29e6fa38f060122e425de5b204bf543d4"
+  },
+  "read_only_dependencies": {
+    "research/mamba3h/PROGRAM.md": "6b1f910a1cbb3d9aaaeacaac772279bc38999676415847fbc1f065d60f5e1a08",
+    "research/mamba3h/integration/CONTRACT.md": "b528cf009d16dac7c6e7486533524954f8b4d06d5dffd72547ea404cf41ba5b0",
+    "OXN/nsos/build-gm-cpu/nsos_ext.cp312-win_amd64.pyd": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+    "OXN/nsos/tests/mamba3_validation/test_scan_recompute.py": "735bb1c63539f99e80547a95234c006f70a2d64a9ec54303fb6d8c4053f039a7",
+    "OXN/nsos/tests/mamba3_validation/mamba3_scan_oracle.py": "74156b5cb61e5669f98eacb1e9f9e05b3a3f7c3a6e0b99b2804e3fd594aad102"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E",
+  "phase": "p1_checks", "learned": false, "optimizer_updates": 0,
+  "device": "CPU", "max_threads": 2, "wall_seconds": 60,
+  "paired_seeds": [11,23,37,53,71], "splits": ["train","validation","test"],
+  "episodes_per_seed_split": 8,
+  "grid": [
+    {"entities":1,"length":12,"operations":4,"queries":4,"distractors":1,"overwrite":1,"revocations":1},
+    {"entities":3,"length":16,"operations":4,"queries":4,"distractors":2,"overwrite":1,"revocations":1}
+  ],
+  "arms": ["global","per_entity"],
+  "state_dimensions": "global5 vs per_entity5E; explicit unequal active state budget",
+  "labels": "Orin benchmarks.oracle.solve offline only; no targets in model.step",
+  "readout": "fixed linear6classes; undefined compact5 mapped to Orin125 offline",
+  "negative_controls": ["entity_interference","reverse_OP_order","ignored_overwrite","ignored_revoke","query_leakage","changed_future_and_targets"],
+  "fp64_atol": 2e-12,
+  "unattempted": ["learned fit","native integration","native architecture","NCE2E","GPU","SOTA"]
+}

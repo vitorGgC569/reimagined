@@ -1,0 +1,187 @@
+{
+  "passed": true,
+  "baseline_commit": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "source_zip_sha256": "0ed640330c4b58c0d9058a5617c96fa1029d2ad8bdcda37f5e1b1d5db37b507b",
+  "zip_commit_comment": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "source_entries": [
+    {
+      "path": "OXN/nsos/src/mamba3_layer.cpp",
+      "archive_raw_sha256": "102ef8f789e93d600bf3df8d3de233988665347f8a086f7dd58aa97e4232bb14",
+      "git_blob_bitwise_equal": true,
+      "old_checkout_sha256": "102ef8f789e93d600bf3df8d3de233988665347f8a086f7dd58aa97e4232bb14",
+      "matches_checkout_raw": true,
+      "matches_checkout_with_CRLF": false
+    },
+    {
+      "path": "OXN/nsos/include/mamba3_layer_math.h",
+      "archive_raw_sha256": "fda96a0fe1453c5f85273605fa564c8652935fa52f0d027da8a5ffae9cc7969f",
+      "git_blob_bitwise_equal": true,
+      "old_checkout_sha256": "fda96a0fe1453c5f85273605fa564c8652935fa52f0d027da8a5ffae9cc7969f",
+      "matches_checkout_raw": true,
+      "matches_checkout_with_CRLF": false
+    },
+    {
+      "path": "OXN/nsos/src/bindings.cpp",
+      "archive_raw_sha256": "9e85970c129d54aa2d8a4edc5e9dbe99803381700c5afeebcd9e945fc6335fb5",
+      "git_blob_bitwise_equal": true,
+      "old_checkout_sha256": "9e85970c129d54aa2d8a4edc5e9dbe99803381700c5afeebcd9e945fc6335fb5",
+      "matches_checkout_raw": true,
+      "matches_checkout_with_CRLF": false
+    }
+  ],
+  "archived_files_verified": 28,
+  "files": [
+    {
+      "path": "OXN/nsos/build-gm-cpu/CMakeCache.txt",
+      "bytes": 23663,
+      "sha256": "350cb1511a6f0c948b3ba9fcf145f9f8f527a4de1f5a8517ee1d0c8fb028794b"
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/nsos_core.lib",
+      "bytes": 13712880,
+      "sha256": "0aa1af218893952ca4a2033c2ce4c0ec18830796f85fc31ae957d11a0d47d944"
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/nsos_ext.cp312-win_amd64.pyd",
+      "bytes": 4693504,
+      "sha256": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f"
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/nsos_ext.lib",
+      "bytes": 1612,
+      "sha256": "3e6a4ae8050aaf7394ec8d6486541ed2046aacdf6942b3db4f540d91814ed804"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/amd_comgr.dll",
+      "bytes": 120778192,
+      "sha256": "502f18de05f5e282d97b20c692d6baededce03986acc24b1bec58378a38f060c"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/amdhip64_7.dll",
+      "bytes": 22094800,
+      "sha256": "09acfb3c48fbe0204b571250f1f8eec6ea7a0b6e7ee0771f965eefc7fa7783d7"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/CMakeCache.txt",
+      "bytes": 24635,
+      "sha256": "5102cb1afd7ef4257e67b74bf8911b78f8eb0424f954c1f4c0da723a70de3c79"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/hipblas.dll",
+      "bytes": 811984,
+      "sha256": "aea240a4f80fc40861ba91792224f9e0111eb2669399b95309f866d5787e4214"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/libhipblaslt.dll",
+      "bytes": 6546384,
+      "sha256": "e75755f50f6daffc9bbd240e04e3ea893a2eb1ff13893310d2a4534c120185b5"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/nsos_core.lib",
+      "bytes": 19067410,
+      "sha256": "05da238819a9e96e0eae2327f7f506127aeb89d4628cd5ef38ce4a27df651d68"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/nsos_ext.cp312-win_amd64.pyd",
+      "bytes": 7725568,
+      "sha256": "8212a02b9e1486e84352aaeba2c42b02072d3b775d2f4cc2b6b98f5dbb8f5060"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/nsos_ext.lib",
+      "bytes": 1612,
+      "sha256": "3e6a4ae8050aaf7394ec8d6486541ed2046aacdf6942b3db4f540d91814ed804"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/rocblas.dll",
+      "bytes": 20884432,
+      "sha256": "fe0f3ba7a91e28bb7baefeb11345a8e5b3f77e0fed47582dfa1b38224790d682"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/rocm_kpack.dll",
+      "bytes": 191952,
+      "sha256": "1c9ac51ea099f4b2eb0e216fb5e647778e6b81c4c5625de0bd71d410552d452c"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/rocsolver.dll",
+      "bytes": 23895504,
+      "sha256": "55196bb630f251c5813bf29c34ccd268790db11fa7ce746de3f12e5c9946bbaa"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_fused_dense_adam.exe",
+      "bytes": 5892608,
+      "sha256": "cf6ab629f8735a0f05b880a4d38e16afec9fd7c3900c7f25670b7cb5c09e5fa4"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_hybrid_integral.exe",
+      "bytes": 5974528,
+      "sha256": "b6396e547ca0ce34ea0777b8fcdafc80aa56b05847863ae40e8f51183dd86580"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_mamba3_parallel.exe",
+      "bytes": 2563072,
+      "sha256": "843e8da387991c8fe324a08569ef4e59c6a3a812b77dbdb8e18681c2af8e2bbc"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_mamba3_projected.exe",
+      "bytes": 2620416,
+      "sha256": "46ae8b0608f176474afb712962d1a62a29dee66799251c24059b1225429085e8"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_mamba3_projection_wmma.exe",
+      "bytes": 6046720,
+      "sha256": "df8b2b631954464e28edf2b3b02922bad91f52f7d9e5103277b4deee4e29ed4b"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_mamba3_siso.exe",
+      "bytes": 2428928,
+      "sha256": "436a3fbcaced76364ac8ec44c23aabe02e783975b03df75f96f152b5f34bfb7d"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_muon_adam_transaction.exe",
+      "bytes": 2369536,
+      "sha256": "1e4c1b4da0498d6a49cbfcf996026b1f8fff2edc531e911c1c8eec46d1fe5d39"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_muon_trainer.exe",
+      "bytes": 5880832,
+      "sha256": "61f62fdd90e2edf8b519c766e3dbd715db2e2def0858749c3269042befaf5768"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_gpu_muon_transaction.exe",
+      "bytes": 2408960,
+      "sha256": "614ad1ef8d4370504949e198441bd6168cf729b9a222b4e9ce92439817b9b098"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_mamba3_integral_reference.exe",
+      "bytes": 153088,
+      "sha256": "5408e23bb1fa75809992bf315b25d1ea89342523bfd146a3e97bd42cd6807464"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_mamba3_layer.exe",
+      "bytes": 6526464,
+      "sha256": "1bc739d98ebe1638bac3c4fe84920df0bdaca01a4529d1f1d11037344c62fb5f"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_mamba3_scan_identity.exe",
+      "bytes": 5893120,
+      "sha256": "6b2e518439161b73ff56a1af3ab4938d8ae61138ad86eb7b1c9e910dcb2d78cc"
+    },
+    {
+      "path": "OXN/nsos/build-gm-hip-gpuopt/test_muon_math.exe",
+      "bytes": 92672,
+      "sha256": "f9dda34c6849ea60039f7dd91b7276424214f15144b35bfbc6c5c02fabc8a94e"
+    }
+  ],
+  "archive_json_sha256": "491dd44fd77e0e53dd16afb86dd2e11ebd1d0b6eeab17b9096835d075afec364",
+  "private_CPU_equals_archived_original": true,
+  "CPU_sha256": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+  "HIP_sha256": "8212a02b9e1486e84352aaeba2c42b02072d3b775d2f4cc2b6b98f5dbb8f5060",
+  "HIP_loaded": false,
+  "GPU_used": false,
+  "old_P0_manifest_sha256": "fd72ca8887958f56f435d53876f2050ee84f59d1f784a7def9bcba6fa3943d8e",
+  "P1_manifest_sha256": "ee7fe95033d7653006cbabb6eafc5d05c8c5a43228d269dd41e1922c1c5b901e",
+  "old_evidence_reclassified": false,
+  "learned_updates": 0,
+  "elapsed_seconds": 0.47633029997814447,
+  "limitation": "Archive content agrees with committed sources and archived binaries; this does not certify a hermetic build. Behavioral equivalence is independently recorded in P0/P1."
+}

@@ -1,0 +1,15 @@
+{
+  "scope": "native_CPU_reference_gate_NOT_algebra_integration",
+  "gpu_executed": false,
+  "baseline_commit": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "provider": "C:\\Users\\vitor\\OneDrive\\Desktop\\OGrandeOxta\\reimagined\\OXN\\nsos\\build-gm-cpu\\nsos_ext.cp312-win_amd64.pyd",
+  "timeout_seconds": 90,
+  "source_test_sha256": "735bb1c63539f99e80547a95234c006f70a2d64a9ec54303fb6d8c4053f039a7",
+  "source_oracle_sha256": "74156b5cb61e5669f98eacb1e9f9e05b3a3f7c3a6e0b99b2804e3fd594aad102",
+  "provider_sha256_before": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+  "status": "executed",
+  "returncode": 0,
+  "elapsed_seconds": 4.424654399976134,
+  "provider_sha256_after": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+  "provider_unchanged": true
+}

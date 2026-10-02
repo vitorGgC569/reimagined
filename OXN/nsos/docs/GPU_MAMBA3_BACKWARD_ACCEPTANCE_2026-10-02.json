@@ -1,0 +1,128 @@
+{
+  "schema": "mamba3_backward_rank_lds_published_summary_v1",
+  "date": "2026-10-02",
+  "status": "locally_validated_experimental_GPU",
+  "geometry": "RX7600 D768/L16/B1/S512/N128/P64/R1/BF16/fusedAdamLR.002; synthetic",
+  "change": "Flash LDS v2 rank-sized shared dQ/dK capacities1/2/4/8; unchanged arithmetic/ABI/identity",
+  "private_paired": {
+    "pairs": [
+      {
+        "pair": 0,
+        "baseline_mean_ms": 1280.97307,
+        "candidate_mean_ms": 675.78088,
+        "baseline_fenced_mean_ms": 1280.97661,
+        "candidate_fenced_mean_ms": 675.78434
+      },
+      {
+        "pair": 1,
+        "baseline_mean_ms": 1325.42745,
+        "candidate_mean_ms": 692.98767,
+        "baseline_fenced_mean_ms": 1325.43165,
+        "candidate_fenced_mean_ms": 692.99136
+      },
+      {
+        "pair": 2,
+        "baseline_mean_ms": 1315.55747,
+        "candidate_mean_ms": 701.25067,
+        "baseline_fenced_mean_ms": 1315.56098,
+        "candidate_fenced_mean_ms": 701.25445
+      }
+    ],
+    "step_speedup_geomean": 1.8946705130080528,
+    "paired_log_t95": [
+      1.8496900582251212,
+      1.9407447949992145
+    ],
+    "baseline_steps_s": 0.7649240526413695,
+    "candidate_steps_s": 1.4492619058870382,
+    "baseline_tokens_s": 391.6411149523812,
+    "candidate_tokens_s": 742.0220958141635,
+    "state_snapshot_bytes": 524296912,
+    "state_snapshot_sha256": "4827c6ed70b17b5b5f075f933b0236814a8ec079257d0b6724a9365dc21e08c6",
+    "separate_diagnostic_phase": {
+      "baseline": {
+        "enabled": true,
+        "wall_ms": 1265.2111,
+        "forward_ms": 192.7298,
+        "backward_ms": 1041.4659,
+        "optimizer_ms": 28.8917
+      },
+      "candidate": {
+        "enabled": true,
+        "wall_ms": 704.909,
+        "forward_ms": 197.2014,
+        "backward_ms": 479.1563,
+        "optimizer_ms": 26.2765
+      }
+    }
+  },
+  "shared_production": {
+    "mean_native_ms": 686.37085,
+    "steps_s": 1.456938330058743,
+    "tokens_s": 745.9524249900765,
+    "separate_diagnostic_phase": {
+      "enabled": true,
+      "wall_ms": 705.2313,
+      "forward_ms": 189.7716,
+      "backward_ms": 488.0325,
+      "optimizer_ms": 24.8111
+    },
+    "same_private_loss_identity_state": true,
+    "single_production_timing_process_not_new_paired_interval": true
+  },
+  "tests": [
+    {
+      "name": "final-20261002-backward-rank-lds-cpu.xml",
+      "passed": 72,
+      "seconds": 35.0,
+      "sha256": "2f1a6276cb6070d843d19c6759945ba1e9a2bc4eb39606a15040b44fa9a0fc98"
+    },
+    {
+      "name": "final-20261002-backward-rank-lds-hip.xml",
+      "passed": 162,
+      "seconds": 262.0,
+      "sha256": "e5295dcb8e0ca8afd99fb305bed5c1784ebdf5f8e8af17c9adfcc80e8a610977"
+    },
+    {
+      "name": "final-20261002-backward-rank-lds-active-ranks.xml",
+      "passed": 1,
+      "seconds": 8.0,
+      "sha256": "c799b9ce3f027978544053cddda7a633f17bd5d8b7935495047daca01d18ae81"
+    }
+  ],
+  "local_product_fingerprints": {
+    "library": {
+      "filename": "nsos_core.lib",
+      "sha256": "4f449ec85e5db07840e9cd304014da42be9c82766db7c620d5077a4ece7f5e6a"
+    },
+    "production_pyd": {
+      "filename": "nsos_ext.cp312-win_amd64.pyd",
+      "sha256": "3076f3b020bccfe755b94adb9256931bff6c6a945561a2710844ff0a76efd772"
+    },
+    "production_executable": {
+      "filename": "production_driver.exe",
+      "sha256": "1df62ba2edae119f8a74f24d860bbef3eed29287de195ba35783bb22ba26e753"
+    },
+    "production_link_map": {
+      "filename": "override.map",
+      "sha256": "ecf205754591c46c8a3e8cf15bfe85c773301c6d129a01c1c690befec89f6ad8"
+    },
+    "prior_library_archive": {
+      "filename": "nsos_core.lib",
+      "sha256": "06a125fab5782833dbf8d9fd176d526e60e50a3d19a34de62cc305bf7a31f270"
+    }
+  },
+  "original_local_receipt_sha256": "2ecc7142ff1417095814e3ab771bb3b1fac72e6397eaa29abd987f118e1169a4",
+  "raw_artifacts_in_git": false,
+  "fingerprint_scope": "original local raw files/binaries; Git line-ending normalization may change source blob hashes",
+  "limits": [
+    "synthetic target performance only",
+    "production single timing process; speedup interval from private three pairs",
+    "no quality/SOTA/time-to-quality claim",
+    "GOLD576 blocked",
+    "hierarchy opt-in",
+    "GPU gradient copies remain",
+    "Mamba3H research paused"
+  ],
+  "quality_claim": false
+}

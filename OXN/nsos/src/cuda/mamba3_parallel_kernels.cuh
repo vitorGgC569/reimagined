@@ -102,7 +102,7 @@ __device__ inline float drive(Shape s,Layout l,const float* p,const float* w,Tra
         prev+=pk*pv*px;curr+=tr.k[((bh*s.sequence+t)*s.rank+r)*s.state_dim+n]*raw[s.inner()+h*s.head_dim+pp]*px;}
     return c.beta*prev+c.gamma*curr;
 }
-__host__ __device__ inline Trace<const float> constant(Trace<float> x) {return {x.history,x.q,x.k,x.phase,x.readout,x.parallel,x.checkpoints,x.coefficients,x.replay_lds};}
+__host__ __device__ inline Trace<const float> constant(Trace<float> x) {return {x.history,x.q,x.k,x.phase,x.readout,x.parallel,x.checkpoints,x.coefficients,x.replay_lds,x.hierarchical,x.hierarchy_a,x.hierarchy_b};}
 __device__ inline std::size_t history_at(Shape s,Trace<const float> tr,std::size_t bh,int t,int cell) {
     const int slots=tr.checkpoints?(s.sequence+tile-1)/tile+1:s.sequence+1;
     return (bh*slots+t)*s.head_dim*s.state_dim+cell;
@@ -325,15 +325,20 @@ __global__ void token_backward_kernel(Shape s,Layout l,const float* p,const floa
 // and right GH halos MUST be scalar-reconstructed from their own chunks:
 // affine checkpoints and scalar replay endpoints need not be bitwise equal.
 constexpr int flash_backward_t=4,flash_backward_stride=129;
-struct FlashBackwardShared {
+template<int ScratchRanks> struct FlashBackwardShared {
+    static_assert(ScratchRanks==1||ScratchRanks==2||ScratchRanks==4||ScratchRanks==8);
     float state[flash_backward_t+1][flash_backward_stride];
     float gh[flash_backward_t+1][flash_backward_stride];
-    float dq[flash_backward_t][8*lanes],dk[flash_backward_t][8*lanes];
+    float dq[flash_backward_t][ScratchRanks*lanes],dk[flash_backward_t][ScratchRanks*lanes];
     float coefficient[3][flash_backward_t][lanes];
     float red[lanes];double dred[lanes];
 };
-static_assert(sizeof(FlashBackwardShared)==45608,"Flash v2 LDS resource contract changed");
-__global__ __launch_bounds__(lanes) void flash_token_backward_kernel(Shape s,Layout l,const float* p,const float* w,const int* valid,
+static_assert(sizeof(FlashBackwardShared<1>)==16936);
+static_assert(sizeof(FlashBackwardShared<2>)==21032);
+static_assert(sizeof(FlashBackwardShared<4>)==29224);
+static_assert(sizeof(FlashBackwardShared<8>)==45608);
+using FlashBackwardSharedMaximum=FlashBackwardShared<8>;
+template<int ScratchRanks> __global__ __launch_bounds__(lanes) void flash_token_backward_kernel(Shape s,Layout l,const float* p,const float* w,const int* valid,
         State<const float> initial,Trace<const float> tr,State<const float> seed,State<float> di,
         BackwardWorkspace ws,float* status) {
     const int ttiles=(s.sequence+flash_backward_t-1)/flash_backward_t;
@@ -341,7 +346,7 @@ __global__ __launch_bounds__(lanes) void flash_token_backward_kernel(Shape s,Lay
     const int N=s.state_dim,P=s.head_dim,R=s.rank,len=valid[b];
     if(len<0||len>s.sequence||tbase>=len) return; // CTA-uniform, including poison padding.
     const int count=std::min(flash_backward_t,len-tbase),begin=tbase/tile*tile,end=std::min(begin+tile,len);
-    __shared__ FlashBackwardShared shared;
+    __shared__ FlashBackwardShared<ScratchRanks> shared;
     float* red=shared.red;double* dred=shared.dred;
     const auto ll=local_layout(s);
     for(int localt=0;localt<count;++localt) {

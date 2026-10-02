@@ -2,6 +2,33 @@
 
 ## Current Position
 
+### Mamba-3 integrated parallel/Flash backward checkpoint — 2026-10-02
+
+The newer integrated block supports SISO/MIMO, tile-parallel forward/backward,
+Flash LDS replay v2, BF16/FP16 projections with FP32 controltail, native fused
+Adam and Muon paths. This supersedes the standalone-only status of the earlier
+September 30 entries below. It does not promote GPU to a supported product.
+
+Rank-sized Flash backward LDS capacities1/2/4/8 preserve arithmetic order and
+shrink SISO shared scratch from45608 to16936 bytes. Three private paired fresh
+processes on RX7600 measured1.89467x whole-step speedup [1.84969,1.94074] at
+D768/L16/B1/S512/N128/P64/R1, BF16 projections, fused AdamLR.002, synthetic
+vocab257 data. Shared no-override execution measured1.456938steps/s745.952tok/s;
+separate timing1 diagnostic backward488.033ms. All524296912 authoritative
+state snapshot bytes match the private baseline after13 commits.
+
+Latest shared HIP162/162, CPU72/72 and strengthened active/empty odd-rank GPU
+regression pass. These are correctness and scoped performance results, not
+general language quality, cross-hardware certification or SOTA evidence.
+Four original lowp-vs-FP32 GOLD comparisons still fail; GOLD576 remains blocked.
+Hierarchical interchunk transport remains experimental opt-in because measured
+target probes regressed. The archived ABI64 profiler cannot link to this ABI80
+build; its rejected negative HIP event is not an accepted timing trace.
+
+See [rank-LDS implementation and evidence](GPU_MAMBA3_BACKWARD_RANK_LDS_2026-10-02.md),
+[portable acceptance summary](GPU_MAMBA3_BACKWARD_ACCEPTANCE_2026-10-02.json), and
+[product closure assessment](PRODUCT_ASSESSMENT_2026-10-02.md).
+
 ### Mamba-3 SISO RDNA boundary replay and owning tape — 2026-09-30
 
 Post-BCNorm SISO FP32 forward/backward now runs on gfx1102 with explicit

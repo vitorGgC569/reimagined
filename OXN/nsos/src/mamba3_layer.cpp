@@ -80,6 +80,8 @@ struct Mamba3Tape::Impl {
     Tensor adjoint,dmixed,dprojection,partial,dcore,scratch,din_weight,dout_weight,dinput;
     mb::GpuProvider gpu_provider=mb::GpuProvider::DenseReference;
     Tensor gy,token_parameters,bc_gradient,phase_gradient,reverse,dz,dx_value,ddt,da,dtrap,coefficients;
+    // Scratch belongs to the consumed tape; backward reuses it, not primal data.
+    mutable Tensor hierarchy_a,hierarchy_b;
     mb::BackwardWorkspace backward_workspace() {return {gy.raw_data(),token_parameters.raw_data(),bc_gradient.raw_data(),phase_gradient.raw_data(),reverse.raw_data(),dz.raw_data(),dx_value.raw_data(),ddt.raw_data(),da.raw_data(),dtrap.raw_data()};}
     Mamba3State initial,final,dinitial,seed;
     std::thread::id thread=std::this_thread::get_id();
@@ -133,9 +135,9 @@ struct Mamba3Tape::Impl {
 #endif
         return out;
     }
-    mb::Trace<float> trace() {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data(),gpu_provider!=mb::GpuProvider::DenseReference,mb::is_flash_provider(gpu_provider),coefficients.raw_data(),gpu_provider==mb::GpuProvider::FlashFp32ReplayLdsV2};}
-    mb::Trace<const float> trace_const() const {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data(),gpu_provider!=mb::GpuProvider::DenseReference,mb::is_flash_provider(gpu_provider),coefficients.raw_data(),gpu_provider==mb::GpuProvider::FlashFp32ReplayLdsV2};}
-    std::size_t workspace() const {return (std::size_t(history.size)+coefficients.size+q.size+k.size+phase.size+readout.size+partial.size+scratch.size+gy.size+token_parameters.size+bc_gradient.size+phase_gradient.size+reverse.size+dz.size+dx_value.size+ddt.size+da.size+dtrap.size)*sizeof(float);}
+    mb::Trace<float> trace() {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data(),gpu_provider!=mb::GpuProvider::DenseReference,mb::is_flash_provider(gpu_provider),coefficients.raw_data(),mb::is_replay_lds_provider(gpu_provider),mb::is_hierarchical_provider(gpu_provider),hierarchy_a.raw_data(),hierarchy_b.raw_data()};}
+    mb::Trace<const float> trace_const() const {return {history.raw_data(),q.raw_data(),k.raw_data(),phase.raw_data(),readout.raw_data(),gpu_provider!=mb::GpuProvider::DenseReference,mb::is_flash_provider(gpu_provider),coefficients.raw_data(),mb::is_replay_lds_provider(gpu_provider),mb::is_hierarchical_provider(gpu_provider),hierarchy_a.raw_data(),hierarchy_b.raw_data()};}
+    std::size_t workspace() const {return (std::size_t(history.size)+coefficients.size+q.size+k.size+phase.size+readout.size+partial.size+scratch.size+gy.size+token_parameters.size+bc_gradient.size+phase_gradient.size+reverse.size+dz.size+dx_value.size+ddt.size+da.size+dtrap.size+hierarchy_a.size+hierarchy_b.size)*sizeof(float);}
 };
 struct Mamba3Layer::Impl {
     int model;Mamba3Config config;Device device=Device::CPU;Tensor core;std::vector<Parameter> params;std::string name="mamba3";
@@ -224,7 +226,7 @@ std::shared_ptr<Mamba3Tape> Mamba3Layer::forward_owned(const Tensor& input,const
     auto p=std::make_unique<Mamba3Tape::Impl>();p->shape=s;p->device=layer.device;
     p->gpu_provider=mb::gpu_provider_from_environment();
     require(p->gpu_provider==mb::GpuProvider::DenseReference||layer.device==Device::GPU,"Mamba3 optimized provider requires GPU; no CPU fallback");
-    require(p->gpu_provider==mb::GpuProvider::DenseReference||mb::parallel_eligible(s),"Mamba3 optimized provider workspace/grid capacity exceeded");p->model_id=layer.id;p->input_shape=dims;p->core_fields=fields(s);
+    require(p->gpu_provider==mb::GpuProvider::DenseReference||mb::parallel_eligible(s),"Mamba3 optimized provider workspace/grid capacity exceeded");require(!mb::is_hierarchical_provider(p->gpu_provider)||mb::hierarchical_eligible(s),"Mamba3 hierarchical workspace capacity exceeded");p->model_id=layer.id;p->input_shape=dims;p->core_fields=fields(s);
     p->projection_policy=mp::policy();
     if(p->projection_policy!=mp::Policy::ExactFP32) {
         require(layer.device==Device::GPU,"Mamba3 lowp projection requires GPU; no host fallback");
@@ -262,6 +264,7 @@ std::shared_ptr<Mamba3Tape> Mamba3Layer::forward_owned(const Tensor& input,const
     }
     p->projection=p->dense(p->input,p->in_weight,false,true,mp::ExactAxis::OutputCols,2*s.inner()+2*s.bc());p->mixed=Tensor::zeros({B*S,s.inner()},layer.device);
     if(p->gpu_provider!=mb::GpuProvider::DenseReference) p->coefficients=flat(mb::coefficient_size(s),layer.device);
+    if(mb::is_hierarchical_provider(p->gpu_provider)) {p->hierarchy_a=flat(mb::hierarchy_elements(s),layer.device);p->hierarchy_b=flat(mb::hierarchy_elements(s),layer.device);}
     p->history=flat(mb::is_flash_provider(p->gpu_provider)?mb::checkpoint_history_size(s):mb::history_size(s),layer.device);p->q=flat(mb::rotation_size(s),layer.device);p->k=flat(mb::rotation_size(s),layer.device);p->phase=flat(mb::phase_size(s),layer.device);p->readout=flat(mb::readout_size(s),layer.device);
     if(layer.device==Device::CPU) {for(int b=0;b<B;++b) if(!p->status.data()[b]) mb::detail::forward_batch(s,mb::Layout(s),b,p->projection.data(),p->core.data(),p->valid.data(),source(p->initial),dest(p->final),p->trace(),p->mixed.data(),p->status.data());++layer.telemetry.cpu_forward;}
 #ifdef USE_CUDA
@@ -269,6 +272,7 @@ std::shared_ptr<Mamba3Tape> Mamba3Layer::forward_owned(const Tensor& input,const
         switch(p->gpu_provider) {
         case mb::GpuProvider::DenseReference: ++layer.telemetry.gpu_reference_forward;break;
         case mb::GpuProvider::ParallelFp32: ++layer.telemetry.gpu_parallel_forward;break;
+        case mb::GpuProvider::FlashFp32HierarchicalV1:
         case mb::GpuProvider::FlashFp32ReplayLdsV2:
         case mb::GpuProvider::FlashFp32: ++layer.telemetry.gpu_flash_forward;break;
         }
@@ -287,6 +291,7 @@ Mamba3Backward Mamba3Layer::backward_owned(const std::shared_ptr<Mamba3Tape>& ta
         switch(tape->impl_->gpu_provider) {
         case mb::GpuProvider::DenseReference: ++impl_->telemetry.gpu_reference_backward;break;
         case mb::GpuProvider::ParallelFp32: ++impl_->telemetry.gpu_parallel_backward;break;
+        case mb::GpuProvider::FlashFp32HierarchicalV1:
         case mb::GpuProvider::FlashFp32ReplayLdsV2:
         case mb::GpuProvider::FlashFp32: ++impl_->telemetry.gpu_flash_backward;break;
         }

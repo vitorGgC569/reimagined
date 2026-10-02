@@ -1,0 +1,72 @@
+{
+  "status": "completed",
+  "seed": 23,
+  "arm": "M3",
+  "label": "actual_native_frozen_backbone_adapter_P0",
+  "updates": 20,
+  "elapsed_seconds": 1.2463167000096291,
+  "loss_first": 29.60275650024414,
+  "loss_last": 10.442543029785156,
+  "grad_norm_max": 150.88926696777344,
+  "grad_norm_p99": 150.5579672241211,
+  "trainable_parameters": 507,
+  "trainable_bytes": 2028,
+  "persistent_buffer_bytes": 256,
+  "evaluations": {
+    "validation": {
+      "accuracy": 0.171875,
+      "correct": 22,
+      "total": 128,
+      "latency_seconds": 0.11922210000921041,
+      "retrieval": {
+        "reads": 128,
+        "similarity_evaluations": 114,
+        "similarity_madds": 912,
+        "topk_calls": 114,
+        "value_reads": 114,
+        "writes": 256,
+        "evictions": 0,
+        "overwrites": 146,
+        "revocations": 32
+      },
+      "aux_state_bytes_per_eval_batch": 4000,
+      "cache_bytes_estimate": 1116,
+      "state_norm_max": 553.7228393554688
+    },
+    "test": {
+      "accuracy": 0.203125,
+      "correct": 52,
+      "total": 256,
+      "latency_seconds": 0.23614729999098927,
+      "retrieval": {
+        "reads": 256,
+        "similarity_evaluations": 226,
+        "similarity_madds": 1808,
+        "topk_calls": 226,
+        "value_reads": 226,
+        "writes": 512,
+        "evictions": 0,
+        "overwrites": 287,
+        "revocations": 64
+      },
+      "aux_state_bytes_per_eval_batch": 4000,
+      "cache_bytes_estimate": 1116,
+      "state_norm_max": 545.3803100585938
+    }
+  },
+  "parameters_ever_nonzero_gradient": 352,
+  "native_frozen_parameters": 3340,
+  "native_persistent_state_bytes_per_example": 5408,
+  "feature_cache_bytes": {
+    "train": 65536,
+    "validation": 32768,
+    "test": 65536
+  },
+  "routing": "visible causal metadata, no learned gates",
+  "native_backbone_frozen": true,
+  "full_compute_matched": false,
+  "protocol": "P0-pilot-v2-causal-wiring-correction",
+  "protocol_sha256": "df30294bbdb0823b43d053687042f7abba5a47d392cc088607ad374d6a576ec1",
+  "M3_memory_input": "algebra_pre_read",
+  "runner_sha256": "69d26dc496117e5a7bba91a169d47eb342dbf62f908af87253cbf816da078073"
+}

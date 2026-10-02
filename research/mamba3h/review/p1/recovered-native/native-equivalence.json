@@ -1,0 +1,79 @@
+{
+  "label": "actual_native_Mamba3_CPU",
+  "passed": true,
+  "details": [
+    {
+      "rank": 1,
+      "chunk_forward_max_abs": 0.0,
+      "directional_vjp": {
+        "input": {
+          "analytic": 0.007978400215506554,
+          "numeric": 0.007972004329323545,
+          "absolute_error": 6.395886183008237e-06
+        },
+        "phase": {
+          "analytic": 0.01729562133550644,
+          "numeric": 0.017285964956828548,
+          "absolute_error": 9.656378677891375e-06
+        },
+        "ssm": {
+          "analytic": 0.00376998633146286,
+          "numeric": 0.00376223418773608,
+          "absolute_error": 7.752143726780236e-06
+        },
+        "k": {
+          "analytic": 2.9829661798430607e-06,
+          "numeric": 1.6214167439243532e-06,
+          "absolute_error": 1.3615494359187075e-06
+        },
+        "v": {
+          "analytic": 4.040487692691386e-05,
+          "numeric": 4.448402603218771e-05,
+          "absolute_error": 4.079149105273849e-06
+        }
+      },
+      "masked_nan_pass": true,
+      "single_use_negative_pass": true,
+      "configuration": "mamba3_dense_fp32_siso_mimo_n128_v1:e9594ce1c732d97440f0332fdc43170a2294dbfa:1:8:1:2:4:128:1:1:1:0:0x1.0000000000000p-1:0x1.4f8b580000000p-17:0x1.a36e2e0000000p-14",
+      "parameter_count": 3340,
+      "persistent_state_bytes": 10816
+    },
+    {
+      "rank": 4,
+      "chunk_forward_max_abs": 0.0,
+      "directional_vjp": {
+        "input": {
+          "analytic": -0.9015485644340515,
+          "numeric": -0.901568730467539,
+          "absolute_error": 2.0166033487534207e-05
+        },
+        "phase": {
+          "analytic": -0.02191796712577343,
+          "numeric": -0.02190753265797485,
+          "absolute_error": 1.043446779858126e-05
+        },
+        "ssm": {
+          "analytic": -0.0010701660066843033,
+          "numeric": -0.0010725638708575236,
+          "absolute_error": 2.3978641732202988e-06
+        },
+        "k": {
+          "analytic": -3.4296408557565883e-07,
+          "numeric": 6.522480056059266e-07,
+          "absolute_error": 9.952120911815854e-07
+        },
+        "v": {
+          "analytic": 1.7223624126927461e-06,
+          "numeric": 2.6544104414494285e-06,
+          "absolute_error": 9.320480287566824e-07
+        }
+      },
+      "masked_nan_pass": true,
+      "single_use_negative_pass": true,
+      "configuration": "mamba3_dense_fp32_siso_mimo_n128_v1:e9594ce1c732d97440f0332fdc43170a2294dbfa:1:8:1:2:4:128:1:4:1:0:0x1.0000000000000p-1:0x1.4f8b580000000p-17:0x1.a36e2e0000000p-14",
+      "parameter_count": 11092,
+      "persistent_state_bytes": 16960
+    }
+  ],
+  "threads": 2
+}

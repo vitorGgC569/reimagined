@@ -1,0 +1,170 @@
+{
+  "prepare_status": "failed_frozen_provider_guard",
+  "optimizer_updates": 0,
+  "launch_error": "PowerShell semicolon ran run despite failed preparation; run lacked readiness guard",
+  "preserved_ledger": [
+    {
+      "seed": 11,
+      "arm": "M0",
+      "status": "failed",
+      "returncode": 1,
+      "wall_seconds": 2.2642996000358835
+    },
+    {
+      "seed": 11,
+      "arm": "MC_capacity",
+      "status": "failed",
+      "returncode": 1,
+      "wall_seconds": 2.227558600017801
+    },
+    {
+      "seed": 11,
+      "arm": "M2_symbolic_address",
+      "status": "failed",
+      "returncode": 1,
+      "wall_seconds": 2.4850603999802843
+    },
+    {
+      "seed": 11,
+      "arm": "M2_anonymous_k2",
+      "status": "failed",
+      "returncode": 1,
+      "wall_seconds": 2.223570899979677
+    },
+    {
+      "seed": 11,
+      "arm": "MA_anonymous_k2",
+      "status": "failed",
+      "returncode": 1,
+      "wall_seconds": 2.3845693000475876
+    },
+    {
+      "seed": 23,
+      "arm": "M0",
+      "status": "failed_setup",
+      "optimizer_updates": 0,
+      "reason": "child attempted without prepared seed; parent failed writing missing seed directory log",
+      "measured_wall_seconds": null,
+      "conservative_budget_charge_seconds": 90
+    },
+    {
+      "seed": 23,
+      "arm": "MC_capacity",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 23,
+      "arm": "M2_symbolic_address",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 23,
+      "arm": "M2_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 23,
+      "arm": "MA_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 37,
+      "arm": "M0",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 37,
+      "arm": "MC_capacity",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 37,
+      "arm": "M2_symbolic_address",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 37,
+      "arm": "M2_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 37,
+      "arm": "MA_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 53,
+      "arm": "M0",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 53,
+      "arm": "MC_capacity",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 53,
+      "arm": "M2_symbolic_address",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 53,
+      "arm": "M2_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 53,
+      "arm": "MA_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 71,
+      "arm": "M0",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 71,
+      "arm": "MC_capacity",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 71,
+      "arm": "M2_symbolic_address",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 71,
+      "arm": "M2_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    },
+    {
+      "seed": 71,
+      "arm": "MA_anonymous_k2",
+      "status": "unattempted",
+      "optimizer_updates": 0
+    }
+  ],
+  "aggregate_conservative_charge_seconds": 101.58505880006123,
+  "shared_current_provider_sha256": "8987a6e56eaf433a1d4e1a0609a700b515e591d7bfe94080cb63695d3bf4a434",
+  "recovered_sha256": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+  "recovered_from": "artifacts\\maestri_integral_20261001_gpuopt\\root-baseline-4db1250\\OXN\\nsos\\build-gm-cpu\\nsos_ext.cp312-win_amd64.pyd",
+  "private_path": "research\\mamba3h\\integration\\p1\\provider\\nsos_ext.cp312-win_amd64.pyd"
+}

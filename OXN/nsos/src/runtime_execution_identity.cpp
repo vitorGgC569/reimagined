@@ -527,11 +527,16 @@ RuntimeExecutionIdentity capture_runtime_execution_identity(
             throw std::invalid_argument("Mamba3 parallel/Flash requires fully GPU Mamba3 model");
         add_field(identity,"mamba3.scan_provider",
             mamba3_block::is_flash_provider(mamba3_scan_provider)
-                ? (mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "flash_fp32_replay_lds_v2" : "flash_fp32_v1") : "parallel_fp32_v1");
+                ? (mamba3_block::is_hierarchical_provider(mamba3_scan_provider) ? "flash_fp32_hierarchical_v1" : mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "flash_fp32_replay_lds_v2" : "flash_fp32_v1") : "parallel_fp32_v1");
         add_field(identity,"mamba3.scan_tile_tokens",std::to_string(mamba3_block::parallel_tile));
-        if(mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2) {
-            add_field(identity,"mamba3.state_prefix","tile32_hillis_steele_sequential_chunk_carry_v1");
-            add_field(identity,"mamba3.state_suffix","tile32_hillis_steele_sequential_reverse_carry_v1");
+        if(mamba3_block::is_replay_lds_provider(mamba3_scan_provider)) {
+            add_field(identity,"mamba3.state_prefix",mamba3_block::is_hierarchical_provider(mamba3_scan_provider)?"tile32_hs_arity32_hs_prefix_fmaf_parent_fixup_v1":"tile32_hillis_steele_sequential_chunk_carry_v1");
+            add_field(identity,"mamba3.state_suffix",mamba3_block::is_hierarchical_provider(mamba3_scan_provider)?"tile32_hs_arity32_hs_suffix_fmaf_parent_fixup_v1":"tile32_hillis_steele_sequential_reverse_carry_v1");
+            if(mamba3_block::is_hierarchical_provider(mamba3_scan_provider)) {
+                add_field(identity,"mamba3.hierarchy_arity","32");
+                add_field(identity,"mamba3.hierarchy_scratch","owned_pair_tree_fp32_reused_after_forward_v1");
+                add_field(identity,"mamba3.boundary_arithmetic","inclusive_chunk_pair_fmaf_public_seed_v1");
+            }
             add_field(identity,"mamba3.backward_replay","t4_p1_n128_stride129_explicit_scalar_seam_halos_v2");
             add_field(identity,"mamba3.phase_order","serial_token_fp32_wrap_v1");
         }
@@ -542,13 +547,13 @@ RuntimeExecutionIdentity capture_runtime_execution_identity(
         add_field(identity, "mamba3.precision", "fp32_dense_projections_fp64_norm_vjp_radial");
         add_field(identity, "mamba3.history",
             mamba3_block::is_flash_provider(mamba3_scan_provider)
-                ? (mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "tile32_boundaries_t4_lds_explicit_halos_v2" : "tile32_boundaries_replay_v1") : "dense_bh_time_pn_v1");
+                ? (mamba3_block::is_hierarchical_provider(mamba3_scan_provider)?"hier32_tile32_boundaries_t4_lds_scalar_halos_v1":mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "tile32_boundaries_t4_lds_explicit_halos_v2" : "tile32_boundaries_replay_v1") : "dense_bh_time_pn_v1");
         add_field(identity, "mamba3.publication", "explicit_all_batch_status_audit_v1");
     }
     add_field(identity, "checkpoint.gradient_policy",
               config.mamba3_enabled
                   ? (mamba3_block::is_flash_provider(mamba3_scan_provider)
-                        ? (mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "retain_mamba3_tile32_boundary_replay_lds_v2" : "retain_mamba3_tile32_boundary_replay_v1")
+                        ? (mamba3_block::is_hierarchical_provider(mamba3_scan_provider)?"retain_mamba3_hier32_tile32_boundary_replay_lds_v1":mamba3_scan_provider==mamba3_block::GpuProvider::FlashFp32ReplayLdsV2 ? "retain_mamba3_tile32_boundary_replay_lds_v2" : "retain_mamba3_tile32_boundary_replay_v1")
                         : "retain_mamba3_full_history_v1")
                   : config.use_gradient_checkpointing
                   ? "selective_faithful_recompute_v1"
@@ -563,12 +568,12 @@ RuntimeExecutionIdentity capture_runtime_execution_identity(
     if (config.mamba3_enabled) {
         add_field(identity, "mamba.history_layout",
                   mamba3_block::is_flash_provider(mamba3_scan_provider)
-                      ? "mamba3_tile32_boundaries_bh_pn_v1"
+                      ? (mamba3_block::is_hierarchical_provider(mamba3_scan_provider)?"mamba3_hier32_tile32_boundaries_bh_pn_v1":"mamba3_tile32_boundaries_bh_pn_v1")
                       : "mamba3_dense_bh_time_pn_v1");
         add_field(identity, "mamba.scan_geometry",
                   mamba3_scan_provider==mamba3_block::GpuProvider::DenseReference
                       ? "mamba3_serial_batch_owner_v1"
-                      : "mamba3_tile32_affine_prefix_128threads_4cells_v1");
+                      : mamba3_block::is_hierarchical_provider(mamba3_scan_provider)?"mamba3_tile32_local_arity32_tree_128threads_4cells_v1":"mamba3_tile32_affine_prefix_128threads_4cells_v1");
     } else {
 #ifdef USE_CUDA
     add_field(identity, "mamba.history_layout",

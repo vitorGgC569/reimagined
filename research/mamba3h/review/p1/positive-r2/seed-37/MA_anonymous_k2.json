@@ -1,0 +1,238 @@
+{
+  "status": "completed",
+  "seed": 37,
+  "arm": "MA_anonymous_k2",
+  "label": "actual_native_frozen_backbone_adapter_P1a_positive_control",
+  "updates": 30,
+  "elapsed_seconds": 0.486206800036598,
+  "losses": [
+    1.881445288658142,
+    1.4414030313491821,
+    1.527710199356079,
+    1.7227957248687744,
+    1.3454893827438354,
+    1.6711416244506836,
+    1.444077491760254,
+    1.3161572217941284,
+    1.2215850353240967,
+    1.2049560546875,
+    1.4198906421661377,
+    1.8533642292022705,
+    1.2519491910934448,
+    1.4688791036605835,
+    1.6539103984832764,
+    1.0893298387527466,
+    1.156883955001831,
+    1.572407841682434,
+    0.7677092552185059,
+    1.1184072494506836,
+    1.4031336307525635,
+    1.3180453777313232,
+    0.7456088066101074,
+    1.2968958616256714,
+    1.2855058908462524,
+    1.123720645904541,
+    1.1407381296157837,
+    1.2606126070022583,
+    0.8288273811340332,
+    1.0196740627288818
+  ],
+  "grad_norm_max": 2.701904535293579,
+  "grad_norm_p99": 2.638362493515015,
+  "qk_gradient_norms": [
+    {
+      "query": 0.14207561314105988,
+      "key": 0.17608335614204407
+    },
+    {
+      "query": 0.06756757199764252,
+      "key": 0.08084096759557724
+    },
+    {
+      "query": 0.10453686118125916,
+      "key": 0.13929368555545807
+    },
+    {
+      "query": 0.3076387941837311,
+      "key": 0.48063600063323975
+    },
+    {
+      "query": 0.07698186486959457,
+      "key": 0.14258845150470734
+    },
+    {
+      "query": 0.1615009307861328,
+      "key": 0.3536513149738312
+    },
+    {
+      "query": 0.45335784554481506,
+      "key": 1.1616346836090088
+    },
+    {
+      "query": 0.08429291844367981,
+      "key": 0.09976155310869217
+    },
+    {
+      "query": 0.3599942624568939,
+      "key": 0.5043683648109436
+    },
+    {
+      "query": 0.061498381197452545,
+      "key": 0.12394069880247116
+    },
+    {
+      "query": 0.15609966218471527,
+      "key": 0.26693058013916016
+    },
+    {
+      "query": 0.29034340381622314,
+      "key": 0.23627449572086334
+    },
+    {
+      "query": 0.4504639506340027,
+      "key": 0.6520843505859375
+    },
+    {
+      "query": 0.2309766709804535,
+      "key": 0.6073281764984131
+    },
+    {
+      "query": 0.255276083946228,
+      "key": 0.21158559620380402
+    },
+    {
+      "query": 0.16550278663635254,
+      "key": 0.5514271259307861
+    },
+    {
+      "query": 0.10423792153596878,
+      "key": 0.15929999947547913
+    },
+    {
+      "query": 0.3091117739677429,
+      "key": 0.6543565392494202
+    },
+    {
+      "query": 0.1385088413953781,
+      "key": 0.27562451362609863
+    },
+    {
+      "query": 0.14444668591022491,
+      "key": 0.3845418393611908
+    },
+    {
+      "query": 0.8708327412605286,
+      "key": 1.4572055339813232
+    },
+    {
+      "query": 0.32186758518218994,
+      "key": 0.6313756704330444
+    },
+    {
+      "query": 0.10560773313045502,
+      "key": 0.26015999913215637
+    },
+    {
+      "query": 0.4399219751358032,
+      "key": 0.8673681616783142
+    },
+    {
+      "query": 0.26834768056869507,
+      "key": 0.43552419543266296
+    },
+    {
+      "query": 0.32723402976989746,
+      "key": 1.0739519596099854
+    },
+    {
+      "query": 0.279602587223053,
+      "key": 0.6261636018753052
+    },
+    {
+      "query": 0.3127787411212921,
+      "key": 1.502396583557129
+    },
+    {
+      "query": 0.13034002482891083,
+      "key": 0.22065091133117676
+    },
+    {
+      "query": 0.20671573281288147,
+      "key": 0.713333010673523
+    }
+  ],
+  "gradient_active_parameter_tensor_sizes": 292,
+  "parameters": 319,
+  "parameter_bytes": 1276,
+  "evaluations": {
+    "validation": {
+      "accuracy": 0.40625,
+      "correct": 13,
+      "total": 32,
+      "latency_seconds": 0.027143699990119785,
+      "actual_counters": {
+        "read_requests": 32,
+        "reads": 32,
+        "similarity_evaluations": 160,
+        "similarity_madds": 1280,
+        "topk_calls": 32,
+        "topk_candidates": 160,
+        "address_candidates": 0,
+        "value_reads": 64,
+        "writes": 192,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 36864,
+        "output_madds": 12288,
+        "attention_madds": 512,
+        "candidate_slot_checks": 192
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 13.745781898498535
+    },
+    "test": {
+      "accuracy": 0.484375,
+      "correct": 31,
+      "total": 64,
+      "latency_seconds": 0.05057999998098239,
+      "actual_counters": {
+        "read_requests": 64,
+        "reads": 64,
+        "similarity_evaluations": 320,
+        "similarity_madds": 2560,
+        "topk_calls": 64,
+        "topk_candidates": 320,
+        "address_candidates": 0,
+        "value_reads": 128,
+        "writes": 384,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 73728,
+        "output_madds": 24576,
+        "attention_madds": 1024,
+        "candidate_slot_checks": 384
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 16.715042114257812
+    }
+  },
+  "protocol_sha256": "3d0a1ac21c36b88d3bd9acb6fc693bf89d887c59cf9ed1cdb1f1b56a6f1e3dd5",
+  "runner_sha256": "e336f663fdaba8871964928976208b08d08c06f2f10552e8fb552885649bf1db",
+  "initial_weights_sha256": "9952b3602302da6a9ba30630812f6f9b546ca3988bf15f0c28a08d1b5ed987b4",
+  "final_weights_sha256": "567e6d6da1b732719678c638a732e1a12eb2a85e2e996bb6e6e5358733d092c2",
+  "native_frozen_parameters": 3340,
+  "native_state_bytes_per_example": 5408,
+  "routing": "anonymous k2",
+  "common_conditioning_sha256": "0f5a86b67642c4e58edacaab02f6b9f712e5a9733e98a42126523ac11e3b1557",
+  "compute_fully_matched": false
+}

@@ -1,0 +1,8 @@
+{
+  "status": "failed_baseline_inventory_guard",
+  "peer_files_verified_before_failure": true,
+  "old_root2_322_files_verified_before_failure": true,
+  "reason": "Shared native source and executables also changed during Codex production work; initial collector expected only provider drift",
+  "resolution": "Record shared drift explicitly; verify optional frozen evidence and exact private provider independently. No shared source/runtime is used for P1 and no old receipt is rewritten.",
+  "optimizer_updates": 0
+}

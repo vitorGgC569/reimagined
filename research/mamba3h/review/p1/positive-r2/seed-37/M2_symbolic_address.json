@@ -1,0 +1,238 @@
+{
+  "status": "completed",
+  "seed": 37,
+  "arm": "M2_symbolic_address",
+  "label": "actual_native_frozen_backbone_adapter_P1a_positive_control",
+  "updates": 30,
+  "elapsed_seconds": 0.4571248000138439,
+  "losses": [
+    1.709844946861267,
+    1.2615922689437866,
+    1.220595359802246,
+    1.3445810079574585,
+    1.4279159307479858,
+    1.5873527526855469,
+    0.9342236518859863,
+    1.134548544883728,
+    0.6570513248443604,
+    0.7619821429252625,
+    0.48372864723205566,
+    1.1590477228164673,
+    0.7749359607696533,
+    0.595237672328949,
+    0.3798876404762268,
+    0.43328702449798584,
+    0.2258986085653305,
+    0.2093086689710617,
+    0.18859392404556274,
+    0.08859357982873917,
+    0.18961872160434723,
+    0.02270876243710518,
+    0.10630639642477036,
+    0.1053977981209755,
+    0.08581047505140305,
+    0.06883999705314636,
+    0.007605220191180706,
+    0.08027242124080658,
+    0.006892472505569458,
+    0.024341700598597527
+  ],
+  "grad_norm_max": 2.4077744483947754,
+  "grad_norm_p99": 2.3089512157440186,
+  "qk_gradient_norms": [
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    },
+    {
+      "query": 0.0,
+      "key": 0.0
+    }
+  ],
+  "gradient_active_parameter_tensor_sizes": 164,
+  "parameters": 319,
+  "parameter_bytes": 1276,
+  "evaluations": {
+    "validation": {
+      "accuracy": 1.0,
+      "correct": 32,
+      "total": 32,
+      "latency_seconds": 0.030435699969530106,
+      "actual_counters": {
+        "read_requests": 32,
+        "reads": 32,
+        "similarity_evaluations": 32,
+        "similarity_madds": 256,
+        "topk_calls": 32,
+        "topk_candidates": 32,
+        "address_candidates": 0,
+        "value_reads": 32,
+        "writes": 96,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 36864,
+        "output_madds": 12288,
+        "attention_madds": 256,
+        "candidate_slot_checks": 192
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1116,
+      "slot_norm_max": 12.352203369140625
+    },
+    "test": {
+      "accuracy": 0.96875,
+      "correct": 62,
+      "total": 64,
+      "latency_seconds": 0.049831699987407774,
+      "actual_counters": {
+        "read_requests": 64,
+        "reads": 64,
+        "similarity_evaluations": 64,
+        "similarity_madds": 512,
+        "topk_calls": 64,
+        "topk_candidates": 64,
+        "address_candidates": 0,
+        "value_reads": 64,
+        "writes": 192,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 73728,
+        "output_madds": 24576,
+        "attention_madds": 512,
+        "candidate_slot_checks": 384
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1116,
+      "slot_norm_max": 15.608536720275879
+    }
+  },
+  "protocol_sha256": "3d0a1ac21c36b88d3bd9acb6fc693bf89d887c59cf9ed1cdb1f1b56a6f1e3dd5",
+  "runner_sha256": "e336f663fdaba8871964928976208b08d08c06f2f10552e8fb552885649bf1db",
+  "initial_weights_sha256": "9952b3602302da6a9ba30630812f6f9b546ca3988bf15f0c28a08d1b5ed987b4",
+  "final_weights_sha256": "327017660e854741943ec5e68f491483a8ae6142ee5121ef27866dad6dc1f515",
+  "native_frozen_parameters": 3340,
+  "native_state_bytes_per_example": 5408,
+  "routing": "symbolic ADDRESS",
+  "common_conditioning_sha256": "0f5a86b67642c4e58edacaab02f6b9f712e5a9733e98a42126523ac11e3b1557",
+  "compute_fully_matched": false
+}

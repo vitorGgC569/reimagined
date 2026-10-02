@@ -24,6 +24,14 @@ cd reimagined
 
 ## Where to look
 
+The October 2026 RX 7600 Mamba-3 backward checkpoint is documented in
+[`GPU_MAMBA3_BACKWARD_RANK_LDS_2026-10-02.md`](OXN/nsos/docs/GPU_MAMBA3_BACKWARD_RANK_LDS_2026-10-02.md).
+The rank-sized LDS specialization is integrated and locally tested. Its
+synthetic D768/L16/B1/S512 experiment measured 1.895x paired whole-step speedup;
+the rebuilt shared binary measured 1.457 steps/s. GPU remains experimental.
+See the [product assessment and remaining gates](OXN/nsos/docs/PRODUCT_ASSESSMENT_2026-10-02.md)
+and [optional, paused Mamba3H research](research/mamba3h/README.md).
+
 | Audience | Start here |
 |---|---|
 | Reproducing the July 2026 GPU benchmark | [`docs/benchmarks/README.md`](docs/benchmarks/README.md) |

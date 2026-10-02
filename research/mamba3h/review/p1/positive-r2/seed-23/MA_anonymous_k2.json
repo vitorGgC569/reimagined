@@ -1,0 +1,238 @@
+{
+  "status": "completed",
+  "seed": 23,
+  "arm": "MA_anonymous_k2",
+  "label": "actual_native_frozen_backbone_adapter_P1a_positive_control",
+  "updates": 30,
+  "elapsed_seconds": 0.506838700035587,
+  "losses": [
+    1.8619630336761475,
+    1.8195959329605103,
+    1.5942093133926392,
+    1.6268837451934814,
+    1.4334230422973633,
+    1.5348464250564575,
+    1.3530007600784302,
+    1.61058509349823,
+    1.573060154914856,
+    1.2619829177856445,
+    1.2496516704559326,
+    1.3405338525772095,
+    1.3668005466461182,
+    1.4922406673431396,
+    1.4914648532867432,
+    1.4058120250701904,
+    1.2892553806304932,
+    1.38064706325531,
+    1.0906959772109985,
+    1.2294951677322388,
+    1.2377649545669556,
+    1.1141971349716187,
+    1.0530458688735962,
+    1.0046968460083008,
+    1.4097774028778076,
+    1.4113820791244507,
+    1.4271200895309448,
+    1.668338418006897,
+    1.0364952087402344,
+    1.3351755142211914
+  ],
+  "grad_norm_max": 2.5340614318847656,
+  "grad_norm_p99": 2.399513673782349,
+  "qk_gradient_norms": [
+    {
+      "query": 0.10321306437253952,
+      "key": 0.11100524663925171
+    },
+    {
+      "query": 0.023999905213713646,
+      "key": 0.029982952401041985
+    },
+    {
+      "query": 0.10405956208705902,
+      "key": 0.08216231316328049
+    },
+    {
+      "query": 0.08484093844890594,
+      "key": 0.08387899398803711
+    },
+    {
+      "query": 0.15786290168762207,
+      "key": 0.16688039898872375
+    },
+    {
+      "query": 0.1448574662208557,
+      "key": 0.1536659151315689
+    },
+    {
+      "query": 0.0831453800201416,
+      "key": 0.08751803636550903
+    },
+    {
+      "query": 0.0256071537733078,
+      "key": 0.024870194494724274
+    },
+    {
+      "query": 0.05056501552462578,
+      "key": 0.055990900844335556
+    },
+    {
+      "query": 0.023259300738573074,
+      "key": 0.020878015086054802
+    },
+    {
+      "query": 0.029013659805059433,
+      "key": 0.024897923693060875
+    },
+    {
+      "query": 0.0491793267428875,
+      "key": 0.046151529997587204
+    },
+    {
+      "query": 0.019968494772911072,
+      "key": 0.01705600880086422
+    },
+    {
+      "query": 0.030826104804873466,
+      "key": 0.03637147694826126
+    },
+    {
+      "query": 0.08819013833999634,
+      "key": 0.08356790244579315
+    },
+    {
+      "query": 0.051829613745212555,
+      "key": 0.081837959587574
+    },
+    {
+      "query": 0.037099018692970276,
+      "key": 0.04806011915206909
+    },
+    {
+      "query": 0.012813680805265903,
+      "key": 0.02465086244046688
+    },
+    {
+      "query": 0.08602137118577957,
+      "key": 0.05847368761897087
+    },
+    {
+      "query": 0.08091641217470169,
+      "key": 0.10852799564599991
+    },
+    {
+      "query": 0.1075642853975296,
+      "key": 0.14202278852462769
+    },
+    {
+      "query": 0.05037669837474823,
+      "key": 0.049411896616220474
+    },
+    {
+      "query": 0.046144112944602966,
+      "key": 0.051177240908145905
+    },
+    {
+      "query": 0.07811497896909714,
+      "key": 0.06279715150594711
+    },
+    {
+      "query": 0.21308885514736176,
+      "key": 0.24025610089302063
+    },
+    {
+      "query": 0.395578533411026,
+      "key": 0.3315064609050751
+    },
+    {
+      "query": 0.12938766181468964,
+      "key": 0.17039494216442108
+    },
+    {
+      "query": 0.1610262542963028,
+      "key": 0.3027758300304413
+    },
+    {
+      "query": 0.050276897847652435,
+      "key": 0.07594802975654602
+    },
+    {
+      "query": 0.27828851342201233,
+      "key": 0.5208778381347656
+    }
+  ],
+  "gradient_active_parameter_tensor_sizes": 292,
+  "parameters": 319,
+  "parameter_bytes": 1276,
+  "evaluations": {
+    "validation": {
+      "accuracy": 0.15625,
+      "correct": 5,
+      "total": 32,
+      "latency_seconds": 0.027558400004636496,
+      "actual_counters": {
+        "read_requests": 32,
+        "reads": 32,
+        "similarity_evaluations": 160,
+        "similarity_madds": 1280,
+        "topk_calls": 32,
+        "topk_candidates": 160,
+        "address_candidates": 0,
+        "value_reads": 64,
+        "writes": 192,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 36864,
+        "output_madds": 12288,
+        "attention_madds": 512,
+        "candidate_slot_checks": 192
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 9.491713523864746
+    },
+    "test": {
+      "accuracy": 0.265625,
+      "correct": 17,
+      "total": 64,
+      "latency_seconds": 0.05908950004959479,
+      "actual_counters": {
+        "read_requests": 64,
+        "reads": 64,
+        "similarity_evaluations": 320,
+        "similarity_madds": 2560,
+        "topk_calls": 64,
+        "topk_candidates": 320,
+        "address_candidates": 0,
+        "value_reads": 128,
+        "writes": 384,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 73728,
+        "output_madds": 24576,
+        "attention_madds": 1024,
+        "candidate_slot_checks": 384
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 11.344680786132812
+    }
+  },
+  "protocol_sha256": "3d0a1ac21c36b88d3bd9acb6fc693bf89d887c59cf9ed1cdb1f1b56a6f1e3dd5",
+  "runner_sha256": "e336f663fdaba8871964928976208b08d08c06f2f10552e8fb552885649bf1db",
+  "initial_weights_sha256": "4757e497624f1f8fdc99ae90a013b7dfcb6a6ad88a1e99b9908a460b5c1c33d0",
+  "final_weights_sha256": "ba8fd2ad2c076cec4f4885fc0f47b9fb8320f7ac6a311458c1591da09b43cb50",
+  "native_frozen_parameters": 3340,
+  "native_state_bytes_per_example": 5408,
+  "routing": "anonymous k2",
+  "common_conditioning_sha256": "7c33dc0cee0715cb5bb210e8c3bb7f917e80c9a3c5c8506823131f7ee55ac64b",
+  "compute_fully_matched": false
+}

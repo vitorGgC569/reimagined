@@ -1,0 +1,18 @@
+{
+  "baseline_read_only": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "scope": "research/mamba3h/memory_only",
+  "files_sha256": {
+    "__init__.py": "aee56e883d7437772c63391ed6274c9100845ee5caed3953336ffbed13d14658",
+    "HANDOFF.md": "5609e36f0442c44df80e8d13b178422eeb31684f448c2e3df4b93c813f17c841",
+    "initial_run_note.json": "485286f3f750b4de149b2bf55e2b40025fee3a72c23f3cc805c5b8457d327397",
+    "learned_results.json": "0c548e7a6386fdcff1760e3d8b637f2c4ecb21a6121ec6216439f0d00e20c977",
+    "learned_results_initial.json": "de549be738c98276339d5d0b04d539363bbb0f7e8ce582462c6916f19ab0b9d2",
+    "learned_trial.py": "55d2c25cbe5810ed498ef983ffa7e1cf91f9abfa8c23d0db8eee0e08b193490d",
+    "slots.py": "d71014c38df919661b629873673a16024dc6224d03a9ac11a294c20ecca6e28f",
+    "test_receipt.json": "60c994e8a6515a91f1a306736dd2a9a05eb540d15f578493f70165a396d90de9",
+    "test_results.log": "b43d52383ab7b29c15a750f6243a40f15874c99bbf9fa3f5ae7abd34ab66513c",
+    "test_slots.py": "3a791def2e5c2ec9f2cb408f911602575dfe1e435955044e10ac02c2e7e767b2",
+    "trial_protocol.json": "f72b46d15d02ef3ae86d2b0a15c5971ba933a711310569283f1e05824b9816ff",
+    "verify.py": "42b7249d6eb56f62352547851aa5242193d5b05032c31a3fa2d6053dfb813f6a"
+  }
+}

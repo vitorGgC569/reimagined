@@ -1,0 +1,9 @@
+{
+  "label": "actual_native_frozen_backbone_features",
+  "seed": 11,
+  "elapsed_seconds": 0.06405289995018393,
+  "configuration": "mamba3_dense_fp32_siso_mimo_n128_v1:e9594ce1c732d97440f0332fdc43170a2294dbfa:1:8:1:2:4:128:1:1:1:0:0x1.0000000000000p-1:0x1.4f8b580000000p-17:0x1.a36e2e0000000p-14",
+  "parameter_count": 3340,
+  "input_sha256": "09bf4143b730d6e253b8a4d00fb0b27152512ddacc62d4cc3b5a9b19b097d293",
+  "output_sha256": "56fe4ded532fe0b2109a53dd9d861e00ee890cce96b11f1a02ab84890b501ec4"
+}

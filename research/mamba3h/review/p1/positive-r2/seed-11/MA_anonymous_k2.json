@@ -1,0 +1,238 @@
+{
+  "status": "completed",
+  "seed": 11,
+  "arm": "MA_anonymous_k2",
+  "label": "actual_native_frozen_backbone_adapter_P1a_positive_control",
+  "updates": 30,
+  "elapsed_seconds": 0.4671364000532776,
+  "losses": [
+    2.1766655445098877,
+    1.673708438873291,
+    1.4589489698410034,
+    1.8695716857910156,
+    1.3347415924072266,
+    1.56507408618927,
+    1.451783537864685,
+    1.2077007293701172,
+    1.146055817604065,
+    1.0131111145019531,
+    1.0738632678985596,
+    0.9674203395843506,
+    1.2979545593261719,
+    0.8871979117393494,
+    1.0277082920074463,
+    0.854243278503418,
+    0.766399085521698,
+    0.6165759563446045,
+    1.2891557216644287,
+    1.4468574523925781,
+    1.0937116146087646,
+    1.1422228813171387,
+    1.0597803592681885,
+    0.7920705080032349,
+    0.9794543981552124,
+    0.7068331241607666,
+    0.5745253562927246,
+    0.802726686000824,
+    1.684158444404602,
+    1.0206905603408813
+  ],
+  "grad_norm_max": 4.305873870849609,
+  "grad_norm_p99": 4.112792603969575,
+  "qk_gradient_norms": [
+    {
+      "query": 0.18517233431339264,
+      "key": 0.2072807401418686
+    },
+    {
+      "query": 0.04352917894721031,
+      "key": 0.04366238787770271
+    },
+    {
+      "query": 0.11349811404943466,
+      "key": 0.10439052432775497
+    },
+    {
+      "query": 0.07221777737140656,
+      "key": 0.06623870134353638
+    },
+    {
+      "query": 0.19156590104103088,
+      "key": 0.16780026257038116
+    },
+    {
+      "query": 0.0424630306661129,
+      "key": 0.04285731539130211
+    },
+    {
+      "query": 0.07227301597595215,
+      "key": 0.07115206867456436
+    },
+    {
+      "query": 0.07449305802583694,
+      "key": 0.05053865909576416
+    },
+    {
+      "query": 0.020436709746718407,
+      "key": 0.019912736490368843
+    },
+    {
+      "query": 0.07891955971717834,
+      "key": 0.07023631781339645
+    },
+    {
+      "query": 0.21892784535884857,
+      "key": 0.21510794758796692
+    },
+    {
+      "query": 0.17262697219848633,
+      "key": 0.15824829041957855
+    },
+    {
+      "query": 0.16086143255233765,
+      "key": 0.14877156913280487
+    },
+    {
+      "query": 0.12897154688835144,
+      "key": 0.14297188818454742
+    },
+    {
+      "query": 0.10937211662530899,
+      "key": 0.1209823414683342
+    },
+    {
+      "query": 0.05622692406177521,
+      "key": 0.08193717151880264
+    },
+    {
+      "query": 0.19204959273338318,
+      "key": 0.22749803960323334
+    },
+    {
+      "query": 0.06216460466384888,
+      "key": 0.09594743698835373
+    },
+    {
+      "query": 0.28539416193962097,
+      "key": 0.3155849874019623
+    },
+    {
+      "query": 0.2749871611595154,
+      "key": 0.23410733044147491
+    },
+    {
+      "query": 0.29458117485046387,
+      "key": 0.2377820909023285
+    },
+    {
+      "query": 0.07926194369792938,
+      "key": 0.11159434169530869
+    },
+    {
+      "query": 0.44875568151474,
+      "key": 0.34765779972076416
+    },
+    {
+      "query": 0.02164839394390583,
+      "key": 0.02798396162688732
+    },
+    {
+      "query": 0.08898211270570755,
+      "key": 0.18512548506259918
+    },
+    {
+      "query": 0.08375482261180878,
+      "key": 0.16213952004909515
+    },
+    {
+      "query": 0.1954881250858307,
+      "key": 0.16550979018211365
+    },
+    {
+      "query": 0.08586880564689636,
+      "key": 0.20631611347198486
+    },
+    {
+      "query": 2.312260866165161,
+      "key": 1.9460374116897583
+    },
+    {
+      "query": 0.21354512870311737,
+      "key": 0.2860094904899597
+    }
+  ],
+  "gradient_active_parameter_tensor_sizes": 292,
+  "parameters": 319,
+  "parameter_bytes": 1276,
+  "evaluations": {
+    "validation": {
+      "accuracy": 0.65625,
+      "correct": 21,
+      "total": 32,
+      "latency_seconds": 0.03151180001441389,
+      "actual_counters": {
+        "read_requests": 32,
+        "reads": 32,
+        "similarity_evaluations": 160,
+        "similarity_madds": 1280,
+        "topk_calls": 32,
+        "topk_candidates": 160,
+        "address_candidates": 0,
+        "value_reads": 64,
+        "writes": 192,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 36864,
+        "output_madds": 12288,
+        "attention_madds": 512,
+        "candidate_slot_checks": 192
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 9.963418006896973
+    },
+    "test": {
+      "accuracy": 0.5,
+      "correct": 32,
+      "total": 64,
+      "latency_seconds": 0.0634546999935992,
+      "actual_counters": {
+        "read_requests": 64,
+        "reads": 64,
+        "similarity_evaluations": 320,
+        "similarity_madds": 2560,
+        "topk_calls": 64,
+        "topk_candidates": 320,
+        "address_candidates": 0,
+        "value_reads": 128,
+        "writes": 384,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 73728,
+        "output_madds": 24576,
+        "attention_madds": 1024,
+        "candidate_slot_checks": 384
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 11.955294609069824
+    }
+  },
+  "protocol_sha256": "3d0a1ac21c36b88d3bd9acb6fc693bf89d887c59cf9ed1cdb1f1b56a6f1e3dd5",
+  "runner_sha256": "e336f663fdaba8871964928976208b08d08c06f2f10552e8fb552885649bf1db",
+  "initial_weights_sha256": "846dc6dc41644951ebb20c849c2ad4cc3d7261a3c30232c6da1fa8ff95581296",
+  "final_weights_sha256": "e8505fe025ea7e91c60e8da7034dfe2328bd584e81c480b286b2f44f1b0f5121",
+  "native_frozen_parameters": 3340,
+  "native_state_bytes_per_example": 5408,
+  "routing": "anonymous k2",
+  "common_conditioning_sha256": "69800b93e9023fda0b94569584d278b07b216ccfeab285b3354ec81560d9cebc",
+  "compute_fully_matched": false
+}

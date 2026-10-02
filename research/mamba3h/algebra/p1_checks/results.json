@@ -1,0 +1,4677 @@
+{
+  "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E",
+  "device": "CPU",
+  "torch_threads": 2,
+  "learned": false,
+  "optimizer_updates": 0,
+  "protocol_sha256": "cc966ebb38eba41d5014131672097f1926406366d9f1456d20807ef85839b920",
+  "preserved_p0_before": {
+    "operators.py": "1a37d9a58b6e45e2fae25a5514cf4f33135dfdc56618315054d017d0845dc2a6",
+    "test_algebra.py": "018b7e7039230c907b79dd2fba20038a0572e13e0678d294f470ac9b3fbca0fd",
+    "run_diagnostics.py": "eabd7431f9bbb2f65a4f0cae3f110d89b9929d072fc7ef863a7a17431dc6063a",
+    "native_probe.py": "16cae3bccaa4f6ba68550cc6249e875a4b3c286ba18d36c74e83831bcd2a3571",
+    "freeze_manifest.py": "c696c0546e1f7097dcf3d81e75c1ec8e3679a306c701744128331767ba2b6d5e",
+    "protocol.json": "b9030d41674d43d8cca5473abcd356bc2f96d64e34096eb968dfe018f74897eb",
+    "results.json": "4255b2449696384a6be40f988ac891db87b3b1b2291b06ec5d457e2e95f9efa6",
+    "tests.log": "9dd1ecf8002c697ab00c6426e354312b58bb29079b4afbe44db5add125f62f54",
+    "native_receipt.json": "71e9e84e05edcba3a64f8c051fc32f18a8262583d8317cd7082ba919fcc02279",
+    "native_results.json": "7ec93caed8317e5cb4af13d295bb481dafddb94936e04779f311ddfc31c46708",
+    "native_tests.log": "4622d7f5c76725d407dfc87cf77a4bae6bd5ad3821b65f091425fe48602d03d1",
+    "HANDOFF.md": "61e8a6a70ca9fffdd857a5f352b00fc29e6fa38f060122e425de5b204bf543d4",
+    "manifest.json": "7a389aac8f7d54fef77344b6b8c9ef1704235586b40799d56e2f58a1c80ed43d"
+  },
+  "cells": [
+    {
+      "seed": 11,
+      "split": "train",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "a65d4b5334ad1207ab06415375f9d9e034acf4c90689f0b83536e5617dfaa1fc",
+      "solver_labels_sha256": "313fc12f4d7e2a3ee701c06b7ac785fb08f734f85c69486d2c346ab1de2081a9",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 10,
+          "failures": [],
+          "elapsed_seconds": 0.005725399998482317,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 10,
+          "failures": [],
+          "elapsed_seconds": 0.006942199950572103,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 11,
+      "split": "validation",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "431d1857054e7fe6635f79de8b8d0002fda024affdd1118f8d018cbf576d9e32",
+      "solver_labels_sha256": "65d674502cd8ff2c02443a456b021852cd7f9a399e6ce559dab719bc5d7399ef",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 7,
+          "failures": [],
+          "elapsed_seconds": 0.006537200009915978,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 7,
+          "failures": [],
+          "elapsed_seconds": 0.006612900004256517,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 11,
+      "split": "test",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "dfef044531b879a01c58dcb0010abd2b468beb428e9f5424d4ca923070e12b93",
+      "solver_labels_sha256": "b24b26b713180f585ad91624ba759b8d7a5858d13fc8841ff11e04ead1511eb3",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 15,
+          "failures": [],
+          "elapsed_seconds": 0.005786099995020777,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 15,
+          "failures": [],
+          "elapsed_seconds": 0.005734400008805096,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 23,
+      "split": "train",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "3b7ec0aafd31fef987591db941eafb262638b1997525fb13bb7020c865a38ce4",
+      "solver_labels_sha256": "114e2d217ddd6e98e7f2c1513e0e25353b0e91673deb308b2fe563918951907b",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.005921499978285283,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.007251600036397576,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 23,
+      "split": "validation",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "9ff6ed0de07bcf0aaecf8d408beb4275b4bef5b99c91fdf36d91aa6e06efc475",
+      "solver_labels_sha256": "1f657c90830a019c7131e9073aa7d53460bbc84cd146d4c243aec66ca6199b82",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 13,
+          "failures": [],
+          "elapsed_seconds": 0.006389799993485212,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 13,
+          "failures": [],
+          "elapsed_seconds": 0.005485899979248643,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 23,
+      "split": "test",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "ec15150c0a924aae5c7e4223eba247212464c6d3152eeb38306c9c776461bc79",
+      "solver_labels_sha256": "3ead683dcea8c47135d4e0bf3b0c26f3f2e1153774c12a3764e841e7c093dad0",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 9,
+          "failures": [],
+          "elapsed_seconds": 0.006136500043794513,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 9,
+          "failures": [],
+          "elapsed_seconds": 0.00597969995578751,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 37,
+      "split": "train",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "c115b5dbd56bc030d14134c24269d7734b41c5cf14e15019bf65623ec94f44fc",
+      "solver_labels_sha256": "1b779876b9c14c51343772f4b21a522c5756827fe56d18de0bfa15b963c73b92",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 11,
+          "failures": [],
+          "elapsed_seconds": 0.007332499953918159,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 11,
+          "failures": [],
+          "elapsed_seconds": 0.0068373000249266624,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 37,
+      "split": "validation",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "9db00dffa019aba80987c358d94d2b9bda8e4a44fe9668a745bcadeb4d6edcbd",
+      "solver_labels_sha256": "30e93fb6d8e99d4c1dd085f560d3ab2d6d2fc364044b39f89d8d38d9b1d9d546",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 12,
+          "failures": [],
+          "elapsed_seconds": 0.0059071999858133495,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 12,
+          "failures": [],
+          "elapsed_seconds": 0.005265199986752123,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 37,
+      "split": "test",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "fc66d9d7776fd4a0800722c153bf675100b841c9c165eca1b6cca15e0482d9ce",
+      "solver_labels_sha256": "c6c7ccf31ed9926306f808bd78605e19096b46c93be8143d2698d43a0c1ed0dd",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 5,
+          "failures": [],
+          "elapsed_seconds": 0.0062265999731607735,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 5,
+          "failures": [],
+          "elapsed_seconds": 0.005546400032471865,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 53,
+      "split": "train",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "90054a8c4e7fa7a67871544db81c79484d2758bfaeb46bd94118a2c58148f3af",
+      "solver_labels_sha256": "976d680db9a9052cc1d41bed3f6ce299d1795648f5b7d1b402f0c66058b0caa7",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.007002400001510978,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.005330500018317252,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 53,
+      "split": "validation",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "7ac73df45a6ba32973539c8f7998307187b77d8268043480059a6c71f2e46eaa",
+      "solver_labels_sha256": "6574d44349bcd1f32a0bf71c23c956e2fd44081634dcf35a9219a41ae700e41f",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 12,
+          "failures": [],
+          "elapsed_seconds": 0.005404499999713153,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 12,
+          "failures": [],
+          "elapsed_seconds": 0.007337599992752075,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 53,
+      "split": "test",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "7e912ff5619446508478f3ed9b845a4af77a520d99dcfbd9aa6de748aa0bfa81",
+      "solver_labels_sha256": "98f6ef7a1cd20db98a23f0d5697162be892374cf76567cc130384a3b21e18b5b",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 14,
+          "failures": [],
+          "elapsed_seconds": 0.00535160000436008,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 14,
+          "failures": [],
+          "elapsed_seconds": 0.006415200012270361,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 71,
+      "split": "train",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "4de497cfa5ba545b29c98438688087b4def5fccbb2fbfbf4ab9061d8b256d730",
+      "solver_labels_sha256": "9b26eff1b555ba193e472b2b870f607162927d8fc2aeef872794f95b8146cc47",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 9,
+          "failures": [],
+          "elapsed_seconds": 0.005631899985019118,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 9,
+          "failures": [],
+          "elapsed_seconds": 0.005391400016378611,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 71,
+      "split": "validation",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "0895b7e2dee836f410f529032fe6c2ddf9f32532c45f4a9e21ea250c526ca439",
+      "solver_labels_sha256": "714d5de84929ceb9c68bb61a62e2736c25975d4e89bd73e47e0a361fd42834a2",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.005916299996897578,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.005302899982780218,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 71,
+      "split": "test",
+      "difficulty": {
+        "entities": 1,
+        "length": 12,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 1,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "ccb4e80d2c3e82593aa4413fa578cbf69ed8df51249d8b698cacc7f1036f21f9",
+      "solver_labels_sha256": "ce40f7a05b1dbaa8af89244a4b5ed1765f3c023cb88e03eac02acb3ad8b0251b",
+      "arms": {
+        "global": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 11,
+          "failures": [],
+          "elapsed_seconds": 0.006452000001445413,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 11,
+          "failures": [],
+          "elapsed_seconds": 0.005277099960949272,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 16,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 0,
+            "DISTRACTOR": 8
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 11,
+      "split": "train",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "f87453fc923ea289382bd5cfcc9c00c169c872c3aa701de0983ae92d53044ffb",
+      "solver_labels_sha256": "54fcecceaab9a592b04a0794c8482ac9c2e9514a977057670074c0b1121017a1",
+      "arms": {
+        "global": {
+          "correct": 9,
+          "queries": 32,
+          "accuracy": 0.28125,
+          "whole_episode_correct": 0,
+          "undefined_queries": 6,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 5,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 0,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 6,
+              "predicted": 0,
+              "expected": 2
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 12,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 6,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 9,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 3,
+              "event_index": 13,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 4,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 6,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 4,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 4,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 3,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 4,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 9,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 10,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 7,
+              "event_index": 11,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 12,
+              "predicted": 0,
+              "expected": 3
+            }
+          ],
+          "elapsed_seconds": 0.008463200007099658,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 6,
+          "failures": [],
+          "elapsed_seconds": 0.00708360003773123,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 11,
+      "split": "validation",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "e4dd39ea2acb05139a783f5fab50e073d6a25da1ba8ad93a840ac39bd22c457d",
+      "solver_labels_sha256": "5033d19fff9b504defdae2a80d02d20e50fea5f448df15480279e7b4ef762690",
+      "arms": {
+        "global": {
+          "correct": 11,
+          "queries": 32,
+          "accuracy": 0.34375,
+          "whole_episode_correct": 0,
+          "undefined_queries": 6,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 7,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 0,
+              "event_index": 8,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 0,
+              "event_index": 11,
+              "predicted": 0,
+              "expected": 2
+            },
+            {
+              "episode": 0,
+              "event_index": 14,
+              "predicted": 0,
+              "expected": 2
+            },
+            {
+              "episode": 1,
+              "event_index": 3,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 1,
+              "event_index": 7,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 4,
+              "predicted": 2,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 12,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 2,
+              "expected": 5
+            },
+            {
+              "episode": 3,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 4,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 4,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 4,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 5,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 5,
+              "event_index": 6,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 3,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 6,
+              "event_index": 5,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 7,
+              "event_index": 8,
+              "predicted": 0,
+              "expected": 1
+            }
+          ],
+          "elapsed_seconds": 0.00867490004748106,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 0,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 1
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 6,
+          "failures": [],
+          "elapsed_seconds": 0.007773399993311614,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 0,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 1
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 11,
+      "split": "test",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "747658b9487d0bfaac77c2a2ac924ef164254da723a1fc1e854483640f98bcc8",
+      "solver_labels_sha256": "e589cc58272d3055fb30e6da7d0f0bf9774450950d5b5f0e2512b46e1d93afce",
+      "arms": {
+        "global": {
+          "correct": 8,
+          "queries": 32,
+          "accuracy": 0.25,
+          "whole_episode_correct": 0,
+          "undefined_queries": 7,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 4,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 0,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 0,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 0,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 5,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 3,
+              "expected": 5
+            },
+            {
+              "episode": 3,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 4,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 9,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 4,
+              "event_index": 10,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 5,
+              "event_index": 3,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 14,
+              "predicted": 2,
+              "expected": 5
+            },
+            {
+              "episode": 6,
+              "event_index": 5,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 12,
+              "predicted": 1,
+              "expected": 5
+            },
+            {
+              "episode": 6,
+              "event_index": 14,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 6,
+              "predicted": 1,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 10,
+              "predicted": 1,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 0
+            }
+          ],
+          "elapsed_seconds": 0.008534299966413528,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 7,
+          "failures": [],
+          "elapsed_seconds": 0.008280100009869784,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 23,
+      "split": "train",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "d1fe8ee3e2113d3db02e541f8d4443a6272bd3c93f669002b6a6ad0194004761",
+      "solver_labels_sha256": "06cef7ad585a6d6c370287854088f5f2854bb04bb6ff2085784945e0c38b2811",
+      "arms": {
+        "global": {
+          "correct": 15,
+          "queries": 32,
+          "accuracy": 0.46875,
+          "whole_episode_correct": 0,
+          "undefined_queries": 6,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 6,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 0,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 0,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 1,
+              "event_index": 8,
+              "predicted": 2,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 12,
+              "predicted": 4,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 2,
+              "expected": 5
+            },
+            {
+              "episode": 3,
+              "event_index": 3,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 6,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 4,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 15,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 6,
+              "event_index": 5,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 7,
+              "event_index": 5,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 7,
+              "predicted": 2,
+              "expected": 1
+            }
+          ],
+          "elapsed_seconds": 0.009407599980477244,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 6,
+          "failures": [],
+          "elapsed_seconds": 0.008552899991627783,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 23,
+      "split": "validation",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "2852dd0379b9a692db5a18cf357f1a289e05f827051f211125b80925fac0a6cd",
+      "solver_labels_sha256": "63685ef7172d05de041e2a1e139c6c8a54d24539a110a6e0e5acac4c16708702",
+      "arms": {
+        "global": {
+          "correct": 9,
+          "queries": 32,
+          "accuracy": 0.28125,
+          "whole_episode_correct": 0,
+          "undefined_queries": 3,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 8,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 0,
+              "event_index": 11,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 0,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 0,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 1,
+              "event_index": 9,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 12,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 11,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 13,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 3,
+              "event_index": 7,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 4,
+              "event_index": 15,
+              "predicted": 2,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 3,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 7,
+              "predicted": 0,
+              "expected": 2
+            },
+            {
+              "episode": 5,
+              "event_index": 10,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 6,
+              "event_index": 3,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 4,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 5,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 8,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 9,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 12,
+              "predicted": 2,
+              "expected": 0
+            }
+          ],
+          "elapsed_seconds": 0.008328699972480536,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 0,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 1
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 3,
+          "failures": [],
+          "elapsed_seconds": 0.00824970001121983,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 0,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 1
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 23,
+      "split": "test",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "a784fed41114b0365c4acd2e06f00135161a03ea892783be10bc67d7c2bc010f",
+      "solver_labels_sha256": "5143c9853eb0108d307d5f65fdc0ba5506b7b8c7351a0de452d1ce439afa0727",
+      "arms": {
+        "global": {
+          "correct": 11,
+          "queries": 32,
+          "accuracy": 0.34375,
+          "whole_episode_correct": 0,
+          "undefined_queries": 6,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 3,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 0,
+              "event_index": 7,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 0,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 1,
+              "event_index": 7,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 1,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 8,
+              "predicted": 4,
+              "expected": 5
+            },
+            {
+              "episode": 2,
+              "event_index": 9,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 2,
+              "event_index": 13,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 3,
+              "event_index": 11,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 3,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 3,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 4,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 13,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 14,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 6,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 7,
+              "event_index": 6,
+              "predicted": 2,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 11,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 7,
+              "event_index": 13,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 14,
+              "predicted": 0,
+              "expected": 5
+            }
+          ],
+          "elapsed_seconds": 0.008187700004782528,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 6,
+          "failures": [],
+          "elapsed_seconds": 0.00816970004234463,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 37,
+      "split": "train",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "18c690b2ae55d592ac9ef80560a82044a73146cae23f64a3c8f5acb72a0af828",
+      "solver_labels_sha256": "9bb4d4b7e6ec3fb19e6255cc84c03e85effb49ee55c743e5250bf8b109a79625",
+      "arms": {
+        "global": {
+          "correct": 11,
+          "queries": 32,
+          "accuracy": 0.34375,
+          "whole_episode_correct": 0,
+          "undefined_queries": 2,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 9,
+              "predicted": 1,
+              "expected": 0
+            },
+            {
+              "episode": 0,
+              "event_index": 10,
+              "predicted": 1,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 4,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 1,
+              "event_index": 14,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 3,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 3,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 5,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 4,
+              "event_index": 6,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 4,
+              "event_index": 11,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 5,
+              "event_index": 6,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 8,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 5,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 14,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 15,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 3,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 7,
+              "event_index": 6,
+              "predicted": 0,
+              "expected": 2
+            },
+            {
+              "episode": 7,
+              "event_index": 7,
+              "predicted": 0,
+              "expected": 2
+            }
+          ],
+          "elapsed_seconds": 0.00856809999095276,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 2,
+          "failures": [],
+          "elapsed_seconds": 0.009191599965561181,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 37,
+      "split": "validation",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "98f51f619b644b47ba291da23dde1a8b3abdad71337e51affee58bd44ba338a9",
+      "solver_labels_sha256": "0add17f0f51b95590f53b0031ad9c150ec455cebae5456b76e14d8ebecad1ebc",
+      "arms": {
+        "global": {
+          "correct": 17,
+          "queries": 32,
+          "accuracy": 0.53125,
+          "whole_episode_correct": 0,
+          "undefined_queries": 8,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 8,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 0,
+              "event_index": 13,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 0,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 7,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 4,
+              "event_index": 14,
+              "predicted": 2,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 4,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 7,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 11,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 6,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 6,
+              "event_index": 15,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 12,
+              "predicted": 3,
+              "expected": 4
+            }
+          ],
+          "elapsed_seconds": 0.012426499975845218,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.008501800009980798,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 37,
+      "split": "test",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "3aa89e5d776a6b7bc14d55501a2e0a6a28f6ce3229e9ee03f2a87257159c6a90",
+      "solver_labels_sha256": "250783764941e265c2d933d08768208de19cb7f02dfaef67a9804b1550643e0c",
+      "arms": {
+        "global": {
+          "correct": 7,
+          "queries": 32,
+          "accuracy": 0.21875,
+          "whole_episode_correct": 0,
+          "undefined_queries": 8,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 1,
+              "event_index": 8,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 1,
+              "event_index": 9,
+              "predicted": 4,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 4,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 7,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 10,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 12,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 6,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 4,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 3,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 5,
+              "event_index": 11,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 14,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 6,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 12,
+              "predicted": 4,
+              "expected": 5
+            },
+            {
+              "episode": 6,
+              "event_index": 13,
+              "predicted": 4,
+              "expected": 5
+            },
+            {
+              "episode": 6,
+              "event_index": 14,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 6,
+              "predicted": 4,
+              "expected": 2
+            },
+            {
+              "episode": 7,
+              "event_index": 11,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 4
+            }
+          ],
+          "elapsed_seconds": 0.00833099998999387,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 8,
+          "failures": [],
+          "elapsed_seconds": 0.008705399988684803,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 53,
+      "split": "train",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "22a0ca040f6fc515b44b35106a1ed04f8098997d6e3702290e48ea244d4d6e5b",
+      "solver_labels_sha256": "dc1b2fb0c8ee1892d1794820d6ba03801164928b9b57ccb5e36fb729674e659a",
+      "arms": {
+        "global": {
+          "correct": 13,
+          "queries": 32,
+          "accuracy": 0.40625,
+          "whole_episode_correct": 0,
+          "undefined_queries": 4,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 4,
+              "predicted": 1,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 9,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 6,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 2,
+              "event_index": 14,
+              "predicted": 4,
+              "expected": 5
+            },
+            {
+              "episode": 3,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 3,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 7,
+              "predicted": 4,
+              "expected": 3
+            },
+            {
+              "episode": 4,
+              "event_index": 10,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 11,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 4,
+              "event_index": 14,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 5,
+              "event_index": 7,
+              "predicted": 2,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 11,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 12,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 7,
+              "event_index": 12,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 14,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 15,
+              "predicted": 1,
+              "expected": 4
+            }
+          ],
+          "elapsed_seconds": 0.009151300007943064,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 4,
+          "failures": [],
+          "elapsed_seconds": 0.0069281000178307295,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 53,
+      "split": "validation",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "53fb8ff4afdb788eae7fc5ce61cf3b8ccea7daed412d07ea7354d1cf39853a2e",
+      "solver_labels_sha256": "c66870e66a5851d0480da774c32f208c43c2134088df85cffedd79f7963e0b9b",
+      "arms": {
+        "global": {
+          "correct": 12,
+          "queries": 32,
+          "accuracy": 0.375,
+          "whole_episode_correct": 0,
+          "undefined_queries": 6,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 5,
+              "predicted": 1,
+              "expected": 0
+            },
+            {
+              "episode": 0,
+              "event_index": 8,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 0,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 1,
+              "event_index": 4,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 1,
+              "event_index": 5,
+              "predicted": 2,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 9,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 12,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 9,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 15,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 5,
+              "event_index": 4,
+              "predicted": 4,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 6,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 12,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 15,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 12,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 6,
+              "event_index": 15,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 7,
+              "event_index": 14,
+              "predicted": 1,
+              "expected": 5
+            }
+          ],
+          "elapsed_seconds": 0.00773239997215569,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 6,
+          "failures": [],
+          "elapsed_seconds": 0.007266899978276342,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 53,
+      "split": "test",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "7131612e1cd2b12f1d2d2d0bb2b1b569433593a02c88c94395a6a3ff27fd327a",
+      "solver_labels_sha256": "bdb6c0df99514fddbaac24435ac5c3fba73a82fe4a20cce0ce13abae1edce6a5",
+      "arms": {
+        "global": {
+          "correct": 12,
+          "queries": 32,
+          "accuracy": 0.375,
+          "whole_episode_correct": 0,
+          "undefined_queries": 4,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 5,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 0,
+              "event_index": 7,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 12,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 15,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 2,
+              "event_index": 10,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 12,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 13,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 3,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 9,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 4,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 6,
+              "event_index": 5,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 6,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 4,
+              "predicted": 2,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 4
+            }
+          ],
+          "elapsed_seconds": 0.01098469999851659,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 4,
+          "failures": [],
+          "elapsed_seconds": 0.010709899943321943,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 71,
+      "split": "train",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "09be40cb61232a9db51ba2bab95c6489008f9f765cbb6f1039159a38359584c6",
+      "solver_labels_sha256": "37c84c055c5e13acd940b213c6ad58f8bf7279aa978726c0f4bfad60849886b3",
+      "arms": {
+        "global": {
+          "correct": 8,
+          "queries": 32,
+          "accuracy": 0.25,
+          "whole_episode_correct": 0,
+          "undefined_queries": 4,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 6,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 0,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 1,
+              "event_index": 9,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 1,
+              "event_index": 13,
+              "predicted": 0,
+              "expected": 5
+            },
+            {
+              "episode": 2,
+              "event_index": 7,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 2,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 3,
+              "event_index": 5,
+              "predicted": 2,
+              "expected": 0
+            },
+            {
+              "episode": 3,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 4,
+              "event_index": 6,
+              "predicted": 1,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 12,
+              "predicted": 1,
+              "expected": 2
+            },
+            {
+              "episode": 4,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 5,
+              "event_index": 5,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 7,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 6,
+              "event_index": 5,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 6,
+              "event_index": 12,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 6,
+              "event_index": 13,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 7,
+              "event_index": 4,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 8,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 10,
+              "predicted": 4,
+              "expected": 3
+            },
+            {
+              "episode": 7,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 4
+            }
+          ],
+          "elapsed_seconds": 0.009172099991701543,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 0,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 1
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 4,
+          "failures": [],
+          "elapsed_seconds": 0.007368699996732175,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 0,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 1
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 71,
+      "split": "validation",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "b9eb5b6cc76f7b68d8cb2cf254490179054bd396d3c58f245af02a13bc3635fe",
+      "solver_labels_sha256": "bb1e064146de91c47b700550353a8838060f3159096d74150dc497e80ffb36f3",
+      "arms": {
+        "global": {
+          "correct": 12,
+          "queries": 32,
+          "accuracy": 0.375,
+          "whole_episode_correct": 0,
+          "undefined_queries": 2,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 0,
+              "event_index": 15,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 1,
+              "event_index": 5,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 2,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 12,
+              "predicted": 2,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 5,
+              "predicted": 4,
+              "expected": 2
+            },
+            {
+              "episode": 2,
+              "event_index": 9,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 2,
+              "event_index": 10,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 3,
+              "event_index": 6,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 3,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 3,
+              "event_index": 15,
+              "predicted": 5,
+              "expected": 3
+            },
+            {
+              "episode": 4,
+              "event_index": 9,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 4,
+              "event_index": 15,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 5,
+              "event_index": 4,
+              "predicted": 4,
+              "expected": 3
+            },
+            {
+              "episode": 5,
+              "event_index": 9,
+              "predicted": 4,
+              "expected": 0
+            },
+            {
+              "episode": 6,
+              "event_index": 6,
+              "predicted": 3,
+              "expected": 2
+            },
+            {
+              "episode": 6,
+              "event_index": 11,
+              "predicted": 2,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 9,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 13,
+              "predicted": 3,
+              "expected": 1
+            }
+          ],
+          "elapsed_seconds": 0.00925259996438399,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 2,
+          "failures": [],
+          "elapsed_seconds": 0.006990900030359626,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    },
+    {
+      "seed": 71,
+      "split": "test",
+      "difficulty": {
+        "entities": 3,
+        "length": 16,
+        "operations": 4,
+        "queries": 4,
+        "distractors": 2,
+        "overwrite": 1,
+        "revocations": 1
+      },
+      "status": "executed",
+      "episodes": 8,
+      "corpus_sha256": "75be8af7942c8f1203334c5100711472e71bed34fd4cac2b88eb82dd4e3a87ec",
+      "solver_labels_sha256": "b1ec9daaa1ec7b349b2468ef50226ad414788074b2a3e06d8905a4f875684152",
+      "arms": {
+        "global": {
+          "correct": 6,
+          "queries": 32,
+          "accuracy": 0.1875,
+          "whole_episode_correct": 0,
+          "undefined_queries": 1,
+          "failures": [
+            {
+              "episode": 0,
+              "event_index": 8,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 0,
+              "event_index": 10,
+              "predicted": 3,
+              "expected": 4
+            },
+            {
+              "episode": 1,
+              "event_index": 8,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 9,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 10,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 1,
+              "event_index": 13,
+              "predicted": 0,
+              "expected": 3
+            },
+            {
+              "episode": 2,
+              "event_index": 4,
+              "predicted": 2,
+              "expected": 0
+            },
+            {
+              "episode": 2,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 0
+            },
+            {
+              "episode": 2,
+              "event_index": 15,
+              "predicted": 4,
+              "expected": 5
+            },
+            {
+              "episode": 3,
+              "event_index": 5,
+              "predicted": 1,
+              "expected": 3
+            },
+            {
+              "episode": 3,
+              "event_index": 8,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 3,
+              "event_index": 14,
+              "predicted": 5,
+              "expected": 2
+            },
+            {
+              "episode": 4,
+              "event_index": 4,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 5,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 10,
+              "predicted": 0,
+              "expected": 1
+            },
+            {
+              "episode": 4,
+              "event_index": 13,
+              "predicted": 0,
+              "expected": 4
+            },
+            {
+              "episode": 5,
+              "event_index": 5,
+              "predicted": 2,
+              "expected": 0
+            },
+            {
+              "episode": 5,
+              "event_index": 6,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 5,
+              "event_index": 7,
+              "predicted": 2,
+              "expected": 1
+            },
+            {
+              "episode": 6,
+              "event_index": 6,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 6,
+              "event_index": 10,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 6,
+              "event_index": 11,
+              "predicted": 5,
+              "expected": 4
+            },
+            {
+              "episode": 7,
+              "event_index": 4,
+              "predicted": 4,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 8,
+              "predicted": 3,
+              "expected": 0
+            },
+            {
+              "episode": 7,
+              "event_index": 9,
+              "predicted": 3,
+              "expected": 1
+            },
+            {
+              "episode": 7,
+              "event_index": 11,
+              "predicted": 4,
+              "expected": 0
+            }
+          ],
+          "elapsed_seconds": 0.009259800019208342,
+          "max_state_norm": 1.0,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 40,
+            "active_state_dimensions_per_sample": 5,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        },
+        "per_entity": {
+          "correct": 32,
+          "queries": 32,
+          "accuracy": 1.0,
+          "whole_episode_correct": 8,
+          "undefined_queries": 1,
+          "failures": [],
+          "elapsed_seconds": 0.007209900009911507,
+          "max_state_norm": 1.7320508075688772,
+          "counts": {
+            "SET": 32,
+            "OP": 32,
+            "QUERY": 32,
+            "REVOKE": 8,
+            "NOOP": 8,
+            "DISTRACTOR": 16
+          },
+          "budget": {
+            "counts": {
+              "SET": 1,
+              "OP": 0,
+              "QUERY": 0,
+              "REVOKE": 0,
+              "NOOP": 0,
+              "DISTRACTOR": 0
+            },
+            "parameter_count": 0,
+            "fixed_buffer_bytes": 688,
+            "persistent_state_bytes": 120,
+            "active_state_dimensions_per_sample": 15,
+            "cache_bytes": 0,
+            "retrieval_similarity_operations": 0,
+            "scope": "isolated_exact_known_operator_control_NOT_actualnative_NCE2E"
+          }
+        }
+      }
+    }
+  ],
+  "unattempted": [
+    "learned fit",
+    "native integration",
+    "native architecture",
+    "NCE2E",
+    "GPU",
+    "SOTA"
+  ],
+  "tests": {
+    "run": 9,
+    "passed": true,
+    "failures": 0,
+    "errors": 0
+  },
+  "preserved_p0_after": {
+    "operators.py": "1a37d9a58b6e45e2fae25a5514cf4f33135dfdc56618315054d017d0845dc2a6",
+    "test_algebra.py": "018b7e7039230c907b79dd2fba20038a0572e13e0678d294f470ac9b3fbca0fd",
+    "run_diagnostics.py": "eabd7431f9bbb2f65a4f0cae3f110d89b9929d072fc7ef863a7a17431dc6063a",
+    "native_probe.py": "16cae3bccaa4f6ba68550cc6249e875a4b3c286ba18d36c74e83831bcd2a3571",
+    "freeze_manifest.py": "c696c0546e1f7097dcf3d81e75c1ec8e3679a306c701744128331767ba2b6d5e",
+    "protocol.json": "b9030d41674d43d8cca5473abcd356bc2f96d64e34096eb968dfe018f74897eb",
+    "results.json": "4255b2449696384a6be40f988ac891db87b3b1b2291b06ec5d457e2e95f9efa6",
+    "tests.log": "9dd1ecf8002c697ab00c6426e354312b58bb29079b4afbe44db5add125f62f54",
+    "native_receipt.json": "71e9e84e05edcba3a64f8c051fc32f18a8262583d8317cd7082ba919fcc02279",
+    "native_results.json": "7ec93caed8317e5cb4af13d295bb481dafddb94936e04779f311ddfc31c46708",
+    "native_tests.log": "4622d7f5c76725d407dfc87cf77a4bae6bd5ad3821b65f091425fe48602d03d1",
+    "HANDOFF.md": "61e8a6a70ca9fffdd857a5f352b00fc29e6fa38f060122e425de5b204bf543d4",
+    "manifest.json": "7a389aac8f7d54fef77344b6b8c9ef1704235586b40799d56e2f58a1c80ed43d"
+  },
+  "p0_bytes_unchanged": true,
+  "elapsed_seconds": 0.6339573999866843,
+  "aggregate": {
+    "1": {
+      "global": {
+        "correct": 480,
+        "queries": 480
+      },
+      "per_entity": {
+        "correct": 480,
+        "queries": 480
+      }
+    },
+    "3": {
+      "global": {
+        "correct": 161,
+        "queries": 480
+      },
+      "per_entity": {
+        "correct": 480,
+        "queries": 480
+      }
+    }
+  }
+}

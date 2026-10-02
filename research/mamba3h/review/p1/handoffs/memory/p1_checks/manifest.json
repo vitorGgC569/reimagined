@@ -1,0 +1,16 @@
+{
+  "scope": "new_files_only_memory/p1_checks",
+  "frozen_parent_manifest_sha256": "376ba6fb332a77235950c9a3ad0fb41daa2f488b60c7360d60e76848417b6149",
+  "files_sha256": {
+    "attempt-1.json": "56d5e13c5652d5eda666fb4a0f5d07764a96ae7319dd87ee854fbc34f7487b81",
+    "attempt-1.log": "52191264d539afe2299708c7406c91cb060ebd7c6122c3100e0c6ddbd771217d",
+    "attempt-2.json": "168a5c7127dde7ed91e18b8553ea73aff1eb53e40115dcebf6525c638f87e5e7",
+    "attempt-2.log": "beb67644867f162160c60c742c25808c9c160c4e8bb56ccca6593af73100d658",
+    "checks.py": "2bff6454fc5e2323881068f842dc02b24bd5a6bfbf0db46ef56df533c1ee8580",
+    "HANDOFF.md": "16ca3e83cb1fb87ca27941117116415e09870f7673df8acf067c05ad21b76ee5",
+    "protocol.json": "5aef0e039d58ec584a4e720cf513a16c9ccda2460c7dcccb4bfaec6c82ee71df",
+    "results.json": "168a5c7127dde7ed91e18b8553ea73aff1eb53e40115dcebf6525c638f87e5e7",
+    "routing.py": "394233b096a1c53ebd6c562ce9dbef1f7e5dd6f06d614667ddbc0a5dd4130590",
+    "run_checks.py": "7f46c2b1ea99ea968eb71637dfab69f1f104b68e2dcbcb9392fca67bbc511c24"
+  }
+}

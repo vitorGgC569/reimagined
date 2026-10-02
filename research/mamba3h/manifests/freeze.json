@@ -1,0 +1,57 @@
+{
+  "baseline_commit": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "observed_head": "4db1250e7435318e1c2522b27649a5d5433f2f48",
+  "utc": "2026-10-02T02:33:37.023085+00:00",
+  "files": [
+    {
+      "path": "research/mamba3h/PROGRAM.md",
+      "sha256": "6b1f910a1cbb3d9aaaeacaac772279bc38999676415847fbc1f065d60f5e1a08",
+      "bytes": 5723
+    },
+    {
+      "path": "research/mamba3h/integration/CONTRACT.md",
+      "sha256": "b528cf009d16dac7c6e7486533524954f8b4d06d5dffd72547ea404cf41ba5b0",
+      "bytes": 3814
+    },
+    {
+      "path": "OXN/nsos/src/mamba3_layer.cpp",
+      "sha256": "102ef8f789e93d600bf3df8d3de233988665347f8a086f7dd58aa97e4232bb14",
+      "bytes": 35463
+    },
+    {
+      "path": "OXN/nsos/include/mamba3_layer_math.h",
+      "sha256": "fda96a0fe1453c5f85273605fa564c8652935fa52f0d027da8a5ffae9cc7969f",
+      "bytes": 11587
+    },
+    {
+      "path": "OXN/nsos/src/bindings.cpp",
+      "sha256": "9e85970c129d54aa2d8a4edc5e9dbe99803381700c5afeebcd9e945fc6335fb5",
+      "bytes": 88379
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/nsos_ext.cp312-win_amd64.pyd",
+      "sha256": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f",
+      "bytes": 4693504
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/test_mamba3_layer.exe",
+      "sha256": "295274404b9227940e0e21b7a6bcb03f0ad88092927cb9422f2381ff6de62e48",
+      "bytes": 3495936
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/test_mamba3_integral_reference.exe",
+      "sha256": "71dd9f88a839a4fe4a6db317d33e6cdefe5b92ae3b9d13052e97f2fa9f7ccfc5",
+      "bytes": 153088
+    },
+    {
+      "path": "OXN/nsos/build-gm-cpu/mamba3_math_oracle_probe.exe",
+      "sha256": "ffe32a493348683d80606f7389f574b1e53238357edc3b2cb58aafe2bbd34e21",
+      "bytes": 175616
+    }
+  ],
+  "inherited_HIP_extension_sha256": "8212a02b9e1486e84352aaeba2c42b02072d3b775d2f4cc2b6b98f5dbb8f5060",
+  "native_binary_commit_provenance": "not independently certified by hash; equivalence tested separately",
+  "production_diff": "",
+  "max_threads_per_process": 2,
+  "gpu_executed": false
+}

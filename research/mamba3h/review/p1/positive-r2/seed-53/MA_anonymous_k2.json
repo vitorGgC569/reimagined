@@ -1,0 +1,238 @@
+{
+  "status": "completed",
+  "seed": 53,
+  "arm": "MA_anonymous_k2",
+  "label": "actual_native_frozen_backbone_adapter_P1a_positive_control",
+  "updates": 30,
+  "elapsed_seconds": 0.5328952000127174,
+  "losses": [
+    1.4239035844802856,
+    1.389667272567749,
+    1.3990529775619507,
+    1.4935232400894165,
+    1.1418671607971191,
+    1.1332935094833374,
+    1.8835917711257935,
+    1.4397292137145996,
+    1.8598616123199463,
+    1.1383761167526245,
+    1.0785902738571167,
+    1.3935675621032715,
+    1.0683308839797974,
+    1.5069856643676758,
+    1.2481344938278198,
+    1.1299117803573608,
+    1.0101996660232544,
+    1.1838384866714478,
+    0.9483426809310913,
+    1.1687439680099487,
+    1.1458659172058105,
+    1.042317509651184,
+    1.048844337463379,
+    0.9474403858184814,
+    0.9565503597259521,
+    0.8184533715248108,
+    1.146052598953247,
+    1.0370101928710938,
+    1.0148289203643799,
+    0.6572792530059814
+  ],
+  "grad_norm_max": 1.4370346069335938,
+  "grad_norm_p99": 1.414306104183197,
+  "qk_gradient_norms": [
+    {
+      "query": 0.02816959284245968,
+      "key": 0.031605176627635956
+    },
+    {
+      "query": 0.07578543573617935,
+      "key": 0.08301636576652527
+    },
+    {
+      "query": 0.051455289125442505,
+      "key": 0.06815741211175919
+    },
+    {
+      "query": 0.15556223690509796,
+      "key": 0.11856690794229507
+    },
+    {
+      "query": 0.059150904417037964,
+      "key": 0.061769191175699234
+    },
+    {
+      "query": 0.1773354709148407,
+      "key": 0.1219826340675354
+    },
+    {
+      "query": 0.14187166094779968,
+      "key": 0.14781607687473297
+    },
+    {
+      "query": 0.05986110493540764,
+      "key": 0.04943763464689255
+    },
+    {
+      "query": 0.11523813009262085,
+      "key": 0.15440626442432404
+    },
+    {
+      "query": 0.09650739282369614,
+      "key": 0.10116082429885864
+    },
+    {
+      "query": 0.07738544791936874,
+      "key": 0.08844631165266037
+    },
+    {
+      "query": 0.1598609983921051,
+      "key": 0.16819100081920624
+    },
+    {
+      "query": 0.035301465541124344,
+      "key": 0.05001990869641304
+    },
+    {
+      "query": 0.09061243385076523,
+      "key": 0.08955665677785873
+    },
+    {
+      "query": 0.09968256950378418,
+      "key": 0.1285591870546341
+    },
+    {
+      "query": 0.09497516602277756,
+      "key": 0.08669921010732651
+    },
+    {
+      "query": 0.13565661013126373,
+      "key": 0.12771670520305634
+    },
+    {
+      "query": 0.1675223410129547,
+      "key": 0.21715129911899567
+    },
+    {
+      "query": 0.09690721333026886,
+      "key": 0.10273822396993637
+    },
+    {
+      "query": 0.06409270316362381,
+      "key": 0.08058780431747437
+    },
+    {
+      "query": 0.0755087286233902,
+      "key": 0.08072762191295624
+    },
+    {
+      "query": 0.19245292246341705,
+      "key": 0.21665231883525848
+    },
+    {
+      "query": 0.08189763128757477,
+      "key": 0.08228972554206848
+    },
+    {
+      "query": 0.10141824930906296,
+      "key": 0.1158967912197113
+    },
+    {
+      "query": 0.2214469015598297,
+      "key": 0.24070288240909576
+    },
+    {
+      "query": 0.17787282168865204,
+      "key": 0.2176523208618164
+    },
+    {
+      "query": 0.13098955154418945,
+      "key": 0.10913299769163132
+    },
+    {
+      "query": 0.083957239985466,
+      "key": 0.1373850256204605
+    },
+    {
+      "query": 0.15396136045455933,
+      "key": 0.20711426436901093
+    },
+    {
+      "query": 0.10308106243610382,
+      "key": 0.1330888867378235
+    }
+  ],
+  "gradient_active_parameter_tensor_sizes": 292,
+  "parameters": 319,
+  "parameter_bytes": 1276,
+  "evaluations": {
+    "validation": {
+      "accuracy": 0.375,
+      "correct": 12,
+      "total": 32,
+      "latency_seconds": 0.03394510003272444,
+      "actual_counters": {
+        "read_requests": 32,
+        "reads": 32,
+        "similarity_evaluations": 160,
+        "similarity_madds": 1280,
+        "topk_calls": 32,
+        "topk_candidates": 160,
+        "address_candidates": 0,
+        "value_reads": 64,
+        "writes": 192,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 36864,
+        "output_madds": 12288,
+        "attention_madds": 512,
+        "candidate_slot_checks": 192
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 6.743349075317383
+    },
+    "test": {
+      "accuracy": 0.4375,
+      "correct": 28,
+      "total": 64,
+      "latency_seconds": 0.054228799999691546,
+      "actual_counters": {
+        "read_requests": 64,
+        "reads": 64,
+        "similarity_evaluations": 320,
+        "similarity_madds": 2560,
+        "topk_calls": 64,
+        "topk_candidates": 320,
+        "address_candidates": 0,
+        "value_reads": 128,
+        "writes": 384,
+        "evictions": 0,
+        "overwrites": 0,
+        "revocations": 0,
+        "retention_drops": 0,
+        "projection_madds": 73728,
+        "output_madds": 24576,
+        "attention_madds": 1024,
+        "candidate_slot_checks": 384
+      },
+      "reserved_aux_bytes_per_example": 630,
+      "active_aux_bytes_per_example": 630,
+      "dummy_padding_bytes_per_example": 0,
+      "cache_bytes_estimate": 1340,
+      "slot_norm_max": 7.364750385284424
+    }
+  },
+  "protocol_sha256": "3d0a1ac21c36b88d3bd9acb6fc693bf89d887c59cf9ed1cdb1f1b56a6f1e3dd5",
+  "runner_sha256": "e336f663fdaba8871964928976208b08d08c06f2f10552e8fb552885649bf1db",
+  "initial_weights_sha256": "d6075fde5d58ecb7d90c14c4f8e6f1f3d19e7905dc41f22b1a464aaa11b333b2",
+  "final_weights_sha256": "e96f1ad487774aa583539c298fa8b9044edb4839aac770a151f0530229b00f6d",
+  "native_frozen_parameters": 3340,
+  "native_state_bytes_per_example": 5408,
+  "routing": "anonymous k2",
+  "common_conditioning_sha256": "63c68c29772688a85dfc2d682684c05cec141366fb21b413b03a7441a499bfb7",
+  "compute_fully_matched": false
+}

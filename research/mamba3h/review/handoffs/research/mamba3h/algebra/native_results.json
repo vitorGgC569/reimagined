@@ -1,0 +1,49 @@
+{
+  "pin": "e9594ce1c732d97440f0332fdc43170a2294dbfa",
+  "python": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+  "numpy": "2.4.6",
+  "device": "CPU",
+  "elapsed_seconds": 4.146860099979676,
+  "tests": 9,
+  "passed": true,
+  "skipped": 0,
+  "details": [
+    {
+      "test": "scan_serial_quadratic",
+      "cases": 120,
+      "N": 128
+    },
+    {
+      "test": "quadratic_finite_difference_operand_vjp",
+      "directions": 9
+    },
+    {
+      "test": "recompute_all_operand_adjoints",
+      "cases": 84,
+      "storage_scope": "SSM boundaries+local states only, not whole tape"
+    },
+    {
+      "test": "native_full_layer",
+      "device": "Device.CPU",
+      "cases": 16,
+      "directional_derivatives": 252,
+      "max_abs_output": 4.213154992882551e-06
+    },
+    {
+      "test": "native_streaming_shared_groups",
+      "boundaries": [
+        16,
+        32,
+        33
+      ],
+      "lengths": [
+        65,
+        17
+      ]
+    }
+  ],
+  "gpu_executed": false,
+  "lds_executed": false,
+  "native_module": "C:\\Users\\vitor\\OneDrive\\Desktop\\OGrandeOxta\\reimagined\\OXN\\nsos\\build-gm-cpu\\nsos_ext.cp312-win_amd64.pyd",
+  "native_sha256": "050f71f279bdd0df7b2f0fd00824376334cd8520db8343419df953990449232f"
+}

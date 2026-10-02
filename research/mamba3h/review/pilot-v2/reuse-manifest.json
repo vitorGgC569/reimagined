@@ -1,0 +1,283 @@
+{
+  "cells": [
+    {
+      "seed": 11,
+      "arm": "M0",
+      "source": "review\\pilot\\seed-11\\M0.json",
+      "sha256": "efeee7617b6485055e86b1514e424545ccc6792e6a6ef4583e8a16f147162f17"
+    },
+    {
+      "seed": 11,
+      "arm": "M1",
+      "source": "review\\pilot\\seed-11\\M1.json",
+      "sha256": "2fcca8714888503c78eacfde53f619f55c41f7227c21fde30a2e9a91b317e9ce"
+    },
+    {
+      "seed": 11,
+      "arm": "M2",
+      "source": "review\\pilot\\seed-11\\M2.json",
+      "sha256": "52f764253bde7b043ee0f2d8acb66e49c6f5504ae60f1e33323923fb8d864d83"
+    },
+    {
+      "seed": 11,
+      "arm": "MA",
+      "source": "review\\pilot\\seed-11\\MA.json",
+      "sha256": "b35f852bc666754f2f53a79e3dbfc23086148714b20a8199be2ed27b4f564829"
+    },
+    {
+      "seed": 11,
+      "arm": "MC",
+      "source": "review\\pilot\\seed-11\\MC.json",
+      "sha256": "69f010b5c5a92b7754f4cbf3323d43b70c761ee4da383669d667e5a9037c3176"
+    },
+    {
+      "seed": 23,
+      "arm": "M0",
+      "source": "review\\pilot\\seed-23\\M0.json",
+      "sha256": "f9ffb1868c183151253d948913ccda715c076e74036569e6dc20aa53e0ff215f"
+    },
+    {
+      "seed": 23,
+      "arm": "M1",
+      "source": "review\\pilot\\seed-23\\M1.json",
+      "sha256": "27d1ae1cdf68b54373c1ea2b038e114f1f297013000adfe2856e5b536ac6dd07"
+    },
+    {
+      "seed": 23,
+      "arm": "M2",
+      "source": "review\\pilot\\seed-23\\M2.json",
+      "sha256": "17356d000e7c111bd237660edf8cd6f1984c84ae0960f85516b29545db042e8d"
+    },
+    {
+      "seed": 23,
+      "arm": "MA",
+      "source": "review\\pilot\\seed-23\\MA.json",
+      "sha256": "6131f69b15e6581dd54d97c39d186a7a2506a590af183ab5e352c71a7c5f8370"
+    },
+    {
+      "seed": 23,
+      "arm": "MC",
+      "source": "review\\pilot\\seed-23\\MC.json",
+      "sha256": "7a08793863143876f1e499e3c2428fc0308f6e0f6deaee2ab6926332525bd9f6"
+    },
+    {
+      "seed": 37,
+      "arm": "M0",
+      "source": "review\\pilot\\seed-37\\M0.json",
+      "sha256": "14101152d857f397a64c93bd7e4affac6cb89edfcc5aef3291a7e5ef0f88b00e"
+    },
+    {
+      "seed": 37,
+      "arm": "M1",
+      "source": "review\\pilot\\seed-37\\M1.json",
+      "sha256": "bf811b95d886588d704375c7712e67f967a34053bc2043872a8f4ffaf6001f7d"
+    },
+    {
+      "seed": 37,
+      "arm": "M2",
+      "source": "review\\pilot\\seed-37\\M2.json",
+      "sha256": "1ce02fb5425bef628eed62f443965d58105a42e60297e0ca7aa893693499bc1f"
+    },
+    {
+      "seed": 37,
+      "arm": "MA",
+      "source": "review\\pilot\\seed-37\\MA.json",
+      "sha256": "f125f07986f16460714114626f0f605a88abeeb8c0c915f492bfbebc89df945b"
+    },
+    {
+      "seed": 37,
+      "arm": "MC",
+      "source": "review\\pilot\\seed-37\\MC.json",
+      "sha256": "e0e0b7cbe128345ab06ec2c42f8d8d617fb424420f4c506f14d353dbacd304a6"
+    },
+    {
+      "seed": 53,
+      "arm": "M0",
+      "source": "review\\pilot\\seed-53\\M0.json",
+      "sha256": "0bff8ad24abaf5eea7fce141f160268c1b8119fd8c1e2dc93ccc61a4dbeee1a3"
+    },
+    {
+      "seed": 53,
+      "arm": "M1",
+      "source": "review\\pilot\\seed-53\\M1.json",
+      "sha256": "929d3c4ee705a851c7461b3ef91cf2f207a4009228a13c532a1db15cd9ee5e18"
+    },
+    {
+      "seed": 53,
+      "arm": "M2",
+      "source": "review\\pilot\\seed-53\\M2.json",
+      "sha256": "63aff6ccb1f2d63c1658314eb632af82bada96a46a404a29f189a2cab4e54c25"
+    },
+    {
+      "seed": 53,
+      "arm": "MA",
+      "source": "review\\pilot\\seed-53\\MA.json",
+      "sha256": "5630ae30818c6a0c0b3e5cc92ddb5ccc92a408ed646fd26e1f74f4cdeee4f8fc"
+    },
+    {
+      "seed": 53,
+      "arm": "MC",
+      "source": "review\\pilot\\seed-53\\MC.json",
+      "sha256": "c0a45a2919e8684e40cead0e25310c9699f1b805e0241f9419f0e13b2a74ce8e"
+    },
+    {
+      "seed": 71,
+      "arm": "M0",
+      "source": "review\\pilot\\seed-71\\M0.json",
+      "sha256": "df338c28cb1931a0e0899a9690cac77fdeb83350163df00b8db368f7ef401826"
+    },
+    {
+      "seed": 71,
+      "arm": "M1",
+      "source": "review\\pilot\\seed-71\\M1.json",
+      "sha256": "f42c331aae29622849ba49d2d9c595bdf67c866e01937e9acabc335f431cb998"
+    },
+    {
+      "seed": 71,
+      "arm": "M2",
+      "source": "review\\pilot\\seed-71\\M2.json",
+      "sha256": "5d74c4d194c0f039cdd6bab27e85061aad11f212bc280f7a6b7a24c934349b0d"
+    },
+    {
+      "seed": 71,
+      "arm": "MA",
+      "source": "review\\pilot\\seed-71\\MA.json",
+      "sha256": "9fc77061e89551c7ae65aa1c65e3e546d38dada8c7b50468ef61a926a29bf3c1"
+    },
+    {
+      "seed": 71,
+      "arm": "MC",
+      "source": "review\\pilot\\seed-71\\MC.json",
+      "sha256": "549afe100f5ccdbe2bbdc4ee6d5b3ea8623a6c4dc0a102ed1a5e606847428a58"
+    }
+  ],
+  "datasets": [
+    {
+      "seed": 11,
+      "path": "review\\pilot-v2\\seed-11\\episodes.json",
+      "sha256": "757931aaac8ce1a6be84601a8ac2e74b6410599537854937cb8718033a412047"
+    },
+    {
+      "seed": 11,
+      "path": "review\\pilot-v2\\seed-11\\input.npz",
+      "sha256": "09bf4143b730d6e253b8a4d00fb0b27152512ddacc62d4cc3b5a9b19b097d293"
+    },
+    {
+      "seed": 11,
+      "path": "review\\pilot-v2\\seed-11\\native.npz",
+      "sha256": "56fe4ded532fe0b2109a53dd9d861e00ee890cce96b11f1a02ab84890b501ec4"
+    },
+    {
+      "seed": 11,
+      "path": "review\\pilot-v2\\seed-11\\native.json",
+      "sha256": "f6507bca3dd77cd1a7cec8b39c6dfa34b6a2ee2aa94ebe9b555e08180dac0ef4"
+    },
+    {
+      "seed": 11,
+      "path": "review\\pilot-v2\\seed-11\\native.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "seed": 23,
+      "path": "review\\pilot-v2\\seed-23\\episodes.json",
+      "sha256": "92cefd7db0fc0f7640956be5763ef718471ca5387b17d1a2841310f9a01b7f11"
+    },
+    {
+      "seed": 23,
+      "path": "review\\pilot-v2\\seed-23\\input.npz",
+      "sha256": "f4310cc484034a4120a252b2ee06af6c6138f810e5bc4290040b2d70701daf78"
+    },
+    {
+      "seed": 23,
+      "path": "review\\pilot-v2\\seed-23\\native.npz",
+      "sha256": "4542900e9343db064d172bb9a1f066c6089c194cfb919c591e262931f37b7a1c"
+    },
+    {
+      "seed": 23,
+      "path": "review\\pilot-v2\\seed-23\\native.json",
+      "sha256": "858f65f5638ff5cfbdb7860c4f114324fd86f9de5a71eaec7659f561dc913e6c"
+    },
+    {
+      "seed": 23,
+      "path": "review\\pilot-v2\\seed-23\\native.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "seed": 37,
+      "path": "review\\pilot-v2\\seed-37\\episodes.json",
+      "sha256": "3013ec1d866cee90cf12ee97f23d16bfbe0dedef553fe35fce19315eafee49bb"
+    },
+    {
+      "seed": 37,
+      "path": "review\\pilot-v2\\seed-37\\input.npz",
+      "sha256": "8ee8c3eb3ca6f0bae9ad814842c41bba7751662512a6d6247246a4f856b338f2"
+    },
+    {
+      "seed": 37,
+      "path": "review\\pilot-v2\\seed-37\\native.npz",
+      "sha256": "e68024e6cfb0c9122b114b6bdccbf37c1a3aff18b5bb86fd11aa496cabf5b95c"
+    },
+    {
+      "seed": 37,
+      "path": "review\\pilot-v2\\seed-37\\native.json",
+      "sha256": "e39626906bc121195ab1dc1c34f9b0d70f3b97782a13a8e6e549e241c34347e1"
+    },
+    {
+      "seed": 37,
+      "path": "review\\pilot-v2\\seed-37\\native.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "seed": 53,
+      "path": "review\\pilot-v2\\seed-53\\episodes.json",
+      "sha256": "36ca136dfe2717dcbc73cfb890a15d55839aafb93ba92088158011bf91a09d59"
+    },
+    {
+      "seed": 53,
+      "path": "review\\pilot-v2\\seed-53\\input.npz",
+      "sha256": "28c857cdb790a62499404f8f4ba7b7daf74ca5e7e9a21903ae43095401e83278"
+    },
+    {
+      "seed": 53,
+      "path": "review\\pilot-v2\\seed-53\\native.npz",
+      "sha256": "6a106f27ab7b198ffdb8d1ac2f4387a2681e50f7d8244095caa21d1233ce5712"
+    },
+    {
+      "seed": 53,
+      "path": "review\\pilot-v2\\seed-53\\native.json",
+      "sha256": "0cfaf3b0196fdbe1b5921aca0d394cfee51e41efcb42c23f4629632245e5d8e3"
+    },
+    {
+      "seed": 53,
+      "path": "review\\pilot-v2\\seed-53\\native.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "seed": 71,
+      "path": "review\\pilot-v2\\seed-71\\episodes.json",
+      "sha256": "7b6bd54ba7b40c943210401d810ae222d6a6032d2cccdd3d192b9355de14b083"
+    },
+    {
+      "seed": 71,
+      "path": "review\\pilot-v2\\seed-71\\input.npz",
+      "sha256": "af07fc5c1b6b2a6e06c04254816bf8984bd1fb642d838b33f992f68274405bec"
+    },
+    {
+      "seed": 71,
+      "path": "review\\pilot-v2\\seed-71\\native.npz",
+      "sha256": "12c1f616916d10a44782c2418a4d3fb54c458338cbc6bb40eae6119f3ad1aef0"
+    },
+    {
+      "seed": 71,
+      "path": "review\\pilot-v2\\seed-71\\native.json",
+      "sha256": "e8759cec84c77125b9189e370ab8748fe3383ad19e2743350df290665dc0520c"
+    },
+    {
+      "seed": 71,
+      "path": "review\\pilot-v2\\seed-71\\native.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "parent_summary_sha256": "ead591a1284a34f08449da75632c52e54425a5e09243481fdf80af5ca5f9c570",
+  "protocol_sha256": "df30294bbdb0823b43d053687042f7abba5a47d392cc088607ad374d6a576ec1"
+}
